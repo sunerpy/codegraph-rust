@@ -13241,6 +13241,333 @@ pub fn ruby_rails_model_moves_into_app_models() -> Case {
         .edge_metadata_after(RAILS_USER_MODEL, "framework", "rails")
 }
 
+// ---- W7-19f: ASP.NET ----
+
+/// A controller in a file no detection rule reads by its name, so the root
+/// files decide whether ASP.NET is detected.
+const ASPNET_USERS_FILE: &str = "src/Web/Api/Users.cs";
+const ASPNET_USERS: &str = "[Route(\"api/users\")]\npublic class UsersController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n";
+const ASPNET_USERS_ROUTE: &str = "route src/Web/Api/Users.cs::route:/api/users";
+const ASPNET_USERS_LIST: &str = "method UsersController::List";
+const ASPNET_STARTUP: &str = "public class Startup\n{\n}\n";
+
+/// W7-19f: a root `Startup.cs` appears: ASP.NET is detected, and the
+/// controller's route links to its action.
+pub fn csharp_aspnet_root_startup_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .write("Startup.cs", ASPNET_STARTUP)
+        .detected_before("aspnet", false)
+        .detected_after("aspnet", true)
+        .edge_after(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// W7-19f: the root `Startup.cs` is deleted: ASP.NET is not detected, and
+/// the route goes.
+pub fn csharp_aspnet_root_startup_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("Startup.cs", ASPNET_STARTUP)
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .remove("Startup.cs")
+        .detected_before("aspnet", true)
+        .detected_after("aspnet", false)
+        .edge_before(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// The configuration keeps the root `Program.cs` out of the index: only the
+/// `dotnet` control kind tells a sync it changed.
+const ASPNET_EXCLUDE_PROGRAM: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"Program.cs\"]\n";
+const ASPNET_PROGRAM_PLAIN: &str = "var app = Builder.Create(args);\n";
+const ASPNET_PROGRAM_WEB: &str = "var app = WebApplication.Create(args);\n";
+
+/// W7-19f: the root `Program.cs`, which the configuration keeps out of the
+/// index, comes to build a web host: ASP.NET is detected.
+pub fn csharp_aspnet_excluded_program_gains_a_web_host() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(".codegraph/config.toml", ASPNET_EXCLUDE_PROGRAM)
+        .file("Program.cs", ASPNET_PROGRAM_PLAIN)
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .write("Program.cs", ASPNET_PROGRAM_WEB)
+        .detected_before("aspnet", false)
+        .detected_after("aspnet", true)
+        .edge_after(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// W7-19f: the excluded root `Program.cs` no longer builds one: ASP.NET is
+/// not detected.
+pub fn csharp_aspnet_excluded_program_loses_its_web_host() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(".codegraph/config.toml", ASPNET_EXCLUDE_PROGRAM)
+        .file("Program.cs", ASPNET_PROGRAM_WEB)
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .write("Program.cs", ASPNET_PROGRAM_PLAIN)
+        .detected_before("aspnet", true)
+        .detected_after("aspnet", false)
+        .edge_before(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// A controller detection reads by its name, with and without a second
+/// action.
+const ASPNET_CONTROLLER_FILE: &str = "src/Web/Controllers/OrdersController.cs";
+const ASPNET_CONTROLLER: &str = "[ApiController]\n[Route(\"api/orders\")]\npublic class OrdersController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n";
+const ASPNET_CONTROLLER_TWO: &str = "[ApiController]\n[Route(\"api/orders\")]\npublic class OrdersController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult List() => Ok();\n\n    [HttpGet(\"{id}\")]\n    public IActionResult Get(int id) => Ok();\n}\n";
+const ASPNET_ORDERS_ROUTE: &str =
+    "route src/Web/Controllers/OrdersController.cs::route:/api/orders";
+const ASPNET_ORDER_ROUTE: &str =
+    "route src/Web/Controllers/OrdersController.cs::route:/api/orders/{id}";
+
+/// W7-19f: a controller gains an `[HttpGet("{id}")]` action: a route for it
+/// links to the method.
+pub fn csharp_aspnet_controller_gains_an_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER)
+        .write(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER_TWO)
+        .edge_throughout(
+            ASPNET_ORDERS_ROUTE,
+            "references",
+            "method OrdersController::List",
+        )
+        .edge_after(
+            ASPNET_ORDER_ROUTE,
+            "references",
+            "method OrdersController::Get",
+        )
+}
+
+/// W7-19f: the controller loses the action and its route.
+pub fn csharp_aspnet_controller_loses_an_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER_TWO)
+        .write(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER)
+        .edge_before(
+            ASPNET_ORDER_ROUTE,
+            "references",
+            "method OrdersController::Get",
+        )
+        .edge_throughout(
+            ASPNET_ORDERS_ROUTE,
+            "references",
+            "method OrdersController::List",
+        )
+}
+
+/// A FastEndpoints endpoint whose path is a constant in the request's own
+/// file, in an app a root `Program.cs` shows.
+const ASPNET_WEB_PROGRAM: &str = "var builder = WebApplication.CreateBuilder(args);\n";
+const ASPNET_ENDPOINT_FILE: &str = "src/Web/Contributors/Create.cs";
+const ASPNET_ENDPOINT: &str = "public class Create : Endpoint<CreateContributorRequest>\n{\n  public override void Configure()\n  {\n    Post(CreateContributorRequest.Route);\n  }\n\n  public override async Task ExecuteAsync(CreateContributorRequest request, CancellationToken ct)\n  {\n  }\n}\n";
+const ASPNET_REQUEST_FILE: &str = "src/Web/Contributors/Create.CreateContributorRequest.cs";
+const ASPNET_REQUEST: &str = "public class CreateContributorRequest\n{\n  public const string Route = \"/Contributors\";\n}\n";
+const ASPNET_REQUEST_PEOPLE: &str =
+    "public class CreateContributorRequest\n{\n  public const string Route = \"/People\";\n}\n";
+const ASPNET_REQUEST_BARE: &str =
+    "public class CreateContributorRequest\n{\n  public string Name { get; set; } = \"\";\n}\n";
+
+/// W7-19f: the constant's value changes: the route, in a file the sync
+/// does not read, is named by the new value.
+pub fn csharp_aspnet_endpoint_constant_changes_its_value() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST_PEOPLE)
+        .named_before("route", "POST /Contributors")
+        .named_after("route", "POST /People")
+}
+
+/// W7-19f: the constant's value changes back.
+pub fn csharp_aspnet_endpoint_constant_changes_its_value_back() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST_PEOPLE)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .named_before("route", "POST /People")
+        .named_after("route", "POST /Contributors")
+}
+
+/// W7-19f: the constant is deleted: the route gets back the name its own
+/// file gives it (KEEP-RUST: upstream's sync keeps the last value).
+pub fn csharp_aspnet_endpoint_constant_is_deleted() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST_BARE)
+        .named_before("route", "POST /Contributors")
+        .named_after("route", "POST CreateContributorRequest.Route")
+}
+
+/// W7-19f: the constant comes back.
+pub fn csharp_aspnet_endpoint_constant_comes_back() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST_BARE)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .named_before("route", "POST CreateContributorRequest.Route")
+        .named_after("route", "POST /Contributors")
+}
+
+/// An endpoint group detection reads by its directory, and the app's
+/// extension that writes the group head.
+const ASPNET_GROUP_FILE: &str = "src/Web/Endpoints/TodoItems.cs";
+const ASPNET_GROUP: &str = "public class TodoItems : IEndpointGroup\n{\n    public static void Map(RouteGroupBuilder groupBuilder)\n    {\n        groupBuilder.MapPost(CreateTodoItem);\n    }\n    public static int CreateTodoItem() => 1;\n}\n";
+const ASPNET_GROUP_PREFIXED: &str = "public class TodoItems : IEndpointGroup\n{\n    public static string RoutePrefix => \"/todo\";\n    public static void Map(RouteGroupBuilder groupBuilder)\n    {\n        groupBuilder.MapPost(CreateTodoItem);\n    }\n    public static int CreateTodoItem() => 1;\n}\n";
+const ASPNET_HEAD_FILE: &str = "src/Web/Infrastructure/WebApplicationExtensions.cs";
+const ASPNET_HEAD: &str = "public static class WebApplicationExtensions\n{\n    public static void MapEndpoints(WebApplication app, string groupName)\n    {\n        var group = app.MapGroup($\"/api/{groupName}\");\n    }\n}\n";
+
+/// W7-19f: the file writing the group head appears: the group's route,
+/// in a file the sync does not read, is named under it.
+pub fn csharp_aspnet_group_head_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .write(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .named_before("route", "POST /TodoItems")
+        .named_after("route", "POST /api/TodoItems")
+}
+
+/// W7-19f: the head's file is deleted: the route gets back its file's name
+/// (KEEP-RUST: upstream's sync keeps the head's).
+pub fn csharp_aspnet_group_head_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .file(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .remove(ASPNET_HEAD_FILE)
+        .named_before("route", "POST /api/TodoItems")
+        .named_after("route", "POST /TodoItems")
+}
+
+/// W7-19f: the group class comes to give its own `RoutePrefix` literal: its
+/// route is named under it, not under the head.
+pub fn csharp_aspnet_group_gains_a_route_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .file(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .write(ASPNET_GROUP_FILE, ASPNET_GROUP_PREFIXED)
+        .named_before("route", "POST /api/TodoItems")
+        .named_after("route", "POST /todo")
+}
+
+/// W7-19f: the group class drops its `RoutePrefix` literal: the head names
+/// its route again.
+pub fn csharp_aspnet_group_loses_its_route_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP_PREFIXED)
+        .file(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .write(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .named_before("route", "POST /todo")
+        .named_after("route", "POST /api/TodoItems")
+}
+
+/// Two classes named `OrderService`, one in a `/Services/` folder Pattern 2
+/// prefers; a parameter of that type, in a controller that shows ASP.NET.
+const ASPNET_SERVICE: &str = "public class OrderService\n{\n}\n";
+const ASPNET_SERVICE_FILE: &str = "src/App/Services/OrderService.cs";
+const ASPNET_SERVICE_MOVED_FILE: &str = "src/App/Core/OrderService.cs";
+const ASPNET_LEGACY_SERVICE_FILE: &str = "src/Legacy/OrderService.cs";
+const ASPNET_CHECKOUT_FILE: &str = "src/Web/CheckoutController.cs";
+const ASPNET_CHECKOUT: &str = "public class CheckoutController : ControllerBase\n{\n    public int Pay(OrderService service) { return 1; }\n}\n";
+const ASPNET_PAY_SERVICE: (&str, &str, &str) = (
+    "method CheckoutController::Pay",
+    "references",
+    "class OrderService @src/App/Services/OrderService.cs",
+);
+
+/// W7-19f (#2225): the service moves out of `/Services/`: of two
+/// candidates in no preferred folder Pattern 2 takes neither (KEEP-RUST),
+/// leaving the reference to the name matcher's guess.
+pub fn csharp_aspnet_service_moves_out_of_services() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(ASPNET_CHECKOUT_FILE, ASPNET_CHECKOUT)
+        .file(ASPNET_SERVICE_FILE, ASPNET_SERVICE)
+        .file(ASPNET_LEGACY_SERVICE_FILE, ASPNET_SERVICE)
+        .rename(ASPNET_SERVICE_FILE, ASPNET_SERVICE_MOVED_FILE)
+        .edge_metadata_before(ASPNET_PAY_SERVICE, "framework", "aspnet")
+        .no_edge_metadata_after(
+            (
+                ASPNET_PAY_SERVICE.0,
+                ASPNET_PAY_SERVICE.1,
+                "class OrderService @src/App/Core/OrderService.cs",
+            ),
+            "framework",
+            "aspnet",
+        )
+        .no_edge_metadata_after(
+            (
+                ASPNET_PAY_SERVICE.0,
+                ASPNET_PAY_SERVICE.1,
+                "class OrderService @src/Legacy/OrderService.cs",
+            ),
+            "framework",
+            "aspnet",
+        )
+}
+
+/// W7-19f (#2225): the service moves into `/Services/`: Pattern 2 takes it.
+pub fn csharp_aspnet_service_moves_into_services() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(ASPNET_CHECKOUT_FILE, ASPNET_CHECKOUT)
+        .file(ASPNET_SERVICE_MOVED_FILE, ASPNET_SERVICE)
+        .file(ASPNET_LEGACY_SERVICE_FILE, ASPNET_SERVICE)
+        .rename(ASPNET_SERVICE_MOVED_FILE, ASPNET_SERVICE_FILE)
+        .edge_metadata_after(ASPNET_PAY_SERVICE, "framework", "aspnet")
+}
+
+/// A Razor page's `@model IndexModel`, with the PageModel of the parent
+/// page and perhaps its own beside it.
+const ASPNET_BASKET_PAGE: &str = "Pages/Basket/Index.cshtml";
+const ASPNET_BASKET_PAGE_SRC: &str = "@page\n@model IndexModel\n<h1>Basket</h1>\n";
+const ASPNET_BASKET_MODEL_FILE: &str = "Pages/Basket/Index.cshtml.cs";
+const ASPNET_INDEX_MODEL_FILE: &str = "Pages/Index.cshtml.cs";
+const ASPNET_INDEX_MODEL: &str = "public class IndexModel : PageModel\n{\n}\n";
+const ASPNET_BASKET_COMPONENT: &str = "component Pages/Basket/Index.cshtml::Index";
+
+/// W7-19f (#2415): the PageModel beside the basket page appears: the
+/// page's `@model` moves to it from the parent page's.
+pub fn razor_aspnet_page_model_beside_the_page_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Razor, Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_BASKET_PAGE, ASPNET_BASKET_PAGE_SRC)
+        .file(ASPNET_INDEX_MODEL_FILE, ASPNET_INDEX_MODEL)
+        .write(ASPNET_BASKET_MODEL_FILE, ASPNET_INDEX_MODEL)
+        .edge_before(
+            ASPNET_BASKET_COMPONENT,
+            "references",
+            "class IndexModel @Pages/Index.cshtml.cs",
+        )
+        .edge_after(
+            ASPNET_BASKET_COMPONENT,
+            "references",
+            "class IndexModel @Pages/Basket/Index.cshtml.cs",
+        )
+}
+
+/// W7-19f (#2415): the PageModel beside the page is deleted: the `@model`
+/// goes back to the parent page's.
+pub fn razor_aspnet_page_model_beside_the_page_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Razor, Language::CSharp],
+    )
+    .file("Program.cs", ASPNET_WEB_PROGRAM)
+    .file(ASPNET_BASKET_PAGE, ASPNET_BASKET_PAGE_SRC)
+    .file(ASPNET_INDEX_MODEL_FILE, ASPNET_INDEX_MODEL)
+    .file(ASPNET_BASKET_MODEL_FILE, ASPNET_INDEX_MODEL)
+    .remove(ASPNET_BASKET_MODEL_FILE)
+    .edge_before(
+        ASPNET_BASKET_COMPONENT,
+        "references",
+        "class IndexModel @Pages/Basket/Index.cshtml.cs",
+    )
+    .edge_after(
+        ASPNET_BASKET_COMPONENT,
+        "references",
+        "class IndexModel @Pages/Index.cshtml.cs",
+    )
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {

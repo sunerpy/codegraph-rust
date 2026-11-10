@@ -2003,6 +2003,7 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             .collect::<Vec<_>>(),
         [
             "control_inputs:csharp",
+            "control_inputs:dotnet",
             "control_inputs:go",
             "control_inputs:js",
             "control_inputs:jvm",
@@ -2018,23 +2019,27 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
     );
     for (row, input) in [
         (0, "\"App/App.csproj\""),
-        (1, "\"svc/go.mod\""),
-        (2, "\"tsconfig.json\""),
-        (2, "\"package.json\""),
+        // ASP.NET's two root files, both absent: `App/Program.cs` is no
+        // root one.
+        (1, "\"Program.cs\":null"),
+        (1, "\"Startup.cs\":null"),
+        (2, "\"svc/go.mod\""),
+        (3, "\"tsconfig.json\""),
+        (3, "\"package.json\""),
         // A digest, where the five absent root files record null.
-        (3, "\"pom.xml\":\""),
-        (3, "\"build.sbt\":null"),
+        (4, "\"pom.xml\":\""),
+        (4, "\"build.sbt\":null"),
         // A digest, where the two absent Laravel root files record null.
-        (4, "\"composer.json\":\""),
-        (4, "\"artisan\":null"),
-        (4, "\"app/Http/Kernel.php\":null"),
+        (5, "\"composer.json\":\""),
+        (5, "\"artisan\":null"),
+        (5, "\"app/Http/Kernel.php\":null"),
         // A digest, where the seven absent root files record null.
-        (5, "\"requirements.txt\":\""),
+        (6, "\"requirements.txt\":\""),
         // Rails' four root files, all absent.
-        (6, "\"Gemfile\":null"),
-        (6, "\"config/routes.rb\":null"),
-        (7, "\"Cargo.toml\""),
-        (9, "\"react\""),
+        (7, "\"Gemfile\":null"),
+        (7, "\"config/routes.rb\":null"),
+        (8, "\"Cargo.toml\""),
+        (10, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),

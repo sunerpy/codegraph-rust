@@ -39,14 +39,14 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Rails, Spring, Play, Expo Router and GoFrame (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, Expo Router, GoFrame and ASP.NET (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
   React Native / Expo / Fabric bridges,
-  Swift↔ObjC bridging, and the Go-module / C# route
+  Swift↔ObjC bridging, and the Go-module route
   extractors. These are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction
@@ -511,7 +511,7 @@ regex engine), is not listed.
   one of its names is declared somewhere, so there it resolves or stays
   unresolved by what unrelated files declare (`astro.rs`).
 - **A name heuristic's tier with two candidates (W7-19b).** The pick the
-  Django, Flask and FastAPI name heuristics share (#2225) resolves a tier only
+  Django, Flask, FastAPI, Spring and ASP.NET name heuristics share (#2225) resolves a tier only
   through its one candidate: two declarations of the name in the reference's
   file, its directory, a preferred folder or the project answer nothing and
   stop the search, and the reference goes on to import and name resolution
@@ -633,6 +633,19 @@ regex engine), is not listed.
   functions, classes and modules; colby takes them in any language, a
   monorepo front end's TypeScript `UsersController` among a route's
   controllers (`frameworks/rails.rs`).
+- **ASP.NET's conventions stop at a pick that answers nothing (W7-19f).**
+  ASP.NET's convention rules (`…Controller`, `…Service` or `I…`,
+  `…Repository`, a letters-only model, `…ViewModel` or `…Dto`) go on to the
+  next rule only when a rule finds no candidate. A rule whose shared pick
+  answers nothing (a tier of two, a pick in another code family) ends them,
+  as Spring's do. colby tries the next rule only when there is no candidate
+  either, and takes the first otherwise (`frameworks/aspnet.rs`).
+- **An ASP.NET constant route takes one value (W7-19f).** A FastEndpoints
+  route whose path is a constant (`Post(CreateContributorRequest.Route)`) is
+  renamed by its value only when every C# class or struct of the constant's
+  class name that declares the field gives the same value; several values
+  leave it the name its file gives it. colby takes the first such class in
+  its store's order (`frameworks/aspnet.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -994,4 +1007,7 @@ file's classes, or naming the file as their
 `app/controllers/<controller>_controller.rb` (`rails_routes_version`).
 Laravel's route names need no lane: every sync recomputes them from their
 qualified names, as colby's does, so a mount that goes away is undone in
-both.
+both. ASP.NET's route names (W7-19f) need none either: every sync recomputes
+a constant route's and an endpoint group's names from their qualified
+names, and a route whose constant or group head went away gets its file's
+name back (`frameworks/aspnet.rs`), where colby's sync keeps the old name.

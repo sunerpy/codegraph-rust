@@ -22666,6 +22666,227 @@ mod ruby_frameworks {
     }
 }
 
+mod csharp_frameworks {
+    use super::support::{Graph, Indexed, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// An ASP.NET project of `files`.
+    fn aspnet(files: &[(&str, &str)]) -> Indexed {
+        let project = project_of(files).index();
+        assert!(
+            detected(&project.db()).contains("\"aspnet\""),
+            "{}",
+            detected(&project.db())
+        );
+        project
+    }
+
+    /// Every route's name, sorted.
+    fn route_names(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream's `handlerOf`: the qualified names of what the route in
+    /// `file` (or named `name`) references.
+    fn handlers_of(graph: &Graph, route: impl Fn(&super::support::NodeRow) -> bool) -> Vec<String> {
+        let route = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && route(node))
+            .expect("the route");
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == route.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| target.qualified_name.clone())
+            .collect()
+    }
+
+    /// Upstream #2158 (`fastendpoints-routes.test.ts`): an endpoint class
+    /// declares its verb and path in `Configure()`, a constant path in the
+    /// request's own file included, and handles the request in its own
+    /// `HandleAsync` or `ExecuteAsync`; a minimal API's path starts at the
+    /// root.
+    #[test]
+    fn pr2158_fastendpoints_routes_are_named_and_reach_their_own_handlers() {
+        let project = aspnet(&[
+            (
+                "src/Web/Contributors/Create.CreateContributorRequest.cs",
+                "namespace Web.Contributors;\n\npublic class CreateContributorRequest\n{\n  public const string Route = \"/Contributors\";\n  public string Name { get; set; } = \"\";\n}\n",
+            ),
+            (
+                "src/Web/Contributors/Create.cs",
+                "namespace Web.Contributors;\n\npublic class Create : Endpoint<CreateContributorRequest, CreateContributorResponse>\n{\n  public override void Configure()\n  {\n    Post(CreateContributorRequest.Route);\n    AllowAnonymous();\n  }\n\n  public override async Task ExecuteAsync(CreateContributorRequest request, CancellationToken ct)\n  {\n  }\n}\n",
+            ),
+            (
+                "src/Web/Contributors/List.cs",
+                "namespace Web.Contributors;\n\npublic class List : EndpointWithoutRequest<ContributorListResponse>\n{\n  public override void Configure()\n  {\n    Get(\"/Contributors\");\n    AllowAnonymous();\n  }\n\n  public override async Task HandleAsync(CancellationToken ct)\n  {\n  }\n}\n",
+            ),
+            (
+                "src/Web/Projects/List.cs",
+                "namespace Web.Projects;\n\npublic class List : EndpointWithoutRequest<ProjectListResponse>\n{\n  public override void Configure()\n  {\n    Get($\"/{nameof(Project)}s\");\n  }\n\n  public override async Task HandleAsync(CancellationToken ct)\n  {\n  }\n}\n",
+            ),
+            (
+                "src/Api/Program.cs",
+                "var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\napp.MapGet(\"api/todos\", GetTodos);\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            [
+                "GET /Contributors",
+                "GET /Projects",
+                "GET /api/todos",
+                "POST /Contributors"
+            ],
+            "{}",
+            graph.report()
+        );
+        let in_file =
+            |file: &'static str| move |node: &super::support::NodeRow| node.file_path == file;
+        assert_eq!(
+            handlers_of(graph, in_file("src/Web/Contributors/Create.cs")),
+            ["Web.Contributors::Create::ExecuteAsync"],
+            "{}",
+            graph.report()
+        );
+        // Two classes named `List`: each route reaches its own class's
+        // handler.
+        assert_eq!(
+            handlers_of(graph, in_file("src/Web/Contributors/List.cs")),
+            ["Web.Contributors::List::HandleAsync"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            handlers_of(graph, in_file("src/Web/Projects/List.cs")),
+            ["Web.Projects::List::HandleAsync"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2415 (`framework-resolve-language.test.ts`, eShopOnWeb):
+    /// ASP.NET resolves Razor references too, and each page's `@model
+    /// IndexModel` reaches the PageModel beside it.
+    #[test]
+    fn pr2415_a_razor_page_model_reaches_the_page_model_beside_it() {
+        let project = aspnet(&[
+            (
+                "Program.cs",
+                "var builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddRazorPages();\nvar app = builder.Build();\napp.MapRazorPages();\napp.Run();\n",
+            ),
+            (
+                "Pages/_ViewImports.cshtml",
+                "@namespace Shop.Web.Pages\n@addTagHelper *, Microsoft.AspNetCore.Mvc.TagHelpers\n",
+            ),
+            (
+                "Pages/Index.cshtml",
+                "@page\n@model IndexModel\n<h1>Catalog</h1>\n",
+            ),
+            (
+                "Pages/Index.cshtml.cs",
+                "using Microsoft.AspNetCore.Mvc.RazorPages;\n\nnamespace Shop.Web.Pages;\n\npublic class IndexModel : PageModel\n{\n}\n",
+            ),
+            (
+                "Pages/Basket/Index.cshtml",
+                "@page\n@model IndexModel\n<h1>Basket</h1>\n",
+            ),
+            (
+                "Pages/Basket/Index.cshtml.cs",
+                "using Microsoft.AspNetCore.Mvc.RazorPages;\n\nnamespace Shop.Web.Pages.Basket;\n\npublic class IndexModel : PageModel\n{\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let model_of = |page: &str| {
+            let ids: Vec<&str> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.file_path == page)
+                .map(|node| node.id.as_str())
+                .collect();
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "references" && ids.contains(&edge.source.as_str()))
+                .filter_map(|edge| graph.node(&edge.target))
+                .map(|target| target.file_path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            model_of("Pages/Index.cshtml"),
+            ["Pages/Index.cshtml.cs"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            model_of("Pages/Basket/Index.cshtml"),
+            ["Pages/Basket/Index.cshtml.cs"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `bc45e907` (`ui-steps-api-servers.test.ts`, the route half):
+    /// an endpoint group's routes are named under the class, then under the
+    /// app's `MapGroup($"/api/{groupName}")` head, and reach their handlers.
+    #[test]
+    fn endpoint_group_routes_are_named_under_the_apps_head() {
+        let project = aspnet(&[
+            (
+                "src/Web/Endpoints/TodoItems.cs",
+                "using Microsoft.AspNetCore.Http.HttpResults;\nnamespace Demo.Web.Endpoints;\npublic class TodoItems : IEndpointGroup\n{\n    public static void Map(RouteGroupBuilder groupBuilder)\n    {\n        groupBuilder.RequireAuthorization();\n        groupBuilder.MapPost(CreateTodoItem);\n        groupBuilder.MapPut(UpdateTodoItem, \"{id}\");\n    }\n    public static async Task<Created<int>> CreateTodoItem(ISender sender, CreateTodoItemCommand command)\n    {\n        var id = await sender.Send(command);\n        return TypedResults.Created($\"/{nameof(TodoItems)}/{id}\", id);\n    }\n    public static async Task<Results<NoContent, BadRequest>> UpdateTodoItem(ISender sender, int id, UpdateTodoItemCommand command)\n    {\n        if (id != command.Id)\n            return TypedResults.BadRequest();\n        await sender.Send(command);\n        return TypedResults.NoContent();\n    }\n}\n",
+            ),
+            (
+                "src/Web/Infrastructure/WebApplicationExtensions.cs",
+                "using Microsoft.AspNetCore.Builder;\nnamespace Demo.Web.Infrastructure;\npublic static class WebApplicationExtensions\n{\n    public static WebApplication MapEndpoints(this WebApplication app)\n    {\n        var groupName = \"x\";\n        var group = app.MapGroup($\"/api/{groupName}\").WithTags(groupName);\n        return app;\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            route_names(graph),
+            ["POST /api/TodoItems", "PUT /api/TodoItems/{id}"],
+            "{}",
+            graph.report()
+        );
+        let named = |name: &'static str| move |node: &super::support::NodeRow| node.name == name;
+        assert_eq!(
+            handlers_of(graph, named("POST /api/TodoItems")),
+            ["Demo.Web.Endpoints::TodoItems::CreateTodoItem"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            handlers_of(graph, named("PUT /api/TodoItems/{id}")),
+            ["Demo.Web.Endpoints::TodoItems::UpdateTodoItem"],
+            "{}",
+            graph.report()
+        );
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 
