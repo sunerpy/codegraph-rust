@@ -126,7 +126,7 @@ pub struct FileReferenceSite {
 }
 
 /// A family of references a framework lane of a sync reads in bulk
-/// ([`Store::lane_references`], W7-19d, W7-19e).
+/// ([`Store::lane_references`], W7-19d, W7-19e, W7-19g).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneReferences {
     /// A PHP route's references: Laravel's, the only resolver that makes
@@ -141,6 +141,9 @@ pub enum LaneReferences {
     /// A Ruby route's references: Rails', the only resolver that makes Ruby
     /// routes.
     RubyRoutes,
+    /// A Swift route's references: Vapor's, the only resolver that makes
+    /// Swift routes.
+    SwiftRoutes,
 }
 
 impl LaneReferences {
@@ -171,6 +174,10 @@ impl LaneReferences {
             ),
             Self::RubyRoutes => (
                 "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'",
+                Vec::new(),
+            ),
+            Self::SwiftRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'",
                 Vec::new(),
             ),
         }

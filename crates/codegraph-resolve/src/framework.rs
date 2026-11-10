@@ -10,10 +10,11 @@
 //! port implements Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri,
 //! Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router,
 //! Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, Expo
-//! Router, GoFrame and ASP.NET in [`crate::frameworks`], detected
-//! per-project by [`crate::frameworks::detect_frameworks`]. The others
-//! (React Native, Expo and Fabric bridges, Swift, Rust, the Go-module route
-//! extractors, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
+//! Router, GoFrame, ASP.NET, SwiftUI, UIKit and Vapor in
+//! [`crate::frameworks`], detected per-project by
+//! [`crate::frameworks::detect_frameworks`]. The others (React Native, Expo
+//! and Fabric bridges, the Swift↔Objective-C bridge, Rust, the Go-module
+//! route extractors, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
 //! additive heuristic layer on top of the deterministic import + name-matching
 //! core, and porting them is tracked as future work.
 //!

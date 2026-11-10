@@ -537,6 +537,12 @@ and withdrawn with the others before a sync's first change. A sync that finds it
 missing or at another version re-resolves every file holding a Rails route's
 reference. It is not a canonical surface.
 
+The Vapor lane stores no rows either, only its marker `vapor_routes_version` (1),
+written by a full index, a migration and every sync whose resolution is persisted,
+and withdrawn with the others before a sync's first change. A sync that finds it
+missing or at another version re-resolves every file holding a Swift route's
+reference. It is not a canonical surface.
+
 `synthesis_version` (17) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws

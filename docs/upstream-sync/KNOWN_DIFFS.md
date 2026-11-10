@@ -39,7 +39,7 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Rails, Spring, Play, Expo Router, GoFrame and ASP.NET (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, Expo Router, GoFrame, ASP.NET, SwiftUI, UIKit and Vapor (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
@@ -511,7 +511,7 @@ regex engine), is not listed.
   one of its names is declared somewhere, so there it resolves or stays
   unresolved by what unrelated files declare (`astro.rs`).
 - **A name heuristic's tier with two candidates (W7-19b).** The pick the
-  Django, Flask, FastAPI, Spring and ASP.NET name heuristics share (#2225) resolves a tier only
+  Django, Flask, FastAPI, Spring, ASP.NET, SwiftUI, UIKit and Vapor name heuristics share (#2225) resolves a tier only
   through its one candidate: two declarations of the name in the reference's
   file, its directory, a preferred folder or the project answer nothing and
   stop the search, and the reference goes on to import and name resolution
@@ -646,6 +646,26 @@ regex engine), is not listed.
   class name that declares the field gives the same value; several values
   leave it the name its file gives it. colby takes the first such class in
   its store's order (`frameworks/aspnet.rs`).
+- **SwiftUI's, UIKit's and Vapor's conventions stop at a pick that answers
+  nothing (W7-19g).** Their convention rules (SwiftUI's `…View`, `…ViewModel`,
+  `…Store` or `…Manager` and model; UIKit's `…ViewController`, `…View`,
+  `…Cell` and `…Delegate` or `…DataSource`; Vapor's `…Controller`, Fluent
+  model and `…Middleware`) go on to the next rule only when a rule finds no
+  candidate. A rule whose shared pick answers nothing (a tier of two, such as
+  a type and its `extension` in one folder, or a pick in another code family)
+  ends them, as Spring's and ASP.NET's do. colby tries the next rule only when
+  there is no candidate either, and takes the first otherwise; where that is
+  an `extension`, its Swift type gate moves the edge to the declaration the
+  extension extends, as Rust's name matching does after the framework
+  answers nothing, so the target is mostly the same and only the resolver and
+  the confidence differ (`frameworks/swift.rs`).
+- **A Vapor handler's overloads (W7-19g).** Of one type's methods named as a
+  route's handler (`use: index`), the one a route takes when there are
+  several is the sole one whose first lines (at most three, not past its end)
+  declare a `Request` parameter (`(req: Request`, `(_ req: Request`); none or
+  two such leave the handler unresolved. colby takes the earliest of those
+  that declare one, else the earliest of all, which guesses when both or
+  neither take the request Vapor passes (`frameworks/swift.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -1005,6 +1025,11 @@ references of that name (`drupal_refs_version`). So do Rails' controllers
 from any file re-resolves the Rails route references naming one of the
 file's classes, or naming the file as their
 `app/controllers/<controller>_controller.rb` (`rails_routes_version`).
+So do Vapor's handlers (W7-19g): each Swift method or function name a file
+that a sync changes declares before the change or after it re-resolves the
+Vapor route handlers naming that method (`vapor_routes_version`), whether or
+not the name moved, since a handler's choice also reads its candidates'
+types and first lines (a `Request` parameter, an `extension A.B` line).
 Laravel's route names need no lane: every sync recomputes them from their
 qualified names, as colby's does, so a mount that goes away is undone in
 both. ASP.NET's route names (W7-19f) need none either: every sync recomputes

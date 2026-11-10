@@ -9,8 +9,9 @@
 //! ([`astro`]), Django, Flask and FastAPI ([`python`]), Rails ([`rails`]),
 //! Spring ([`spring`]), Play ([`play`]), Expo Router ([`expo_router`]), Vue
 //! and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot ([`godot`]), Tauri
-//! ([`tauri`]), GoFrame ([`goframe`]) and ASP.NET ([`aspnet`]). The other
-//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
+//! ([`tauri`]), GoFrame ([`goframe`]), ASP.NET ([`aspnet`]) and SwiftUI,
+//! UIKit and Vapor ([`swift`]). The other upstream resolvers remain
+//! deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -51,6 +52,7 @@ pub mod route_href;
 pub mod spring;
 pub mod svelte;
 pub mod sveltekit_router;
+pub mod swift;
 pub mod tanstack_router;
 pub mod tauri;
 pub mod vue;
@@ -71,7 +73,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// ported neighbours (Laravel and Drupal first, Express before NestJS, Astro
 /// between Angular Router
 /// and Expo Router, the Python frameworks after Astro, Rails, Spring and Play
-/// after them, ASP.NET after GoFrame); the entries already
+/// after them, ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after
+/// ASP.NET); the entries already
 /// here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
@@ -183,6 +186,16 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // above answers one (Godot reads GDScript's, Astro only its own
         // names), so its place changes no other reference's resolution.
         Box::new(aspnet::AspnetResolver),
+        // SwiftUI's and UIKit's conventions, then Vapor's routes and
+        // conventions (#2106, #2157, #2273, #2242), after ASP.NET as upstream
+        // registers them. They read only Swift references, and no resolver
+        // above answers one (Godot reads GDScript's, Astro only its own
+        // names), so their place changes no other reference's resolution;
+        // between them a tie (UIKit's and Vapor's `…ViewController` at 0.85)
+        // goes to the earlier, as upstream's.
+        Box::new(swift::SwiftUiResolver),
+        Box::new(swift::UikitResolver),
+        Box::new(swift::VaporResolver),
     ];
     candidates
         .into_iter()

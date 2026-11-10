@@ -14,6 +14,18 @@
   {
     "col": 0,
     "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:vapor/Sources/App/routes.swift:4:GET:/hello",
+    "target": "function:94b39098bab610cdaf0bdebd6ef1b20f"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
     "line": 9,
     "metadata": {
       "confidence": 0.9,
@@ -197,6 +209,19 @@
     "provenance": null,
     "source": "route:laravel/routes/web.php:6:GET:/users",
     "target": "method:89630d061e1ba36c3a3eee13e796d89a"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "vapor",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:vapor/Sources/App/Controllers/TodoController.swift:6:GET:/todos",
+    "target": "method:e26506678f57fd0e05462e7399ce0be8"
   },
   {
     "col": 0,

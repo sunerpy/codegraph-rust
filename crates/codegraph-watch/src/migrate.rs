@@ -288,6 +288,7 @@ pub(crate) fn migrate_project(
     crate::laravel_routes::write_marker(rebuild.store())?;
     crate::drupal_refs::write_marker(rebuild.store())?;
     crate::rails_routes::write_marker(rebuild.store())?;
+    crate::vapor_routes::write_marker(rebuild.store())?;
     crate::dart_heads::write_marker(rebuild.store())?;
     crate::dart_libraries::write_marker(rebuild.store())?;
 

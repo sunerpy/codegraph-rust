@@ -22887,6 +22887,564 @@ mod csharp_frameworks {
     }
 }
 
+mod swift_frameworks {
+    use super::support::{EdgeRow, Graph, Indexed, NodeRow, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// A project of `files` that detects each of `frameworks`.
+    fn detecting(frameworks: &[&str], files: &[(&str, &str)]) -> Indexed {
+        let project = project_of(files).index();
+        let found = detected(&project.db());
+        for framework in frameworks {
+            assert!(found.contains(&format!("\"{framework}\"")), "{found}");
+        }
+        project
+    }
+
+    /// Upstream's `handlers`: each route's targets, as
+    /// `METHOD path :line -> Owner::method (file)`, sorted.
+    fn handlers(graph: &Graph) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|route| {
+                let bound: Vec<String> = graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.source == route.id)
+                    .filter_map(|edge| graph.node(&edge.target))
+                    .map(|target| {
+                        let file = target.file_path.rsplit('/').next().unwrap_or_default();
+                        format!("{} ({file})", target.qualified_name)
+                    })
+                    .collect();
+                let bound = if bound.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    bound.join(", ")
+                };
+                format!("{} :{} -> {bound}", route.name, route.start_line)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The route named `name`.
+    fn route<'g>(graph: &'g Graph, name: &str) -> &'g NodeRow {
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == "route" && node.name == name)
+            .unwrap_or_else(|| panic!("the route {name}:\n{}", graph.report()))
+    }
+
+    /// The edges into the node of `kind` named `name` in `file`, but its
+    /// file's `contains`.
+    fn edges_into<'g>(graph: &'g Graph, kind: &str, name: &str, file: &str) -> Vec<&'g EdgeRow> {
+        let target = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == kind && node.name == name && node.file_path == file)
+            .unwrap_or_else(|| panic!("the {kind} {name} of {file}:\n{}", graph.report()));
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.target == target.id && edge.kind != "contains")
+            .collect()
+    }
+
+    /// The framework each edge names (`-` for none).
+    fn frameworks_of(edges: &[&EdgeRow]) -> Vec<String> {
+        edges
+            .iter()
+            .map(|edge| {
+                edge.metadata
+                    .get("framework")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("-")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    const PACKAGE: &str = "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: \"App\", dependencies: [.package(url: \"https://github.com/vapor/vapor.git\", from: \"4.0.0\")])\n";
+
+    /// Upstream #2106 (`vapor-route-handlers.test.ts`): a route binds the
+    /// handler on the type it names: same-named handlers on different
+    /// controllers, a nested `API` type and an `extension API.X` each to
+    /// their own, and a handler on a type the project lacks to nothing.
+    #[test]
+    fn pr2106_same_named_handlers_bind_to_the_types_their_routes_name() {
+        let project = detecting(
+            &["vapor"],
+            &[
+                ("Package.swift", PACKAGE),
+                (
+                    "Sources/App/routes.swift",
+                    "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"authors\", use: AuthorController.show)\n    app.get(\"search\", use: SearchController.show)\n    app.get(\"health\", use: HealthCheckController.show)\n    app.get(\"packages\", use: PackageController.show)\n    app.get(\"api\", \"packages\", use: API.PackageController.get)\n    app.get(\"api\", \"search\", use: API.SearchController.get)\n    app.get(\"missing\", use: MissingController.show)\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/AuthorController.swift",
+                    "import Vapor\nenum AuthorController {\n    static func show(req: Request) async throws -> String { \"AuthorController\" }\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/SearchController.swift",
+                    "import Vapor\nenum SearchController {\n    static func show(req: Request) async throws -> String { \"SearchController\" }\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/HealthCheckController.swift",
+                    "import Vapor\nenum HealthCheckController {\n    static func show(req: Request) async throws -> String { \"HealthCheckController\" }\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/PackageController.swift",
+                    "import Vapor\nenum PackageController {}\n",
+                ),
+                (
+                    "Sources/App/Controllers/PackageController+routes.swift",
+                    "import Vapor\nextension PackageController {\n    static func show(req: Request) async throws -> String { \"package\" }\n    static func get(req: Request) async throws -> String { \"html get\" }\n}\n",
+                ),
+                ("Sources/App/Controllers/API/API.swift", "enum API {}\n"),
+                (
+                    "Sources/App/Controllers/API/API+PackageController.swift",
+                    "import Vapor\nextension API {\n    enum PackageController {\n        static func get(req: Request) async throws -> String { \"api package\" }\n    }\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/API/API+SearchController.swift",
+                    "import Vapor\nextension API {\n    enum SearchController {}\n}\nextension API.SearchController {\n    static func get(req: Request) async throws -> String { \"api search\" }\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        assert_eq!(
+            handlers(graph),
+            [
+                "GET /api/packages :7 -> API::PackageController::get (API+PackageController.swift)",
+                "GET /api/search :8 -> SearchController::get (API+SearchController.swift)",
+                "GET /authors :3 -> AuthorController::show (AuthorController.swift)",
+                "GET /health :5 -> HealthCheckController::show (HealthCheckController.swift)",
+                // Never another controller's `show`.
+                "GET /missing :9 -> nothing",
+                "GET /packages :6 -> PackageController::show (PackageController+routes.swift)",
+                "GET /search :4 -> SearchController::show (SearchController.swift)",
+            ],
+            "{}",
+            graph.report()
+        );
+        let missing = route(graph, "GET /missing");
+        assert!(
+            graph
+                .unresolved
+                .iter()
+                .any(|reference| reference.from_node_id == missing.id
+                    && reference.reference_name == "MissingController@show"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2106: of a type's overloads, the one that takes the
+    /// `Request` Vapor calls a handler with handles the route; its node
+    /// starts at its `@Sendable`.
+    #[test]
+    fn pr2106_the_overload_that_takes_the_request_handles_the_route() {
+        let project = detecting(
+            &["vapor"],
+            &[
+                ("Package.swift", PACKAGE),
+                (
+                    "Sources/App/routes.swift",
+                    "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"sitemap\", use: SiteMapController.index)\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/SiteMapController.swift",
+                    "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    @Sendable\n    static func index(req: Request) async throws -> String { index(packages: []) }\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        let sitemap = route(graph, "GET /sitemap");
+        let targets: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == sitemap.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| format!("{}:{}", target.qualified_name, target.start_line))
+            .collect();
+        assert_eq!(
+            targets,
+            ["SiteMapController::index:4"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2106: `use: self.x` and a bare `x` bind the method of the
+    /// type the route is written in, in its own body or in another
+    /// extension of it; `todos.index` the type `let todos = X()` made; a
+    /// top-level route's bare name the function of its file.
+    #[test]
+    fn pr2106_self_and_bare_handlers_bind_to_the_routes_own_type() {
+        let project = detecting(
+            &["vapor"],
+            &[
+                ("Package.swift", PACKAGE),
+                (
+                    "Sources/App/Controllers/Collections.swift",
+                    "import Vapor\nstruct TodoController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        let todos = routes.grouped(\"todos\")\n        todos.get(use: index)\n        todos.post(use: self.create)\n    }\n    func index(req: Request) async throws -> String { \"todos\" }\n    func create(req: Request) async throws -> String { \"new todo\" }\n}\nstruct UserController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        let users = routes.grouped(\"users\")\n        users.get(use: index)\n    }\n    func index(req: Request) async throws -> String { \"users\" }\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/Tags.swift",
+                    "import Vapor\nstruct TagController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        routes.get(\"tags\", use: self.index)\n    }\n}\n",
+                ),
+                (
+                    "Sources/App/Controllers/Tags+handlers.swift",
+                    "import Vapor\nextension TagController {\n    func index(req: Request) async throws -> String { \"tags\" }\n}\n",
+                ),
+                (
+                    "Sources/App/routes.swift",
+                    "import Vapor\nfunc routes(_ app: Application) throws {\n    let todos = TodoController()\n    app.get(\"all-todos\", use: todos.index)\n    app.get(\"hello\", use: hello)\n}\nfunc hello(req: Request) -> String { \"hi\" }\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        assert_eq!(
+            handlers(graph),
+            [
+                "GET /all-todos :4 -> TodoController::index (Collections.swift)",
+                "GET /hello :5 -> hello (routes.swift)",
+                "GET /tags :4 -> TagController::index (Tags+handlers.swift)",
+                "GET /todos :5 -> TodoController::index (Collections.swift)",
+                "GET /users :14 -> UserController::index (Collections.swift)",
+                "POST /todos :6 -> TodoController::create (Collections.swift)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2157 (`vapor-closure-routes.test.ts`): a trailing-closure
+    /// route, a `webSocket` and an `on(.POST, …, use:)` are routes; the `{`
+    /// of an `if let` and an HTTP client's call are not.
+    #[test]
+    fn pr2157_closure_websocket_and_on_routes_are_routes() {
+        let project = detecting(
+            &["vapor"],
+            &[
+                ("Package.swift", PACKAGE),
+                (
+                    "Sources/App/routes.swift",
+                    "import Vapor\n\nfunc routes(_ app: Application) throws {\n    app.get(\"hello\", \":name\") { req async throws -> String in\n        guard let name = req.parameters.get(\"name\") else { throw Abort(.badRequest) }\n        return \"Hello, \\(name)\"\n    }\n    app.webSocket(\"chat\") { req, client in\n        client.send(\"hi\")\n    }\n    let todos = app.grouped(\"todos\")\n    todos.on(.POST, \"import\", body: .collect(maxSize: \"1mb\"), use: importTodos)\n}\n\nfunc importTodos(req: Request) async throws -> HTTPStatus { .ok }\n\nfunc lookup(req: Request) async throws -> String {\n    if let owner = req.parameters.get(\"owner\") {\n        return owner\n    }\n    let res = try await req.client.get(\"https://example.com\") { out in\n        try out.query.encode([\"q\": \"x\"])\n    }\n    return \"\\(res.status)\"\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        let mut names: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["GET /hello/:name", "POST /todos/import", "WS /chat"],
+            "{}",
+            graph.report()
+        );
+        let post = route(graph, "POST /todos/import");
+        let targets: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == post.id)
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| target.name.as_str())
+            .collect();
+        assert!(targets.contains(&"importTodos"), "{}", graph.report());
+    }
+
+    /// Upstream #2273 (`vapor-closure-route-body.test.ts`): a closure route's
+    /// calls are the route's.
+    #[test]
+    fn pr2273_a_closure_route_calls_what_its_closure_calls() {
+        let project = detecting(
+            &["vapor"],
+            &[
+                ("Package.swift", PACKAGE),
+                (
+                    "Sources/App/Greeter.swift",
+                    "import Vapor\nenum Greeter {\n    static func greeting(for name: String) -> String { \"hi \\(name)\" }\n    static func audit(_ name: String) {}\n}\n",
+                ),
+                (
+                    "Sources/App/routes.swift",
+                    "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"hello\", \":name\") { req async throws -> String in\n        let name = req.parameters.get(\"name\") ?? \"world\"\n        Greeter.audit(name)\n        return Greeter.greeting(for: name)\n    }\n    app.webSocket(\"echo\") { req, ws in\n        ws.onText { ws, text in ws.send(text) }\n    }\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        let hello = route(graph, "GET /hello/:name");
+        let mut callees: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == hello.id && edge.kind == "calls")
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| target.qualified_name.as_str())
+            .collect();
+        callees.sort_unstable();
+        assert_eq!(
+            callees,
+            ["Greeter::audit", "Greeter::greeting"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2109 (`swiftui-viewer-noise.test.ts`): a SwiftUI view and
+    /// an `@main` app are each their own struct node, with no twin.
+    #[test]
+    fn pr2109_each_swiftui_view_has_one_node() {
+        let project = detecting(
+            &["swiftui"],
+            &[
+                (
+                    "App/HomeView.swift",
+                    "import SwiftUI\nstruct HomeView: View {\n    var body: some View { Text(\"Home\") }\n}\n\n#Preview {\n    HomeView()\n}\n",
+                ),
+                (
+                    "App/main.swift",
+                    "import Foundation\nlet server = Server()\nserver.start()\n",
+                ),
+                (
+                    "App/Server.swift",
+                    "final class Server {\n    func start() {}\n}\n",
+                ),
+                (
+                    "App/App.swift",
+                    "import SwiftUI\n@main\nstruct HomeApp: App {\n    var body: some Scene { WindowGroup { HomeView() } }\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        for name in ["HomeView", "HomeApp"] {
+            let kinds: Vec<&str> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.name == name)
+                .map(|node| node.kind.as_str())
+                .collect();
+            assert_eq!(kinds, ["struct"], "{name}: {}", graph.report());
+        }
+    }
+
+    /// SwiftUI's view convention (Rust's own example): of two `ProfileView`
+    /// structs, the one under `/Views/` is the view a screen in neither
+    /// folder makes.
+    #[test]
+    fn swiftui_a_view_resolves_to_the_struct_under_views() {
+        let project = detecting(
+            &["swiftui"],
+            &[
+                ("App/App.swift", "import SwiftUI\n"),
+                (
+                    "App/Screens/HomeScreen.swift",
+                    "struct HomeScreen {\n    func makeProfile() {\n        _ = ProfileView()\n    }\n}\n",
+                ),
+                ("App/Views/ProfileView.swift", "struct ProfileView {\n}\n"),
+                ("App/Legacy/ProfileView.swift", "struct ProfileView {\n}\n"),
+            ],
+        );
+        let graph = project.graph();
+        let into_views = edges_into(
+            graph,
+            "struct",
+            "ProfileView",
+            "App/Views/ProfileView.swift",
+        );
+        assert_eq!(
+            frameworks_of(&into_views),
+            ["swiftui"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            into_views
+                .iter()
+                .all(|edge| edge.resolved_by() == Some("framework")),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            edges_into(
+                graph,
+                "struct",
+                "ProfileView",
+                "App/Legacy/ProfileView.swift"
+            )
+            .is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// UIKit's view-controller convention (Rust's own example): of two
+    /// `SettingsViewController` classes, the one under `/ViewControllers/`.
+    #[test]
+    fn uikit_a_view_controller_resolves_to_the_class_under_view_controllers() {
+        let project = detecting(
+            &["uikit"],
+            &[
+                ("App/Shell.swift", "import UIKit\n"),
+                (
+                    "App/Coordinators/AppCoordinator.swift",
+                    "final class AppCoordinator {\n    func start() {\n        _ = SettingsViewController()\n    }\n}\n",
+                ),
+                (
+                    "App/ViewControllers/SettingsViewController.swift",
+                    "final class SettingsViewController {\n}\n",
+                ),
+                (
+                    "App/Legacy/SettingsViewController.swift",
+                    "final class SettingsViewController {\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        let into_controllers = edges_into(
+            graph,
+            "class",
+            "SettingsViewController",
+            "App/ViewControllers/SettingsViewController.swift",
+        );
+        assert_eq!(
+            frameworks_of(&into_controllers),
+            ["uikit"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            edges_into(
+                graph,
+                "class",
+                "SettingsViewController",
+                "App/Legacy/SettingsViewController.swift"
+            )
+            .is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// UIKit's and Vapor's `…Controller` conventions answer the same 0.85:
+    /// the earlier resolver, UIKit's, decides (upstream's order).
+    #[test]
+    fn uikit_wins_the_tie_with_vapor_on_a_view_controller() {
+        let project = detecting(
+            &["uikit", "vapor"],
+            &[
+                ("App/Shell.swift", "import UIKit\n"),
+                ("App/Server.swift", "import Vapor\n"),
+                (
+                    "App/Main.swift",
+                    "func start() {\n    _ = ReportViewController()\n}\n",
+                ),
+                (
+                    "App/ViewControllers/ReportViewController.swift",
+                    "final class ReportViewController {\n}\n",
+                ),
+                (
+                    "App/Routes/ReportViewController.swift",
+                    "final class ReportViewController {\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        let into_controllers = edges_into(
+            graph,
+            "class",
+            "ReportViewController",
+            "App/ViewControllers/ReportViewController.swift",
+        );
+        assert_eq!(
+            frameworks_of(&into_controllers),
+            ["uikit"],
+            "{}",
+            graph.report()
+        );
+        assert!(
+            edges_into(
+                graph,
+                "class",
+                "ReportViewController",
+                "App/Routes/ReportViewController.swift"
+            )
+            .is_empty(),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream #2242: Swift's conventions are for Swift's references. An
+    /// Objective-C call that only SwiftUI's view convention would resolve is
+    /// no framework edge.
+    #[test]
+    fn pr2242_an_objective_c_reference_takes_no_swift_convention() {
+        let project = detecting(
+            &["swiftui"],
+            &[
+                ("App/App.swift", "import SwiftUI\n"),
+                ("App/Views/ProfileView.swift", "struct ProfileView {\n}\n"),
+                ("App/Legacy/ProfileView.swift", "struct ProfileView {\n}\n"),
+                (
+                    "ObjC/Bridge.m",
+                    "void showProfile(void) {\n    ProfileView();\n}\n",
+                ),
+            ],
+        );
+        let graph = project.graph();
+        let bridge: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.file_path == "ObjC/Bridge.m")
+            .map(|node| node.id.as_str())
+            .collect();
+        let from_bridge: Vec<&EdgeRow> = graph
+            .edges
+            .iter()
+            .filter(|edge| bridge.contains(&edge.source.as_str()))
+            .filter(|edge| {
+                graph
+                    .node(&edge.target)
+                    .is_some_and(|target| target.name == "ProfileView")
+            })
+            .collect();
+        let waiting = graph.unresolved.iter().any(|reference| {
+            reference.file_path == "ObjC/Bridge.m" && reference.reference_name == "ProfileView"
+        });
+        assert!(!from_bridge.is_empty() || waiting, "{}", graph.report());
+        assert!(
+            from_bridge
+                .iter()
+                .all(|edge| edge.resolved_by() != Some("framework")),
+            "{}",
+            graph.report()
+        );
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 

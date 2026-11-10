@@ -3,8 +3,8 @@
 //! the C# project files, the Cargo manifests and the Go module files
 //! (W7-15d1), the root files the Python frameworks are detected by
 //! (W7-19b), Spring and Play are (W7-19c), Laravel and Drupal are (W7-19d),
-//! Rails is (W7-19e) and ASP.NET is (W7-19f), and which frameworks the
-//! project uses.
+//! Rails is (W7-19e), ASP.NET is (W7-19f) and Vapor is (W7-19g), and which
+//! frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
@@ -20,7 +20,8 @@
 //! [`codegraph_resolve::frameworks::laravel::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES`],
-//! [`codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES`]); every
+//! [`codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES`]); every
 //! full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
@@ -29,8 +30,8 @@
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
 //! that moved re-resolves every file of its languages whole (the Python,
-//! JVM, PHP, Ruby and .NET kinds' languages are none: they move only which
-//! frameworks a sync detects); a framework that
+//! JVM, PHP, Ruby, .NET and Swift kinds' languages are none: they move only
+//! which frameworks a sync detects); a framework that
 //! came or went, or a manifest edit that moves which files a framework that
 //! runs only in its own apps extracts, re-extracts every file, since
 //! framework nodes are made at extraction. The rows are written last;
@@ -93,10 +94,14 @@ pub enum ControlKind {
     /// may leave out a `Program.cs` or a `Startup.cs`. Not [`Self::Csharp`],
     /// whose project files and listings C# type resolution reads.
     Dotnet,
+    /// The root file Vapor is detected by, the same way: a configuration
+    /// may leave out the root `Package.swift`, which is an indexed Swift
+    /// file otherwise.
+    Swift,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Js,
         Self::Csharp,
         Self::Rust,
@@ -106,6 +111,7 @@ impl ControlKind {
         Self::Php,
         Self::Ruby,
         Self::Dotnet,
+        Self::Swift,
     ];
 
     fn key(self) -> &'static str {
@@ -119,6 +125,7 @@ impl ControlKind {
             Self::Php => "php",
             Self::Ruby => "ruby",
             Self::Dotnet => "dotnet",
+            Self::Swift => "swift",
         }
     }
 
@@ -148,7 +155,7 @@ impl ControlKind {
             Self::Go => name == "go.mod",
             // Their files are named by their root paths
             // ([`is_control_file`]).
-            Self::Python | Self::Jvm | Self::Php | Self::Ruby | Self::Dotnet => false,
+            Self::Python | Self::Jvm | Self::Php | Self::Ruby | Self::Dotnet | Self::Swift => false,
         }
     }
 
@@ -160,7 +167,7 @@ impl ControlKind {
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
             Self::Go => path.ends_with(".go"),
-            Self::Python | Self::Jvm | Self::Php | Self::Ruby | Self::Dotnet => false,
+            Self::Python | Self::Jvm | Self::Php | Self::Ruby | Self::Dotnet | Self::Swift => false,
         }
     }
 }
@@ -195,9 +202,9 @@ pub fn is_tauri_marker(relative: &str) -> bool {
 }
 
 /// Whether `relative` names a control file of any kind, a Tauri marker, a
-/// root file the Python, Spring, Play, Laravel, Drupal, Rails or ASP.NET
-/// frameworks are detected by, or a Dart pubspec manifest (the Dart library
-/// lane's):
+/// root file the Python, Spring, Play, Laravel, Drupal, Rails, ASP.NET or
+/// Vapor frameworks are detected by, or a Dart pubspec manifest (the Dart
+/// library lane's):
 /// the watcher hands its events to the sync, though it is no source file.
 pub fn is_control_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
@@ -207,6 +214,7 @@ pub fn is_control_file(relative: &str) -> bool {
         || php_root_files().any(|file| file == relative)
         || codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES.contains(&relative)
         || codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES.contains(&relative)
+        || codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES.contains(&relative)
         || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
         || crate::dart_libraries::is_pubspec_path(relative)
 }
@@ -383,6 +391,14 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
         }
         ControlKind::Dotnet => {
             for relative in codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Swift => {
+            for relative in codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES {
                 out.insert(
                     relative.to_string(),
                     file_digest(&project_root.join(relative)),
@@ -911,6 +927,43 @@ mod tests {
         assert!(is_control_file("Startup.cs"));
         assert!(!is_control_file("src/Program.cs"));
         assert_eq!(ControlKind::Dotnet.row_key(), "control_inputs:dotnet");
+    }
+
+    /// The Swift kind reads Vapor's root `Package.swift`, present or not,
+    /// and names no file to re-resolve; the watcher hands its events to the
+    /// sync (W7-19g).
+    #[test]
+    fn the_swift_kind_digests_its_root_file_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-swift-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = digests_of(ControlKind::Swift, &dir, &[]);
+        std::fs::write(dir.join("Package.swift"), "// vapor\n").unwrap();
+        let digests = digests_of(ControlKind::Swift, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            missing.into_iter().collect::<Vec<_>>(),
+            [("Package.swift".to_string(), None)]
+        );
+        assert_eq!(
+            digests.into_iter().collect::<Vec<_>>(),
+            [(
+                "Package.swift".to_string(),
+                Some(hash_content("// vapor\n"))
+            )]
+        );
+        assert!(!ControlKind::Swift.reads_from("Package.swift", Language::Swift));
+        assert!(!ControlKind::Swift.names_file("Package.swift"));
+        assert!(is_control_file("Package.swift"));
+        assert!(!is_control_file("Sources/App/Package.swift"));
+        assert!(!is_control_file("Sources/App/routes.swift"));
+        assert_eq!(ControlKind::Swift.row_key(), "control_inputs:swift");
     }
 
     /// The files the synthesis stage last read beside the index, and the
