@@ -9,9 +9,10 @@
 //! ([`astro`]), Django, Flask and FastAPI ([`python`]), Rails ([`rails`]),
 //! Spring ([`spring`]), Play ([`play`]), Expo Router ([`expo_router`]), Vue
 //! and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot ([`godot`]), Tauri
-//! ([`tauri`]), GoFrame ([`goframe`]), ASP.NET ([`aspnet`]) and SwiftUI,
-//! UIKit and Vapor ([`swift`]). The other upstream resolvers remain
-//! deferred (see `KNOWN_DIFFS.md`).
+//! ([`tauri`]), GoFrame ([`goframe`]), Rust's axum and actix routes and
+//! Cargo workspace crates ([`rust`], [`cargo_workspace`]), ASP.NET
+//! ([`aspnet`]) and SwiftUI, UIKit and Vapor ([`swift`]). The other
+//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -22,6 +23,7 @@
 pub mod angular_router;
 pub mod aspnet;
 pub mod astro;
+pub mod cargo_workspace;
 pub mod drupal;
 pub mod expo_router;
 pub mod express;
@@ -49,6 +51,7 @@ pub mod react;
 pub mod react_router;
 pub(crate) mod react_tables;
 pub mod route_href;
+pub mod rust;
 pub mod spring;
 pub mod svelte;
 pub mod sveltekit_router;
@@ -73,8 +76,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// ported neighbours (Laravel and Drupal first, Express before NestJS, Astro
 /// between Angular Router
 /// and Expo Router, the Python frameworks after Astro, Rails, Spring and Play
-/// after them, ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after
-/// ASP.NET); the entries already
+/// after them, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor
+/// after ASP.NET); the entries already
 /// here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
@@ -180,11 +183,20 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // resolver. It resolves no reference, so its place here changes
         // no resolution; the synthesis stage joins its routes.
         Box::new(goframe::GoFrameResolver),
-        // ASP.NET's routes and conventions (#2158, #2415), after GoFrame as
-        // upstream registers it; Rust's Expo Router already stands before
-        // GoFrame. It reads only C# and Razor references, and no resolver
-        // above answers one (Godot reads GDScript's, Astro only its own
-        // names), so its place changes no other reference's resolution.
+        // Rust's axum and actix routes, its conventions and the Cargo
+        // workspace's crates (#2359, #2224, #2214, #151), after GoFrame as
+        // upstream registers it. It reads only Rust references, and no
+        // resolver above answers one (Godot reads GDScript's, Astro only its
+        // own names; Tauri reads Rust's `#[tauri::command]`s but resolves
+        // JavaScript's `invoke` calls), so its place changes no other
+        // reference's resolution.
+        Box::new(rust::RustResolver),
+        // ASP.NET's routes and conventions (#2158, #2415), after GoFrame and
+        // Rust as upstream registers it; this port's Expo Router already
+        // stands before GoFrame. It reads only C# and Razor references, and
+        // no resolver above answers one (Godot reads GDScript's, Astro only
+        // its own names), so its place changes no other reference's
+        // resolution.
         Box::new(aspnet::AspnetResolver),
         // SwiftUI's and UIKit's conventions, then Vapor's routes and
         // conventions (#2106, #2157, #2273, #2242), after ASP.NET as upstream

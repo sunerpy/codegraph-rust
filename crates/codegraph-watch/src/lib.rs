@@ -28,6 +28,7 @@ pub mod r_bindings;
 pub mod rails_routes;
 pub mod resolved_refs;
 pub mod ruby_heads;
+pub mod rust_crate_roots;
 pub mod rust_receivers;
 pub mod scala_surfaces;
 pub mod shopify_themes;

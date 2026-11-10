@@ -68,6 +68,8 @@ struct Caches {
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
     rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
+    /// The Cargo workspace's crates for the pass (W7-19h).
+    cargo_workspace_crates: Option<Arc<crate::frameworks::cargo_workspace::CrateMap>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
     /// Each directory's package.json / Deno import-map scope for the pass.
     manifest_scopes: HashMap<String, Arc<ManifestScope>>,
@@ -152,6 +154,7 @@ impl Caches {
             go_module: None,
             go_modules: None,
             rust_crates: None,
+            cargo_workspace_crates: None,
             workspace_packages: None,
             manifest_scopes: HashMap::new(),
             all_files: None,
@@ -1037,6 +1040,19 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             &self.get_all_files(),
         ));
         self.caches.borrow_mut().rust_crates = Some(Arc::clone(&crates));
+        crates
+    }
+
+    fn list_directories(&self, dir: &str) -> Vec<String> {
+        crate::frameworks::cargo_workspace::list_directories_within(&self.project_root, dir)
+    }
+
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        if let Some(cached) = self.caches.borrow().cargo_workspace_crates.clone() {
+            return cached;
+        }
+        let crates = Arc::new(crate::frameworks::cargo_workspace::crate_map(self));
+        self.caches.borrow_mut().cargo_workspace_crates = Some(Arc::clone(&crates));
         crates
     }
 

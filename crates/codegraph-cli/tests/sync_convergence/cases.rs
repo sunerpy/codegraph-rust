@@ -14226,6 +14226,349 @@ pub fn swift_vapor_group_prefix_changes() -> Case {
         )
 }
 
+// ---- W7-19h: Rust's axum and actix routes and Cargo workspace crates ----
+
+/// A workspace of the members `alpha` and `beta`, `alpha` naming the crate
+/// `beta` in a `use`.
+const RUST_WORKSPACE: &str = "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n";
+const RUST_ALPHA_MANIFEST: &str = "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n";
+const RUST_BETA_MANIFEST: &str = "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n";
+const RUST_GAMMA_MANIFEST: &str = "[package]\nname = \"gamma\"\nversion = \"0.1.0\"\n";
+const RUST_USES_BETA: &str = "use beta::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n";
+const RUST_THING: &str = "pub struct Thing;\n";
+const RUST_MAIN: &str = "fn main() {}\n";
+/// The `use beta::…`'s crate root edge, to the member's `lib.rs` or
+/// `main.rs`.
+const RUST_ALPHA_TO_BETA_LIB: (&str, &str, &str) = (
+    "file:crates/alpha/src/lib.rs",
+    "imports",
+    "file:crates/beta/src/lib.rs",
+);
+const RUST_ALPHA_TO_BETA_MAIN: (&str, &str, &str) = (
+    "file:crates/alpha/src/lib.rs",
+    "imports",
+    "file:crates/beta/src/main.rs",
+);
+
+/// W7-19h (#151): the member `beta`, a binary, gains a `src/lib.rs`: the
+/// crate root `use beta::…` links is the library, no longer the `main.rs`.
+pub fn rust_workspace_member_gains_a_lib_beside_its_main() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/main.rs", RUST_MAIN)
+        .write("crates/beta/src/lib.rs", RUST_THING)
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_MAIN, "framework", "rust")
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (#151): the member's `src/lib.rs` is deleted: the crate root is
+/// its `main.rs` again.
+pub fn rust_workspace_member_loses_its_lib_beside_its_main() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/main.rs", RUST_MAIN)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .remove("crates/beta/src/lib.rs")
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_MAIN, "framework", "rust")
+}
+
+/// Files declaring no name `use beta::Thing` writes, so that no name their
+/// nodes touch reaches the reference.
+const RUST_HELPER: &str = "pub fn helper() {}\n";
+const RUST_OTHER: &str = "pub fn other() {}\n";
+
+/// W7-19h (#151): the member `beta`, whose `src/` holds no crate root yet,
+/// gains its `src/lib.rs`: the `use beta::…` nothing answered links that
+/// crate root. No manifest changes, and the member's `src/util.rs` already
+/// put its directories' manifests among the Rust control inputs, so only
+/// the lane's retry by name reaches the reference.
+pub fn rust_workspace_member_gains_its_crate_root() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/util.rs", RUST_HELPER)
+        .write("crates/beta/src/lib.rs", RUST_OTHER)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (#151): the member's only crate root is deleted: `use beta::…`
+/// links nothing.
+pub fn rust_workspace_member_loses_its_crate_root() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/util.rs", RUST_HELPER)
+        .file("crates/beta/src/lib.rs", RUST_OTHER)
+        .remove("crates/beta/src/lib.rs")
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// A root package that is also a workspace of the member `beta`, its
+/// `main.rs` naming `beta` in a `use`.
+const RUST_ROOT_WORKSPACE: &str =
+    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"crates/beta\"]\n";
+const RUST_ROOT_USES_BETA: &str = "use beta::Thing;\n";
+const RUST_ROOT_TO_BETA_CRATE: (&str, &str, &str) =
+    ("file:src/main.rs", "imports", "file:crates/beta/src/lib.rs");
+const RUST_ROOT_TO_BETA_MODULE: (&str, &str, &str) =
+    ("file:src/main.rs", "imports", "file:src/beta.rs");
+
+/// W7-19h: the root gains a module `src/beta.rs`: the module rule reads the
+/// root's modules before the workspace's crates, so `beta` is that module,
+/// no longer the crate.
+pub fn rust_root_module_appears_over_a_workspace_crate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file("Cargo.toml", RUST_ROOT_WORKSPACE)
+        .file("src/main.rs", RUST_ROOT_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("src/beta.rs", RUST_THING)
+        .edge_metadata_before(RUST_ROOT_TO_BETA_CRATE, "framework", "rust")
+        .edge_metadata_after(RUST_ROOT_TO_BETA_MODULE, "framework", "rust")
+}
+
+/// W7-19h: the root module `src/beta.rs` is deleted: `beta` is the
+/// workspace's crate again.
+pub fn rust_root_module_over_a_workspace_crate_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_ROOT_WORKSPACE)
+        .file("src/main.rs", RUST_ROOT_USES_BETA)
+        .file("src/beta.rs", RUST_THING)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .remove("src/beta.rs")
+        .edge_metadata_before(RUST_ROOT_TO_BETA_MODULE, "framework", "rust")
+        .edge_metadata_after(RUST_ROOT_TO_BETA_CRATE, "framework", "rust")
+}
+
+const RUST_WORKSPACE_A: &str = "[workspace]\nmembers = [\"crates/a\"]\n";
+const RUST_WORKSPACE_A_B: &str = "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n";
+const RUST_A_MANIFEST: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+const RUST_B_MANIFEST: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\n";
+const RUST_USES_B: &str = "use b::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n";
+const RUST_A_TO_B: (&str, &str, &str) = (
+    "file:crates/a/src/lib.rs",
+    "imports",
+    "file:crates/b/src/lib.rs",
+);
+
+/// W7-19h (#151): the root's `members` gains `crates/b`: `use b::…` links
+/// that crate's root.
+pub fn rust_workspace_members_gain_a_crate() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_A)
+        .file("crates/a/Cargo.toml", RUST_A_MANIFEST)
+        .file("crates/a/src/lib.rs", RUST_USES_B)
+        .file("crates/b/Cargo.toml", RUST_B_MANIFEST)
+        .file("crates/b/src/lib.rs", RUST_THING)
+        .write("Cargo.toml", RUST_WORKSPACE_A_B)
+        .edge_metadata_after(RUST_A_TO_B, "framework", "rust")
+}
+
+/// W7-19h (#151): the root's `members` loses `crates/b`: `b` names no crate.
+pub fn rust_workspace_members_lose_a_crate() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_A_B)
+        .file("crates/a/Cargo.toml", RUST_A_MANIFEST)
+        .file("crates/a/src/lib.rs", RUST_USES_B)
+        .file("crates/b/Cargo.toml", RUST_B_MANIFEST)
+        .file("crates/b/src/lib.rs", RUST_THING)
+        .write("Cargo.toml", RUST_WORKSPACE_A)
+        .edge_metadata_before(RUST_A_TO_B, "framework", "rust")
+        .no_edge_after(RUST_A_TO_B.0, RUST_A_TO_B.1, RUST_A_TO_B.2)
+}
+
+/// W7-19h (#151): the member `beta` renames its package `gamma`: `beta`
+/// names no crate.
+pub fn rust_workspace_member_renames_its_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("crates/beta/Cargo.toml", RUST_GAMMA_MANIFEST)
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+        .no_edge_after(
+            RUST_ALPHA_TO_BETA_LIB.0,
+            RUST_ALPHA_TO_BETA_LIB.1,
+            RUST_ALPHA_TO_BETA_LIB.2,
+        )
+}
+
+/// W7-19h (#151): the member takes the package name `beta` back.
+pub fn rust_workspace_member_takes_its_package_name_back() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_GAMMA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+const RUST_WORKSPACE_GLOB: &str = "[workspace]\nmembers = [\"crates/*\"]\n";
+
+/// W7-19h (#151): a directory the `crates/*` glob matches appears, with a
+/// manifest and a `src/lib.rs`: `use beta::…` links that crate's root.
+pub fn rust_workspace_glob_gains_a_member() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_GLOB)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .write("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .write("crates/beta/src/lib.rs", RUST_THING)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (#151): the glob's member directory goes: `beta` names no crate.
+pub fn rust_workspace_glob_loses_a_member() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_GLOB)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .remove("crates/beta/Cargo.toml")
+        .remove("crates/beta/src/lib.rs")
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// An axum application whose route's handler is declared beside it.
+const RUST_AXUM_APP: &str = "use axum::{routing::get, Router};\n\nfn list_users() {}\n\nfn app() -> Router {\n    Router::new().route(\"/users\", get(list_users))\n}\n";
+const RUST_USERS_ROUTE: &str = "route src/main.rs::route:/users";
+const RUST_APP_MANIFEST: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+
+/// W7-19h (#2359): a root `Cargo.toml` appears: Rust's frameworks are
+/// detected, and the axum route links its handler.
+pub fn rust_root_manifest_appears_beside_axum_routes() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("src/main.rs", RUST_AXUM_APP)
+        .write("Cargo.toml", RUST_APP_MANIFEST)
+        .detected_before("rust", false)
+        .detected_after("rust", true)
+        .named_after("route", "GET /users")
+        .edge_after(RUST_USERS_ROUTE, "references", "function list_users")
+}
+
+/// W7-19h (#2359): the root `Cargo.toml` is deleted: no Rust framework is
+/// detected, and the route goes.
+pub fn rust_root_manifest_beside_axum_routes_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_APP)
+        .remove("Cargo.toml")
+        .detected_before("rust", true)
+        .detected_after("rust", false)
+        .edge_before(RUST_USERS_ROUTE, "references", "function list_users")
+}
+
+/// An axum route whose handler is written through the module `handlers`.
+const RUST_AXUM_THROUGH_HANDLERS: &str = "mod handlers;\n\nuse axum::{routing::get, Router};\n\nfn app() -> Router {\n    Router::new().route(\"/users\", get(handlers::list_users))\n}\n";
+const RUST_LIST_USERS: &str = "pub fn list_users() {}\n";
+
+/// W7-19h (#2359): the module holding the route's handler appears: the
+/// route, whose reference sits where the handler is written, links it.
+pub fn rust_route_handler_module_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_THROUGH_HANDLERS)
+        .write("src/handlers.rs", RUST_LIST_USERS)
+        .edge_after(
+            RUST_USERS_ROUTE,
+            "references",
+            "function list_users @src/handlers.rs",
+        )
+}
+
+/// W7-19h (#2359): the handler's module is deleted: the route links
+/// nothing.
+pub fn rust_route_handler_module_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_THROUGH_HANDLERS)
+        .file("src/handlers.rs", RUST_LIST_USERS)
+        .remove("src/handlers.rs")
+        .edge_before(
+            RUST_USERS_ROUTE,
+            "references",
+            "function list_users @src/handlers.rs",
+        )
+}
+
+/// An axum route naming `items::list_handler`, which two modules `items`
+/// declare.
+const RUST_AXUM_ITEMS: &str = "mod web;\nmod admin;\n\nuse axum::{routing::get, Router};\n\nfn app() -> Router {\n    Router::new().route(\"/items\", get(items::list_handler))\n}\n";
+const RUST_LIST_HANDLER: &str = "pub fn list_handler() {}\n";
+const RUST_ITEMS_ROUTE: &str = "route src/main.rs::route:/items";
+
+/// W7-19h: one of two `list_handler`s moves into `src/handlers/`: the
+/// handler rule picks the one its folders prefer.
+pub fn rust_handler_moves_into_handlers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_ITEMS)
+        .file("src/web/items.rs", RUST_LIST_HANDLER)
+        .file("src/admin/items.rs", RUST_LIST_HANDLER)
+        .rename("src/admin/items.rs", "src/handlers/items.rs")
+        .edge_before(
+            RUST_ITEMS_ROUTE,
+            "references",
+            "function list_handler @src/admin/items.rs",
+        )
+        .edge_metadata_after(
+            (
+                RUST_ITEMS_ROUTE,
+                "references",
+                "function list_handler @src/handlers/items.rs",
+            ),
+            "framework",
+            "rust",
+        )
+}
+
+/// W7-19h: the preferred `list_handler` moves out of `src/handlers/`: with
+/// two candidates and none preferred the handler rule declines, and name
+/// matching answers.
+pub fn rust_handler_moves_out_of_handlers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_ITEMS)
+        .file("src/web/items.rs", RUST_LIST_HANDLER)
+        .file("src/handlers/items.rs", RUST_LIST_HANDLER)
+        .rename("src/handlers/items.rs", "src/admin/items.rs")
+        .edge_metadata_before(
+            (
+                RUST_ITEMS_ROUTE,
+                "references",
+                "function list_handler @src/handlers/items.rs",
+            ),
+            "framework",
+            "rust",
+        )
+        .no_edge_metadata_after(
+            (
+                RUST_ITEMS_ROUTE,
+                "references",
+                "function list_handler @src/admin/items.rs",
+            ),
+            "framework",
+            "rust",
+        )
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {

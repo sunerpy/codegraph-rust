@@ -39,7 +39,7 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Rails, Spring, Play, Expo Router, GoFrame, ASP.NET, SwiftUI, UIKit and Vapor (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, Expo Router, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit and Vapor (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
@@ -511,7 +511,7 @@ regex engine), is not listed.
   one of its names is declared somewhere, so there it resolves or stays
   unresolved by what unrelated files declare (`astro.rs`).
 - **A name heuristic's tier with two candidates (W7-19b).** The pick the
-  Django, Flask, FastAPI, Spring, ASP.NET, SwiftUI, UIKit and Vapor name heuristics share (#2225) resolves a tier only
+  Django, Flask, FastAPI, Spring, ASP.NET, SwiftUI, UIKit, Vapor and Rust name heuristics share (#2225) resolves a tier only
   through its one candidate: two declarations of the name in the reference's
   file, its directory, a preferred folder or the project answer nothing and
   stop the search, and the reference goes on to import and name resolution
@@ -666,6 +666,35 @@ regex engine), is not listed.
   two such leave the handler unresolved. colby takes the earliest of those
   that declare one, else the earliest of all, which guesses when both or
   neither take the request Vapor passes (`frameworks/swift.rs`).
+- **Rust's conventions stop at a pick that answers nothing (W7-19h).** Rust's
+  convention rules (`…_handler` or `handle_…`, `…Service` or `…Repository`, a
+  letters-only capitalized model) go on to the next rule only when a rule
+  finds no candidate the reference can name under the Rust scope rule. A rule
+  whose shared pick answers nothing (a tier of two, a pick in another code
+  family) ends them, the module rule's too, as Spring's do. colby tries the
+  next rule only when there is no candidate either, and takes the first
+  otherwise (`frameworks/rust.rs`).
+- **A Rust module is its file node (W7-19h).** The module rule links a
+  lowercase name to the file node of the root's `src/<name>.rs` or
+  `src/<name>/mod.rs`, or of a workspace crate's `src/lib.rs` or
+  `src/main.rs`. colby takes that file's module node, which no Rust
+  extraction writes, else the file's first node by line and id, which is a
+  declaration rather than the file when one written on the file's first line
+  (a `const`, an `enum`, a field) has an id sorting before `file:`
+  (`frameworks/rust.rs`).
+- **A Cargo workspace's crates (W7-19h).** The crates the Rust module rule
+  reads come from members inside the project: a member that is an absolute
+  path or leaves the root once normalized, and a glob whose static prefix
+  does, is neither read nor listed, where colby reads its manifest and then
+  finds no indexed crate root there. A glob member's walk lists each
+  directory's subdirectories sorted by name, where colby's come in the
+  filesystem's order. A name two members give (both their names, or one's
+  name and the other's `_` alias) names neither, where colby's later member
+  takes it; Cargo itself refuses two packages of one name. A glob reads `*`,
+  `?`, `[…]` (`[!…]` and `[^…]` negated), `{a,b}` and `**`, the part of
+  picomatch a Cargo workspace writes; any other form (a leading `!`, an
+  extglob, a group, an escape, a POSIX class, a brace without a comma)
+  expands to nothing (`frameworks/cargo_workspace.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -901,6 +930,14 @@ regex engine), is not listed.
   `make`); local-scope offsets are bytes, colby's UTF-16 code units
   (`dart_chains.rs`, `dart_prefixes.rs`, `dart_local_scope.rs`,
   `dart_scope.rs`).
+- **A Rust route's handler column (W7-19h).** An axum or actix builder
+  route's reference to its handler sits where the handler's name is written
+  (#2359), at its byte column: the Rust scope rule cuts the reference's line
+  at its column as a byte offset, as tree-sitter's Rust references store
+  theirs. colby stores the UTF-16 column, which its scope rule reads the
+  same way; the two differ only on a line holding a non-ASCII character
+  before the handler (`.route("/café", get(handlers::list))`). Route nodes'
+  columns are UTF-16 code units in both (`frameworks/rust.rs`).
 - **Store and RTK initializers (W7-16b).** A Vue store's or an RTK Query
   api's initializer is walked as its declaration's, skipping only what became
   a node: the store call, its wrappers, `state` and an endpoint's other
@@ -1030,6 +1067,11 @@ that a sync changes declares before the change or after it re-resolves the
 Vapor route handlers naming that method (`vapor_routes_version`), whether or
 not the name moved, since a handler's choice also reads its candidates'
 types and first lines (a `Request` parameter, an `extension A.B` line).
+So do Rust's crate roots (W7-19h): a root `src/<name>.rs` or
+`src/<name>/mod.rs`, or a workspace member's `src/lib.rs` or `src/main.rs`,
+that a sync adds or removes re-resolves the references named for the module
+or for the member's crate, since the module rule's target is a file node
+that no such name reaches (`rust_crate_roots_version`).
 Laravel's route names need no lane: every sync recomputes them from their
 qualified names, as colby's does, so a mount that goes away is undone in
 both. ASP.NET's route names (W7-19f) need none either: every sync recomputes

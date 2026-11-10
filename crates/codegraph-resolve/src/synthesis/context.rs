@@ -251,6 +251,14 @@ impl ResolutionContext for ViewContext<'_, '_> {
         self.store.get_rust_crates()
     }
 
+    fn list_directories(&self, dir: &str) -> Vec<String> {
+        self.store.list_directories(dir)
+    }
+
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        self.store.cargo_workspace_crates()
+    }
+
     fn get_cpp_include_dirs(&self) -> Vec<String> {
         self.store.get_cpp_include_dirs()
     }
