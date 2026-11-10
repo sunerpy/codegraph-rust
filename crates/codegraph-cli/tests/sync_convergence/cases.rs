@@ -13568,6 +13568,664 @@ pub fn razor_aspnet_page_model_beside_the_page_is_deleted() -> Case {
     )
 }
 
+/// A root `Package.swift` that names `vapor`, which Vapor is detected by, and
+/// one that names no package.
+const VAPOR_PACKAGE: &str = "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: \"App\", dependencies: [.package(url: \"https://github.com/vapor/vapor.git\", from: \"4.0.0\")])\n";
+const VAPOR_PACKAGE_PLAIN: &str =
+    "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: \"App\")\n";
+const VAPOR_ROUTES_FILE: &str = "Sources/App/routes.swift";
+
+/// A route whose handler is a method of a type no file declares yet.
+const VAPOR_MISSING_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"missing\", use: MissingController.show)\n}\n";
+const VAPOR_MISSING_FILE: &str = "Sources/App/Controllers/MissingController.swift";
+const VAPOR_MISSING: &str = "import Vapor\nenum MissingController {\n    static func show(req: Request) async throws -> String { \"missing\" }\n}\n";
+const VAPOR_MISSING_ROUTE: &str = "route Sources/App/routes.swift::route:/missing";
+const VAPOR_MISSING_SHOW: &str = "method MissingController::show";
+
+/// W7-19g (#2106): the type a route's `use:` names comes to declare the
+/// handler, in a file of its own: the route, waiting under its whole name
+/// `MissingController@show`, links.
+pub fn swift_vapor_handler_type_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .write(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .edge_after(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// W7-19g: the handler's file is deleted: the route waits again.
+pub fn swift_vapor_handler_type_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .file(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .remove(VAPOR_MISSING_FILE)
+        .edge_before(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// Two overloads of a route's handler: the second comes to take the
+/// `Request` Vapor calls a handler with, a change of text that renames
+/// nothing.
+const VAPOR_SITEMAP_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"sitemap\", use: SiteMapController.index)\n}\n";
+const VAPOR_SITEMAP_FILE: &str = "Sources/App/Controllers/SiteMapController.swift";
+const VAPOR_SITEMAP_NO_REQUEST: &str = "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(names: [String]) async throws -> String { \"\" }\n}\n";
+const VAPOR_SITEMAP_REQUEST: &str = "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(req: Request) async throws -> String { \"\" }\n}\n";
+const VAPOR_SITEMAP_ROUTE: (&str, &str, &str) = (
+    "route Sources/App/routes.swift::route:/sitemap",
+    "references",
+    "method SiteMapController::index @Sources/App/Controllers/SiteMapController.swift:4",
+);
+
+/// W7-19g: of two overloads neither of which takes the `Request`, the
+/// route takes none (KEEP-RUST); the second comes to take it, and the
+/// route links to it.
+pub fn swift_vapor_handler_overload_gains_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_SITEMAP_ROUTES)
+        .file(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_NO_REQUEST)
+        .write(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_REQUEST)
+        .edge_after(
+            VAPOR_SITEMAP_ROUTE.0,
+            VAPOR_SITEMAP_ROUTE.1,
+            VAPOR_SITEMAP_ROUTE.2,
+        )
+}
+
+/// W7-19g: the overload stops taking the `Request`: the route takes
+/// neither.
+pub fn swift_vapor_handler_overload_loses_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_SITEMAP_ROUTES)
+        .file(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_REQUEST)
+        .write(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_NO_REQUEST)
+        .edge_before(
+            VAPOR_SITEMAP_ROUTE.0,
+            VAPOR_SITEMAP_ROUTE.1,
+            VAPOR_SITEMAP_ROUTE.2,
+        )
+}
+
+/// A handler and a rival overload in another extension of its type: a
+/// change of the rival's file alone moves the route, whose edge points into
+/// the handler's file, which no change touches.
+const VAPOR_RIVAL_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"rival\", use: RivalController.index)\n}\n";
+const VAPOR_RIVAL_FILE: &str = "Sources/App/Controllers/RivalController.swift";
+const VAPOR_RIVAL: &str = "import Vapor\nenum RivalController {\n    static func index(req: Request) async throws -> String { \"\" }\n}\n";
+const VAPOR_RIVAL_EXTENSION_FILE: &str = "Sources/App/Controllers/RivalController+Legacy.swift";
+const VAPOR_RIVAL_NO_REQUEST: &str = "import Vapor\nextension RivalController {\n    static func index(names: [String]) -> String { names.joined() }\n}\n";
+const VAPOR_RIVAL_REQUEST: &str = "import Vapor\nextension RivalController {\n    static func index(req: Request, names: [String]) -> String { names.joined() }\n}\n";
+const VAPOR_RIVAL_ROUTE: (&str, &str, &str) = (
+    "route Sources/App/routes.swift::route:/rival",
+    "references",
+    "method RivalController::index @Sources/App/Controllers/RivalController.swift:3",
+);
+
+/// W7-19g: the rival comes to take the `Request` too: of two overloads
+/// taking it the route takes none (KEEP-RUST), though the handler's file
+/// is unchanged.
+pub fn swift_vapor_handler_rival_overload_gains_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_RIVAL_ROUTES)
+        .file(VAPOR_RIVAL_FILE, VAPOR_RIVAL)
+        .file(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_NO_REQUEST)
+        .write(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_REQUEST)
+        .edge_before(
+            VAPOR_RIVAL_ROUTE.0,
+            VAPOR_RIVAL_ROUTE.1,
+            VAPOR_RIVAL_ROUTE.2,
+        )
+}
+
+/// W7-19g: the rival stops taking the `Request`: the route links to the
+/// handler again.
+pub fn swift_vapor_handler_rival_overload_loses_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_RIVAL_ROUTES)
+        .file(VAPOR_RIVAL_FILE, VAPOR_RIVAL)
+        .file(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_REQUEST)
+        .write(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_NO_REQUEST)
+        .edge_after(
+            VAPOR_RIVAL_ROUTE.0,
+            VAPOR_RIVAL_ROUTE.1,
+            VAPOR_RIVAL_ROUTE.2,
+        )
+}
+
+/// The route's type, declaring no handler yet, in the file it keeps: a
+/// change of that file adds a callable of a name it declared none of.
+const VAPOR_MISSING_EMPTY: &str = "import Vapor\nenum MissingController {\n}\n";
+
+/// W7-19g: the type's own file comes to declare the route's handler: the
+/// route, waiting under its whole name, links.
+pub fn swift_vapor_handler_type_gains_the_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .file(VAPOR_MISSING_FILE, VAPOR_MISSING_EMPTY)
+        .write(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .edge_after(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// W7-19g: the handler goes from its type's file: the route waits again.
+pub fn swift_vapor_handler_type_loses_the_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .file(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .write(VAPOR_MISSING_FILE, VAPOR_MISSING_EMPTY)
+        .edge_before(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// A handler declared in `extension API.SearchController`, whose method's
+/// qualified name is `SearchController::get`: only the extension's head
+/// names the `API` type, and a head that drops it renames nothing.
+const VAPOR_API_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"api\", \"search\", use: API.SearchController.get)\n}\n";
+const VAPOR_API_FILE: &str = "Sources/App/Controllers/API/API.swift";
+const VAPOR_API: &str = "enum API {}\n";
+const VAPOR_API_SEARCH_FILE: &str = "Sources/App/Controllers/API/API+SearchController.swift";
+const VAPOR_API_SEARCH: &str = "import Vapor\nextension API {\n    enum SearchController {}\n}\nextension API.SearchController {\n    static func get(req: Request) async throws -> String { \"api search\" }\n}\n";
+const VAPOR_API_SEARCH_BARE: &str = "import Vapor\nextension API {\n    enum SearchController {}\n}\nextension SearchController {\n    static func get(req: Request) async throws -> String { \"api search\" }\n}\n";
+const VAPOR_API_SEARCH_ROUTE: &str = "route Sources/App/routes.swift::route:/api/search";
+const VAPOR_API_SEARCH_GET: &str = "method SearchController::get";
+
+/// W7-19g (#2106): the extension's head comes to write `API.`: the route
+/// `API.SearchController.get` links to its method.
+pub fn swift_vapor_extension_gains_its_api_path() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_API_ROUTES)
+        .file(VAPOR_API_FILE, VAPOR_API)
+        .file(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH_BARE)
+        .write(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH)
+        .edge_after(VAPOR_API_SEARCH_ROUTE, "references", VAPOR_API_SEARCH_GET)
+}
+
+/// W7-19g: the head drops its `API.`: the route links to nothing.
+pub fn swift_vapor_extension_loses_its_api_path() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_API_ROUTES)
+        .file(VAPOR_API_FILE, VAPOR_API)
+        .file(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH)
+        .write(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH_BARE)
+        .edge_before(VAPOR_API_SEARCH_ROUTE, "references", VAPOR_API_SEARCH_GET)
+}
+
+/// A handler on the type a route names, in an extension of its own file or
+/// in the type's body.
+const VAPOR_PACKAGES_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"packages\", use: PackageController.show)\n}\n";
+const VAPOR_PACKAGE_TYPE_FILE: &str = "Sources/App/Controllers/PackageController.swift";
+const VAPOR_PACKAGE_TYPE: &str = "import Vapor\nenum PackageController {}\n";
+const VAPOR_PACKAGE_TYPE_SHOW: &str = "import Vapor\nenum PackageController {\n    static func show(req: Request) async throws -> String { \"package\" }\n}\n";
+const VAPOR_PACKAGE_ROUTES_FILE: &str = "Sources/App/Controllers/PackageController+routes.swift";
+const VAPOR_PACKAGE_EXTENSION: &str = "import Vapor\nextension PackageController {\n    static func show(req: Request) async throws -> String { \"package\" }\n}\n";
+const VAPOR_PACKAGE_EXTENSION_EMPTY: &str = "import Vapor\nextension PackageController {\n}\n";
+const VAPOR_PACKAGES_ROUTE: &str = "route Sources/App/routes.swift::route:/packages";
+
+/// W7-19g: the handler moves from the type's extension into the type's own
+/// body, in another file: the route follows it.
+pub fn swift_vapor_handler_moves_into_its_type() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_PACKAGES_ROUTES)
+        .file(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE)
+        .file(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION)
+        .write(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION_EMPTY)
+        .write(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE_SHOW)
+        .edge_before(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController+routes.swift",
+        )
+        .edge_after(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController.swift",
+        )
+}
+
+/// W7-19g: the handler moves back into the extension.
+pub fn swift_vapor_handler_moves_into_an_extension() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_PACKAGES_ROUTES)
+        .file(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE_SHOW)
+        .file(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION_EMPTY)
+        .write(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE)
+        .write(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION)
+        .edge_before(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController.swift",
+        )
+        .edge_after(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController+routes.swift",
+        )
+}
+
+/// A route collection whose `self.index` names a method its type declares
+/// in another file's extension.
+const VAPOR_TAGS_FILE: &str = "Sources/App/Controllers/Tags.swift";
+const VAPOR_TAGS: &str = "import Vapor\nstruct TagController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        routes.get(\"tags\", use: self.index)\n    }\n}\n";
+const VAPOR_TAG_HANDLERS_FILE: &str = "Sources/App/Controllers/Tags+handlers.swift";
+const VAPOR_TAG_HANDLERS: &str = "import Vapor\nextension TagController {\n    func index(req: Request) async throws -> String { \"tags\" }\n}\n";
+const VAPOR_TAGS_ROUTE: &str = "route Sources/App/Controllers/Tags.swift::route:/tags";
+const VAPOR_TAGS_INDEX: &str = "method TagController::index";
+
+/// W7-19g (#2106): the extension that declares `self.index` appears: the
+/// route links to it.
+pub fn swift_vapor_self_handler_extension_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_TAGS_FILE, VAPOR_TAGS)
+        .write(VAPOR_TAG_HANDLERS_FILE, VAPOR_TAG_HANDLERS)
+        .edge_after(VAPOR_TAGS_ROUTE, "references", VAPOR_TAGS_INDEX)
+}
+
+/// W7-19g: the extension is deleted: the route waits again.
+pub fn swift_vapor_self_handler_extension_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_TAGS_FILE, VAPOR_TAGS)
+        .file(VAPOR_TAG_HANDLERS_FILE, VAPOR_TAG_HANDLERS)
+        .remove(VAPOR_TAG_HANDLERS_FILE)
+        .edge_before(VAPOR_TAGS_ROUTE, "references", VAPOR_TAGS_INDEX)
+}
+
+/// A top-level route whose bare `use: hello` is the project's one function
+/// of that name, until another file declares a second.
+const VAPOR_HELLO_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"hello\", use: hello)\n}\n";
+const VAPOR_HELLO_FILE: &str = "Sources/App/Hello.swift";
+const VAPOR_HELLO: &str = "import Vapor\nfunc hello(req: Request) -> String { \"hi\" }\n";
+const VAPOR_HELLO_TWIN_FILE: &str = "Sources/Tools/Hello.swift";
+const VAPOR_HELLO_TWIN: &str = "func hello(name: String) -> String { name }\n";
+const VAPOR_HELLO_ROUTE: (&str, &str, &str) = (
+    "route Sources/App/routes.swift::route:/hello",
+    "references",
+    "function hello @Sources/App/Hello.swift",
+);
+
+/// W7-19g (#2106): a second function `hello` appears: the bare handler names
+/// no one function of the project, and links to nothing.
+pub fn swift_vapor_bare_handler_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_HELLO_ROUTES)
+        .file(VAPOR_HELLO_FILE, VAPOR_HELLO)
+        .write(VAPOR_HELLO_TWIN_FILE, VAPOR_HELLO_TWIN)
+        .edge_before(
+            VAPOR_HELLO_ROUTE.0,
+            VAPOR_HELLO_ROUTE.1,
+            VAPOR_HELLO_ROUTE.2,
+        )
+        .no_edge_after(
+            VAPOR_HELLO_ROUTE.0,
+            VAPOR_HELLO_ROUTE.1,
+            VAPOR_HELLO_ROUTE.2,
+        )
+}
+
+/// W7-19g: the second `hello` is deleted: the route links to the one left.
+pub fn swift_vapor_bare_handler_loses_its_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_HELLO_ROUTES)
+        .file(VAPOR_HELLO_FILE, VAPOR_HELLO)
+        .file(VAPOR_HELLO_TWIN_FILE, VAPOR_HELLO_TWIN)
+        .remove(VAPOR_HELLO_TWIN_FILE)
+        .edge_after(
+            VAPOR_HELLO_ROUTE.0,
+            VAPOR_HELLO_ROUTE.1,
+            VAPOR_HELLO_ROUTE.2,
+        )
+}
+
+/// Routes and a handler that import nothing, so that only the root
+/// `Package.swift` or another file can show Vapor.
+const VAPOR_USERS_ROUTES: &str = "func routes(_ app: Application) throws {\n    app.get(\"users\", use: UserController.index)\n}\n";
+const VAPOR_USER_CONTROLLER_FILE: &str = "Sources/App/Controllers/UserController.swift";
+const VAPOR_USER_CONTROLLER: &str =
+    "enum UserController {\n    static func index(req: Request) -> String { \"users\" }\n}\n";
+const VAPOR_USERS_ROUTE: &str = "route Sources/App/routes.swift::route:/users";
+const VAPOR_USERS_INDEX: &str = "method UserController::index";
+
+/// W7-19g: the root `Package.swift` comes to name `vapor`: Vapor is
+/// detected, and the route links.
+pub fn swift_vapor_package_gains_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE)
+        .detected_before("vapor", false)
+        .detected_after("vapor", true)
+        .edge_after(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// W7-19g: the root `Package.swift` drops `vapor`: Vapor is not detected,
+/// and the route goes.
+pub fn swift_vapor_package_drops_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .detected_before("vapor", true)
+        .detected_after("vapor", false)
+        .edge_before(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// The configuration keeps the root `Package.swift` out of the index: only
+/// the `swift` control kind tells a sync it changed.
+const VAPOR_EXCLUDE_PACKAGE: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"Package.swift\"]\n";
+
+/// W7-19g: the root `Package.swift`, which the configuration keeps out of
+/// the index, comes to name `vapor`: Vapor is detected.
+pub fn swift_vapor_excluded_package_gains_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file(".codegraph/config.toml", VAPOR_EXCLUDE_PACKAGE)
+        .file("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE)
+        .detected_before("vapor", false)
+        .detected_after("vapor", true)
+        .edge_after(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// W7-19g: the excluded `Package.swift` drops `vapor`: Vapor is not
+/// detected.
+pub fn swift_vapor_excluded_package_drops_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file(".codegraph/config.toml", VAPOR_EXCLUDE_PACKAGE)
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .detected_before("vapor", true)
+        .detected_after("vapor", false)
+        .edge_before(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// A file that routes nothing, with and without the `import Vapor` that
+/// shows Vapor.
+const VAPOR_CONFIGURE_FILE: &str = "Sources/App/configure.swift";
+const VAPOR_CONFIGURE_PLAIN: &str = "func configure() {}\n";
+const VAPOR_CONFIGURE_IMPORT: &str = "import Vapor\nfunc configure() {}\n";
+
+/// W7-19g: a file that routes nothing comes to `import Vapor`: Vapor is
+/// detected, and the route in another file links.
+pub fn swift_vapor_import_appears_in_a_file_that_routes_nothing() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_PLAIN)
+        .write(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_IMPORT)
+        .detected_before("vapor", false)
+        .detected_after("vapor", true)
+        .edge_after(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// W7-19g: the `import Vapor` goes: Vapor is not detected.
+pub fn swift_vapor_import_goes_from_a_file_that_routes_nothing() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_IMPORT)
+        .write(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_PLAIN)
+        .detected_before("vapor", true)
+        .detected_after("vapor", false)
+        .edge_before(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// Two `ProfileView` structs, one in a `/Views/` folder SwiftUI's view
+/// convention prefers, and a screen in neither folder that makes one; a
+/// file that comes to show SwiftUI or goes.
+const SWIFTUI_APP_FILE: &str = "App/App.swift";
+const SWIFTUI_APP_PLAIN: &str = "struct AppRoot {\n}\n";
+const SWIFTUI_APP_IMPORT: &str = "import SwiftUI\nstruct AppRoot {\n}\n";
+const SWIFTUI_SCREEN_FILE: &str = "App/Screens/HomeScreen.swift";
+const SWIFTUI_SCREEN: &str =
+    "struct HomeScreen {\n    func makeProfile() {\n        _ = ProfileView()\n    }\n}\n";
+const SWIFTUI_PROFILE_VIEW: &str = "struct ProfileView {\n}\n";
+const SWIFTUI_MAKE_PROFILE: (&str, &str, &str) = (
+    "method HomeScreen::makeProfile",
+    "instantiates",
+    "struct ProfileView @App/Views/ProfileView.swift",
+);
+
+/// W7-19g: a file comes to `import SwiftUI`: SwiftUI is detected, and the
+/// view the screen makes is the one under `/Views/`.
+pub fn swiftui_import_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_PLAIN)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_SCREEN)
+        .file("App/Views/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .file("App/Legacy/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .write(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .detected_before("swiftui", false)
+        .detected_after("swiftui", true)
+        .edge_metadata_after(SWIFTUI_MAKE_PROFILE, "framework", "swiftui")
+}
+
+/// W7-19g: the `import SwiftUI` goes: SwiftUI is not detected, and no edge
+/// names it.
+pub fn swiftui_import_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_SCREEN)
+        .file("App/Views/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .file("App/Legacy/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .write(SWIFTUI_APP_FILE, SWIFTUI_APP_PLAIN)
+        .detected_before("swiftui", true)
+        .detected_after("swiftui", false)
+        .edge_metadata_before(SWIFTUI_MAKE_PROFILE, "framework", "swiftui")
+        .no_edge_metadata_after(SWIFTUI_MAKE_PROFILE, "framework", "swiftui")
+}
+
+/// Two `SettingsViewController` classes, one in a `/ViewControllers/`
+/// folder UIKit's convention prefers; a file whose comment comes to name
+/// `UIView`, which shows UIKit as upstream reads it.
+const UIKIT_SHELL_FILE: &str = "App/Shell.swift";
+const UIKIT_SHELL_PLAIN: &str = "struct Shell {\n}\n";
+const UIKIT_SHELL_COMMENT: &str = "// Hosts a UIView.\nstruct Shell {\n}\n";
+const UIKIT_COORDINATOR_FILE: &str = "App/Coordinators/AppCoordinator.swift";
+const UIKIT_COORDINATOR: &str = "final class AppCoordinator {\n    func start() {\n        _ = SettingsViewController()\n    }\n}\n";
+const UIKIT_SETTINGS: &str = "final class SettingsViewController {\n}\n";
+const UIKIT_START_SETTINGS: (&str, &str, &str) = (
+    "method AppCoordinator::start",
+    "instantiates",
+    "class SettingsViewController @App/ViewControllers/SettingsViewController.swift",
+);
+
+/// W7-19g: a comment comes to name `UIView`: UIKit is detected, and the
+/// controller the coordinator makes is the one under `/ViewControllers/`.
+pub fn uikit_view_mention_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(UIKIT_SHELL_FILE, UIKIT_SHELL_PLAIN)
+        .file(UIKIT_COORDINATOR_FILE, UIKIT_COORDINATOR)
+        .file(
+            "App/ViewControllers/SettingsViewController.swift",
+            UIKIT_SETTINGS,
+        )
+        .file("App/Legacy/SettingsViewController.swift", UIKIT_SETTINGS)
+        .write(UIKIT_SHELL_FILE, UIKIT_SHELL_COMMENT)
+        .detected_before("uikit", false)
+        .detected_after("uikit", true)
+        .edge_metadata_after(UIKIT_START_SETTINGS, "framework", "uikit")
+}
+
+/// W7-19g: the comment goes: UIKit is not detected.
+pub fn uikit_view_mention_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(UIKIT_SHELL_FILE, UIKIT_SHELL_COMMENT)
+        .file(UIKIT_COORDINATOR_FILE, UIKIT_COORDINATOR)
+        .file(
+            "App/ViewControllers/SettingsViewController.swift",
+            UIKIT_SETTINGS,
+        )
+        .file("App/Legacy/SettingsViewController.swift", UIKIT_SETTINGS)
+        .write(UIKIT_SHELL_FILE, UIKIT_SHELL_PLAIN)
+        .detected_before("uikit", true)
+        .detected_after("uikit", false)
+        .edge_metadata_before(UIKIT_START_SETTINGS, "framework", "uikit")
+        .no_edge_metadata_after(UIKIT_START_SETTINGS, "framework", "uikit")
+}
+
+/// A closure route whose body calls a method of a type in another file.
+const VAPOR_CLOSURE_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"hello\", \":name\") { req async throws -> String in\n        Greeter.audit(\"x\")\n        return \"hi\"\n    }\n}\n";
+const VAPOR_GREETER_FILE: &str = "Sources/App/Greeter.swift";
+const VAPOR_GREETER: &str =
+    "import Vapor\nenum Greeter {\n    static func audit(_ name: String) {}\n}\n";
+const VAPOR_CLOSURE_ROUTE: &str = "route Sources/App/routes.swift::route:/hello/:name";
+const VAPOR_GREETER_AUDIT: &str = "method Greeter::audit";
+
+/// W7-19g (#2273): the type a closure route's body calls appears: the
+/// route calls its method.
+pub fn swift_vapor_closure_call_target_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_CLOSURE_ROUTES)
+        .write(VAPOR_GREETER_FILE, VAPOR_GREETER)
+        .named_before("route", "GET /hello/:name")
+        .edge_after(VAPOR_CLOSURE_ROUTE, "calls", VAPOR_GREETER_AUDIT)
+}
+
+/// W7-19g: the type is deleted: the call waits again.
+pub fn swift_vapor_closure_call_target_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_CLOSURE_ROUTES)
+        .file(VAPOR_GREETER_FILE, VAPOR_GREETER)
+        .remove(VAPOR_GREETER_FILE)
+        .edge_before(VAPOR_CLOSURE_ROUTE, "calls", VAPOR_GREETER_AUDIT)
+}
+
+/// Two `TodoController` structs, one in a `/Controllers/` folder Vapor's
+/// convention prefers, and a function in neither folder that makes one.
+const VAPOR_TODO: &str = "struct TodoController {\n}\n";
+const VAPOR_TODO_FILE: &str = "Sources/App/Controllers/TodoController.swift";
+const VAPOR_TODO_MOVED_FILE: &str = "Sources/App/Models/TodoController.swift";
+const VAPOR_TODO_LEGACY_FILE: &str = "Sources/Legacy/TodoController.swift";
+const VAPOR_MAKES_TODO: &str = "func configure() {\n    _ = TodoController()\n}\n";
+const VAPOR_CONFIGURE_TODO: (&str, &str, &str) = (
+    "function configure",
+    "instantiates",
+    "struct TodoController @Sources/App/Controllers/TodoController.swift",
+);
+
+/// W7-19g (#2225): the controller moves out of `/Controllers/`: of two
+/// candidates in no preferred folder the convention takes neither
+/// (KEEP-RUST), leaving the reference to the name matcher's guess.
+pub fn swift_vapor_controller_moves_out_of_controllers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_MAKES_TODO)
+        .file(VAPOR_TODO_FILE, VAPOR_TODO)
+        .file(VAPOR_TODO_LEGACY_FILE, VAPOR_TODO)
+        .rename(VAPOR_TODO_FILE, VAPOR_TODO_MOVED_FILE)
+        .edge_metadata_before(VAPOR_CONFIGURE_TODO, "framework", "vapor")
+        .no_edge_metadata_after(
+            (
+                VAPOR_CONFIGURE_TODO.0,
+                VAPOR_CONFIGURE_TODO.1,
+                "struct TodoController @Sources/App/Models/TodoController.swift",
+            ),
+            "framework",
+            "vapor",
+        )
+        .no_edge_metadata_after(
+            (
+                VAPOR_CONFIGURE_TODO.0,
+                VAPOR_CONFIGURE_TODO.1,
+                "struct TodoController @Sources/Legacy/TodoController.swift",
+            ),
+            "framework",
+            "vapor",
+        )
+}
+
+/// W7-19g (#2225): the controller moves into `/Controllers/`: the
+/// convention takes it.
+pub fn swift_vapor_controller_moves_into_controllers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_MAKES_TODO)
+        .file(VAPOR_TODO_MOVED_FILE, VAPOR_TODO)
+        .file(VAPOR_TODO_LEGACY_FILE, VAPOR_TODO)
+        .rename(VAPOR_TODO_MOVED_FILE, VAPOR_TODO_FILE)
+        .edge_metadata_after(VAPOR_CONFIGURE_TODO, "framework", "vapor")
+}
+
+/// Two `Profile` structs, one in a `/Models/` folder SwiftUI's model
+/// convention prefers, a screen that makes one, and an extension of the
+/// model beside it: the extension is a class node of the same name, so the
+/// preferred folder holds two candidates.
+const SWIFTUI_MODEL_SCREEN: &str =
+    "struct HomeScreen {\n    func makeProfile() {\n        _ = Profile()\n    }\n}\n";
+const SWIFTUI_MODEL: &str = "struct Profile {\n}\n";
+const SWIFTUI_MODEL_EXTENSION_FILE: &str = "App/Models/Profile+Codable.swift";
+const SWIFTUI_MODEL_EXTENSION: &str = "extension Profile {\n}\n";
+const SWIFTUI_MAKE_MODEL: (&str, &str, &str) = (
+    "method HomeScreen::makeProfile",
+    "instantiates",
+    "struct Profile @App/Models/Profile.swift",
+);
+
+/// W7-19g (#2225): an extension of the model appears beside it: the
+/// preferred folder holds two candidates, and the convention takes neither
+/// (KEEP-RUST).
+pub fn swiftui_model_gains_an_extension_beside_it() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_MODEL_SCREEN)
+        .file("App/Models/Profile.swift", SWIFTUI_MODEL)
+        .file("App/Legacy/Profile.swift", SWIFTUI_MODEL)
+        .write(SWIFTUI_MODEL_EXTENSION_FILE, SWIFTUI_MODEL_EXTENSION)
+        .edge_metadata_before(SWIFTUI_MAKE_MODEL, "framework", "swiftui")
+        .no_edge_metadata_after(SWIFTUI_MAKE_MODEL, "framework", "swiftui")
+}
+
+/// W7-19g: the extension is deleted: the convention takes the model again.
+pub fn swiftui_model_loses_its_extension() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_MODEL_SCREEN)
+        .file("App/Models/Profile.swift", SWIFTUI_MODEL)
+        .file("App/Legacy/Profile.swift", SWIFTUI_MODEL)
+        .file(SWIFTUI_MODEL_EXTENSION_FILE, SWIFTUI_MODEL_EXTENSION)
+        .remove(SWIFTUI_MODEL_EXTENSION_FILE)
+        .edge_metadata_after(SWIFTUI_MAKE_MODEL, "framework", "swiftui")
+}
+
+/// A route collection's group, renamed in its own file.
+const VAPOR_TODOS_FILE: &str = "Sources/App/Controllers/Collections.swift";
+const VAPOR_TODOS: &str = "import Vapor\nstruct TodoController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        let todos = routes.grouped(\"todos\")\n        todos.get(use: index)\n    }\n    func index(req: Request) async throws -> String { \"todos\" }\n}\n";
+const VAPOR_TASKS: &str = "import Vapor\nstruct TodoController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        let todos = routes.grouped(\"tasks\")\n        todos.get(use: index)\n    }\n    func index(req: Request) async throws -> String { \"todos\" }\n}\n";
+
+/// W7-19g: a group's prefix changes in the routes' own file: the route is
+/// renamed with it, and still reaches its handler.
+pub fn swift_vapor_group_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_TODOS_FILE, VAPOR_TODOS)
+        .write(VAPOR_TODOS_FILE, VAPOR_TASKS)
+        .named_before("route", "GET /todos")
+        .named_after("route", "GET /tasks")
+        .edge_after(
+            "route Sources/App/Controllers/Collections.swift::route:/tasks",
+            "references",
+            "method TodoController::index",
+        )
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {

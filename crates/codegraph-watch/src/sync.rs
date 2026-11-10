@@ -719,6 +719,10 @@ fn sync_paths_with_store(
     // changes moved (W7-19e), the same way.
     let rails_bootstrap = crate::rails_routes::needs_bootstrap(store)?;
     changed_names.rails.track = recorded("rails");
+    // And for the Vapor route handlers whose candidates a failed sync's
+    // changes moved (W7-19g), the same way.
+    let vapor_bootstrap = crate::vapor_routes::needs_bootstrap(store)?;
+    changed_names.vapor.track = recorded("vapor");
     // And for the Dart files whose bare calls read other files' class heads:
     // every Dart file is re-resolved once (W4-DART-01). A rebuild for an
     // unreadable row starts with the marker current: withdraw it before
@@ -870,6 +874,7 @@ fn sync_paths_with_store(
         || laravel_bootstrap
         || drupal_bootstrap
         || rails_bootstrap
+        || vapor_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
     // A bootstrap re-resolves dependents without `begin_mutation`: the
@@ -906,6 +911,7 @@ fn sync_paths_with_store(
         changed_names.laravel.track = false;
         changed_names.drupal.track = false;
         changed_names.rails.track = false;
+        changed_names.vapor.track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
                 continue;
@@ -1461,6 +1467,16 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if vapor_bootstrap {
+            for file in crate::vapor_routes::every_route_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if case_bootstrap {
             for file in crate::case_folded::every_case_insensitive_file(
                 store,
@@ -1645,6 +1661,18 @@ fn sync_paths_with_store(
             }
             changed_names.note_any(retries.names);
         }
+        // The Vapor route handlers whose method a changed file declares on
+        // either side (W7-19g), read the same way.
+        if changed_names.vapor.track && frameworks.iter().any(|name| name == "vapor") {
+            let touched = changed_names.vapor.touched(store)?;
+            let retries = crate::vapor_routes::retries(store, &touched)?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -1745,6 +1773,7 @@ fn sync_paths_with_store(
         crate::laravel_routes::write_marker(store)?;
         crate::drupal_refs::write_marker(store)?;
         crate::rails_routes::write_marker(store)?;
+        crate::vapor_routes::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
         crate::resolved_refs::restore_marker(
@@ -2264,6 +2293,7 @@ fn remove_tracked_file(
     changed_names.laravel.note(relative, &old_nodes);
     changed_names.drupal.note(relative, &old_nodes);
     changed_names.rails.note(relative, &old_nodes);
+    changed_names.vapor.note(relative, &old_nodes);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2695,12 +2725,13 @@ fn reextract_into_store(
     changed_names.note_restorable(relative, &old_nodes, &touched);
     changed_names.absorb_node_diff(touched);
     // What a Play action's choice read of this file (W7-19c), a Laravel
-    // controller's and a Drupal handler's or hook's (W7-19d), and a Rails
-    // route target's (W7-19e).
+    // controller's and a Drupal handler's or hook's (W7-19d), a Rails route
+    // target's (W7-19e) and a Vapor route handler's (W7-19g).
     changed_names.play.note(relative, &old_nodes);
     changed_names.laravel.note(relative, &old_nodes);
     changed_names.drupal.note(relative, &old_nodes);
     changed_names.rails.note(relative, &old_nodes);
+    changed_names.vapor.note(relative, &old_nodes);
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -2973,6 +3004,9 @@ struct ChangedNames {
     /// What the changed files held that a Rails route target's choice reads:
     /// Ruby class names and the names of methods and functions (W7-19e).
     rails: crate::rails_routes::RailsChanges,
+    /// What the changed files held that a Vapor route handler's choice
+    /// reads: the names of Swift methods and functions (W7-19g).
+    vapor: crate::vapor_routes::VaporChanges,
     /// The Rust type, trait and alias names that came, went or changed: a
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
@@ -3091,6 +3125,7 @@ impl ChangedNames {
             crate::laravel_routes::withdraw_marker(store)?;
             crate::drupal_refs::withdraw_marker(store)?;
             crate::rails_routes::withdraw_marker(store)?;
+            crate::vapor_routes::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
@@ -6360,6 +6395,72 @@ pub(crate) mod tests {
         assert!(!lane_pending(&db));
     }
 
+    /// W7-19g: likewise for the `swift` kind, in an index built before it
+    /// and the Vapor lane. The first sync detects the frameworks once (Vapor,
+    /// as before), re-resolves every route file's references once, bringing
+    /// back the edge an older sync lost, and writes the row and the marker
+    /// back; the next counts neither.
+    #[test]
+    fn a_missing_swift_control_row_and_lane_marker_detect_and_re_resolve_once() {
+        let dir = TestDir::new("control-inputs-swift-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_REQUEST];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(vapor_routed(&db), "{expected:#?}");
+        let row_key = crate::control_inputs::ControlKind::Swift.row_key();
+        let row = metadata(&db, &row_key).expect("the Swift row");
+        let frameworks = metadata(&db, crate::control_inputs::FRAMEWORKS_KEY);
+        assert!(
+            frameworks
+                .as_deref()
+                .is_some_and(|found| found.contains("\"vapor\"")),
+            "{frameworks:?}"
+        );
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Swift)
+        };
+        let lane_pending = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::vapor_routes::needs_bootstrap(&store).unwrap()
+        };
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the route edge an older sync lost");
+            store.delete_project_metadata(&row_key).unwrap();
+            store
+                .delete_project_metadata(crate::vapor_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert!(moved(&db));
+        assert!(lane_pending(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Vapor was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            frameworks
+        );
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+    }
+
     /// W5-06: a control file a watcher event names is read whole, so one
     /// replaced with its size and modification time kept still counts as
     /// changed.
@@ -7422,6 +7523,115 @@ pub(crate) mod tests {
         assert_ne!(edge_projection(&db), expected);
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(lane_marker(&db, crate::rails_routes::VERSION_KEY), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const VAPOR_PACKAGE: (&str, &str) = (
+        "Package.swift",
+        "// swift-tools-version:5.9\nlet package = Package(name: \"App\", dependencies: [.package(url: \"https://github.com/vapor/vapor.git\", from: \"4.0.0\")])\n",
+    );
+    const VAPOR_ROUTES: (&str, &str) = (
+        "Sources/App/routes.swift",
+        "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"sitemap\", use: SiteMapController.index)\n}\n",
+    );
+    const VAPOR_NO_REQUEST: (&str, &str) = (
+        "Sources/App/Controllers/SiteMapController.swift",
+        "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(names: [String]) async throws -> String { \"\" }\n}\n",
+    );
+    const VAPOR_REQUEST: (&str, &str) = (
+        "Sources/App/Controllers/SiteMapController.swift",
+        "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(req: Request) async throws -> String { \"\" }\n}\n",
+    );
+
+    /// Whether the Vapor route links to the handler overload that takes the
+    /// `Request`.
+    fn vapor_routed(db: &Path) -> bool {
+        edge_projection(db).iter().any(|edge| {
+            edge.starts_with(
+                "Sources/App/routes.swift:Sources/App/routes.swift::route:/sitemap -[references]-> \
+                 Sources/App/Controllers/SiteMapController.swift:SiteMapController::index ",
+            )
+        })
+    }
+
+    /// W7-19g: a sync failing after it gave the second overload its
+    /// `Request`, before resolving, leaves the next sync, with nothing
+    /// changed, to link the route's `SiteMapController@index` to it, as a
+    /// fresh index has it: the reference waits under its whole name, which
+    /// no lane but Vapor's wakes, and the Vapor marker the failure left away
+    /// brings it back.
+    #[test]
+    fn a_vapor_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let dir = TestDir::new("vapor-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_NO_REQUEST];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::vapor_routes::VERSION_KEY),
+            Some(crate::vapor_routes::VERSION.to_string())
+        );
+        assert!(!vapor_routed(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[VAPOR_REQUEST]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [VAPOR_REQUEST.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::vapor_routes::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!vapor_routed(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_REQUEST];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("vapor-routes-fresh", &fresh)
+        );
+        assert!(vapor_routed(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::vapor_routes::VERSION_KEY),
+            Some(crate::vapor_routes::VERSION.to_string())
+        );
+    }
+
+    /// W7-19g: an index without the Vapor marker (built before it, or a sync
+    /// that stopped) has every file holding a Swift route's reference
+    /// re-resolved by its next sync, with nothing changed: the handler edge
+    /// an older sync lost comes back. The other Swift lanes' markers stay, so
+    /// none of them re-resolves the route file.
+    #[test]
+    fn an_index_without_the_vapor_marker_re_resolves_the_route_files() {
+        let version = Some(crate::vapor_routes::VERSION.to_string());
+        let dir = TestDir::new("vapor-routes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_REQUEST];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::vapor_routes::VERSION_KEY), version);
+        assert!(vapor_routed(&db), "{:#?}", edge_projection(&db));
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route' AND file_path = 'Sources/App/routes.swift')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the handler edge an older sync lost");
+            store
+                .delete_project_metadata(crate::vapor_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lane_marker(&db, crate::vapor_routes::VERSION_KEY), version);
         assert_eq!(edge_projection(&db), expected);
     }
 

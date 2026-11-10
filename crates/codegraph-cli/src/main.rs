@@ -6514,6 +6514,7 @@ fn index_project_inner(
     codegraph_watch::laravel_routes::write_marker(&store)?;
     codegraph_watch::drupal_refs::write_marker(&store)?;
     codegraph_watch::rails_routes::write_marker(&store)?;
+    codegraph_watch::vapor_routes::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
