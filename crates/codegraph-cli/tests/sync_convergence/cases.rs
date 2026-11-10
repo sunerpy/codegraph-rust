@@ -12818,6 +12818,429 @@ pub fn php_drupal_use_import_stays_unresolved_when_its_last_segment_appears() ->
         .no_edge_after("namespace App", "imports", "class Baz::Bar")
 }
 
+/// The root `Gemfile` Rails is detected by, never indexed, and one that
+/// names no Rails gem.
+const RAILS_GEMFILE: &str = "gem \"rails\", \"~> 7.1\"\n";
+const RAILS_GEMFILE_PLAIN: &str = "gem \"rack\"\n";
+/// An explicit route in a file that draws no routes: once Rails is
+/// detected, upstream reads one in any Ruby file, as Rust does.
+const RAILS_API_ROUTES_FILE: &str = "lib/api_routes.rb";
+const RAILS_API_ROUTES: &str = "get '/users', to: 'users#index'\n";
+const RAILS_API_USERS_ROUTE: &str = "route lib/api_routes.rb::route:/users";
+/// The conventional controller file of `users`, with and without the
+/// action a route names.
+const RAILS_USERS_FILE: &str = "app/controllers/users_controller.rb";
+const RAILS_USERS: &str =
+    "class UsersController\n  def index\n    1\n  end\n\n  def show\n    2\n  end\nend\n";
+const RAILS_USERS_SHOW: &str = "class UsersController\n  def show\n    2\n  end\nend\n";
+const RAILS_USERS_INDEX: &str = "method UsersController::index";
+const RAILS_USERS_SHOW_METHOD: &str = "method UsersController::show";
+
+/// W7-19e: the root `Gemfile` comes to name `rails`: Rails is detected, and
+/// the explicit route in `lib/` links to its controller's action.
+pub fn ruby_rails_gemfile_gains_rails() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE_PLAIN)
+        .file(RAILS_API_ROUTES_FILE, RAILS_API_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("Gemfile", RAILS_GEMFILE)
+        .detected_before("rails", false)
+        .detected_after("rails", true)
+        .edge_after(RAILS_API_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the root `Gemfile` drops `rails`: Rails is not detected, and the
+/// route goes.
+pub fn ruby_rails_gemfile_drops_rails() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_API_ROUTES_FILE, RAILS_API_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("Gemfile", RAILS_GEMFILE_PLAIN)
+        .detected_before("rails", true)
+        .detected_after("rails", false)
+        .edge_before(RAILS_API_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// An engine's routes, drawn under a `config/` below the project root: the
+/// file alone makes Rails detected.
+const RAILS_ENGINE_ROUTES_FILE: &str = "engine/config/routes.rb";
+const RAILS_ENGINE_ROUTES: &str = "Engine.routes.draw do\n  get 'users', to: 'users#index'\nend\n";
+const RAILS_ENGINE_USERS_ROUTE: &str = "route engine/config/routes.rb::route:users#index";
+
+/// W7-19e: an engine's `config/routes.rb` appears: Rails is detected by it,
+/// and its route links.
+pub fn ruby_rails_engine_routes_file_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write(RAILS_ENGINE_ROUTES_FILE, RAILS_ENGINE_ROUTES)
+        .detected_before("rails", false)
+        .detected_after("rails", true)
+        .edge_after(RAILS_ENGINE_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the engine's `config/routes.rb` is deleted: Rails is not
+/// detected.
+pub fn ruby_rails_engine_routes_file_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file(RAILS_ENGINE_ROUTES_FILE, RAILS_ENGINE_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .remove(RAILS_ENGINE_ROUTES_FILE)
+        .detected_before("rails", true)
+        .detected_after("rails", false)
+        .edge_before(RAILS_ENGINE_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// The application's routes, a resource limited to two actions.
+const RAILS_ROUTES: &str =
+    "Rails.application.routes.draw do\n  resources :users, only: [:index, :show]\nend\n";
+const RAILS_USERS_ROUTE: &str = "route config/routes.rb::route:users#index";
+const RAILS_USERS_SHOW_ROUTE: &str = "route config/routes.rb::route:users#show";
+
+/// W7-19e: the controller file the routes' `users` names appears: the
+/// routes, waiting under their whole names, link.
+pub fn ruby_rails_controller_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .write(RAILS_USERS_FILE, RAILS_USERS)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .edge_after(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+}
+
+/// W7-19e: the controller file is deleted: the routes wait again.
+pub fn ruby_rails_controller_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .remove(RAILS_USERS_FILE)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the controller gains the action a route names.
+pub fn ruby_rails_controller_gains_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS_SHOW)
+        .write(RAILS_USERS_FILE, RAILS_USERS)
+        .edge_throughout(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the controller loses the action.
+pub fn ruby_rails_controller_loses_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write(RAILS_USERS_FILE, RAILS_USERS_SHOW)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// A controller outside the conventional file, which a route reaches by
+/// its class's name.
+const RAILS_ENGINE_USERS_FILE: &str = "engine/app/controllers/users_controller.rb";
+const RAILS_MEMBERS: &str = "class MembersController\n  def index\n    1\n  end\nend\n";
+const RAILS_USERS_INDEX_ONLY: &str = "class UsersController\n  def index\n    1\n  end\nend\n";
+
+/// W7-19e: a controller outside the conventional file is renamed to the
+/// class the route's `users` names: the route links by the class.
+pub fn ruby_rails_controller_class_is_renamed_to_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_MEMBERS)
+        .write(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the class is renamed away again: no class answers the route.
+pub fn ruby_rails_controller_class_is_renamed_away_from_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_ENGINE_USERS_FILE, RAILS_MEMBERS)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .no_edge_after(
+            RAILS_USERS_ROUTE,
+            "references",
+            "method MembersController::index",
+        )
+}
+
+/// Another controller of the name outside the conventional file, holding
+/// the action too: of two Rails takes neither (KNOWN_DIFFS: upstream takes
+/// its store's first).
+const RAILS_ADMIN_USERS_FILE: &str = "admin/app/controllers/users_controller.rb";
+const RAILS_ENGINE_USERS_INDEX: &str =
+    "method UsersController::index @engine/app/controllers/users_controller.rb";
+
+/// W7-19e: a second `UsersController` holding the action appears: the
+/// route's link to the first goes, though nothing it links to changed.
+pub fn ruby_rails_second_controller_class_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+        .no_edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// W7-19e: the second `UsersController` goes: the route, waiting under its
+/// whole name, links to the one left.
+pub fn ruby_rails_second_controller_class_goes() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .remove(RAILS_ADMIN_USERS_FILE)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// W7-19e: another controller's class is renamed to the route's
+/// `UsersController`: two classes now hold the action, so the route's link
+/// to the first goes, though no node it links to changed and no node named
+/// as its target came or went.
+pub fn ruby_rails_second_class_is_renamed_to_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_ADMIN_USERS_FILE, RAILS_MEMBERS)
+        .write(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+        .no_edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// W7-19e: the second class is renamed away again: the route links to the
+/// one left.
+pub fn ruby_rails_second_class_is_renamed_away_from_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_ADMIN_USERS_FILE, RAILS_MEMBERS)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// The conventional controller file holding the action as a top-level
+/// function: Rails reads that file first, whatever classes it declares.
+const RAILS_USERS_FUNCTION: &str = "def index\n  1\nend\n";
+const RAILS_USERS_FUNCTION_INDEX: &str = "function index @app/controllers/users_controller.rb";
+
+/// W7-19e: the conventional controller file appears holding only a
+/// function of the action's name: the route, waiting under its whole name,
+/// links to it, though no class of the name came.
+pub fn ruby_rails_conventional_controller_file_appears_with_only_a_function() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .write(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+}
+
+/// W7-19e: that file goes: the route waits again.
+pub fn ruby_rails_conventional_controller_file_with_only_a_function_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .remove(RAILS_USERS_FILE)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+}
+
+/// W7-19e: the conventional controller file appears beside the class the
+/// route reached: the route moves to the file's action, though no class of
+/// the name came or went.
+pub fn ruby_rails_conventional_controller_file_appears_beside_the_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+}
+
+/// W7-19e: the conventional controller file goes: the route reaches the
+/// class again.
+pub fn ruby_rails_conventional_controller_file_goes_beside_the_class() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .remove(RAILS_USERS_FILE)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// An engine's routes naming `admin/zones`, and two `ZonesController`s
+/// holding the action: the admin one, whose file the route's path names,
+/// and the API's.
+const RAILS_ZONES_ROUTES_FILE: &str = "backend/config/routes.rb";
+const RAILS_ZONES_ROUTES: &str = "Spree::Core::Engine.routes.draw do\n  namespace :admin do\n    resources :zones, only: [:show]\n  end\nend\n";
+const RAILS_ADMIN_ZONES_FILE: &str = "backend/app/controllers/spree/admin/zones_controller.rb";
+const RAILS_MANAGE_ZONES_FILE: &str = "backend/app/controllers/spree/manage/zones_controller.rb";
+const RAILS_ADMIN_ZONES: &str = "module Spree\n  module Admin\n    class ZonesController\n      def show\n        1\n      end\n    end\n  end\nend\n";
+const RAILS_API_ZONES_FILE: &str = "api/app/controllers/spree/api/zones_controller.rb";
+const RAILS_API_ZONES: &str = "module Spree\n  module Api\n    class ZonesController\n      def show\n        2\n      end\n    end\n  end\nend\n";
+/// The admin controller without the route's `show`.
+const RAILS_ADMIN_ZONES_INDEX: &str = "module Spree\n  module Admin\n    class ZonesController\n      def index\n        1\n      end\n    end\n  end\nend\n";
+const RAILS_ZONES_ROUTE: &str = "route backend/config/routes.rb::route:admin/zones#show";
+const RAILS_ADMIN_ZONES_SHOW: &str = "method Spree::Admin::ZonesController::show";
+const RAILS_API_ZONES_SHOW: &str = "method Spree::Api::ZonesController::show";
+
+/// W7-19e: the admin controller's file moves out of `admin/`: no file ends
+/// with the route's `/admin/zones_controller.rb`, both `ZonesController`s
+/// hold `show`, and of two Rails takes neither (KNOWN_DIFFS: upstream takes
+/// its store's first).
+pub fn ruby_rails_namespaced_controller_file_moves_out_of_its_namespace() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_ADMIN_ZONES_FILE, RAILS_ADMIN_ZONES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .rename(RAILS_ADMIN_ZONES_FILE, RAILS_MANAGE_ZONES_FILE)
+        .edge_before(RAILS_ZONES_ROUTE, "references", RAILS_ADMIN_ZONES_SHOW)
+        .no_edge_after(RAILS_ZONES_ROUTE, "references", RAILS_ADMIN_ZONES_SHOW)
+        .no_edge_after(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+}
+
+/// W7-19e: the file moves back under `admin/`: the route's path names it,
+/// and the route links to it again.
+pub fn ruby_rails_namespaced_controller_file_moves_into_its_namespace() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_MANAGE_ZONES_FILE, RAILS_ADMIN_ZONES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .rename(RAILS_MANAGE_ZONES_FILE, RAILS_ADMIN_ZONES_FILE)
+        .edge_after(RAILS_ZONES_ROUTE, "references", RAILS_ADMIN_ZONES_SHOW)
+}
+
+/// W7-19e: the route's own module's controller appears without `show`:
+/// the route reads only its module's controllers now, so its link to the
+/// API's `show` goes, though no node named `show` came or went (only the
+/// lane re-opens it, by its site).
+pub fn ruby_rails_own_module_controller_without_the_action_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .write(RAILS_ADMIN_ZONES_FILE, RAILS_ADMIN_ZONES_INDEX)
+        .edge_before(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+        .no_edge_after(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+}
+
+/// W7-19e: that controller goes: the route links to the API's `show` again.
+pub fn ruby_rails_own_module_controller_without_the_action_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .file(RAILS_ADMIN_ZONES_FILE, RAILS_ADMIN_ZONES_INDEX)
+        .remove(RAILS_ADMIN_ZONES_FILE)
+        .edge_after(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+}
+
+/// The application's routes, with one route and with a second drawn above
+/// it (the first's line, and so its id, moves).
+const RAILS_ROUTES_ONE: &str =
+    "Rails.application.routes.draw do\n  get 'users', to: 'users#index'\nend\n";
+const RAILS_ROUTES_TWO: &str = "Rails.application.routes.draw do\n  get 'users/:id', to: 'users#show'\n  get 'users', to: 'users#index'\nend\n";
+
+/// W7-19e: the routes file gains a route above the other.
+pub fn ruby_rails_routes_file_gains_a_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES_ONE)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("config/routes.rb", RAILS_ROUTES_TWO)
+        .edge_throughout(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .edge_after(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+}
+
+/// W7-19e: the routes file loses that route.
+pub fn ruby_rails_routes_file_loses_a_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES_TWO)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("config/routes.rb", RAILS_ROUTES_ONE)
+        .edge_throughout(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .edge_before(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+}
+
+/// A controller action naming the model `User`, the model in
+/// `app/models/user.rb` or moved out of `app/models/`, and another class
+/// `User` in `lib/`.
+const RAILS_USERS_QUERYING: &str = "class UsersController\n  def index\n    User.all\n  end\nend\n";
+const RAILS_MODEL_FILE: &str = "app/models/user.rb";
+const RAILS_MODEL_MOVED_FILE: &str = "app/user.rb";
+const RAILS_LEGACY_MODEL_FILE: &str = "lib/legacy/user.rb";
+const RAILS_MODEL: &str = "class User\nend\n";
+const RAILS_USER_MODEL: (&str, &str, &str) = (
+    "method UsersController::index",
+    "references",
+    "class User @app/models/user.rb",
+);
+const RAILS_USER_MOVED: (&str, &str, &str) = (
+    "method UsersController::index",
+    "references",
+    "class User @app/user.rb",
+);
+
+/// W7-19e: the model `User` moves out of `app/models/`: Rails' model
+/// lookup no longer answers, and of the two classes `User` name matching
+/// takes the nearer at its lower confidence.
+pub fn ruby_rails_model_moves_out_of_app_models() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_USERS_FILE, RAILS_USERS_QUERYING)
+        .file(RAILS_MODEL_FILE, RAILS_MODEL)
+        .file(RAILS_LEGACY_MODEL_FILE, RAILS_MODEL)
+        .rename(RAILS_MODEL_FILE, RAILS_MODEL_MOVED_FILE)
+        .edge_metadata_before(RAILS_USER_MODEL, "framework", "rails")
+        .edge_after(RAILS_USER_MOVED.0, RAILS_USER_MOVED.1, RAILS_USER_MOVED.2)
+        .no_edge_metadata_after(RAILS_USER_MOVED, "framework", "rails")
+}
+
+/// W7-19e: the model `User` moves into `app/models/`: Rails' model lookup
+/// answers with it, over name matching's nearer guess.
+pub fn ruby_rails_model_moves_into_app_models() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_USERS_FILE, RAILS_USERS_QUERYING)
+        .file(RAILS_MODEL_MOVED_FILE, RAILS_MODEL)
+        .file(RAILS_LEGACY_MODEL_FILE, RAILS_MODEL)
+        .rename(RAILS_MODEL_MOVED_FILE, RAILS_MODEL_FILE)
+        .edge_before(RAILS_USER_MOVED.0, RAILS_USER_MOVED.1, RAILS_USER_MOVED.2)
+        .edge_metadata_after(RAILS_USER_MODEL, "framework", "rails")
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {

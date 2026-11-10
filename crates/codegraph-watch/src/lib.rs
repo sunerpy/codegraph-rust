@@ -25,6 +25,7 @@ pub mod php_heads;
 pub mod play_routes;
 mod policy;
 pub mod r_bindings;
+pub mod rails_routes;
 pub mod resolved_refs;
 pub mod ruby_heads;
 pub mod rust_receivers;

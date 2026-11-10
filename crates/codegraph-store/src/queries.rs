@@ -126,7 +126,7 @@ pub struct FileReferenceSite {
 }
 
 /// A family of references a framework lane of a sync reads in bulk
-/// ([`Store::lane_references`], W7-19d).
+/// ([`Store::lane_references`], W7-19d, W7-19e).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneReferences {
     /// A PHP route's references: Laravel's, the only resolver that makes
@@ -138,6 +138,9 @@ pub enum LaneReferences {
     PhpHooks,
     /// The PHP references named `{class}::...`, Laravel's `Model::method`.
     PhpStaticCalls(String),
+    /// A Ruby route's references: Rails', the only resolver that makes Ruby
+    /// routes.
+    RubyRoutes,
 }
 
 impl LaneReferences {
@@ -165,6 +168,10 @@ impl LaneReferences {
             Self::PhpStaticCalls(class) => (
                 "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'",
                 vec![format!("{class}::"), format!("{class}:;")],
+            ),
+            Self::RubyRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'",
+                Vec::new(),
             ),
         }
     }

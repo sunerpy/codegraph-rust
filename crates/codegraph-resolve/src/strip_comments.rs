@@ -364,6 +364,94 @@ pub(crate) fn strip_php_comments_keeping_offsets(content: &str) -> String {
     out
 }
 
+/// [`strip_comments_for_regex`] for Ruby with each blanked BYTE but a
+/// newline a space (W7-19e), the way [`strip_js_comments_keeping_offsets`]
+/// blanks JavaScript: a `=begin` … `=end` block at the start of a line and a
+/// `#` comment to the end of its line become spaces, a `'` or `"` string
+/// stays and ends at a newline, and every byte offset of `content` is an
+/// offset of the result. The scan is `strip_ruby`'s, byte by byte: every
+/// byte it looks for is ASCII, and a backslash skips the whole character
+/// after it.
+pub(crate) fn strip_ruby_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    let mut at_line_start = true;
+    while i < n {
+        let c = bytes[i];
+        // `=begin` / `=end` block comments at the start of a line.
+        if at_line_start && c == b'=' && bytes[i..].starts_with(b"=begin") {
+            let start = i;
+            i += "=begin".len();
+            while i < n {
+                if bytes[i] == b'\n' {
+                    let mut j = i + 1;
+                    while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    if bytes[j..].starts_with(b"=end") {
+                        i = j + "=end".len();
+                        while i < n && bytes[i] != b'\n' {
+                            i = next_char(i);
+                        }
+                        break;
+                    }
+                }
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            at_line_start = i > 0 && bytes[i - 1] == b'\n';
+            continue;
+        }
+        // String literals.
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            at_line_start = false;
+            continue;
+        }
+        // Line comment.
+        if c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            at_line_start = false;
+            continue;
+        }
+        if c == b'\n' {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if c == b' ' || c == b'\t' {
+            i += 1;
+            continue;
+        }
+        at_line_start = false;
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
 /// How a comment's text is blanked: one space per character, or per byte.
 #[derive(Clone, Copy)]
 enum Blanking {
@@ -1308,6 +1396,47 @@ mod tests {
         let out = strip_php_comments_keeping_offsets(escaped);
         assert_eq!(out.find('#'), None);
         assert!(out.starts_with("<?php $s = 'a\\é'"));
+    }
+
+    /// W7-19e: the Ruby twin blanks what `strip_ruby` blanks, one space per
+    /// byte: on ASCII text the two agree, and past non-ASCII text in a
+    /// comment every byte offset still holds.
+    #[test]
+    fn ruby_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "# get '/fake', to: 'fake#index'\nget '/real', to: 'real#index' # tail\n",
+            "=begin\nget '/a', to: 'b#c'\n  =end trailing\nget '/d'\n",
+            "  =begin\nx\n=end\ny = 1\n",
+            "\t=begin\nget '/a', to: 'b#c'\n\t=end\nget '/d', to: 'e#f'\n",
+            " \t =begin\nx\n=end\n",
+            "x = 1 =begin\n=end\n",
+            "s = \"a # b\"; t = 'c # d' # e\n",
+            "s = \"it\\\"s # not\" # yes\n",
+            "open = 'never closed\n# next\n",
+            "=begin\nnever closed\n",
+            "e = 'a\\\n# after\n",
+        ] {
+            assert_eq!(
+                strip_ruby_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Ruby),
+                "{ascii:?}"
+            );
+        }
+        let input =
+            "# café — ü 😀\nget '/é', to: 'a#b' # 日本\n=begin\nünïcode 😀\n=end\nresources :x\n";
+        let out = strip_ruby_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("get"), input.find("get"));
+        assert_eq!(out.find("resources"), input.find("resources"));
+        // A string keeps its text; a comment's goes.
+        assert!(out.contains("'/é'") && out.contains("'a#b'"));
+        assert!(!out.contains('ü') && !out.contains('日') && !out.contains('😀'));
+        assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+        // A backslash in a string skips the whole character after it.
+        let escaped = "s = 'a\\é' # c\n";
+        let out = strip_ruby_comments_keeping_offsets(escaped);
+        assert_eq!(out.find('#'), None);
+        assert!(out.starts_with("s = 'a\\é'"));
     }
 
     #[test]

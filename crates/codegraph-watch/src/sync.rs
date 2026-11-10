@@ -715,6 +715,10 @@ fn sync_paths_with_store(
     changed_names.laravel.track = recorded("laravel");
     let drupal_bootstrap = crate::drupal_refs::needs_bootstrap(store)?;
     changed_names.drupal.track = recorded("drupal");
+    // And for the Rails route references whose controllers a failed sync's
+    // changes moved (W7-19e), the same way.
+    let rails_bootstrap = crate::rails_routes::needs_bootstrap(store)?;
+    changed_names.rails.track = recorded("rails");
     // And for the Dart files whose bare calls read other files' class heads:
     // every Dart file is re-resolved once (W4-DART-01). A rebuild for an
     // unreadable row starts with the marker current: withdraw it before
@@ -865,6 +869,7 @@ fn sync_paths_with_store(
         || play_bootstrap
         || laravel_bootstrap
         || drupal_bootstrap
+        || rails_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
     // A bootstrap re-resolves dependents without `begin_mutation`: the
@@ -900,6 +905,7 @@ fn sync_paths_with_store(
         changed_names.play.track = false;
         changed_names.laravel.track = false;
         changed_names.drupal.track = false;
+        changed_names.rails.track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
                 continue;
@@ -1445,6 +1451,16 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if rails_bootstrap {
+            for file in crate::rails_routes::every_route_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if case_bootstrap {
             for file in crate::case_folded::every_case_insensitive_file(
                 store,
@@ -1617,6 +1633,18 @@ fn sync_paths_with_store(
             }
             changed_names.note_any(retries.names);
         }
+        // The Rails route targets whose controllers the changes moved
+        // (W7-19e), read the same way.
+        if changed_names.rails.track && frameworks.iter().any(|name| name == "rails") {
+            let moved = changed_names.rails.moved(store)?;
+            let retries = crate::rails_routes::retries(store, &moved)?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -1716,6 +1744,7 @@ fn sync_paths_with_store(
         crate::play_routes::write_marker(store)?;
         crate::laravel_routes::write_marker(store)?;
         crate::drupal_refs::write_marker(store)?;
+        crate::rails_routes::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
         crate::resolved_refs::restore_marker(
@@ -2234,6 +2263,7 @@ fn remove_tracked_file(
     changed_names.play.note(relative, &old_nodes);
     changed_names.laravel.note(relative, &old_nodes);
     changed_names.drupal.note(relative, &old_nodes);
+    changed_names.rails.note(relative, &old_nodes);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2664,11 +2694,13 @@ fn reextract_into_store(
     // re-extraction makes those (W7-19a0).
     changed_names.note_restorable(relative, &old_nodes, &touched);
     changed_names.absorb_node_diff(touched);
-    // What a Play action's choice read of this file (W7-19c), and a
-    // Laravel controller's and a Drupal handler's or hook's (W7-19d).
+    // What a Play action's choice read of this file (W7-19c), a Laravel
+    // controller's and a Drupal handler's or hook's (W7-19d), and a Rails
+    // route target's (W7-19e).
     changed_names.play.note(relative, &old_nodes);
     changed_names.laravel.note(relative, &old_nodes);
     changed_names.drupal.note(relative, &old_nodes);
+    changed_names.rails.note(relative, &old_nodes);
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -2938,6 +2970,9 @@ struct ChangedNames {
     /// What the changed files held that a Drupal handler's or hook's choice
     /// reads: class and method names, and hook functions (W7-19d).
     drupal: crate::drupal_refs::DrupalChanges,
+    /// What the changed files held that a Rails route target's choice reads:
+    /// Ruby class names and the names of methods and functions (W7-19e).
+    rails: crate::rails_routes::RailsChanges,
     /// The Rust type, trait and alias names that came, went or changed: a
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
@@ -3055,6 +3090,7 @@ impl ChangedNames {
             crate::play_routes::withdraw_marker(store)?;
             crate::laravel_routes::withdraw_marker(store)?;
             crate::drupal_refs::withdraw_marker(store)?;
+            crate::rails_routes::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
@@ -6252,6 +6288,78 @@ pub(crate) mod tests {
         assert_eq!(lanes_pending(&db), (false, false));
     }
 
+    /// W7-19e: likewise for the `ruby` kind, in an index built before it
+    /// and the Rails lane. The first sync detects the frameworks once (Rails,
+    /// as before), re-resolves every route file's references once, bringing
+    /// back the edge an older sync lost, and writes the row and the marker
+    /// back; the next counts neither.
+    #[test]
+    fn a_missing_ruby_control_row_and_lane_marker_detect_and_re_resolve_once() {
+        let dir = TestDir::new("control-inputs-ruby-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_INDEX];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with(&format!("{}:", RAILS_ROUTES.0))
+                    && edge.contains(&format!("-[references]-> {}:", RAILS_INDEX.0))),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Ruby.row_key();
+        let row = metadata(&db, &row_key).expect("the Ruby row");
+        let frameworks = metadata(&db, crate::control_inputs::FRAMEWORKS_KEY);
+        assert!(
+            frameworks
+                .as_deref()
+                .is_some_and(|found| found.contains("\"rails\"")),
+            "{frameworks:?}"
+        );
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Ruby)
+        };
+        let lane_pending = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::rails_routes::needs_bootstrap(&store).unwrap()
+        };
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the route edge an older sync lost");
+            store.delete_project_metadata(&row_key).unwrap();
+            store
+                .delete_project_metadata(crate::rails_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert!(moved(&db));
+        assert!(lane_pending(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Rails was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            frameworks
+        );
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+    }
+
     /// W5-06: a control file a watcher event names is read whole, so one
     /// replaced with its size and modification time kept still counts as
     /// changed.
@@ -7217,6 +7325,104 @@ pub(crate) mod tests {
             lane_marker(&db, crate::drupal_refs::VERSION_KEY),
             Some(crate::drupal_refs::VERSION.to_string())
         );
+    }
+
+    const RAILS_GEMFILE: (&str, &str) = ("Gemfile", "gem \"rails\"\n");
+    const RAILS_ROUTES: (&str, &str) = (
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  get 'users', to: 'users#index'\nend\n",
+    );
+    const RAILS_EMPTY: (&str, &str) = (
+        "app/controllers/users_controller.rb",
+        "class UsersController\nend\n",
+    );
+    const RAILS_INDEX: (&str, &str) = (
+        "app/controllers/users_controller.rb",
+        "class UsersController\n  def index\n  end\nend\n",
+    );
+
+    /// W7-19e: a sync failing after it gave the controller its `index`,
+    /// before resolving, leaves the next sync, with nothing changed, to link
+    /// the route's `users#index` to it, as a fresh index has it: the
+    /// reference waits under its whole name, which no lane but Rails' wakes,
+    /// and the Rails marker the failure left away brings it back.
+    #[test]
+    fn a_rails_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let routed = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with(&format!("{}:", RAILS_ROUTES.0))
+                    && edge.contains(&format!("-[references]-> {}:", RAILS_INDEX.0))
+            })
+        };
+        let dir = TestDir::new("rails-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_EMPTY];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rails_routes::VERSION_KEY),
+            Some(crate::rails_routes::VERSION.to_string())
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[RAILS_INDEX]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [RAILS_INDEX.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::rails_routes::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_INDEX];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("rails-routes-fresh", &fresh)
+        );
+        assert!(routed(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::rails_routes::VERSION_KEY),
+            Some(crate::rails_routes::VERSION.to_string())
+        );
+    }
+
+    /// W7-19e: an index without the Rails marker (built before it, or a sync
+    /// that stopped) has every file holding a Rails route's reference
+    /// re-resolved by its next sync, with nothing changed: the controller
+    /// edge an older sync lost comes back.
+    #[test]
+    fn an_index_without_the_rails_marker_re_resolves_the_route_files() {
+        let version = Some(crate::rails_routes::VERSION.to_string());
+        let dir = TestDir::new("rails-routes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_INDEX];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::rails_routes::VERSION_KEY), version);
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route' AND file_path = 'config/routes.rb')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the controller edge an older sync lost");
+            store
+                .delete_project_metadata(crate::rails_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lane_marker(&db, crate::rails_routes::VERSION_KEY), version);
+        assert_eq!(edge_projection(&db), expected);
     }
 
     fn dart_marker(db: &Path) -> Option<String> {

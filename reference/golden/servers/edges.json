@@ -138,6 +138,32 @@
     "kind": "references",
     "line": 2,
     "metadata": {
+      "confidence": 0.85,
+      "framework": "rails",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:rails/config/routes.rb:2:GET:/users/:id:users#show",
+    "target": "method:519356e5fcc6de599e3961ad1a49bead"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.85,
+      "framework": "rails",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:rails/config/routes.rb:2:GET:/users:users#index",
+    "target": "method:ec5576bfff4fde71d094b1c11bbf0808"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 2,
+    "metadata": {
       "confidence": 0.9,
       "framework": "play",
       "resolvedBy": "framework"
@@ -145,6 +171,19 @@
     "provenance": null,
     "source": "route:play/conf/routes:2:GET:/items/:id",
     "target": "method:dffa1d90061d3bb5d52e05bf5da1951d"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.85,
+      "framework": "rails",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:rails/config/routes.rb:4:GET:/admin/reports:admin/reports#index",
+    "target": "method:fd9132c439cfae25243586341304dc2d"
   },
   {
     "col": 0,
