@@ -9,8 +9,8 @@
 //! ([`astro`]), Django, Flask and FastAPI ([`python`]), Rails ([`rails`]),
 //! Spring ([`spring`]), Play ([`play`]), Expo Router ([`expo_router`]), Vue
 //! and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot ([`godot`]), Tauri
-//! ([`tauri`]) and GoFrame ([`goframe`]). The other upstream resolvers
-//! remain deferred (see `KNOWN_DIFFS.md`).
+//! ([`tauri`]), GoFrame ([`goframe`]) and ASP.NET ([`aspnet`]). The other
+//! upstream resolvers remain deferred (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to
@@ -19,6 +19,7 @@
 //! the upstream runs them (`index.ts:695-701`).
 
 pub mod angular_router;
+pub mod aspnet;
 pub mod astro;
 pub mod drupal;
 pub mod expo_router;
@@ -69,8 +70,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// sits where upstream's `FRAMEWORK_RESOLVERS` puts it relative to its
 /// ported neighbours (Laravel and Drupal first, Express before NestJS, Astro
 /// between Angular Router
-/// and Expo Router, the Python frameworks after Astro, Spring and Play after
-/// them); the entries already
+/// and Expo Router, the Python frameworks after Astro, Rails, Spring and Play
+/// after them, ASP.NET after GoFrame); the entries already
 /// here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
@@ -176,6 +177,12 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // resolver. It resolves no reference, so its place here changes
         // no resolution; the synthesis stage joins its routes.
         Box::new(goframe::GoFrameResolver),
+        // ASP.NET's routes and conventions (#2158, #2415), after GoFrame as
+        // upstream registers it; Rust's Expo Router already stands before
+        // GoFrame. It reads only C# and Razor references, and no resolver
+        // above answers one (Godot reads GDScript's, Astro only its own
+        // names), so its place changes no other reference's resolution.
+        Box::new(aspnet::AspnetResolver),
     ];
     candidates
         .into_iter()

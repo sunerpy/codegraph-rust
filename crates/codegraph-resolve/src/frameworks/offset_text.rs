@@ -1,7 +1,7 @@
 //! A file's source and its comment-stripped text, byte for byte aligned
 //! (W7-19a's Express text, shared with the Python frameworks in W7-19b,
-//! with Spring in W7-19c, with Laravel in W7-19d and with Rails in
-//! W7-19e).
+//! with Spring in W7-19c, with Laravel in W7-19d, with Rails in W7-19e and
+//! with ASP.NET in W7-19f).
 //!
 //! Upstream strips comments one space per UTF-16 code unit and measures
 //! columns, match lengths and windows in code units; the strippers here
@@ -50,6 +50,12 @@ impl<'a> OffsetText<'a> {
     /// Java or Kotlin source ([`strip_java_comments_keeping_offsets`]).
     pub(crate) fn java(content: &'a str) -> Self {
         Self::new(content, strip_java_comments_keeping_offsets(content))
+    }
+
+    /// C# source: upstream strips it as it strips Java
+    /// ([`strip_java_comments_keeping_offsets`]).
+    pub(crate) fn csharp(content: &'a str) -> Self {
+        Self::java(content)
     }
 
     /// PHP source ([`strip_php_comments_keeping_offsets`]).

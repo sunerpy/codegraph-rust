@@ -248,6 +248,18 @@
     "target": "method:9c266f666867e6f29cf57cec22ddddc0"
   },
   {
+    "col": 0,
+    "kind": "references",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:aspnet/Controllers/UsersController.cs:9:GET:/api/[controller]/{id}",
+    "target": "method:5305c5e90802aeb697042a8f5a945c5c"
+  },
+  {
     "col": 11,
     "kind": "calls",
     "line": 10,
