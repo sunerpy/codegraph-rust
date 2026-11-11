@@ -624,6 +624,22 @@ pub trait ResolutionContext {
         crate::rust_scope::no_rust_crates()
     }
 
+    /// The direct subdirectories of the project-relative directory `dir`
+    /// (`.` the root), sorted by name: what a Cargo workspace's glob member
+    /// walks (upstream #151 `listDirectories`). The store and snapshot
+    /// contexts list the project's directories; the default lists none.
+    fn list_directories(&self, _dir: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The Cargo workspace's crates by name and alias, each its member's
+    /// directory, which the Rust resolver's module rule reads (W7-19h,
+    /// upstream `getCargoWorkspaceCrateMap`). Contexts that live for one
+    /// resolution pass read them once; the default reads them on each call.
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        Arc::new(crate::frameworks::cargo_workspace::crate_map(self))
+    }
+
     /// Re-exports declared by a file (`getReExports?`, `types.ts:119-125`).
     /// Empty when the file has none.
     fn get_re_exports(&self, _file_path: &str, _language: Language) -> Vec<ReExport> {

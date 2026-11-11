@@ -565,12 +565,14 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         "a forced migration must write the Play routes marker of `index --force`"
     );
     // The Laravel and Drupal lane markers (W7-19d), the Rails one
-    // (W7-19e) and the Vapor one (W7-19g), likewise.
+    // (W7-19e), the Vapor one (W7-19g) and the Rust crate roots one
+    // (W7-19h), likewise.
     for (prefix, key) in [
         ("laravel_routes", "laravel_routes_version"),
         ("drupal_refs", "drupal_refs_version"),
         ("rails_routes", "rails_routes_version"),
         ("vapor_routes", "vapor_routes_version"),
+        ("rust_crate_roots", "rust_crate_roots_version"),
     ] {
         let marker = |paths: &IndexPaths| {
             Store::open_for_read(paths, deadline(), || false)

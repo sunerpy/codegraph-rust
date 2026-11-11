@@ -935,6 +935,11 @@ pub(crate) mod test_ctx {
         imports: HashMap<String, Vec<ImportMapping>>,
         /// Every path `read_file` was asked for, in order.
         reads: std::sync::Mutex<Vec<String>>,
+        /// Each directory's subdirectories, in the order a listing gives
+        /// them.
+        dirs: HashMap<String, Vec<String>>,
+        /// Every directory `list_directories` was asked for, in order.
+        listed: std::sync::Mutex<Vec<String>>,
     }
 
     impl RouteCtx {
@@ -953,6 +958,20 @@ pub(crate) mod test_ctx {
         /// The paths read so far, in order.
         pub(crate) fn reads(&self) -> Vec<String> {
             self.reads.lock().expect("reads").clone()
+        }
+
+        /// The subdirectories `dir`'s listing gives, in this order.
+        pub(crate) fn dirs(mut self, dir: &str, children: &[&str]) -> Self {
+            self.dirs.insert(
+                dir.to_string(),
+                children.iter().map(|child| child.to_string()).collect(),
+            );
+            self
+        }
+
+        /// The directories listed so far, in order.
+        pub(crate) fn listed(&self) -> Vec<String> {
+            self.listed.lock().expect("listed").clone()
         }
 
         /// A route file and the nodes its router extracted from it.
@@ -1030,6 +1049,10 @@ pub(crate) mod test_ctx {
         }
         fn get_project_root(&self) -> &str {
             "/project"
+        }
+        fn list_directories(&self, dir: &str) -> Vec<String> {
+            self.listed.lock().expect("listed").push(dir.to_string());
+            self.dirs.get(dir).cloned().unwrap_or_default()
         }
         /// Sorted by path, as the store's list is.
         fn get_all_files(&self) -> Vec<String> {

@@ -507,6 +507,8 @@ fn run_case(name: &str, case: &Case) {
         "drupal_refs",
         // The Vapor lane marker (W7-19g).
         "vapor_routes",
+        // The Rust crate roots marker (W7-19h).
+        "rust_crate_roots",
     ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -1746,6 +1748,28 @@ matrix! {
     swiftui_model_gains_an_extension_beside_it,
     swiftui_model_loses_its_extension,
     swift_vapor_group_prefix_changes,
+    rust_workspace_member_gains_a_lib_beside_its_main,
+    rust_workspace_member_loses_its_lib_beside_its_main,
+    rust_workspace_member_gains_its_crate_root,
+    rust_workspace_member_loses_its_crate_root,
+    rust_root_module_appears_over_a_workspace_crate,
+    rust_root_module_over_a_workspace_crate_is_deleted,
+    rust_root_module_shrinks_under_the_size_limit,
+    rust_root_module_grows_over_the_size_limit,
+    rust_workspace_crate_root_shrinks_under_the_size_limit,
+    rust_workspace_crate_root_grows_over_the_size_limit,
+    rust_workspace_members_gain_a_crate,
+    rust_workspace_members_lose_a_crate,
+    rust_workspace_member_renames_its_package,
+    rust_workspace_member_takes_its_package_name_back,
+    rust_workspace_glob_gains_a_member,
+    rust_workspace_glob_loses_a_member,
+    rust_root_manifest_appears_beside_axum_routes,
+    rust_root_manifest_beside_axum_routes_is_deleted,
+    rust_route_handler_module_appears,
+    rust_route_handler_module_is_deleted,
+    rust_handler_moves_into_handlers,
+    rust_handler_moves_out_of_handlers,
     vue_nuxt_config_appears,
     vue_nuxt_app_manifest_gains_nuxt,
     vue_nuxt_page_body_edit,
