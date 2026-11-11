@@ -1,0 +1,115 @@
+name: Perf W7-21
+
+# A throwaway measurement (owner 2026-11-05, OD-B19's method): W7-21's cold
+# init, one-file sync, synthesis stage and peak RSS under the frozen method
+# against W7-20 (28a3b32e), and typescript-large also against fec4fbb
+# (OD-B20), one runner per corpus, which no other session loads. It lives
+# only on perf/w721-* branches and is never merged.
+on:
+  push:
+    branches: ["perf/w721-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-w721
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: never
+  CODEGRAPH_NO_DAEMON: "1"
+  CODEGRAPH_NO_WATCH: "1"
+  PRE: fec4fbb04bbdfee20584254592ba414687d77862
+  BASE: 28a3b32ea532d8f0176e425d1341f3014582aaf8
+  CAND: 551e66a9a1b59850a927408aa6cfb64bc066c623
+
+jobs:
+  measure:
+    name: ${{ matrix.corpus }} (${{ matrix.sides }}), frozen method
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{corpus: rn-firebase, sides: "cand base"}, {corpus: rn-firebase-m, sides: "cand base"}, {corpus: rn-firebase-alias, sides: "cand base"}, {corpus: rn-screens, sides: "cand base"}, {corpus: rn-svg, sides: "cand base"}, {corpus: wikipedia-ios, sides: "cand base"}, {corpus: wikipedia-ios-objc, sides: "cand base"}, {corpus: expo-subset, sides: "cand base"}, {corpus: librechat, sides: "cand base"}, {corpus: typescript-large, sides: "cand base pre"}]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      SIDES: ${{ matrix.sides }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-09-12
+        with:
+          toolchain: 1.98.0
+          components: rustfmt,clippy,llvm-tools-preview
+
+      - name: Tools, disk and runner
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q sqlite3 zstd rsync time
+          root=/mnt/perf
+          if ! sudo mkdir -p "$root" || [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+            root=$RUNNER_TEMP/perf
+          fi
+          sudo mkdir -p "$root" && sudo chown "$USER" "$root"
+          echo "PERF_ROOT=$root" >> "$GITHUB_ENV"
+          mkdir -p "$root/evidence"
+          { echo "root $root"; echo "sides $SIDES"; uname -a; nproc; lscpu | sed -n '1,16p'; free -h; df -h / /mnt /dev/shm "$root"; cat /proc/loadavg; } \
+            | tee "$root/evidence/runner.txt"
+          test "$(df --output=avail -BG "$root" | tail -1 | tr -dc 0-9)" -ge 30
+          test -x /usr/bin/time
+
+      - name: Build the fast builds
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD~1)" = "$CAND"
+          test "$(git rev-parse HEAD~2)" = "$BASE"
+          git merge-base --is-ancestor "$PRE" "$BASE"
+          pre=
+          case "$SIDES" in "cand base") ;; "cand base pre") pre=$PRE ;; *) echo "bad SIDES $SIDES"; exit 2 ;; esac
+          bash .github/perf-w721/build.sh "$PERF_ROOT/dir" "$PERF_ROOT/target" "$BASE" "$CAND" ${pre:+"$pre"} \
+            2>&1 | tee "$PERF_ROOT/evidence/build.log" | grep -E '^(bin-|[0-9a-f]{64} )|Finished|error'
+          rm -rf "$PERF_ROOT/target"
+          df -h "$PERF_ROOT"
+
+      - name: The fast builds differ as W7-21 says
+        run: |
+          set -euo pipefail
+          bash .github/perf-w721/sanity.sh "$PERF_ROOT/dir" crates/codegraph-bench/fixtures/mobile | tee "$PERF_ROOT/evidence/sanity.txt"
+          grep -qx "cand: marker 19, rn-export nodes 1" "$PERF_ROOT/evidence/sanity.txt"
+          grep -qx "base: marker 18, rn-export nodes 0" "$PERF_ROOT/evidence/sanity.txt"
+
+      - name: Fetch the corpus
+        env:
+          CORPUS: ${{ matrix.corpus }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$PERF_ROOT/corpora"
+          spec=$(bash .github/perf-w721/fetch-corpus.sh "$CORPUS" "$PERF_ROOT/corpora")
+          printf '%s\n' "$spec" > "$PERF_ROOT/spec.txt"
+          cat "$PERF_ROOT/spec.txt"
+
+      - name: Measure (frozen method)
+        run: |
+          set -euo pipefail
+          bash .github/perf-w721/quiet-then-perf.sh "$PERF_ROOT/dir" "$PERF_ROOT/evidence" \
+            "$PERF_ROOT" "$(cat "$PERF_ROOT/spec.txt")"
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-w721-${{ matrix.corpus }}-${{ matrix.sides == 'cand base pre' && 'pre' || 'base' }}
+          path: ${{ env.PERF_ROOT }}/evidence
+          if-no-files-found: error
+          retention-days: 30
