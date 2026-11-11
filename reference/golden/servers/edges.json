@@ -136,6 +136,18 @@
   {
     "col": 0,
     "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:gin/main.go:15:GET:/ping",
+    "target": "function:822994b41b49c7ca4069da738515f400"
+  },
+  {
+    "col": 0,
+    "kind": "references",
     "line": 19,
     "metadata": {
       "confidence": 0.9,

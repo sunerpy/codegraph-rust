@@ -48,6 +48,18 @@
     "target": "file:c/src/cmds.h"
   },
   {
+    "col": 0,
+    "kind": "references",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:go/gin/app.go:9:GET:/users",
+    "target": "function:4476dfa12db7b214d4f0de9d7d95ba48"
+  },
+  {
     "col": 1,
     "kind": "calls",
     "line": 10,
@@ -458,7 +470,8 @@
     "line": 14,
     "metadata": {
       "confidence": 0.7,
-      "resolvedBy": "exact-match"
+      "framework": "go",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
@@ -556,7 +569,8 @@
     "line": 18,
     "metadata": {
       "confidence": 0.7,
-      "resolvedBy": "exact-match"
+      "framework": "go",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "function:f8f21c17f8656f84fc213474805a9ec3",
@@ -774,7 +788,8 @@
     "line": 15,
     "metadata": {
       "confidence": 0.7,
-      "resolvedBy": "exact-match"
+      "framework": "go",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "function:207fddb9f2ee9a4411fbcefb730ff29a",
@@ -907,7 +922,8 @@
     "line": 19,
     "metadata": {
       "confidence": 0.7,
-      "resolvedBy": "exact-match"
+      "framework": "go",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "function:f8f21c17f8656f84fc213474805a9ec3",

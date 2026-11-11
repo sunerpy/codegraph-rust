@@ -1951,7 +1951,8 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
         ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n"),
         ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
         ("svc/main.go", "package main\n\nfunc main() {}\n"),
-        // Names no Python framework, so the detected frameworks stay React.
+        // Names no Python framework, so the detected frameworks stay React
+        // and Go (`svc/main.go`).
         ("requirements.txt", "requests>=2\n"),
         // Nor Spring.
         (

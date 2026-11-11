@@ -39,15 +39,14 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Rails, Spring, Play, Expo Router, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit and Vapor (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit and Vapor (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  React Native / Expo / Fabric bridges,
-  Swift↔ObjC bridging, and the Go-module route
-  extractors. These are an additive heuristic layer; on a project where none
+  React Native / Expo / Fabric bridges and
+  Swift↔ObjC bridging. These are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction
   (frontmatter + `<script>` delegation, template `{call(...)}` and
@@ -511,12 +510,18 @@ regex engine), is not listed.
   one of its names is declared somewhere, so there it resolves or stays
   unresolved by what unrelated files declare (`astro.rs`).
 - **A name heuristic's tier with two candidates (W7-19b).** The pick the
-  Django, Flask, FastAPI, Spring, ASP.NET, SwiftUI, UIKit, Vapor and Rust name heuristics share (#2225) resolves a tier only
+  Django, Flask, FastAPI, Spring, ASP.NET, SwiftUI, UIKit, Vapor, Rust and Go name heuristics share (#2225) resolves a tier only
   through its one candidate: two declarations of the name in the reference's
   file, its directory, a preferred folder or the project answer nothing and
   stop the search, and the reference goes on to import and name resolution
   as if the framework were not detected. colby takes the first in its store's
-  order (`frameworks/name_heuristic.rs`).
+  order (`frameworks/name_heuristic.rs`). Go's conventions search only the
+  reference's file and package, and stop at a pick that answers nothing, as
+  Spring's and ASP.NET's do; colby tries the next convention only when there
+  is no candidate either. In a package of valid Go the stop changes no
+  result: the package declares no type and function of one name, and its
+  build-tag twins share their kind, so a later convention could only answer
+  nothing again or find no candidate (`frameworks/go.rs`).
 - **A name heuristic's pick in another code family (W7-19b).** A pick written
   in another code family than the reference answers nothing, for a `calls`
   reference too: a Python `get_db()` in a FastAPI project whose one candidate

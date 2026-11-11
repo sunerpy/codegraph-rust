@@ -10,11 +10,11 @@
 //! port implements Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri,
 //! Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router,
 //! Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, Expo
-//! Router, GoFrame, Rust (axum, actix and Cargo workspaces), ASP.NET,
+//! Router, Go, GoFrame, Rust (axum, actix and Cargo workspaces), ASP.NET,
 //! SwiftUI, UIKit and Vapor in [`crate::frameworks`], detected per-project
 //! by [`crate::frameworks::detect_frameworks`]. The others (React Native,
-//! Expo and Fabric bridges, the Swift↔Objective-C bridge, the Go-module
-//! route extractors, etc.) stay deferred (see `KNOWN_DIFFS.md`): they are an
+//! Expo and Fabric bridges, the Swift↔Objective-C bridge, etc.) stay
+//! deferred (see `KNOWN_DIFFS.md`): they are an
 //! additive heuristic layer on top of the deterministic import + name-matching
 //! core, and porting them is tracked as future work.
 //!
@@ -84,7 +84,7 @@ impl FrameworkExtractionContext {
 /// method maps 1:1 to an upstream field; `Option`-returning methods model the upstream
 /// `?:` optionals. The implementations live in [`crate::frameworks`]; the
 /// trait remains the seam through which
-/// the remaining upstream resolvers (Java/React-Native/Go-module/Swift-ObjC/…) can
+/// the remaining upstream resolvers (Java/React-Native/Swift-ObjC/…) can
 /// be added later.
 pub trait FrameworkResolver: Sync {
     /// `FrameworkResolver` name (`name`, `types.ts:159`).
