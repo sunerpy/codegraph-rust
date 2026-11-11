@@ -1,0 +1,124 @@
+"""Summary of W7-20's CI perf times file (cand = the W7-20 candidate commit's
+fast release build, base = 6a58caa8's, W7-19i; pre = fec4fbb's when SIDES
+names it) under the frozen method: medians over the VALID rounds only (a
+round is valid when the 1-minute load before each of its samples is below 8,
+as the script's `round` lines record); 9 valid rounds needed per measured op.
+Lines (OD-14, plan 2.7, the W7-20 pre-start revision): cold init median at
+most 1.10 x base (above it, the growth must be explained by rows and the
+normalized throughput, canonical rows per second, must stay at least 0.9 x
+base), the one-file sync median at most 1.15 x base, the peak RSS median at
+most 1.15 x base (each measured op); typescript-large's one-file sync also
+at most 1.5 x pre (OD-B20). The synthesis stage alone (`stage`, after a
+timed no-op sync, `noop`) is listed on its own, with no line (plan 2.7).
+A corpus whose graphs DIFFER in hashes.txt gets no verdict. A `sync`
+corpus's single init per side is reference only.
+
+One runner measures the corpora named after the two files; the verdict
+covers those only.
+
+usage: SIDES="cand base[ pre]" python3 -I summary.py <times.txt> <hashes.txt> <corpus>...
+"""
+import collections
+import os
+import statistics
+import sys
+
+sides = os.environ.get("SIDES", "cand base").split()
+assert sides in (["cand", "base"], ["cand", "base", "pre"]), sides
+
+samples = collections.defaultdict(dict)  # (op, corpus, round) -> side -> (wall, rss_kb, load)
+rounds = collections.defaultdict(dict)  # (op, corpus) -> round -> (state, max load)
+load = None
+for line in open(sys.argv[1]):
+    parts = line.split()
+    if not parts:
+        continue
+    if parts[0] == "load":
+        load = float(parts[1])
+    elif parts[0] == "wall":
+        op, corpus, side, rnd = parts[1], parts[2], parts[3], parts[4]
+        wall = float(parts[5])
+        assert parts[6] == "rss_kb", line
+        samples[(op, corpus, rnd)][side] = (wall, int(parts[7]), load)
+    elif parts[0] == "round":
+        rounds[(parts[1], parts[2])][parts[3]] = (parts[4], float(parts[5]))
+
+rows = collections.defaultdict(set)  # (corpus, side) -> init row counts
+graphs = {}
+for line in open(sys.argv[2]):
+    parts = line.split()
+    if parts and parts[0] == "hash":
+        corpus, side, tag = parts[1].split(".", 2)
+        if tag.startswith("init"):
+            rows[(corpus, side)].add(int(parts[3]))
+    elif parts and parts[0] == "graphs":
+        graphs[(parts[1], parts[2])] = parts[3]
+
+LINES = {"init": 1.10, "sync": 1.15}
+PRE_LINES = {("typescript-large", "sync"): 1.5}
+RSS_LINE = 1.15
+corpora = sys.argv[3:]
+assert corpora, "name the corpora"
+ok_all = True
+for corpus in corpora:
+    state = {side: graphs.get((corpus, side)) for side in sides}
+    full = any(op == "init" for op, c in rounds if c == corpus)
+    ops = ["init", "sync", "stage"] if full else ["sync"]
+    if any(v != "agree" for v in state.values()):
+        print(f"{corpus}: NO VERDICT, graphs {state}")
+        ok_all = False
+        continue
+    for op in ops:
+        rs = rounds.get((op, corpus), {})
+        valid = sorted((r for r, (s, _) in rs.items() if s == "valid"), key=int)
+        void = [(r, m) for r, (s, m) in sorted(rs.items(), key=lambda kv: int(kv[0])) if s == "void"]
+        print(f"{corpus} {op}: {len(rs)} rounds, {len(valid)} valid, void {void}")
+        if len(valid) < 9:
+            print(f"  INCOMPLETE: {len(valid)} valid of 9 needed")
+            ok_all = False
+            continue
+        med, rss = {}, {}
+        for side in sides:
+            med[side] = statistics.median(samples[(op, corpus, r)][side][0] for r in valid)
+            rss[side] = statistics.median(samples[(op, corpus, r)][side][1] for r in valid)
+            ls = [samples[(op, corpus, r)][side][2] for r in valid]
+            extra = ""
+            if op == "stage":
+                noop = statistics.median(samples[("noop", corpus, r)][side][0] for r in valid)
+                extra = f", no-op sync median {noop:.4f} s"
+            print(f"  {side}: median {med[side]:.4f} s, peak RSS median {rss[side] / 1024:.1f} MiB, load {min(ls):.2f}-{max(ls):.2f}{extra}")
+        ratio = med["cand"] / med["base"]
+        rss_ratio = rss["cand"] / rss["base"]
+        if op == "stage":
+            line = f"  cand/base {ratio:.3f}, +{(med['cand'] - med['base']) * 1000:.1f} ms (reference, no line)"
+            if "pre" in sides:
+                line += f"; cand/pre {med['cand'] / med['pre']:.3f} (reference)"
+            print(line)
+            continue
+        within = ratio <= LINES[op]
+        note = ""
+        if op == "init" and not within:
+            rb, rc = rows[(corpus, "base")], rows[(corpus, "cand")]
+            if len(rb) == 1 and len(rc) == 1:
+                tb, tc = next(iter(rb)) / med["base"], next(iter(rc)) / med["cand"]
+                note = f"; rows base {next(iter(rb))} cand {next(iter(rc))}, throughput ratio {tc / tb:.3f} (line 0.9)"
+                within = tc / tb >= 0.9 and next(iter(rc)) > next(iter(rb))
+        rss_within = rss_ratio <= RSS_LINE
+        pre_note = ""
+        if "pre" in sides:
+            to_pre = med["cand"] / med["pre"]
+            pre_line = PRE_LINES.get((corpus, op))
+            if pre_line is not None:
+                within = within and to_pre <= pre_line
+                pre_note = f"; cand/pre {to_pre:.3f} (line {pre_line})"
+            else:
+                pre_note = f"; cand/pre {to_pre:.3f} (reference)"
+        print(f"  cand/base {ratio:.3f} (line {LINES[op]}){note}{pre_note}; RSS {rss_ratio:.3f} (line {RSS_LINE})"
+              f" -> {'within' if within and rss_within else 'OVER'}")
+        ok_all = ok_all and within and rss_within
+    if not full:
+        ref = samples.get(("init", corpus, "0"), {})
+        if ref:
+            print(f"{corpus} init (one sample per side, reference only): "
+                  + ", ".join(f"{s} {ref[s][0]:.3f} s {ref[s][1] / 1024:.1f} MiB load {ref[s][2]:.2f}" for s in sides if s in ref))
+print("VERDICT", "within" if ok_all else "NOT WITHIN or INCOMPLETE")
