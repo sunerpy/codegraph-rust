@@ -6162,6 +6162,7 @@ fn index_project_inner(
         Option<codegraph_resolve::lua_scope::LuaModuleRow>,
         Option<codegraph_resolve::dart_scope::HeadRow>,
         Option<codegraph_resolve::dart_libraries::LibraryRow>,
+        Option<codegraph_watch::rn_bridges::BridgeFacts>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
@@ -6180,6 +6181,7 @@ fn index_project_inner(
     let mut go_rows: Vec<(String, codegraph_resolve::go_packages::HeadRow)> = Vec::new();
     let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
     let mut class_head_rows: Vec<(String, codegraph_watch::class_heads::HeadsRow)> = Vec::new();
+    let mut bridge_rows: Vec<(String, codegraph_watch::rn_bridges::BridgeFacts)> = Vec::new();
     let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
     let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
@@ -6267,6 +6269,7 @@ fn index_project_inner(
             let lua_row = codegraph_watch::lua_modules::row_of(language, &source, &result.nodes);
             let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
             let dart_library_row = codegraph_watch::dart_libraries::row_of(language, &source);
+            let bridge_row = codegraph_watch::rn_bridges::row_of(relative, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
@@ -6289,6 +6292,7 @@ fn index_project_inner(
                 lua_row,
                 dart_row,
                 dart_library_row,
+                bridge_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
@@ -6315,6 +6319,7 @@ fn index_project_inner(
                 lua_row,
                 dart_row,
                 dart_library_row,
+                bridge_row,
             )) = payload
             else {
                 files_not_source += 1;
@@ -6406,6 +6411,9 @@ fn index_project_inner(
             if let Some(row) = dart_library_row {
                 dart_library_rows.push((relative.clone(), row));
             }
+            if let Some(row) = bridge_row {
+                bridge_rows.push((relative.clone(), row));
+            }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
             }
@@ -6477,6 +6485,8 @@ fn index_project_inner(
     drop(php_rows);
     codegraph_watch::class_heads::write_index_rows(&store, &mut class_head_rows)?;
     drop(class_head_rows);
+    codegraph_watch::rn_bridges::write_index_rows(&store, &mut bridge_rows)?;
+    drop(bridge_rows);
     codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
     drop(lua_rows);
     codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
@@ -6490,8 +6500,8 @@ fn index_project_inner(
     // (W4-SW-04), Go (W4-GO-01), Rust receiver (W4-RS-03), PHP
     // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01), R base-binding
     // (W4-R-01), Dart head (W4-DART-01), Dart library (W4-DART-02), Play
-    // (W7-19c), Laravel or Drupal (W7-19d), Rails (W7-19e) or Rust crate
-    // root (W7-19h) dependent unrefreshed.
+    // (W7-19c), Laravel or Drupal (W7-19d), Rails (W7-19e), Rust crate root
+    // (W7-19h) or bridge (W7-21) dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     codegraph_watch::java_heads::write_marker(&store)?;
     codegraph_watch::kotlin_surfaces::write_marker(&store)?;
@@ -6516,6 +6526,7 @@ fn index_project_inner(
     codegraph_watch::drupal_refs::write_marker(&store)?;
     codegraph_watch::rails_routes::write_marker(&store)?;
     codegraph_watch::vapor_routes::write_marker(&store)?;
+    codegraph_watch::rn_bridges::write_marker(&store)?;
     codegraph_watch::rust_crate_roots::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;

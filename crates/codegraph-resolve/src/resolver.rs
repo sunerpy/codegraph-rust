@@ -91,7 +91,7 @@ fn is_call_result_chain(reference: &RefView) -> bool {
 /// plain segments not rooted at `this`/`window` (upstream v1.6.1
 /// `isUnresolvedJsMemberCall`, #1862). It is call-site evidence, not
 /// permission to infer a property type: only a framework resolver may bind it.
-fn is_unresolved_js_member_call(reference: &RefView) -> bool {
+pub(crate) fn is_unresolved_js_member_call(reference: &RefView) -> bool {
     fn is_segment(segment: &str) -> bool {
         let mut chars = segment.chars();
         chars
@@ -1463,6 +1463,9 @@ pub struct ReferenceResolver {
     /// The files whose class-head rows the contexts must not read, when the
     /// rows are trusted ([`Self::trust_recorded_class_heads`]).
     recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
+    /// The files whose bridge-facts rows the contexts must not read, when
+    /// the rows are trusted ([`Self::trust_recorded_bridge_rows`]).
+    recorded_bridge_stale: Option<Arc<std::collections::HashSet<String>>>,
     /// Detected `FrameworkResolver` implementations (`frameworks` field,
     /// `index.ts:264`). Empty until [`Self::initialize`] detects react/vue/nestjs.
     framework_resolver_extensions: Vec<Box<dyn FrameworkResolver>>,
@@ -1518,6 +1521,7 @@ impl ReferenceResolver {
             project_root: project_root.into(),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             recorded_heads_stale: None,
+            recorded_bridge_stale: None,
             framework_resolver_extensions: Vec::new(),
             app_gating: std::sync::Mutex::default(),
             framework_gating: None,
@@ -1550,6 +1554,7 @@ impl ReferenceResolver {
         crate::context::StoreResolutionContext::new(store, &self.project_root)
             .with_max_file_size(self.max_file_size)
             .with_recorded_class_heads(self.recorded_heads_stale.clone())
+            .with_recorded_bridge_rows(self.recorded_bridge_stale.clone())
     }
 
     /// Read class heads from the store's class-head rows for every file but
@@ -1557,6 +1562,14 @@ impl ReferenceResolver {
     /// rows were current when it began passes the files it changed.
     pub fn trust_recorded_class_heads(&mut self, stale: std::collections::HashSet<String>) {
         self.recorded_heads_stale = Some(Arc::new(stale));
+    }
+
+    /// Read the React Native and Expo bridges' facts from the store's
+    /// bridge-facts rows for every indexed file but `stale` in the contexts
+    /// this resolver builds (W7-21): a sync whose rows were current when it
+    /// began passes the files it changed.
+    pub fn trust_recorded_bridge_rows(&mut self, stale: std::collections::HashSet<String>) {
+        self.recorded_bridge_stale = Some(Arc::new(stale));
     }
 
     /// Detect the project's frameworks and populate the resolver's

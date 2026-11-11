@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codegraph_core::types::{
@@ -144,41 +145,63 @@ pub enum LaneReferences {
     /// A Swift route's references: Vapor's, the only resolver that makes
     /// Swift routes.
     SwiftRoutes,
+    /// The references written in one of these languages: what the React
+    /// Native and Swift-Objective-C bridges read, which their lane narrows
+    /// by name (W7-21).
+    Languages(Vec<Language>),
 }
 
 impl LaneReferences {
     /// The family's `WHERE` clause and its parameters: a prefix is a range,
     /// which an index on its column serves.
-    fn predicate(&self) -> (&'static str, Vec<String>) {
+    fn predicate(&self) -> (Cow<'static, str>, Vec<String>) {
         // `:` is followed by `;`: the ids of the routes are the ones from
         // `route:` up to `route;`.
         match self {
             Self::PhpRoutes => (
-                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'",
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'".into(),
                 Vec::new(),
             ),
             Self::DrupalRoutingFiles => (
                 "from_node_id >= 'route:' AND from_node_id < 'route;' \
-                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'",
+                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'"
+                    .into(),
                 Vec::new(),
             ),
             // `_` is followed by a backtick.
             Self::PhpHooks => (
-                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'",
+                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'"
+                    .into(),
                 Vec::new(),
             ),
             // `:` is followed by `;`: the names starting `{class}::`.
             Self::PhpStaticCalls(class) => (
-                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'",
+                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'".into(),
                 vec![format!("{class}::"), format!("{class}:;")],
             ),
             Self::RubyRoutes => (
-                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'",
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'".into(),
                 Vec::new(),
             ),
             Self::SwiftRoutes => (
-                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'",
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'"
+                    .into(),
                 Vec::new(),
+            ),
+            // No language is a clause that holds for no row.
+            Self::Languages(languages) if languages.is_empty() => ("0".into(), Vec::new()),
+            Self::Languages(languages) => (
+                format!(
+                    "language IN ({})",
+                    std::iter::repeat_n("?", languages.len())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+                .into(),
+                languages
+                    .iter()
+                    .map(|language| language.as_str().to_string())
+                    .collect(),
             ),
         }
     }

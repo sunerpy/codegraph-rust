@@ -723,6 +723,13 @@ fn sync_paths_with_store(
     // changes moved (W7-19g), the same way.
     let vapor_bootstrap = crate::vapor_routes::needs_bootstrap(store)?;
     changed_names.vapor.track = recorded("vapor");
+    // And for the bridge references a failed sync's changes moved (W7-21):
+    // the bridge-facts rows are rebuilt and, in a project a bridge is
+    // detected in, every JavaScript-family, Swift and Objective-C file is
+    // re-resolved once. The lane compares only when the index recorded a
+    // bridge reading the rows, as Play's does.
+    let rn_bootstrap = crate::rn_bridges::needs_bootstrap(store)?;
+    changed_names.rn_bridges.track = crate::rn_bridges::READERS.iter().any(|name| recorded(name));
     // And for the Rust references the module rule links to a crate root a
     // failed sync's changes added or removed (W7-19h): every Rust file is
     // re-resolved once. The lane retries only when the index recorded Rust,
@@ -881,6 +888,7 @@ fn sync_paths_with_store(
         || drupal_bootstrap
         || rails_bootstrap
         || vapor_bootstrap
+        || rn_bootstrap
         || rust_crate_roots_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
@@ -919,6 +927,7 @@ fn sync_paths_with_store(
         changed_names.drupal.track = false;
         changed_names.rails.track = false;
         changed_names.vapor.track = false;
+        changed_names.rn_bridges.track = false;
         rust_crate_roots_track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
@@ -1691,6 +1700,39 @@ fn sync_paths_with_store(
             }
             changed_names.note_any(retries.names);
         }
+        // The bridge references the changes moved (W7-21), read once the
+        // framework nodes are back: the importers of a changed exported
+        // `requireNativeModule` binding re-resolve whole, the unresolved
+        // references retry by their whole names and the resolved ones by
+        // site. A bootstrap rebuilds the rows and re-resolves every
+        // JavaScript-family, Swift and Objective-C file of a bridged project.
+        let detected =
+            |names: &[&str]| frameworks.iter().any(|name| names.contains(&name.as_str()));
+        let rn_bridges = crate::rn_bridges::bridge_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.rn_bridges,
+            &reindexed,
+            &changed_names.removed_files,
+            rn_bootstrap,
+            detected(&crate::rn_bridges::BRIDGES),
+            changed_names.rn_bridges.track && detected(&crate::rn_bridges::READERS),
+        )?;
+        for file in &rn_bridges.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        for found in &rn_bridges.sites {
+            if !dependent_fallbacks.contains(&found.file_path) {
+                merge_dependent_site(
+                    &mut dependent_sites,
+                    &mut dependent_fallbacks,
+                    found.clone(),
+                );
+            }
+        }
+        changed_names.note_any(rn_bridges.names.iter().cloned());
         // The Rust module rule's targets, the crate roots the changes added
         // or removed or whose file node came or went (W7-19h): a target is a
         // file node named for its file, so no name the changes touched
@@ -1755,6 +1797,17 @@ fn sync_paths_with_store(
                     .collect(),
             );
         }
+        // So were the bridge-facts rows: a file the sync did not change is
+        // read from its row (W7-21).
+        if !rn_bootstrap {
+            resolver.trust_recorded_bridge_rows(
+                reindexed
+                    .iter()
+                    .chain(&changed_names.removed_files)
+                    .cloned()
+                    .collect(),
+            );
+        }
         // A qualified reference (`util::double/1`) is retried by its whole
         // name too, however many share its tail (W5-05).
         let mut retry_names = changed_names.any.clone();
@@ -1794,6 +1847,7 @@ fn sync_paths_with_store(
         go.write_rows(store)?;
         php.write_rows(store)?;
         class_heads.write_rows(store)?;
+        rn_bridges.write_rows(store)?;
         control.write_rows(store)?;
         crate::control_inputs::write_frameworks(store, &frameworks)?;
         dart.write_rows(store)?;
@@ -1825,6 +1879,7 @@ fn sync_paths_with_store(
         crate::drupal_refs::write_marker(store)?;
         crate::rails_routes::write_marker(store)?;
         crate::vapor_routes::write_marker(store)?;
+        crate::rn_bridges::write_marker(store)?;
         crate::rust_crate_roots::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
@@ -2312,6 +2367,9 @@ fn sync_one(
         change.importers.extend(importers.iter().cloned());
         change.added = added;
     }
+    changed_names
+        .rn_bridges
+        .note_importers(relative, &importers);
     if let Some(change) = changed_names.python_files.get_mut(relative) {
         change.importers.extend(importers);
     }
@@ -2362,6 +2420,12 @@ fn remove_tracked_file(
     changed_names.drupal.note(relative, &old_nodes);
     changed_names.rails.note(relative, &old_nodes);
     changed_names.vapor.note(relative, &old_nodes);
+    changed_names
+        .rn_bridges
+        .note(store, relative, &old_nodes, None)?;
+    changed_names
+        .rn_bridges
+        .note_importers(relative, &importers);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2800,6 +2864,10 @@ fn reextract_into_store(
     changed_names.drupal.note(relative, &old_nodes);
     changed_names.rails.note(relative, &old_nodes);
     changed_names.vapor.note(relative, &old_nodes);
+    // What the bridges read of this file's text and methods (W7-21).
+    changed_names
+        .rn_bridges
+        .note(store, relative, &old_nodes, Some((source, &result.nodes)))?;
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -3080,6 +3148,10 @@ struct ChangedNames {
     /// What the changed files held that a Vapor route handler's choice
     /// reads: the names of Swift methods and functions (W7-19g).
     vapor: crate::vapor_routes::VaporChanges,
+    /// What the changed files held that the React Native, Expo and
+    /// Swift-Objective-C bridges read: their bridge facts, and their
+    /// Objective-C and JVM methods (W7-21).
+    rn_bridges: crate::rn_bridges::BridgeChanges,
     /// The Rust type, trait and alias names that came, went or changed: a
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
@@ -3199,6 +3271,7 @@ impl ChangedNames {
             crate::drupal_refs::withdraw_marker(store)?;
             crate::rails_routes::withdraw_marker(store)?;
             crate::vapor_routes::withdraw_marker(store)?;
+            crate::rn_bridges::withdraw_marker(store)?;
             crate::rust_crate_roots::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
@@ -7851,6 +7924,286 @@ pub(crate) mod tests {
             version
         );
         assert_eq!(edge_projection(&db), expected);
+    }
+
+    const RN_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+    );
+    const RN_SWIFT: (&str, &str) = (
+        "ios/CaptureView.swift",
+        "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n",
+    );
+    const RN_SHIM_EMPTY: (&str, &str) = (
+        "ios/CaptureView.m",
+        "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\n@end\n",
+    );
+    const RN_SHIM: (&str, &str) = (
+        "ios/CaptureView.m",
+        "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n",
+    );
+    const RN_SAVE: (&str, &str) = (
+        "src/save.ts",
+        "import { NativeModules } from 'react-native';\n\nexport function save() {\n  NativeModules.CaptureView.syncSettings();\n}\n",
+    );
+
+    /// Whether the JS call is the bridge's edge to the Swift method the shim
+    /// exports.
+    fn rn_bridged(db: &Path) -> bool {
+        edge_projection(db).iter().any(|edge| {
+            edge.starts_with(
+                "src/save.ts:save -[calls]-> ios/CaptureView.swift:CaptureView::syncSettings ",
+            ) && edge.contains("\"framework\":\"react-native-bridge\"")
+        })
+    }
+
+    fn rn_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(
+                codegraph_resolve::frameworks::react_native::ROW_KEY_PREFIX,
+            )
+            .unwrap()
+    }
+
+    /// W7-21: a sync failing after it gave the shim its method, before
+    /// resolving, leaves the bridge marker away, and the next sync, with
+    /// nothing changed, links the JS call to the Swift method and writes the
+    /// shim's new row, as a fresh index has them. (The other lanes' markers
+    /// the failure withdrew re-resolve their own files too, so the marker and
+    /// the rows are what this test reads.)
+    #[test]
+    fn a_bridge_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::rn_bridges::VERSION.to_string());
+        let dir = TestDir::new("rn-bridges-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RN_PACKAGE, RN_SWIFT, RN_SHIM_EMPTY, RN_SAVE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+        assert!(!rn_bridged(&db), "{:#?}", edge_projection(&db));
+        let empty_rows = rn_rows(&db);
+
+        write_files(dir.path(), &[RN_SHIM]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [RN_SHIM.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::rn_bridges::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert_eq!(rn_rows(&db), empty_rows, "rows are written last");
+        assert!(!rn_bridged(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [RN_PACKAGE, RN_SWIFT, RN_SHIM, RN_SAVE];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("rn-bridges-fresh", &fresh)
+        );
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
+        assert_ne!(rn_rows(&db), empty_rows);
+        let fresh_dir = TestDir::new("rn-bridges-fresh-rows");
+        write_files(fresh_dir.path(), &fresh);
+        let fresh_db = default_db_path(fresh_dir.path()).unwrap();
+        sync_changed_paths(
+            fresh_dir.path(),
+            &fresh_db,
+            fresh.iter().map(|(path, _)| *path),
+        )
+        .unwrap();
+        assert_eq!(rn_rows(&db), rn_rows(&fresh_db));
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+    }
+
+    const RN_CACHE: (&str, &str) = (
+        "ios/Cache.m",
+        "#import <Foundation/Foundation.h>\n\n@implementation Cache\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n- (void)run:(CaptureView *)view {\n  [view syncSettingsWithMode:1];\n}\n@end\n",
+    );
+    const RN_CALLER: (&str, &str) = (
+        "ios/Caller.swift",
+        "import Foundation\n\nfunc load(cache: Cache) {\n  _ = cache.fetchEntry(forKey: \"x\")\n}\n",
+    );
+
+    /// W7-21: an index without the bridge marker (built before it, or a sync
+    /// that stopped) rebuilds every bridge row, a row of no file's facts
+    /// dropped, and re-resolves the JS, Swift and Objective-C files of a
+    /// project that shows a bridge, with nothing changed: the bridge edges
+    /// an older sync lost, from each of the three languages, come back. The
+    /// other lanes' markers stay, so none of them re-resolves those files.
+    #[test]
+    fn an_index_without_the_bridge_marker_rebuilds_its_rows_and_re_resolves_the_bridged_files() {
+        let version = Some(crate::rn_bridges::VERSION.to_string());
+        let dir = TestDir::new("rn-bridges-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RN_PACKAGE, RN_SWIFT, RN_SHIM, RN_SAVE, RN_CACHE, RN_CALLER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
+        let expected = edge_projection(&db);
+        let bridged = |edges: &[String], from: &str| {
+            edges.iter().any(|edge| {
+                edge.starts_with(from) && edge.contains("\"framework\":\"swift-objc-bridge\"")
+            })
+        };
+        assert!(
+            bridged(
+                &expected,
+                "ios/Caller.swift:load -[calls]-> ios/Cache.m:Cache::fetchEntryForKey: "
+            ),
+            "{expected:#?}"
+        );
+        assert!(
+            bridged(
+                &expected,
+                "ios/Cache.m:Cache::run: -[calls]-> ios/CaptureView.swift:CaptureView::syncSettings "
+            ),
+            "{expected:#?}"
+        );
+        let rows = rn_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key.ends_with("ios/CaptureView.m")),
+            "{rows:#?}"
+        );
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND json_extract(metadata, \
+                     '$.resolvedBy') = 'framework' AND source IN (SELECT id FROM nodes WHERE \
+                     file_path IN ('src/save.ts', 'ios/Caller.swift', 'ios/Cache.m'))",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 3, "the bridge edges an older sync lost");
+            for (key, _) in &rows {
+                store.delete_project_metadata(key).unwrap();
+            }
+            store
+                .set_project_metadata(
+                    &codegraph_resolve::frameworks::react_native::row_key("src/gone.ts"),
+                    "{\"aliases\":[[\"gone\",\"Gone\"]]}",
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::rn_bridges::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(rn_rows(&db).len(), 1, "only the stale row is left");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+        assert_eq!(rn_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const RN_CAM_EXPORT: (&str, &str) = (
+        "ios/Cam.m",
+        "#import <React/RCTBridgeModule.h>\n\n@implementation Cam\nRCT_EXPORT_MODULE()\nRCT_EXPORT_METHOD(snap:(id)options) {}\n@end\n",
+    );
+    const RN_SHOOT: (&str, &str) = (
+        "src/shoot.ts",
+        "import { NativeModules } from 'react-native';\n\nexport function shoot() {\n  NativeModules.Cam.snap();\n}\n",
+    );
+
+    /// W7-21: a bootstrap re-resolves a project that shows one bridge only,
+    /// the Swift–Objective-C one, or the React Native one by its macro with
+    /// no `package.json` naming React Native (so no Fabric beside it), as
+    /// it does one that shows them all.
+    #[test]
+    fn a_bootstrap_re_resolves_a_project_that_shows_one_bridge() {
+        let version = Some(crate::rn_bridges::VERSION.to_string());
+        for (tag, files, from) in [
+            (
+                "rn-bridges-bootstrap-swift-objc",
+                &[RN_CACHE, RN_CALLER][..],
+                "ios/Caller.swift:load -[calls]-> ",
+            ),
+            (
+                "rn-bridges-bootstrap-macro",
+                &[RN_CAM_EXPORT, RN_SHOOT][..],
+                "src/shoot.ts:shoot -[calls]-> ",
+            ),
+        ] {
+            let dir = TestDir::new(tag);
+            let db = default_db_path(dir.path()).unwrap();
+            write_files(dir.path(), files);
+            sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+            let expected = edge_projection(&db);
+            assert!(
+                expected.iter().any(|edge| {
+                    edge.starts_with(from) && edge.contains("\"resolvedBy\":\"framework\"")
+                }),
+                "{tag}: {expected:#?}"
+            );
+            {
+                let store = Store::open(&db).unwrap();
+                let dropped = store
+                    .connection()
+                    .execute(
+                        "DELETE FROM edges WHERE kind = 'calls' AND json_extract(metadata, \
+                         '$.resolvedBy') = 'framework'",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(dropped, 1, "{tag}: the bridge edge an older sync lost");
+                store
+                    .delete_project_metadata(crate::rn_bridges::VERSION_KEY)
+                    .unwrap();
+            }
+            assert_ne!(edge_projection(&db), expected, "{tag}");
+            sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+            assert_eq!(
+                lane_marker(&db, crate::rn_bridges::VERSION_KEY),
+                version,
+                "{tag}"
+            );
+            assert_eq!(edge_projection(&db), expected, "{tag}");
+        }
+    }
+
+    /// W7-21: a sync reads an unchanged file's bridge facts from its row,
+    /// not its text: with the shim's row naming another module, the JS call
+    /// a sync re-resolves finds no `CaptureView` method, until the shim
+    /// itself changes and is read again.
+    #[test]
+    fn a_sync_reads_an_unchanged_files_bridge_facts_from_its_row() {
+        let dir = TestDir::new("rn-bridges-trusted");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RN_PACKAGE, RN_SWIFT, RN_SHIM, RN_SAVE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
+        {
+            let elsewhere = RN_SHIM.1.replace(
+                "RCT_EXTERN_MODULE(CaptureView",
+                "RCT_EXTERN_MODULE(Elsewhere",
+            );
+            let facts = codegraph_resolve::frameworks::react_native::BridgeFacts::of_text(
+                RN_SHIM.0, &elsewhere,
+            );
+            assert_eq!(facts.externs[0].module, "Elsewhere");
+            Store::open(&db)
+                .unwrap()
+                .set_project_metadata(
+                    &codegraph_resolve::frameworks::react_native::row_key(RN_SHIM.0),
+                    &facts.encode(),
+                )
+                .unwrap();
+        }
+        let save = format!("{}\nexport function spare() {{}}\n", RN_SAVE.1);
+        write_files(dir.path(), &[(RN_SAVE.0, save.as_str())]);
+        sync_changed_paths(dir.path(), &db, [RN_SAVE.0]).unwrap();
+        assert!(!rn_bridged(&db), "{:#?}", edge_projection(&db));
+        let shim = format!("{}\n", RN_SHIM.1);
+        write_files(dir.path(), &[(RN_SHIM.0, shim.as_str())]);
+        sync_changed_paths(dir.path(), &db, [RN_SHIM.0]).unwrap();
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
     }
 
     fn dart_marker(db: &Path) -> Option<String> {

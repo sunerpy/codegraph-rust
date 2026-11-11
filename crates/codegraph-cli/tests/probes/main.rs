@@ -29268,7 +29268,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "18".to_string())]
+            [("synthesis_version".to_string(), "19".to_string())]
         );
     }
 
@@ -41685,6 +41685,1427 @@ mod vue_templates {
                     && edge.line == Some(1)
                     && edge.col.is_none()
                     && edge.provenance.as_deref() == Some("heuristic")),
+            "{}",
+            graph.report()
+        );
+    }
+}
+
+/// W7-21: the React Native, Expo modules, Fabric and Swift-Objective-C
+/// bridges and their synthesis passes (upstream `react-native.ts`,
+/// `expo-modules.ts`, `fabric.ts`, `swift-objc.ts`, `swift-objc-bridge.ts`
+/// and `callback-synthesizer.ts` at `e8ddc4e2`), through `codegraph init`.
+mod mobile_bridges {
+    use super::support::{EdgeRow, Graph, Indexed, NodeRow, Project};
+
+    fn index(files: &[(&str, &str)]) -> Indexed {
+        files
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index()
+    }
+
+    /// The node named `name` in `file` that is no file or import node.
+    #[track_caller]
+    fn node<'g>(graph: &'g Graph, name: &str, file: &str) -> &'g NodeRow {
+        graph
+            .nodes
+            .iter()
+            .find(|node| {
+                node.name == name
+                    && node.file_path == file
+                    && node.kind != "file"
+                    && node.kind != "import"
+            })
+            .unwrap_or_else(|| panic!("no node {name} in {file}:\n{}", graph.report()))
+    }
+
+    /// The edges of `kind` out of `source`.
+    fn out_of<'g>(graph: &'g Graph, source: &NodeRow, kind: &str) -> Vec<&'g EdgeRow> {
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == source.id && edge.kind == kind)
+            .collect()
+    }
+
+    /// `edge`'s target as upstream's tests print it: `language:last
+    /// qualified segment`.
+    fn short(graph: &Graph, edge: &EdgeRow) -> String {
+        let target = graph.node(&edge.target).expect("an edge's target");
+        format!(
+            "{}:{}",
+            target.language,
+            target
+                .qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or_default()
+        )
+    }
+
+    /// The `calls` edges out of `source`, as [`short`], sorted.
+    fn callees(graph: &Graph, source: &NodeRow) -> Vec<String> {
+        let mut out: Vec<String> = out_of(graph, source, "calls")
+            .into_iter()
+            .map(|edge| short(graph, edge))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A string `edge`'s metadata holds under `key`.
+    fn meta<'e>(edge: &'e EdgeRow, key: &str) -> Option<&'e str> {
+        edge.metadata.get(key).and_then(|value| value.as_str())
+    }
+
+    /// The synthesized edges of `pass`, as `source -> target (key)` of the
+    /// sources' and targets' names and `key`'s value, sorted.
+    fn synthesized(graph: &Graph, pass: &str, key: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| meta(edge, "synthesizedBy") == Some(pass))
+            .map(|edge| {
+                let name = |id: &str| graph.node(id).map_or("?", |node| node.name.as_str());
+                format!(
+                    "{} -> {} ({})",
+                    name(&edge.source),
+                    name(&edge.target),
+                    meta(edge, key).unwrap_or("-")
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    const RN_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}",
+    );
+
+    /// Upstream `framework-edge-name.test.ts`: a Swift call bridged to
+    /// Objective-C names the bridge on its edge.
+    #[test]
+    fn w721_a_bridged_edge_names_the_bridge_that_made_it() {
+        let project = index(&[
+            (
+                "Sources/Cache.h",
+                "#import <Foundation/Foundation.h>\n@interface Cache : NSObject\n- (id)fetchEntryForKey:(NSString *)key;\n@end\n",
+            ),
+            (
+                "Sources/Cache.m",
+                "#import \"Cache.h\"\n@implementation Cache\n- (id)fetchEntryForKey:(NSString *)key {\n    return nil;\n}\n@end\n",
+            ),
+            (
+                "Sources/Caller.swift",
+                "import Foundation\n\nfunc load(cache: Cache) {\n    _ = cache.fetchEntry(forKey: \"x\")\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let load = node(graph, "load", "Sources/Caller.swift");
+        let bridged: Vec<&EdgeRow> = out_of(graph, load, "calls")
+            .into_iter()
+            .filter(|edge| {
+                graph
+                    .node(&edge.target)
+                    .is_some_and(|target| target.name == "fetchEntryForKey:")
+            })
+            .collect();
+        assert_eq!(bridged.len(), 1, "{}", graph.report());
+        assert_eq!(bridged[0].resolved_by(), Some("framework"));
+        assert_eq!(meta(bridged[0], "framework"), Some("swift-objc-bridge"));
+        assert_eq!(bridged[0].confidence(), Some(0.6));
+    }
+
+    /// Upstream `swift-objc-bridge-resolver.test.ts`, through the pipeline:
+    /// a Swift call reaches the Objective-C method its name bridges to
+    /// (`play` to `playWithSong:`), an Objective-C message the `@objc` Swift
+    /// method it names and never a plain one (none of whose three lines
+    /// above holds an attribute, upstream's window), and a generic name
+    /// (`reload`) bridges nothing.
+    #[test]
+    fn w721_swift_and_objective_c_reach_each_other_through_the_bridge() {
+        let project = index(&[
+            (
+                "Sources/Player.m",
+                "@implementation Player\n- (void)playWithSong:(NSString *)song {\n}\n- (void)reloadWithData:(id)data {\n}\n@end\n",
+            ),
+            (
+                "Sources/Use.swift",
+                "func listen(player: Player) {\n    player.play(song: \"a\")\n    player.reload(data: nil)\n}\n",
+            ),
+            (
+                "Sources/Chart.swift",
+                "class Chart {\n    @objc open func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n\n// Further than the window from any attribute.\n\nclass Plain {\n    func render(withScale scale: Double) {}\n}\n",
+            ),
+            (
+                "Sources/Caller.m",
+                "@implementation Caller\n- (void)run:(Chart *)chart plain:(Plain *)plain {\n    [chart animateWithXAxisDuration:1 yAxisDuration:2];\n    [plain renderWithScale:2];\n}\n@end\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let listen = node(graph, "listen", "Sources/Use.swift");
+        assert_eq!(
+            callees(graph, listen),
+            ["objc:playWithSong:"],
+            "{}",
+            graph.report()
+        );
+        let run = node(graph, "run:plain:", "Sources/Caller.m");
+        let edges = out_of(graph, run, "calls");
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| short(graph, edge))
+                .collect::<Vec<_>>(),
+            ["swift:animate"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(meta(edges[0], "framework"), Some("swift-objc-bridge"));
+        assert_eq!(edges[0].confidence(), Some(0.6));
+    }
+
+    /// Upstream `react-native-bridge.test.ts` 300-345: an export's
+    /// `rn-export` node, the JavaScript call into its module, nothing for a
+    /// module that lacks the method, and the Java and Objective-C
+    /// implementations of a JavaScript-called method linked both ways.
+    #[test]
+    fn w721_a_legacy_module_export_is_called_and_paired_across_platforms() {
+        let project = index(&[
+            RN_PACKAGE,
+            (
+                "index.ts",
+                "import { NativeModules } from 'react-native';\nexport function ping() { return NativeModules.RNThing.uniquePingMethod(); }\nexport function wrongModule() { return NativeModules.Missing.uniquePingMethod(); }\n",
+            ),
+            (
+                "RNThing.java",
+                "public class RNThing extends ReactContextBaseJavaModule {\n  @Override public String getName() { return \"RNThing\"; }\n  @ReactMethod public void uniquePingMethod(Callback cb) {}\n}\n",
+            ),
+            (
+                "RNThing.m",
+                "@implementation RNThing\nRCT_EXPORT_MODULE()\nRCT_EXPORT_METHOD(uniquePingMethod:(RCTResponseSenderBlock)cb) {}\n@end\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let exports: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.id.starts_with("rn-export:"))
+            .collect();
+        assert_eq!(
+            exports
+                .iter()
+                .map(|node| (node.id.as_str(), node.language.as_str(), node.start_line))
+                .collect::<Vec<_>>(),
+            [("rn-export:RNThing.m:RNThing.uniquePingMethod", "objc", 3)]
+        );
+        let ping = node(graph, "ping", "index.ts");
+        let calls = out_of(graph, ping, "calls");
+        assert_eq!(calls.len(), 1, "{}", graph.report());
+        assert_eq!(calls[0].target, exports[0].id);
+        assert_eq!(calls[0].confidence(), Some(0.95));
+        assert_eq!(meta(calls[0], "framework"), Some("react-native-bridge"));
+        assert_eq!(meta(calls[0], "bridge"), Some("react-native"));
+        assert_eq!(meta(calls[0], "module"), Some("RNThing"));
+        let wrong = node(graph, "wrongModule", "index.ts");
+        assert!(
+            out_of(graph, wrong, "calls").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            synthesized(graph, "rn-cross-platform", "via"),
+            [
+                "uniquePingMethod -> uniquePingMethod (uniquePingMethod)",
+                "uniquePingMethod -> uniquePingMethod (uniquePingMethod)",
+            ]
+        );
+    }
+
+    const SHIM: &str = "#import <React/RCTBridgeModule.h>\n#import <React/RCTViewManager.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, RCTViewManager)\n\nRCT_EXTERN_METHOD(syncSettings:(NSDictionary *)settings)\nRCT_EXTERN_METHOD(finalizeCaptureSession)\nRCT_EXTERN_REMAP_METHOD(pause, pauseInferenceNow)\n\n@end\n";
+
+    /// Upstream `react-native-bridge.test.ts` 347-471, through the pipeline:
+    /// an `RCT_EXTERN` shim's methods reach the Swift class it names, past a
+    /// same-named method of another class, through an alias, a destructured
+    /// alias and `NativeModules.X` at `0.95`, a remapped one under its
+    /// JavaScript name; a bare call at `0.6`; a module lacking the method
+    /// answers nothing, and a native caller is never redirected.
+    #[test]
+    fn w721_an_extern_shim_reaches_the_swift_class_it_names() {
+        let project = index(&[
+            RN_PACKAGE,
+            ("ios/CaptureView.m", SHIM),
+            (
+                "ios/CaptureView.swift",
+                "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: UIView {\n  @objc func syncSettings(_ settings: NSDictionary) {\n  }\n\n  @objc func pauseInferenceNow() {\n  }\n}\n",
+            ),
+            (
+                "ios/CaptureView+ReactBridge.swift",
+                "import Foundation\n\nextension CaptureView {\n  @objc func finalizeCaptureSession() {\n  }\n}\n",
+            ),
+            (
+                "ios/CaptureSettings.swift",
+                "class CaptureSettings {\n  func syncSettings() {\n  }\n  func reuse() {\n    finalizeCaptureSession()\n  }\n}\n",
+            ),
+            (
+                "src/components/capture/capture-view.tsx",
+                "import { NativeModules, NativeEventEmitter } from 'react-native'\nexport const { CaptureEvents } = NativeModules\nexport const captureView = NativeModules.CaptureView\n",
+            ),
+            (
+                "src/hooks/use-review-handlers.ts",
+                "import { captureView } from '../components/capture/capture-view'\nimport { NativeModules } from 'react-native'\nexport function finish() {\n  captureView.finalizeCaptureSession()\n}\nexport function remapped() {\n  captureView.pause()\n}\nexport function named() {\n  NativeModules.CaptureView.syncSettings()\n}\nexport function bare() {\n  syncSettings()\n}\nexport function other() {\n  somethingElse.syncSettings()\n}\nexport function missing() {\n  captureView.nothingHere()\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let file = "src/hooks/use-review-handlers.ts";
+        let bridge = |name: &str| -> Vec<(String, Option<f64>, Option<String>)> {
+            out_of(graph, node(graph, name, file), "calls")
+                .into_iter()
+                .filter(|edge| meta(edge, "framework") == Some("react-native-bridge"))
+                .map(|edge| {
+                    (
+                        graph.describe(&edge.target),
+                        edge.confidence(),
+                        meta(edge, "module").map(str::to_string),
+                    )
+                })
+                .collect()
+        };
+        let finalize =
+            "method CaptureView::finalizeCaptureSession @ios/CaptureView+ReactBridge.swift:4";
+        let sync = "method CaptureView::syncSettings @ios/CaptureView.swift:5";
+        let pause = "method CaptureView::pauseInferenceNow @ios/CaptureView.swift:8";
+        let module = Some("CaptureView".to_string());
+        assert_eq!(
+            bridge("finish"),
+            [(finalize.to_string(), Some(0.95), module.clone())],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            bridge("remapped"),
+            [(pause.to_string(), Some(0.95), module.clone())]
+        );
+        assert_eq!(
+            bridge("named"),
+            [(sync.to_string(), Some(0.95), module.clone())]
+        );
+        assert_eq!(
+            bridge("bare"),
+            [(sync.to_string(), Some(0.6), module.clone())]
+        );
+        assert_eq!(bridge("other"), [(sync.to_string(), Some(0.6), module)]);
+        assert!(bridge("missing").is_empty(), "{}", graph.report());
+        let reuse = node(graph, "reuse", "ios/CaptureSettings.swift");
+        assert!(
+            out_of(graph, reuse, "calls")
+                .iter()
+                .all(|edge| meta(edge, "framework") != Some("react-native-bridge")),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// KEEP-RUST (KNOWN_DIFFS "The bridge a name means"): several
+    /// candidates of a tier answer nothing, where upstream takes the first:
+    /// two Objective-C methods a Swift name bridges to, two exposed Swift
+    /// methods of an Objective-C selector's first base name, and two
+    /// Objective-C methods of one JavaScript name; the platform preference
+    /// is no ambiguity.
+    #[test]
+    fn w721_several_bridge_candidates_answer_nothing() {
+        let project = index(&[
+            RN_PACKAGE,
+            (
+                "ios/Cache.m",
+                "@implementation Cache\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n@end\n",
+            ),
+            (
+                "ios/B.m",
+                "@implementation B\n- (id)fetchEntryForName:(NSString *)name {\n  return nil;\n}\n@end\n",
+            ),
+            (
+                "ios/Use.swift",
+                "func load(cache: Cache) {\n    _ = cache.fetchEntry(forKey: \"x\")\n}\n",
+            ),
+            (
+                "ios/Charts.swift",
+                "class LineChart {\n    @objc func animate(xAxisDuration: Double) {}\n}\nclass BarChart {\n    @objc func animate(xAxisDuration: Double) {}\n}\n",
+            ),
+            (
+                "ios/Caller.m",
+                "@implementation Caller\n- (void)run:(id)chart {\n    [chart animateWithXAxisDuration:1];\n}\n@end\n",
+            ),
+            (
+                "ios/One.m",
+                "@implementation One\nRCT_EXPORT_MODULE(One)\nRCT_EXPORT_METHOD(shared:(id)x) {}\n- (void)shared:(id)x {\n}\n@end\n",
+            ),
+            (
+                "ios/Two.m",
+                "@implementation Two\nRCT_EXPORT_MODULE(Two)\nRCT_EXPORT_METHOD(shared:(id)x) {}\n- (void)shared:(id)x {\n}\n@end\n",
+            ),
+            (
+                "src/a.ts",
+                "export function go() {\n  shared()\n}\nexport function one() {\n  NativeModules.One.shared()\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let bridged = |name: &str, file: &str| -> Vec<String> {
+            out_of(graph, node(graph, name, file), "calls")
+                .into_iter()
+                .filter(|edge| edge.resolved_by() == Some("framework"))
+                .map(|edge| graph.describe(&edge.target))
+                .collect()
+        };
+        assert!(
+            bridged("load", "ios/Use.swift").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            bridged("run:", "ios/Caller.m").is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(bridged("go", "src/a.ts").is_empty(), "{}", graph.report());
+        // A named module's own methods are one tier: its file's.
+        assert_eq!(bridged("one", "src/a.ts").len(), 1, "{}", graph.report());
+    }
+
+    /// Upstream's two early returns (`resolution-index.ts` 1648-1671): the
+    /// by-name answer is not given to an untyped member chain of three or
+    /// more segments, nor to a call on a call's result; `NativeModules.X.m`
+    /// keeps its `0.95`.
+    #[test]
+    fn w721_the_by_name_answer_skips_upstreams_chain_shapes() {
+        let project = index(&[
+            RN_PACKAGE,
+            ("ios/CaptureView.m", SHIM),
+            (
+                "ios/CaptureView.swift",
+                "@objc(CaptureView)\nclass CaptureView: UIView {\n  @objc func syncSettings(_ settings: NSDictionary) {\n  }\n}\n",
+            ),
+            (
+                "src/a.ts",
+                "export function chained() {\n  a.b.syncSettings()\n}\nexport function onResult() {\n  make().syncSettings()\n}\nexport function viaModules() {\n  NativeModules.CaptureView.syncSettings()\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let bridged = |name: &str| -> Vec<Option<f64>> {
+            out_of(graph, node(graph, name, "src/a.ts"), "calls")
+                .into_iter()
+                .filter(|edge| meta(edge, "framework") == Some("react-native-bridge"))
+                .map(EdgeRow::confidence)
+                .collect()
+        };
+        assert!(bridged("chained").is_empty(), "{}", graph.report());
+        assert!(bridged("onResult").is_empty(), "{}", graph.report());
+        assert_eq!(bridged("viaModules"), [Some(0.95)]);
+    }
+
+    const HAPTICS: &str = "\nimport ExpoModulesCore\npublic class HapticsModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoHaptics\")\n    AsyncFunction(\"uniqueExpoHapticCall\") { in /* … */ }\n  }\n}\n";
+
+    /// Upstream `expo-modules.test.ts` 84-200: a call on a
+    /// `requireNativeModule` binding reaches the module's function, and a
+    /// Kotlin generic `AsyncFunction<T>` is extracted and paired with the
+    /// Swift one both ways.
+    #[test]
+    fn w721_an_expo_binding_reaches_its_module_and_the_platforms_pair() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"dependencies\":{\"expo-modules-core\":\"^1.0.0\"}}",
+            ),
+            ("ios/HapticsModule.swift", HAPTICS),
+            (
+                "src/index.ts",
+                "\nimport { requireNativeModule } from 'expo-modules-core';\nconst Haptics = requireNativeModule('ExpoHaptics');\nexport async function impactAsync() {\n  return await Haptics.uniqueExpoHapticCall();\n}\n",
+            ),
+            (
+                "ios/BatteryModule.swift",
+                "import ExpoModulesCore\npublic class BatteryModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoBattery\")\n    AsyncFunction(\"getBatteryLevelAsync\") { () -> Float in return 1.0 }\n  }\n}\n",
+            ),
+            (
+                "android/BatteryModule.kt",
+                "import expo.modules.kotlin.modules.Module\nclass BatteryModule : Module() {\n  override fun definition() = ModuleDefinition {\n    Name(\"ExpoBattery\")\n    AsyncFunction<Float>(\"getBatteryLevelAsync\") { 1.0f }\n  }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let impact = node(graph, "impactAsync", "src/index.ts");
+        let calls = out_of(graph, impact, "calls");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|edge| edge.target.as_str())
+                .collect::<Vec<_>>(),
+            ["expo-module:ios/HapticsModule.swift:ExpoHaptics:uniqueExpoHapticCall:6"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(calls[0].confidence(), Some(0.95));
+        assert_eq!(meta(calls[0], "framework"), Some("expo-modules-js"));
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.id.starts_with("expo-module:")
+                    && node.name == "getBatteryLevelAsync")
+                .map(|node| node.language.as_str())
+                .collect::<Vec<_>>()
+                .len(),
+            2
+        );
+        assert_eq!(
+            synthesized(graph, "expo-cross-platform", "via"),
+            [
+                "getBatteryLevelAsync -> getBatteryLevelAsync (getBatteryLevelAsync)",
+                "getBatteryLevelAsync -> getBatteryLevelAsync (getBatteryLevelAsync)",
+            ]
+        );
+    }
+
+    /// Upstream `expo-modules.test.ts` 202-283 (expo-camera): a default
+    /// export `requireNativeModule<T>('ExpoCamera')` imported as
+    /// `CameraManager` reaches the module's functions on both platforms,
+    /// Swift the target and Kotlin beside it, and else the member of the
+    /// type the binding is given.
+    #[test]
+    fn w721_an_imported_expo_binding_reaches_both_platforms_or_its_type() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"dependencies\":{\"expo-modules-core\":\"^1.0.0\",\"expo\":\"*\"}}",
+            ),
+            (
+                "ios/CameraViewModule.swift",
+                "import ExpoModulesCore\npublic final class CameraViewModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoCamera\")\n    AsyncFunction(\"launchScanner\") { (options: ScannerOptions) in }\n    AsyncFunction(\"dismissScanner\") { }\n  }\n}\n",
+            ),
+            (
+                "android/src/main/java/expo/modules/camera/CameraViewModule.kt",
+                "package expo.modules.camera\nclass CameraViewModule : Module() {\n  override fun definition() = ModuleDefinition {\n    Name(\"ExpoCamera\")\n    AsyncFunction(\"launchScanner\") { options: ScannerOptions -> }\n    AsyncFunction(\"dismissScanner\") { }\n  }\n}\n",
+            ),
+            (
+                "src/Camera.types.ts",
+                "import { NativeModule } from 'expo';\nexport declare class CameraNativeModule extends NativeModule {\n  readonly isAvailableAsync: () => Promise<boolean>;\n}\n",
+            ),
+            (
+                "src/ExpoCameraManager.ts",
+                "import { requireNativeModule } from 'expo';\nimport type { CameraNativeModule } from './Camera.types';\n\nexport default requireNativeModule<CameraNativeModule>('ExpoCamera');\n",
+            ),
+            (
+                "src/CameraView.tsx",
+                "import CameraManager from './ExpoCameraManager';\n\nexport default class CameraView {\n  static async isAvailableAsync(): Promise<boolean> {\n    return CameraManager.isAvailableAsync();\n  }\n  static async launchScanner(options: object): Promise<void> {\n    await CameraManager.launchScanner(options);\n  }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let method = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.name == name
+                        && node.kind == "method"
+                        && node.file_path == "src/CameraView.tsx"
+                })
+                .unwrap_or_else(|| panic!("CameraView.{name}:\n{}", graph.report()))
+        };
+        assert_eq!(
+            callees(graph, method("launchScanner")),
+            [
+                "kotlin:ExpoCamera.launchScanner",
+                "swift:ExpoCamera.launchScanner"
+            ],
+            "{}",
+            graph.report()
+        );
+        let launch = out_of(graph, method("launchScanner"), "calls");
+        let framework: Vec<Option<&str>> =
+            launch.iter().map(|edge| meta(edge, "framework")).collect();
+        // The Swift target names the resolver; the Kotlin also-target does
+        // not.
+        let swift_first: Vec<(String, Option<&str>)> = launch
+            .iter()
+            .map(|edge| (short(graph, edge), meta(edge, "framework")))
+            .collect();
+        assert!(
+            swift_first.contains(&(
+                "swift:ExpoCamera.launchScanner".to_string(),
+                Some("expo-modules-js")
+            )) && swift_first.contains(&("kotlin:ExpoCamera.launchScanner".to_string(), None)),
+            "{framework:?} {swift_first:?}"
+        );
+        assert_eq!(
+            callees(graph, method("isAvailableAsync")),
+            ["typescript:isAvailableAsync"],
+            "{}",
+            graph.report()
+        );
+        let typed = out_of(graph, method("isAvailableAsync"), "calls");
+        assert_eq!(
+            graph.node(&typed[0].target).unwrap().file_path,
+            "src/Camera.types.ts"
+        );
+        assert_eq!(typed[0].confidence(), Some(0.9));
+    }
+
+    /// Upstream `fabric-view.test.ts` 54-140: a codegen spec's component
+    /// reaches its native view class, which a JSX consumer renders.
+    #[test]
+    fn w721_a_fabric_component_reaches_its_native_view() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"dependencies\":{\"react-native\":\"^0.73\"}}",
+            ),
+            (
+                "spec/MyViewNativeComponent.ts",
+                "import { codegenNativeComponent } from 'react-native';\nimport type { ViewProps } from 'react-native';\nexport interface NativeProps extends ViewProps { color?: string; }\nexport default codegenNativeComponent<NativeProps>('MyView');",
+            ),
+            (
+                "ios/MyView.mm",
+                "@interface MyViewView : UIView\n@end\n@implementation MyViewView\n- (void)setColor:(NSString *)c { /* … */ }\n@end",
+            ),
+            (
+                "src/App.tsx",
+                "import React from 'react';\nimport MyView from '../spec/MyViewNativeComponent';\nexport function App() {\n  return <MyView color=\"red\"/>;\n}",
+            ),
+        ]);
+        let graph = project.graph();
+        let components: Vec<&NodeRow> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.id.starts_with("fabric-component:") && node.name == "MyView")
+            .collect();
+        assert_eq!(components.len(), 1, "{}", graph.report());
+        assert_eq!(
+            synthesized(graph, "fabric-native-impl", "viaSuffix"),
+            ["MyView -> MyViewView (View)"]
+        );
+        let rendered: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                meta(edge, "synthesizedBy") == Some("jsx-render") && edge.target == components[0].id
+            })
+            .map(|edge| {
+                graph
+                    .node(&edge.source)
+                    .map_or("?".to_string(), |node| node.name.clone())
+            })
+            .collect();
+        assert_eq!(rendered, ["App"], "{}", graph.report());
+    }
+
+    /// Upstream `fabric-view.test.ts` 142-196 (segmented-control, `6f798dce`),
+    /// written `.jsx` (Rust renders no JSX of a `.js` file, KNOWN_DIFFS): a
+    /// Paper module's `requireNativeComponent` component, rendered under its
+    /// default import's name, reaches its native view class.
+    #[test]
+    fn w721_a_paper_component_reaches_its_native_view() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"dependencies\":{\"react-native\":\"^0.73\"}}",
+            ),
+            (
+                "js/RNCSegmentedControlNativeComponent.jsx",
+                "import { requireNativeComponent } from 'react-native';\nmodule.exports = requireNativeComponent('RNCSegmentedControl');\n",
+            ),
+            (
+                "js/SegmentedControl.jsx",
+                "import * as React from 'react';\nimport RNCSegmentedControlNativeComponent from './RNCSegmentedControlNativeComponent';\nexport default function SegmentedControl(props) {\n  return <RNCSegmentedControlNativeComponent {...props} />;\n}\n",
+            ),
+            (
+                "ios/RNCSegmentedControl.m",
+                "@implementation RNCSegmentedControl\n- (void)setValues:(NSArray *)values { }\n@end\n",
+            ),
+            (
+                "ios/RNCSegmentedControlManager.m",
+                "@implementation RNCSegmentedControlManager\nRCT_EXPORT_MODULE()\nRCT_EXPORT_VIEW_PROPERTY(values, NSArray)\n@end\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let control = node(graph, "SegmentedControl", "js/SegmentedControl.jsx");
+        let component = out_of(graph, control, "calls")
+            .into_iter()
+            .filter_map(|edge| graph.node(&edge.target))
+            .find(|target| target.kind == "component" && target.name == "RNCSegmentedControl")
+            .unwrap_or_else(|| panic!("the rendered component:\n{}", graph.report()));
+        assert_eq!(
+            component.file_path,
+            "js/RNCSegmentedControlNativeComponent.jsx"
+        );
+        let native: Vec<String> = out_of(graph, component, "calls")
+            .into_iter()
+            .filter(|edge| meta(edge, "synthesizedBy") == Some("fabric-native-impl"))
+            .filter_map(|edge| graph.node(&edge.target))
+            .filter(|target| target.language == "objc")
+            .map(|target| target.name.clone())
+            .collect();
+        assert!(
+            native.contains(&"RNCSegmentedControl".to_string()),
+            "{native:?}\n{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rn-event-channel.test.ts` 152-216: inline listeners land
+    /// in the enclosing component, from a Swift `sendEvent(withName:)`.
+    #[test]
+    fn w721_an_inline_listener_lands_in_the_enclosing_component() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"name\":\"x\",\"dependencies\":{\"react-native\":\"^0.76\"}}",
+            ),
+            (
+                "CaptureEvents.swift",
+                "import Foundation\nclass CaptureEvents: RCTEventEmitter {\n  func emitZipComplete() {\n    sendEvent(withName: \"onZipComplete\", body: [\"ok\": true])\n  }\n  func emitProgress() {\n    sendEvent(withName: \"onCaptureProgress\", body: nil)\n  }\n}\n",
+            ),
+            (
+                "App.tsx",
+                "import { useEffect } from 'react'\nexport default function ReviewScreen() {\n  useEffect(() => {\n    const zip = nativeEmitter.addListener('onZipComplete', (data) => {\n      upload(data)\n    })\n    const progress = nativeEmitter.addListener('onCaptureProgress', async function () {\n      await tick()\n    })\n    return () => {\n      zip.remove()\n      progress.remove()\n    }\n  }, [])\n  return null\n}\nfunction upload(d: unknown) {}\nfunction tick() {}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            synthesized(graph, "rn-event-channel", "event"),
+            [
+                "emitProgress -> ReviewScreen (onCaptureProgress)",
+                "emitZipComplete -> ReviewScreen (onZipComplete)",
+            ],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            synthesized(graph, "rn-event-channel", "registeredAt"),
+            [
+                "emitProgress -> ReviewScreen (App.tsx:7)",
+                "emitZipComplete -> ReviewScreen (App.tsx:4)",
+            ]
+        );
+    }
+
+    /// Upstream `rn-event-channel.test.ts` 239-273 (NetInfo, `6a02dcaa`): a
+    /// JavaScript listener on a constant of a namespace import meets the
+    /// native literal.
+    #[test]
+    fn w721_a_constant_event_name_meets_the_native_literal() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"name\":\"netinfo\",\"dependencies\":{\"react-native\":\"^0.73\"}}",
+            ),
+            (
+                "ios/RNCNetInfo.m",
+                "@implementation RNCNetInfo\n- (void)connectionChanged {\n  [self sendEventWithName:@\"netInfo.networkStatusDidChange\" body:@{}];\n}\n@end\n",
+            ),
+            (
+                "src/internal/privateTypes.ts",
+                "export const DEVICE_CONNECTIVITY_EVENT = 'netInfo.networkStatusDidChange';\n",
+            ),
+            (
+                "src/internal/state.ts",
+                "import * as PrivateTypes from './privateTypes';\nexport default class State {\n  start(emitter: any) {\n    emitter.addListener(\n      PrivateTypes.DEVICE_CONNECTIVITY_EVENT,\n      this._handleNativeStateUpdate,\n    );\n  }\n  _handleNativeStateUpdate(state: unknown) { return state; }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            synthesized(graph, "rn-event-channel", "event"),
+            ["connectionChanged -> _handleNativeStateUpdate (netInfo.networkStatusDidChange)"],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rn-event-channel.test.ts` 275-309: a Java constant `emit`
+    /// and a Kotlin `const val` through a `sendEvent` wrapper meet
+    /// JavaScript literal listeners.
+    #[test]
+    fn w721_jvm_constant_sends_meet_literal_listeners() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"name\":\"lib\",\"dependencies\":{\"react-native\":\"^0.73\"}}",
+            ),
+            (
+                "android/src/main/java/app/Tracker.java",
+                "package app;\npublic class Tracker {\n  private static final String PROGRESS_EVENT = \"downloadProgress\";\n  void report(ReactContext ctx) {\n    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(PROGRESS_EVENT, null);\n  }\n}\n",
+            ),
+            (
+                "android/src/main/java/app/Finisher.kt",
+                "package app\nconst val DONE_EVENT = \"downloadDone\"\nclass Finisher {\n  fun finish(ctx: ReactContext) {\n    sendEvent(ctx, DONE_EVENT, null)\n  }\n}\n",
+            ),
+            (
+                "src/index.js",
+                "export function onProgress(e) { return e; }\nexport function onDone(e) { return e; }\nemitter.addListener('downloadProgress', onProgress);\nemitter.addListener('downloadDone', onDone);\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            synthesized(graph, "rn-event-channel", "event"),
+            [
+                "finish -> onDone (downloadDone)",
+                "report -> onProgress (downloadProgress)",
+            ],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `expo-router.test.ts` 622-735's bridge edges: the Swift
+    /// emitter reaches the component whose inline listener hears it, and a
+    /// destructured `NativeModules` alias calls the Swift method its shim
+    /// names (the screens are W7-22's).
+    #[test]
+    fn w721_an_expo_router_app_reaches_swift_and_back() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react\":\"18\",\"react-native\":\"0.76\"}}",
+            ),
+            (
+                "src/app/_layout.tsx",
+                "export default function Layout() { return null }\n",
+            ),
+            (
+                "src/app/index.tsx",
+                "export default function Home() { return null }\n",
+            ),
+            (
+                "ios/CaptureView.swift",
+                "import Foundation\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func startRetake() {\n    CaptureEvents.shared.emitCaptureComplete()\n  }\n}\n",
+            ),
+            (
+                "ios/CaptureView.m",
+                "#import <React/RCTBridgeModule.h>\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(startRetake)\n@end\n",
+            ),
+            (
+                "ios/CaptureEvents.swift",
+                "import Foundation\nclass CaptureEvents: RCTEventEmitter {\n  func emitCaptureComplete() {\n    guard Thread.isMainThread else { return }\n    sendEvent(withName: \"onCaptureComplete\", body: nil)\n  }\n}\n",
+            ),
+            (
+                "src/app/capture/index.tsx",
+                "import { memo, useEffect } from 'react'\nimport { router } from 'expo-router'\nconst MemoizedCaptureComponent = memo(CaptureComponent)\nexport default function ARCapturePage() {\n  return <MemoizedCaptureComponent />\n}\nfunction CaptureComponent() {\n  useEffect(() => {\n    const sub = nativeEmitter.addListener('onCaptureComplete', (data) => {\n      if (!isRetakeBatchActive) {\n        router.push('/capture/review')\n      }\n    })\n    return () => sub.remove()\n  }, [])\n  return null\n}\n",
+            ),
+            (
+                "src/app/capture/review/index.tsx",
+                "import { NativeModules } from 'react-native'\nconst { CaptureView } = NativeModules\nexport default function ReviewScreen() {\n  function handleRetake() {\n    CaptureView.startRetake()\n  }\n  return handleRetake\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            synthesized(graph, "rn-event-channel", "event"),
+            ["emitCaptureComplete -> CaptureComponent (onCaptureComplete)"],
+            "{}",
+            graph.report()
+        );
+        let retake = node(graph, "handleRetake", "src/app/capture/review/index.tsx");
+        let calls = out_of(graph, retake, "calls");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|edge| graph.describe(&edge.target))
+                .collect::<Vec<_>>(),
+            ["method CaptureView::startRetake @ios/CaptureView.swift:4"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(calls[0].confidence(), Some(0.95));
+        assert_eq!(meta(calls[0], "module"), Some("CaptureView"));
+    }
+
+    /// The JavaScript bridges answer before Expo Router (W7-21's
+    /// registration): in an Expo Router app with a screen `/x`, a call
+    /// through a `requireNativeModule` binding and one through
+    /// `NativeModules` named like a navigation reach the native method, and
+    /// make no `navigates` edge.
+    #[test]
+    fn w721_a_native_call_named_like_a_navigation_is_the_bridges() {
+        let project = index(&[
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"expo-modules-core\":\"1\",\"react-native\":\"0.76\"}}",
+            ),
+            (
+                "app/_layout.tsx",
+                "export default function Layout() { return null }\n",
+            ),
+            ("app/x.tsx", "export default function X() { return null }\n"),
+            (
+                "ios/NavModule.swift",
+                "import ExpoModulesCore\npublic class NavModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"Nav\")\n    Function(\"navigate\") { (path: String) in }\n  }\n}\n",
+            ),
+            (
+                "ios/Legacy.m",
+                "@implementation Legacy\nRCT_EXPORT_MODULE(Legacy)\nRCT_EXPORT_METHOD(navigate:(NSString *)path) {}\n@end\n",
+            ),
+            (
+                "src/go.ts",
+                "import { requireNativeModule } from 'expo-modules-core';\nimport { NativeModules } from 'react-native';\nconst Nav = requireNativeModule('Nav');\nexport function expo() {\n  Nav.navigate('/x')\n}\nexport function legacy() {\n  NativeModules.Legacy.navigate('/x')\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let edges = |name: &str| -> Vec<(String, String, Option<f64>, Option<String>)> {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.source == node(graph, name, "src/go.ts").id
+                        && (edge.kind == "calls" || edge.kind == "navigates")
+                })
+                .map(|edge| {
+                    (
+                        edge.kind.clone(),
+                        graph.describe(&edge.target),
+                        edge.confidence(),
+                        meta(edge, "framework").map(str::to_string),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            edges("expo"),
+            [(
+                "calls".to_string(),
+                "method ios/NavModule.swift::Nav.navigate @ios/NavModule.swift:5".to_string(),
+                Some(0.95),
+                Some("expo-modules-js".to_string())
+            )],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            edges("legacy"),
+            [(
+                "calls".to_string(),
+                "method ios/Legacy.m::Legacy.navigate @ios/Legacy.m:3".to_string(),
+                Some(0.95),
+                Some("react-native-bridge".to_string())
+            )],
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Every edge `pass` synthesized, as `source -> target {metadata} @line`:
+    /// the endpoints' qualified names, the metadata but `synthesizedBy` by
+    /// key, and the edge's line, sorted.
+    fn synthesized_rows(graph: &Graph, pass: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| meta(edge, "synthesizedBy") == Some(pass))
+            .map(|edge| {
+                let name = |id: &str| {
+                    graph
+                        .node(id)
+                        .map_or_else(|| id.to_string(), |node| node.qualified_name.clone())
+                };
+                let mut keys: Vec<String> = edge
+                    .metadata
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(key, _)| key.as_str() != "synthesizedBy")
+                    .map(|(key, value)| {
+                        let value = value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_string);
+                        format!("{key}={value}")
+                    })
+                    .collect();
+                keys.sort();
+                format!(
+                    "{} -> {} {{{}}} @{}",
+                    name(&edge.source),
+                    name(&edge.target),
+                    keys.join(", "),
+                    edge.line
+                        .map_or_else(|| "-".to_string(), |line| line.to_string())
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream `rnEventEdges`' send and listen shapes at once:
+    /// each native send (Objective-C and Objective-C++
+    /// `sendEventWithName:`, Swift's `sendEvent(withName:)` and its
+    /// wrapper, a JVM `.emit` and `sendEvent` wrapper; a literal, or a
+    /// constant of each kind a declaration can be, typed or not) reaches
+    /// the listener its event names: a named handler, the last
+    /// registration's site kept; an inline one's enclosing function and a
+    /// constant's handler, the first site kept. The edge has no line.
+    #[test]
+    fn w721_each_native_send_meets_the_listener_its_event_names() {
+        let project = index(&[
+            (
+                "android/app/JvmEmitter.java",
+                "package com.app;\n\npublic class JvmEmitter {\n  static final String JVM_CONST = \"evJvmConst\";\n  String fieldEvent = \"evField\";\n  void literal(ReactContext ctx) {\n    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(\"evJvm\", null);\n  }\n  void wrapper(ReactContext ctx) {\n    sendEvent(ctx, \"evJvmWrapper\", null);\n  }\n  void constant(ReactContext ctx) {\n    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(JVM_CONST, null);\n  }\n  void field(ReactContext ctx) {\n    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(fieldEvent, null);\n  }\n  void let(ReactContext ctx) {\n    ctx.getJSModule(RCTDeviceEventEmitter.class).emit(\"evLet\", null);\n  }\n}\n",
+            ),
+            (
+                "android/app/KtEmitter.kt",
+                "package com.app\n\nconst val ROOT = \"evRoot\"\n\nclass KtEmitter {\n  fun literal(ctx: ReactContext) {\n    ctx.getJSModule(X::class.java).emit(\"evKotlin\", null)\n  }\n  fun rooted(ctx: ReactContext) {\n    ctx.getJSModule(X::class.java).emit(app.ROOT, null)\n  }\n}\n",
+            ),
+            (
+                "ios/Objc.m",
+                "@implementation ObjcEmitter\n- (void)literal {\n  [self sendEventWithName:@\"evObjc\" body:@{}];\n}\n@end\n",
+            ),
+            (
+                "ios/Plus.mm",
+                "@implementation PlusEmitter\n- (void)go {\n  [self sendEventWithName:@\"evObjcpp\" body:nil];\n}\n@end\n",
+            ),
+            (
+                "ios/Swifty.swift",
+                "enum Events: String {\n  case changed = \"evSwiftRaw\"\n}\nenum OtherEvents: String {\n  case changed = \"evDecoy\"\n}\nclass Other {\n  static let named = \"evOther\"\n}\nclass SwiftEmitter: RCTEventEmitter {\n  static let named = \"evSwiftConst\"\n  let propEvent = \"evProp\"\n  func literal() {\n    sendEvent(withName: \"evSwift\", body: nil)\n  }\n  func wrapper() {\n    sendEvent(self.bridge, \"evSwiftWrapper\", nil)\n  }\n  func constant() {\n    sendEvent(withName: SwiftEmitter.named, body: nil)\n  }\n  func raw() {\n    sendEvent(withName: Events.changed.rawValue, body: nil)\n  }\n  func prop() {\n    sendEvent(withName: propEvent, body: nil)\n  }\n  func typed() {\n    sendEvent(withName: \"evTyped\", body: nil)\n  }\n  func bare() {\n    sendEvent(withName: \"evBare\", body: nil)\n  }\n}\n",
+            ),
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+            ),
+            (
+                "src/events.ts",
+                "export const BARE_EVENT = 'evBare';\nexport let LET_EVENT = \"evLet\";\nexport const KOTLIN_EVENT = `evKotlin`;\nexport const TYPED_EVENT: string = 'evTyped';\n",
+            ),
+            (
+                "src/listeners.ts",
+                "import { BARE_EVENT, LET_EVENT, KOTLIN_EVENT, TYPED_EVENT } from './events';\n\nexport function onObjc(e: unknown) { return e; }\nexport function onObjcpp(e: unknown) { return e; }\nexport function onSwift(e: unknown) { return e; }\nexport function onBare(e: unknown) { return e; }\nexport function onLet(e: unknown) { return e; }\nexport function onKotlin(e: unknown) { return e; }\nexport function onSwiftConst(e: unknown) { return e; }\nexport function onSwiftRaw(e: unknown) { return e; }\nexport function onJvmConst(e: unknown) { return e; }\nexport function onRoot(e: unknown) { return e; }\nexport function onField(e: unknown) { return e; }\nexport function onProp(e: unknown) { return e; }\nexport function onTyped(e: unknown) { return e; }\n\nexport function named(emitter: any) {\n  emitter.on('evObjc', onObjc);\n  emitter.once('evObjcpp', onObjcpp);\n  emitter.addListener('evSwift', onSwift);\n  emitter.on('evObjc', onObjc);\n  emitter.on('evSwiftConst', onSwiftConst);\n  emitter.on('evSwiftRaw', onSwiftRaw);\n  emitter.on('evJvmConst', onJvmConst);\n  emitter.on('evRoot', onRoot);\n  emitter.on('evField', onField);\n  emitter.on('evProp', onProp);\n}\n\nexport function inlineOn(emitter: any) {\n  emitter.on('evSwiftWrapper', () => {});\n}\n\nexport function inlineOnce(emitter: any) {\n  emitter.once('evJvm', function () {});\n}\n\nexport function inlineAdd(emitter: any) {\n  emitter.addListener('evJvmWrapper', async (e) => {});\n  emitter.addListener('evJvmWrapper', (e) => {});\n}\n\nexport function constants(emitter: any) {\n  emitter.on(KOTLIN_EVENT, onKotlin);\n  emitter.once(LET_EVENT, onLet);\n  emitter.addListener(BARE_EVENT, onBare);\n  emitter.addListener(BARE_EVENT, onBare);\n  emitter.on(TYPED_EVENT, onTyped);\n}\n",
+            ),
+        ]);
+        let rows = [
+            "ObjcEmitter::literal -> onObjc {event=evObjc, registeredAt=src/listeners.ts:21} @-",
+            "PlusEmitter::go -> onObjcpp {event=evObjcpp, registeredAt=src/listeners.ts:19} @-",
+            "SwiftEmitter::bare -> onBare {event=evBare, registeredAt=src/listeners.ts:46} @-",
+            "SwiftEmitter::constant -> onSwiftConst {event=evSwiftConst, registeredAt=src/listeners.ts:22} @-",
+            "SwiftEmitter::literal -> onSwift {event=evSwift, registeredAt=src/listeners.ts:20} @-",
+            "SwiftEmitter::prop -> onProp {event=evProp, registeredAt=src/listeners.ts:27} @-",
+            "SwiftEmitter::raw -> onSwiftRaw {event=evSwiftRaw, registeredAt=src/listeners.ts:23} @-",
+            "SwiftEmitter::typed -> onTyped {event=evTyped, registeredAt=src/listeners.ts:48} @-",
+            "SwiftEmitter::wrapper -> inlineOn {event=evSwiftWrapper, registeredAt=src/listeners.ts:31} @-",
+            "com.app::JvmEmitter::constant -> onJvmConst {event=evJvmConst, registeredAt=src/listeners.ts:24} @-",
+            "com.app::JvmEmitter::field -> onField {event=evField, registeredAt=src/listeners.ts:26} @-",
+            "com.app::JvmEmitter::let -> onLet {event=evLet, registeredAt=src/listeners.ts:45} @-",
+            "com.app::JvmEmitter::literal -> inlineOnce {event=evJvm, registeredAt=src/listeners.ts:35} @-",
+            "com.app::JvmEmitter::wrapper -> inlineAdd {event=evJvmWrapper, registeredAt=src/listeners.ts:39} @-",
+            "com.app::KtEmitter::literal -> onKotlin {event=evKotlin, registeredAt=src/listeners.ts:44} @-",
+            "com.app::KtEmitter::rooted -> onRoot {event=evRoot, registeredAt=src/listeners.ts:25} @-",
+        ];
+        let graph = project.graph();
+        assert_eq!(
+            synthesized_rows(graph, "rn-event-channel"),
+            rows,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// A named handler several callables have answers nothing (KEEP-RUST),
+    /// one no callable has lands in the enclosing function or value, and a
+    /// dotted one is its last segment; a constant event's handler is its
+    /// file's sole callable of the name, nothing of two, else the enclosing
+    /// function; an event seven dispatchers send or seven handlers hear is
+    /// skipped and six are kept; a file listening by `.once` or
+    /// `.addListener` alone is read; a `this.` constant names no event, and
+    /// two constants of one name holding two values none.
+    #[test]
+    fn w721_an_event_handler_is_the_one_its_name_means_within_the_fan_out_cap() {
+        let project = index(&[
+            (
+                "android/app/Dup.kt",
+                "package com.dup\n\nconst val DUP = \"evDupA\"\nconst val SAME = \"evSame\"\n\nobject Inner {\n  const val DUP = \"evDupB\"\n  const val SAME = \"evSame\"\n}\n\nclass DupEmitter {\n  fun dup(ctx: ReactContext) {\n    ctx.getJSModule(X::class.java).emit(DUP, null)\n  }\n  fun same(ctx: ReactContext) {\n    ctx.getJSModule(X::class.java).emit(SAME, null)\n  }\n}\n",
+            ),
+            (
+                "ios/Misc.swift",
+                "class events {\n  static let READY = \"evThis\"\n}\nclass Misc: RCTEventEmitter {\n  func top() {\n    sendEvent(withName: \"evTop\", body: nil)\n  }\n  func inner() {\n    sendEvent(withName: \"evInner\", body: nil)\n  }\n  func amb() {\n    sendEvent(withName: \"evAmb\", body: nil)\n  }\n  func this() {\n    sendEvent(withName: \"evThis\", body: nil)\n  }\n  func path() {\n    sendEvent(withName: \"evPath\", body: nil)\n  }\n  func several() {\n    sendEvent(withName: \"evSeveral\", body: nil)\n  }\n  func none() {\n    sendEvent(withName: \"evNone\", body: nil)\n  }\n  func variable() {\n    sendEvent(withName: \"evVar\", body: nil)\n  }\n  func onceOnly() {\n    sendEvent(withName: \"evOnceOnly\", body: nil)\n  }\n  func addOnly() {\n    sendEvent(withName: \"evAddOnly\", body: nil)\n  }\n  func ready() {\n    sendEvent(withName: \"evJsReady\", body: nil)\n  }\n}\n",
+            ),
+            (
+                "ios/Senders.swift",
+                "class Senders: RCTEventEmitter {\n  func send0() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func send1() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func send2() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func send3() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func send4() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func send5() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func send6() {\n    sendEvent(withName: \"evSenders\", body: nil)\n  }\n  func sendSix0() {\n    sendEvent(withName: \"evSixSenders\", body: nil)\n  }\n  func sendSix1() {\n    sendEvent(withName: \"evSixSenders\", body: nil)\n  }\n  func sendSix2() {\n    sendEvent(withName: \"evSixSenders\", body: nil)\n  }\n  func sendSix3() {\n    sendEvent(withName: \"evSixSenders\", body: nil)\n  }\n  func sendSix4() {\n    sendEvent(withName: \"evSixSenders\", body: nil)\n  }\n  func sendSix5() {\n    sendEvent(withName: \"evSixSenders\", body: nil)\n  }\n  func many() {\n    sendEvent(withName: \"evMany\", body: nil)\n  }\n  func six() {\n    sendEvent(withName: \"evSix\", body: nil)\n  }\n}\n",
+            ),
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+            ),
+            (
+                "src/add.ts",
+                "export function onAddOnly(e: unknown) { return e; }\nexport function wireAdd(emitter: any) {\n  emitter.addListener('evAddOnly', onAddOnly);\n}\n",
+            ),
+            (
+                "src/b.js",
+                "export class JsEvents {\n  static READY = 'evJsReady';\n}\n",
+            ),
+            (
+                "src/handlers.ts",
+                "export function onPath(e: unknown) { return e; }\n",
+            ),
+            (
+                "src/many.ts",
+                "export function many0(e: unknown) { return e; }\nexport function many1(e: unknown) { return e; }\nexport function many2(e: unknown) { return e; }\nexport function many3(e: unknown) { return e; }\nexport function many4(e: unknown) { return e; }\nexport function many5(e: unknown) { return e; }\nexport function many6(e: unknown) { return e; }\nexport function six0(e: unknown) { return e; }\nexport function six1(e: unknown) { return e; }\nexport function six2(e: unknown) { return e; }\nexport function six3(e: unknown) { return e; }\nexport function six4(e: unknown) { return e; }\nexport function six5(e: unknown) { return e; }\nexport function wireMany(emitter: any) {\n  emitter.on('evMany', many0);\n  emitter.on('evMany', many1);\n  emitter.on('evMany', many2);\n  emitter.on('evMany', many3);\n  emitter.on('evMany', many4);\n  emitter.on('evMany', many5);\n  emitter.on('evMany', many6);\n  emitter.on('evSix', six0);\n  emitter.on('evSix', six1);\n  emitter.on('evSix', six2);\n  emitter.on('evSix', six3);\n  emitter.on('evSix', six4);\n  emitter.on('evSix', six5);\n}\n",
+            ),
+            (
+                "src/once.ts",
+                "export function onOnceOnly(e: unknown) { return e; }\nexport function wireOnce(emitter: any) {\n  emitter.once('evOnceOnly', onOnceOnly);\n}\n",
+            ),
+            (
+                "src/one.ts",
+                "export function dupHandler(e: unknown) { return e; }\n",
+            ),
+            (
+                "src/senders.ts",
+                "export function onSenders(e: unknown) { return e; }\nexport function onSixSenders(e: unknown) { return e; }\nexport function wireSenders(emitter: any) {\n  emitter.on('evSenders', onSenders);\n  emitter.on('evSixSenders', onSixSenders);\n}\n",
+            ),
+            (
+                "src/several.ts",
+                "export const SEVERAL_EVENT = 'evSeveral';\nexport const NONE_EVENT = 'evNone';\nexport const VAR_EVENT = 'evVar';\nclass A {\n  handle(e: unknown) { return e; }\n}\nclass B {\n  handle(e: unknown) { return e; }\n}\nconst handlerVar = makeHandler();\nexport function wireConst(emitter: any) {\n  emitter.on(SEVERAL_EVENT, handle);\n  emitter.on(NONE_EVENT, notDefinedHere);\n  emitter.on(VAR_EVENT, handlerVar);\n}\n",
+            ),
+            (
+                "src/subs.ts",
+                "import { JsEvents } from './b';\n\nexport function onDupA(e: unknown) { return e; }\nexport function onSame(e: unknown) { return e; }\nexport function onThis(e: unknown) { return e; }\nexport function onReady(e: unknown) { return e; }\n\nexport const subscription = emitter.addListener('evTop', missingHandler);\n\nexport function wire(emitter: any) {\n  emitter.on('evInner', unknownName);\n  emitter.on('evAmb', dupHandler);\n  emitter.on('evDupA', onDupA);\n  emitter.on('evSame', onSame);\n  emitter.on('evPath', handlers.onPath);\n}\n\nexport class Owner {\n  start(emitter: any) {\n    emitter.on(this.events.READY, onThis);\n    emitter.on(JsEvents.READY, onReady);\n  }\n}\n",
+            ),
+            (
+                "src/two.ts",
+                "export function dupHandler(e: unknown) { return e; }\n",
+            ),
+        ]);
+        let rows = [
+            "Misc::addOnly -> onAddOnly {event=evAddOnly, registeredAt=src/add.ts:3} @-",
+            "Misc::inner -> wire {event=evInner, registeredAt=src/subs.ts:11} @-",
+            "Misc::none -> wireConst {event=evNone, registeredAt=src/several.ts:13} @-",
+            "Misc::onceOnly -> onOnceOnly {event=evOnceOnly, registeredAt=src/once.ts:3} @-",
+            "Misc::path -> onPath {event=evPath, registeredAt=src/subs.ts:15} @-",
+            "Misc::ready -> onReady {event=evJsReady, registeredAt=src/subs.ts:21} @-",
+            "Misc::top -> subscription {event=evTop, registeredAt=src/subs.ts:8} @-",
+            "Misc::variable -> wireConst {event=evVar, registeredAt=src/several.ts:14} @-",
+            "Senders::sendSix0 -> onSixSenders {event=evSixSenders, registeredAt=src/senders.ts:5} @-",
+            "Senders::sendSix1 -> onSixSenders {event=evSixSenders, registeredAt=src/senders.ts:5} @-",
+            "Senders::sendSix2 -> onSixSenders {event=evSixSenders, registeredAt=src/senders.ts:5} @-",
+            "Senders::sendSix3 -> onSixSenders {event=evSixSenders, registeredAt=src/senders.ts:5} @-",
+            "Senders::sendSix4 -> onSixSenders {event=evSixSenders, registeredAt=src/senders.ts:5} @-",
+            "Senders::sendSix5 -> onSixSenders {event=evSixSenders, registeredAt=src/senders.ts:5} @-",
+            "Senders::six -> six0 {event=evSix, registeredAt=src/many.ts:22} @-",
+            "Senders::six -> six1 {event=evSix, registeredAt=src/many.ts:23} @-",
+            "Senders::six -> six2 {event=evSix, registeredAt=src/many.ts:24} @-",
+            "Senders::six -> six3 {event=evSix, registeredAt=src/many.ts:25} @-",
+            "Senders::six -> six4 {event=evSix, registeredAt=src/many.ts:26} @-",
+            "Senders::six -> six5 {event=evSix, registeredAt=src/many.ts:27} @-",
+            "com.dup::DupEmitter::same -> onSame {event=evSame, registeredAt=src/subs.ts:14} @-",
+        ];
+        let graph = project.graph();
+        assert_eq!(
+            synthesized_rows(graph, "rn-event-channel"),
+            rows,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `fabricNativeImplEdges`: a view component reaches the
+    /// Objective-C, Java, Kotlin or C++ class named for it with each
+    /// suffix; a component no spec declares (a Vue one) reaches none.
+    #[test]
+    fn w721_a_view_component_reaches_the_native_class_of_each_suffix() {
+        let project = index(&[
+            (
+                "android/WithCvComponentView.kt",
+                "class WithCvComponentView {\n  fun a() {}\n}\n",
+            ),
+            (
+                "android/WithVmViewManager.java",
+                "public class WithVmViewManager {\n  void a() {}\n}\n",
+            ),
+            ("cpp/WithMgr.h", "class WithMgr;\n"),
+            (
+                "cpp/WithMgrManager.cpp",
+                "class WithMgrManager {\n public:\n  void a() {}\n};\n",
+            ),
+            (
+                "ios/Exact.m",
+                "@implementation Exact\n- (void)a {\n}\n@end\n",
+            ),
+            (
+                "ios/Plain.m",
+                "@implementation Plain\n- (void)a {\n}\n@end\n",
+            ),
+            (
+                "ios/WithViewView.m",
+                "@implementation WithViewView\n- (void)a {\n}\n@end\n",
+            ),
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+            ),
+            (
+                "src/ExactNativeComponent.ts",
+                "import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\nexport default codegenNativeComponent('Exact');\n",
+            ),
+            (
+                "src/Plain.tsx",
+                "export function Plain() {\n  return null;\n}\n",
+            ),
+            ("src/Plain.vue", "<template>\n  <div />\n</template>\n"),
+            (
+                "src/WithCvNativeComponent.ts",
+                "import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\nexport default codegenNativeComponent('WithCv');\n",
+            ),
+            (
+                "src/WithMgrNativeComponent.ts",
+                "import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\nexport default codegenNativeComponent('WithMgr');\n",
+            ),
+            (
+                "src/WithViewNativeComponent.ts",
+                "import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\nexport default codegenNativeComponent('WithView');\n",
+            ),
+            (
+                "src/WithVmNativeComponent.ts",
+                "import codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\nexport default codegenNativeComponent('WithVm');\n",
+            ),
+        ]);
+        let rows = [
+            "src/ExactNativeComponent.ts::Exact -> Exact {componentName=Exact, viaSuffix=(exact)} @-",
+            "src/WithCvNativeComponent.ts::WithCv -> WithCvComponentView {componentName=WithCv, viaSuffix=ComponentView} @-",
+            "src/WithMgrNativeComponent.ts::WithMgr -> WithMgrManager {componentName=WithMgr, viaSuffix=Manager} @-",
+            "src/WithViewNativeComponent.ts::WithView -> WithViewView {componentName=WithView, viaSuffix=View} @-",
+            "src/WithVmNativeComponent.ts::WithVm -> WithVmViewManager {componentName=WithVm, viaSuffix=ViewManager} @-",
+        ];
+        let graph = project.graph();
+        assert_eq!(
+            synthesized_rows(graph, "fabric-native-impl"),
+            rows,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `expoCrossPlatformEdges`: an Expo function's Kotlin
+    /// declaration and each Swift one reach each other, the two Swift ones
+    /// not each other, and a one-platform function nothing; the edge's line
+    /// is its source's.
+    #[test]
+    fn w721_an_expo_function_pairs_its_declarations_across_two_languages() {
+        let project = index(&[
+            (
+                "android/ShareModule.kt",
+                "package expo.modules.x\n\nimport expo.modules.kotlin.modules.Module\n\nclass ShareModule : Module() {\n  override fun definition() = ModuleDefinition {\n    Name(\"ExpoShare\")\n    AsyncFunction(\"shareAsync\") {\n    }\n  }\n}\n",
+            ),
+            (
+                "ios/Lonely.swift",
+                "import ExpoModulesCore\n\npublic class LonelyModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoLonely\")\n    AsyncFunction(\"aloneAsync\") {\n    }\n  }\n}\n",
+            ),
+            (
+                "ios/ShareModule.swift",
+                "import ExpoModulesCore\n\npublic class ShareModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoShare\")\n    AsyncFunction(\"shareAsync\") {\n    }\n  }\n}\n",
+            ),
+            (
+                "macos/ShareModule.swift",
+                "import ExpoModulesCore\n\npublic class ShareModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoShare\")\n    AsyncFunction(\"shareAsync\") {\n    }\n  }\n}\n",
+            ),
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo-modules-core\":\"^1.0.0\"}}\n",
+            ),
+        ]);
+        let rows = [
+            "android/ShareModule.kt::ExpoShare.shareAsync -> ios/ShareModule.swift::ExpoShare.shareAsync {via=shareAsync} @8",
+            "android/ShareModule.kt::ExpoShare.shareAsync -> macos/ShareModule.swift::ExpoShare.shareAsync {via=shareAsync} @8",
+            "ios/ShareModule.swift::ExpoShare.shareAsync -> android/ShareModule.kt::ExpoShare.shareAsync {via=shareAsync} @6",
+            "macos/ShareModule.swift::ExpoShare.shareAsync -> android/ShareModule.kt::ExpoShare.shareAsync {via=shareAsync} @6",
+        ];
+        let graph = project.graph();
+        assert_eq!(
+            synthesized_rows(graph, "expo-cross-platform"),
+            rows,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `rnCrossPlatformEdges`: a bridge method a TypeScript,
+    /// TSX, JavaScript or JSX caller reaches pairs both ways with its
+    /// Objective-C (by its selector's first keyword), Kotlin and C++
+    /// namesakes, never Swift; an uncalled one, and the names every module
+    /// has, reached by the bridge or an Expo binding, pair with nothing.
+    #[test]
+    fn w721_a_js_called_bridge_method_pairs_with_its_other_native_languages() {
+        let project = index(&[
+            (
+                "android/EvModule.kt",
+                "class EvModule : Module() {\n  override fun definition() = ModuleDefinition {\n    Name(\"ExpoEv\")\n    Function(\"addListener\") {}\n    Function(\"removeListeners\") {}\n    Function(\"invalidate\") {}\n  }\n}\n",
+            ),
+            (
+                "android/Extra.kt",
+                "class Extra {\n  fun viaKotlin() {}\n}\n",
+            ),
+            (
+                "android/InfraModule.java",
+                "package com.app;\n\npublic class InfraModule extends ReactContextBaseJavaModule {\n  public String getName() { return \"Infra\"; }\n  @ReactMethod public void getConstants() {}\n  @ReactMethod public void constantsToExport() {}\n  @ReactMethod public void initialize() {}\n  @ReactMethod public void getDefaultEventTypes() {}\n  @ReactMethod public void supportedEvents() {}\n  @ReactMethod public void requiresMainQueueSetup() {}\n  @ReactMethod public void methodQueue() {}\n  @ReactMethod public void getName2() {}\n}\n",
+            ),
+            (
+                "android/NameModule.java",
+                "package com.app;\n\npublic class NameModule extends ReactContextBaseJavaModule {\n  @ReactMethod public void getName() {}\n}\n",
+            ),
+            (
+                "android/PairModule.java",
+                "package com.app;\n\npublic class PairModule extends ReactContextBaseJavaModule {\n  public String getName() { return \"Pair\"; }\n  @ReactMethod public void fromTs() {}\n  @ReactMethod public void fromTsx() {}\n  @ReactMethod public void fromJs() {}\n  @ReactMethod public void fromJsx() {}\n  @ReactMethod public void uncalled() {}\n  @ReactMethod public void viaKotlin() {}\n  @ReactMethod public void viaCpp() {}\n  @ReactMethod public void withSwift() {}\n}\n",
+            ),
+            (
+                "cpp/Extra.cpp",
+                "class Extra {\n public:\n  void viaCpp() {}\n};\n",
+            ),
+            (
+                "ios/Infra.m",
+                "@implementation InfraImpl\n- (void)getConstants {\n}\n- (void)constantsToExport {\n}\n- (void)initialize {\n}\n- (void)getDefaultEventTypes {\n}\n- (void)supportedEvents {\n}\n- (void)requiresMainQueueSetup {\n}\n- (void)methodQueue {\n}\n- (void)getName2 {\n}\n@end\n",
+            ),
+            (
+                "ios/Name.m",
+                "@implementation NameImpl\n- (void)getName {\n}\n- (void)addListener {\n}\n- (void)removeListeners {\n}\n- (void)invalidate {\n}\n@end\n",
+            ),
+            (
+                "ios/Pair.m",
+                "@implementation PairImpl\n- (void)fromTs:(id)x {\n}\n- (void)fromTsx:(id)x {\n}\n- (void)fromJs:(id)x {\n}\n- (void)fromJsx:(id)x {\n}\n- (void)uncalled:(id)x {\n}\n@end\n",
+            ),
+            (
+                "ios/Swifty.swift",
+                "class Swifty: NSObject {\n  @objc func withSwift() {}\n}\n",
+            ),
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+            ),
+            (
+                "src/a.ts",
+                "import { NativeModules } from 'react-native';\nexport function a() {\n  NativeModules.Pair.fromTs();\n  NativeModules.Pair.viaKotlin();\n  NativeModules.Pair.viaCpp();\n  NativeModules.Pair.withSwift();\n}\n",
+            ),
+            (
+                "src/b.tsx",
+                "import { NativeModules } from 'react-native';\nexport function b() {\n  NativeModules.Pair.fromTsx();\n}\n",
+            ),
+            (
+                "src/c.js",
+                "import { NativeModules } from 'react-native';\nexport function c() {\n  NativeModules.Pair.fromJs();\n}\n",
+            ),
+            (
+                "src/d.jsx",
+                "import { NativeModules } from 'react-native';\nexport function d() {\n  NativeModules.Pair.fromJsx();\n}\n",
+            ),
+            (
+                "src/ev.ts",
+                "import { requireNativeModule } from 'expo-modules-core';\nconst Ev = requireNativeModule('ExpoEv');\nexport function useEv() {\n  Ev.addListener();\n  Ev.removeListeners();\n  Ev.invalidate();\n}\n",
+            ),
+            (
+                "src/infra.ts",
+                "import { NativeModules } from 'react-native';\nexport function useInfra() {\n  NativeModules.Infra.getConstants();\n  NativeModules.Infra.constantsToExport();\n  NativeModules.Infra.initialize();\n  NativeModules.Infra.getDefaultEventTypes();\n  NativeModules.Infra.supportedEvents();\n  NativeModules.Infra.requiresMainQueueSetup();\n  NativeModules.Infra.methodQueue();\n  NativeModules.Infra.getName2();\n}\n",
+            ),
+            (
+                "src/name.ts",
+                "import { NativeModules } from 'react-native';\nexport function useName() {\n  NativeModules.Name.getName();\n}\n",
+            ),
+        ]);
+        let rows = [
+            "Extra::viaCpp -> com.app::PairModule::viaCpp {via=viaCpp} @3",
+            "Extra::viaKotlin -> com.app::PairModule::viaKotlin {via=viaKotlin} @2",
+            "InfraImpl::getName2 -> com.app::InfraModule::getName2 {via=getName2} @16",
+            "PairImpl::fromJs: -> com.app::PairModule::fromJs {via=fromJs} @6",
+            "PairImpl::fromJsx: -> com.app::PairModule::fromJsx {via=fromJsx} @8",
+            "PairImpl::fromTs: -> com.app::PairModule::fromTs {via=fromTs} @2",
+            "PairImpl::fromTsx: -> com.app::PairModule::fromTsx {via=fromTsx} @4",
+            "com.app::InfraModule::getName2 -> InfraImpl::getName2 {via=getName2} @12",
+            "com.app::PairModule::fromJs -> PairImpl::fromJs: {via=fromJs} @7",
+            "com.app::PairModule::fromJsx -> PairImpl::fromJsx: {via=fromJsx} @8",
+            "com.app::PairModule::fromTs -> PairImpl::fromTs: {via=fromTs} @5",
+            "com.app::PairModule::fromTsx -> PairImpl::fromTsx: {via=fromTsx} @6",
+            "com.app::PairModule::viaCpp -> Extra::viaCpp {via=viaCpp} @11",
+            "com.app::PairModule::viaKotlin -> Extra::viaKotlin {via=viaKotlin} @10",
+        ];
+        let graph = project.graph();
+        assert_eq!(
+            synthesized_rows(graph, "rn-cross-platform"),
+            rows,
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `nativeBinding` follows a relative import only: a default
+    /// import through a `tsconfig` path alias of the same binding module is
+    /// not read.
+    #[test]
+    fn w721_an_expo_binding_is_followed_through_a_relative_import_only() {
+        let project = index(&[
+            (
+                "ios/CamModule.swift",
+                "import ExpoModulesCore\n\npublic class CamModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoCam\")\n    AsyncFunction(\"snapAsync\") {\n    }\n  }\n}\n",
+            ),
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo-modules-core\":\"^1.0.0\"}}\n",
+            ),
+            (
+                "src/App.tsx",
+                "import Cam from '@/ExpoCam';\nimport Rel from './ExpoCam';\nexport function shoot() {\n  Cam.snapAsync();\n}\nexport function shootRel() {\n  Rel.snapAsync();\n}\n",
+            ),
+            (
+                "src/ExpoCam.ts",
+                "import { requireNativeModule } from 'expo-modules-core';\nexport default requireNativeModule('ExpoCam');\n",
+            ),
+            (
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"src/*\"]}}}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let shoot = node(graph, "shoot", "src/App.tsx");
+        let relative = node(graph, "shootRel", "src/App.tsx");
+        assert_eq!(
+            callees(graph, relative),
+            ["swift:ExpoCam.snapAsync"],
+            "{}",
+            graph.report()
+        );
+        assert!(callees(graph, shoot).is_empty(), "{}", graph.report());
+    }
+
+    /// Upstream `bindingMemo` is per file: one local name bound to two
+    /// modules in two files reaches each file's module.
+    #[test]
+    fn w721_one_binding_name_in_two_files_reaches_each_files_module() {
+        let module = |name: &str| {
+            format!(
+                "import ExpoModulesCore\n\npublic class {name}Module: Module {{\n  public func definition() -> ModuleDefinition {{\n    Name(\"Expo{name}\")\n    Function(\"go\") {{\n    }}\n  }}\n}}\n"
+            )
+        };
+        let caller = |name: &str| {
+            format!(
+                "import {{ requireNativeModule }} from 'expo-modules-core';\nconst M = requireNativeModule('Expo{name}');\nexport function run{name}() {{\n  M.go();\n}}\n"
+            )
+        };
+        let (x_module, y_module, x, y) = (module("X"), module("Y"), caller("X"), caller("Y"));
+        let project = index(&[
+            (
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"expo-modules-core\":\"^1.0.0\"}}\n",
+            ),
+            ("ios/XModule.swift", &x_module),
+            ("ios/YModule.swift", &y_module),
+            ("src/x.ts", &x),
+            ("src/y.ts", &y),
+        ]);
+        let graph = project.graph();
+        assert_eq!(
+            callees(graph, node(graph, "runX", "src/x.ts")),
+            ["swift:ExpoX.go"],
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            callees(graph, node(graph, "runY", "src/y.ts")),
+            ["swift:ExpoY.go"],
             "{}",
             graph.report()
         );

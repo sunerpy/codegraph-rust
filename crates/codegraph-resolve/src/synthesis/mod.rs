@@ -41,6 +41,7 @@ mod iface;
 mod inputs;
 mod jsx;
 mod links;
+mod react_native;
 mod registry;
 mod stage;
 mod sveltekit;
@@ -64,7 +65,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "18";
+pub const VERSION: &str = "19";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

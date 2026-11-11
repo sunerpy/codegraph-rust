@@ -226,10 +226,10 @@ erased by ordinary source-language visibility (for example Tauri IPC to a
 private Rust command).
 
 The registered framework candidates are Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri,
-Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit and Vapor. Strategy 1 asks them in this order: the first to answer `>= 0.9` wins, and among lower answers the most confident, the earlier on a tie. A port takes the place upstream's `FRAMEWORK_RESOLVERS` gives it among its ported neighbours (Laravel and Drupal first, Express before NestJS, Astro between Angular Router and Expo Router, Django, Flask and FastAPI after Astro, Rails after FastAPI, Spring and Play after Rails, Go between Expo Router and GoFrame, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after ASP.NET), and one placed ahead of others answers below `0.9` or only for references they do not claim. Each activates only when its detection guard
+Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules' JavaScript side, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge, Expo modules' Swift and Kotlin declarations and Fabric's view components. Strategy 1 asks them in this order: the first to answer `>= 0.9` wins, and among lower answers the most confident, the earlier on a tie. A port takes the place upstream's `FRAMEWORK_RESOLVERS` gives it among its ported neighbours (Laravel and Drupal first, Express before NestJS, Astro between Angular Router and Expo Router, Django, Flask and FastAPI after Astro, Rails after FastAPI, Spring and Play after Rails, Go between Expo Router and GoFrame, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after ASP.NET, the React Native bridge and Expo modules' JavaScript side just before Expo Router, the Swift–Objective-C bridge, Expo modules and Fabric after Vapor), and one placed ahead of others answers below `0.9` or only for references they do not claim. Each activates only when its detection guard
 matches, and resolves only references written in its own languages (React
 and Vue their scripts', Express and NestJS TypeScript and JavaScript, Django, Flask and FastAPI Python, Rails Ruby, Spring Java, Kotlin, YAML and
-Properties, Play Scala, Java and YAML, Laravel PHP, Drupal PHP and YAML, ASP.NET C# and Razor, the Go resolver Go, the `rust` resolver Rust, SwiftUI, UIKit and Vapor Swift, Tauri the JS-family
+Properties, Play Scala, Java and YAML, Laravel PHP, Drupal PHP and YAML, ASP.NET C# and Razor, the Go resolver Go, the `rust` resolver Rust, SwiftUI, UIKit and Vapor Swift, the React Native bridge and Expo modules' JavaScript side the JS family, the Swift–Objective-C bridge Swift and Objective-C, Expo modules and Fabric none (they extract their nodes from Swift and Kotlin, and from JS-family, Objective-C, Java and Kotlin files), Tauri the JS-family
 `invoke` sites and Rust; Godot and Astro stay universal), and a resolver's
 claim takes a reference past the name prefilter only in those languages
 (upstream `frameworksFor`, #2415); Laravel's claim takes only a Laravel
@@ -303,7 +303,19 @@ package, and the method a Go struct's embedding promotes into it
 (`interface-impl`, with `promotedInto`), a Kotlin Multiplatform
 declaration's `actual`s (`kotlin-expect-actual`), a generated gRPC server
 stub's methods reaching the same-named methods of each hand-written Go struct
-declaring all of them (`go-grpc-stub-impl`), a Delphi form's unit
+declaring all of them (`go-grpc-stub-impl`), React Native's event channel: the
+function around a native send (`sendEventWithName:@"x"`,
+`sendEvent(withName: "x"`, `.emit("x", …)`, a `sendEvent(…, "x"` wrapper, or
+the constant naming one) reaching each JavaScript handler an `.on`, `.once`
+or `.addListener` registers for the event, by name, inline or under a
+constant, at most six of each an event (`rn-event-channel`, with `event` and
+`registeredAt`), a Fabric or Paper view component reaching the Objective-C,
+Kotlin, Java or C++ class named for it (`fabric-native-impl`, with
+`viaSuffix` and `componentName`), an Expo module function's Swift and Kotlin
+declarations reaching each other (`expo-cross-platform`, with `via`), a Java,
+Kotlin, Objective-C or C++ method that JavaScript calls reaching each method
+of its name in another of those languages, both ways (`rn-cross-platform`,
+with `via`), a Delphi form's unit
 (`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`),
 gin's handler-chain dispatcher (a Go method calling into a `handlers` slice
 by index) reaching each named handler a `Use`, `GET` or other registration
@@ -462,7 +474,7 @@ field in the class, it is written, and its line is the tag's in an inline
 template and the class's for a template file.
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
-Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
+Kotlin, gRPC, React Native, Expo, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
 Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular and SvelteKit passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run

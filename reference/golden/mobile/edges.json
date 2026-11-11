@@ -48,6 +48,19 @@
     "target": "class:3a57e87d807eb4d2915da3f5943b6ea0"
   },
   {
+    "col": 4,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.6,
+      "framework": "swift-objc-bridge",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "method:b9e09b3b72138d018e6e7c4f6f7a7b73",
+    "target": "method:5c5cbcd2b0e6fe7235dc3ae8e281c076"
+  },
+  {
     "col": 49,
     "kind": "calls",
     "line": 10,
@@ -70,6 +83,94 @@
     "provenance": null,
     "source": "method:7213bf39d4184600fdceed846162834b",
     "target": "function:1d9953b5c1201319ca07a6f3ef6e3c80"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "bridge": "react-native",
+      "confidence": 0.95,
+      "framework": "react-native-bridge",
+      "module": "CameraModule",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:8046a67d37fbd343813de38ad289060d",
+    "target": "rn-export:rn/ios/CameraModule.m:CameraModule.takePicture"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "framework": "expo-modules-js",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:ed409b0ec63920ada922d872991c7d64",
+    "target": "expo-module:expo-modules/ios/HelloModule.swift:Hello:hello:7"
+  },
+  {
+    "col": 9,
+    "kind": "calls",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.95,
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "function:ed409b0ec63920ada922d872991c7d64",
+    "target": "expo-module:expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt:Hello:hello:10"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 10,
+    "metadata": {
+      "synthesizedBy": "expo-cross-platform",
+      "via": "hello"
+    },
+    "provenance": "heuristic",
+    "source": "expo-module:expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt:Hello:hello:10",
+    "target": "expo-module:expo-modules/ios/HelloModule.swift:Hello:hello:7"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 11,
+    "metadata": {
+      "synthesizedBy": "rn-cross-platform",
+      "via": "takePicture"
+    },
+    "provenance": "heuristic",
+    "source": "rn-export:rn/ios/CameraModule.m:CameraModule.takePicture",
+    "target": "method:ab6793be7ebd07b31be9173944264c20"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 13,
+    "metadata": {
+      "synthesizedBy": "rn-cross-platform",
+      "via": "takePicture"
+    },
+    "provenance": "heuristic",
+    "source": "method:ab6793be7ebd07b31be9173944264c20",
+    "target": "rn-export:rn/ios/CameraModule.m:CameraModule.takePicture"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 7,
+    "metadata": {
+      "synthesizedBy": "expo-cross-platform",
+      "via": "hello"
+    },
+    "provenance": "heuristic",
+    "source": "expo-module:expo-modules/ios/HelloModule.swift:Hello:hello:7",
+    "target": "expo-module:expo-modules/android/src/main/java/expo/modules/hello/HelloModule.kt:Hello:hello:10"
   },
   {
     "col": null,

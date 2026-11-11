@@ -43,7 +43,16 @@ pub struct StoreResolutionContext<'a> {
     /// The files whose class-head rows are not to be read, when the rows are
     /// trusted at all ([`Self::with_recorded_class_heads`]).
     recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
+    /// The files whose bridge-facts rows are not to be read, when the rows
+    /// are trusted at all ([`Self::with_recorded_bridge_rows`]).
+    recorded_bridge_stale: Option<Arc<std::collections::HashSet<String>>>,
+    /// The store's bridge-facts rows by path, read the first time a bridge
+    /// asks.
+    bridge_rows: std::cell::OnceCell<Arc<BridgeRows>>,
 }
+
+/// Each file's bridge facts as its `rn_bridge_surface:` row records them.
+type BridgeRows = HashMap<String, Arc<crate::frameworks::react_native::BridgeFacts>>;
 
 struct Caches {
     node_cache: LruCache<String, Vec<Arc<Node>>>,
@@ -195,6 +204,8 @@ impl<'a> StoreResolutionContext<'a> {
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             caches: RefCell::new(Caches::new()),
             recorded_heads_stale: None,
+            recorded_bridge_stale: None,
+            bridge_rows: std::cell::OnceCell::new(),
         }
     }
 
@@ -217,6 +228,37 @@ impl<'a> StoreResolutionContext<'a> {
     ) -> Self {
         self.recorded_heads_stale = stale;
         self
+    }
+
+    /// Trust the store's bridge-facts rows (`rn_bridge_surface:<path>`) for
+    /// every indexed file but `stale`, the files a sync changed since they
+    /// were written (W7-21): the React Native and Expo bridges then read a
+    /// file's facts from its row, and an indexed file without one holds
+    /// none, instead of reading every file's text.
+    #[must_use]
+    pub fn with_recorded_bridge_rows(
+        mut self,
+        stale: Option<Arc<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.recorded_bridge_stale = stale;
+        self
+    }
+
+    fn recorded_bridge_rows(&self) -> Arc<BridgeRows> {
+        use crate::frameworks::react_native::{BridgeFacts, ROW_KEY_PREFIX};
+        Arc::clone(self.bridge_rows.get_or_init(|| {
+            Arc::new(
+                self.store
+                    .project_metadata_with_prefix(ROW_KEY_PREFIX)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(key, value)| {
+                        let path = key.strip_prefix(ROW_KEY_PREFIX)?.to_string();
+                        Some((path, Arc::new(BridgeFacts::decode(&value)?)))
+                    })
+                    .collect(),
+            )
+        }))
     }
 
     /// Drop all caches (`clearCaches`, `index.ts:313-324`). Called between
@@ -376,6 +418,53 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             .unwrap_or_default()
             .into_iter()
             .map(Arc::new)
+            .collect()
+    }
+
+    fn get_nodes_by_kind_in_languages_shared(
+        &self,
+        kind: NodeKind,
+        languages: &[Language],
+    ) -> Vec<Arc<Node>> {
+        self.store
+            .nodes_of_kinds_in_languages(&[kind], languages)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
+
+    fn bridge_facts_of_files(
+        &self,
+        files: &[String],
+    ) -> Vec<(String, Arc<crate::frameworks::react_native::BridgeFacts>)> {
+        let Some(stale) = self.recorded_bridge_stale.as_ref() else {
+            return crate::frameworks::react_native::bridge_facts_from_text(self, files);
+        };
+        let rows = self.recorded_bridge_rows();
+        let indexed = self.get_all_files_shared();
+        // A row stands for an indexed file the sync did not change; the
+        // others are read.
+        let trusted = |file: &String| !stale.contains(file) && indexed.binary_search(file).is_ok();
+        let unread: Vec<String> = files
+            .iter()
+            .filter(|file| !trusted(file))
+            .cloned()
+            .collect();
+        let mut read: HashMap<String, Arc<crate::frameworks::react_native::BridgeFacts>> =
+            crate::frameworks::react_native::bridge_facts_from_text(self, &unread)
+                .into_iter()
+                .collect();
+        files
+            .iter()
+            .filter_map(|file| {
+                let facts = if trusted(file) {
+                    rows.get(file).map(Arc::clone)
+                } else {
+                    read.remove(file)
+                };
+                facts.map(|facts| (file.clone(), facts))
+            })
             .collect()
     }
 
@@ -1917,6 +2006,82 @@ mod tests {
         assert_eq!(
             load_go_module_pub(root.to_str().unwrap()).map(|g| g.module_path),
             Some("m/n".to_string())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-21: with the bridge rows trusted, an unchanged indexed file's
+    /// facts are its row's, none without one, and a changed or unindexed
+    /// file's are read from its text; untrusted, every file's are read.
+    #[test]
+    fn store_context_reads_bridge_facts_from_the_rows_of_unchanged_files() {
+        use crate::frameworks::react_native::{BridgeFacts, row_key};
+        let root = temp_root("bridge-rows");
+        let store = open_store(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let text = |module: &str| format!("const m = NativeModules.{module}\n");
+        let row = |file: &str, module: &str| BridgeFacts::of_text(file, &text(module)).encode();
+        for (file, has_row) in [
+            ("src/changed.ts", true),
+            ("src/kept.ts", true),
+            ("src/rowless.ts", false),
+        ] {
+            store.upsert_file(&file_record(file, 0)).unwrap();
+            std::fs::write(root.join(file), text("Disk")).unwrap();
+            if has_row {
+                store
+                    .set_project_metadata(&row_key(file), &row(file, "Row"))
+                    .unwrap();
+            }
+        }
+        // A file on disk the index does not hold, with a row left behind.
+        std::fs::write(root.join("src/unindexed.ts"), text("Disk")).unwrap();
+        store
+            .set_project_metadata(
+                &row_key("src/unindexed.ts"),
+                &row("src/unindexed.ts", "Row"),
+            )
+            .unwrap();
+        let files: Vec<String> = [
+            "src/changed.ts",
+            "src/kept.ts",
+            "src/rowless.ts",
+            "src/unindexed.ts",
+        ]
+        .map(String::from)
+        .to_vec();
+        let modules = |ctx: &StoreResolutionContext<'_>| -> Vec<(String, String)> {
+            ctx.bridge_facts_of_files(&files)
+                .into_iter()
+                .map(|(file, facts)| (file, facts.aliases[0].1.clone()))
+                .collect()
+        };
+        let pairs = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+            rows.iter()
+                .map(|(file, module)| (file.to_string(), module.to_string()))
+                .collect()
+        };
+        let stale: std::collections::HashSet<String> =
+            std::iter::once("src/changed.ts".to_string()).collect();
+        let trusted = StoreResolutionContext::new(&store, root.to_str().unwrap())
+            .with_recorded_bridge_rows(Some(Arc::new(stale)));
+        assert_eq!(
+            modules(&trusted),
+            pairs(&[
+                ("src/changed.ts", "Disk"),
+                ("src/kept.ts", "Row"),
+                ("src/unindexed.ts", "Disk"),
+            ])
+        );
+        let untrusted = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        assert_eq!(
+            modules(&untrusted),
+            pairs(&[
+                ("src/changed.ts", "Disk"),
+                ("src/kept.ts", "Disk"),
+                ("src/rowless.ts", "Disk"),
+                ("src/unindexed.ts", "Disk"),
+            ])
         );
         std::fs::remove_dir_all(&root).ok();
     }

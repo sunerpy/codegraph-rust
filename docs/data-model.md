@@ -90,6 +90,12 @@ index from the states it accepts (current, building, outdated, uninitialized).
 The ordinary symbol ID formula is documented in
 [`equivalence.md`](equivalence.md). Framework-created nodes with an explicitly
 documented compatibility ID are the exception, not a second general formula.
+The React Native, Expo modules and Fabric bridges' nodes take upstream's ids
+(W7-21): an Objective-C method a module exports to JavaScript
+`rn-export:{file}:{module}.{jsName}`, an Expo module's function, property or
+constant `expo-module:{file}:{module}:{name}:{line}`, a view component
+`fabric-component:{file}:{name}:{line}` and a prop of it
+`fabric-prop:{file}:{prop}:{line}`.
 
 ### `edges`
 
@@ -567,7 +573,30 @@ whose resolution is persisted, and withdrawn with the others before a sync's fir
 change. A sync that finds it missing or at another version re-resolves every Rust
 file. It is not a canonical surface.
 
-`synthesis_version` (18) vouches that the synthesized edges are the synthesis
+The bridge lane (W7-21) keeps one row per file holding a fact the React Native,
+Expo modules and Swift–Objective-C bridges read, `rn_bridge_surface:{path}`: a
+JSON object with a `.m` or `.mm` file's `exports` (`RCT_EXPORT_METHOD` and
+`RCT_REMAP_METHOD`) and `externs` (`RCT_EXTERN_*`), each with its `module`, the
+Swift `class` an `RCT_EXTERN` entry names, its `js_name` and its `native_kw`; a
+JavaScript-family file's `aliases`, the `[local, module]` pairs `NativeModules`
+binds; a `.java` or `.kt` file's `jvm_exports`, its `[module, method]`
+`@ReactMethod`s; a `.ts` or `.tsx` file's `turbo_spec`, the module a
+TurboModule spec registers and its methods; the `expo` bindings
+(`requireNativeModule` and its optional form) of a file holding
+`NativeModule`, its `locals`, `default_export` and `named_exports`, each with
+its `module` and its type argument's `type_name`; and a Swift file's `swift_methods`, each
+method or function as `[name, qualified name, exposed to Objective-C]`. A
+file holding none has no row. A full index and a migration write every row; a
+sync writes the rows of the files it changed last, drops those of files that
+went or hold none any more, and its resolution reads the rows of the files it
+did not change. The marker `rn_bridges_version` (1) is written by a full
+index, a migration and every sync whose resolution is persisted, and withdrawn
+with the others before a sync's first change. A sync that finds it missing or
+at another version rebuilds every row and re-resolves every JavaScript-family,
+Swift and Objective-C file of a project a bridge resolver is detected in.
+They are not a canonical surface.
+
+`synthesis_version` (19) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the

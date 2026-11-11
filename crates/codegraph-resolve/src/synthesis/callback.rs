@@ -450,6 +450,29 @@ pub(super) fn event_emitter_edges(view: &View<'_>) -> Result<Vec<Edge>> {
 /// upstream takes the first of `getNodesByName`, the one of the first file by
 /// path).
 fn unique_handler(view: &View<'_>, name: &str, file: &str) -> Result<Option<Node>> {
+    Ok(match named_handler(view, name, file)? {
+        NamedHandler::Unique(node) => Some(*node),
+        NamedHandler::None | NamedHandler::Ambiguous => None,
+    })
+}
+
+/// What a handler's name means at a registration ([`named_handler`]).
+pub(super) enum NamedHandler {
+    /// No function or method has the name.
+    None,
+    /// The one it means.
+    Unique(Box<Node>),
+    /// Several, in the registration's file or, with none there, in the
+    /// project.
+    Ambiguous,
+}
+
+/// The function or method `name` means at a registration in `file`
+/// (W7-14's rule, KNOWN_DIFFS "The handler a name means"): the one of that
+/// name in `file`, else the one in the project; telling a name no callable
+/// has from one several have, which the React Native event channel falls
+/// back on differently (W7-21).
+pub(super) fn named_handler(view: &View<'_>, name: &str, file: &str) -> Result<NamedHandler> {
     let candidates: Vec<Node> = view
         .nodes_named(name)?
         .into_iter()
@@ -460,16 +483,17 @@ fn unique_handler(view: &View<'_>, name: &str, file: &str) -> Result<Option<Node
         .filter(|node| node.file_path == file)
         .collect();
     Ok(match (in_file.len(), candidates.len()) {
-        (1, _) => Some(in_file[0].clone()),
-        (0, 1) => Some(candidates[0].clone()),
-        _ => None,
+        (_, 0) => NamedHandler::None,
+        (1, _) => NamedHandler::Unique(Box::new(in_file[0].clone())),
+        (0, 1) => NamedHandler::Unique(Box::new(candidates[0].clone())),
+        _ => NamedHandler::Ambiguous,
     })
 }
 
 /// An insertion-ordered map: upstream's channels are `Map`s, iterated in the
 /// order their keys arrived; inserting a present key replaces its value in
 /// place.
-struct Ordered<K, V> {
+pub(super) struct Ordered<K, V> {
     entries: Vec<(K, V)>,
     index: HashMap<K, usize>,
 }
@@ -484,7 +508,7 @@ impl<K, V> Default for Ordered<K, V> {
 }
 
 impl<K: Eq + Hash + Clone, V> Ordered<K, V> {
-    fn entry(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
+    pub(super) fn entry(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
         let at = match self.index.get(&key) {
             Some(&at) => at,
             None => {
@@ -496,7 +520,7 @@ impl<K: Eq + Hash + Clone, V> Ordered<K, V> {
         &mut self.entries[at].1
     }
 
-    fn insert(&mut self, key: K, value: V) {
+    pub(super) fn insert(&mut self, key: K, value: V) {
         match self.index.get(&key) {
             Some(&at) => self.entries[at].1 = value,
             None => {
@@ -506,15 +530,27 @@ impl<K: Eq + Hash + Clone, V> Ordered<K, V> {
         }
     }
 
-    fn get(&self, key: &K) -> Option<&V> {
+    pub(super) fn get(&self, key: &K) -> Option<&V> {
         self.index.get(key).map(|&at| &self.entries[at].1)
     }
 
-    fn len(&self) -> usize {
+    /// Insert `value` under `key` unless the key is present (upstream's
+    /// `if (!map.has(key)) map.set(key, value)`).
+    pub(super) fn insert_if_absent(&mut self, key: K, value: V) {
+        if !self.index.contains_key(&key) {
+            self.insert(key, value);
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries.iter().map(|(key, value)| (key, value))
     }
 }

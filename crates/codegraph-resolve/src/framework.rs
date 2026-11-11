@@ -9,12 +9,13 @@
 //! The upstream ships ~22 heuristic `FrameworkResolver` implementations. The Rust
 //! port implements Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri,
 //! Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router,
-//! Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, Expo
-//! Router, Go, GoFrame, Rust (axum, actix and Cargo workspaces), ASP.NET,
-//! SwiftUI, UIKit and Vapor in [`crate::frameworks`], detected per-project
-//! by [`crate::frameworks::detect_frameworks`]. The others (React Native,
-//! Expo and Fabric bridges, the Swift↔Objective-C bridge, etc.) stay
-//! deferred (see `KNOWN_DIFFS.md`): they are an
+//! Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, the
+//! React Native bridge, Expo modules (their JavaScript side and their Swift
+//! and Kotlin declarations), Expo Router, Go, GoFrame, Rust (axum, actix and
+//! Cargo workspaces), ASP.NET, SwiftUI, UIKit, Vapor, the Swift↔Objective-C
+//! bridge and Fabric's view components in [`crate::frameworks`], detected
+//! per-project by [`crate::frameworks::detect_frameworks`]. The others
+//! (Terraform's and CICS's) stay deferred (see `KNOWN_DIFFS.md`): they are an
 //! additive heuristic layer on top of the deterministic import + name-matching
 //! core, and porting them is tracked as future work.
 //!

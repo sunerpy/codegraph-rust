@@ -22,7 +22,7 @@ use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     angular, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe,
-    iface, is_synthesized, jsx, links, registry, sveltekit, tier, vue,
+    iface, is_synthesized, jsx, links, react_native, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -109,6 +109,22 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         dispatch::kotlin_expect_actual_edges,
     ),
     ("goGrpcEdges", go::gate, go_dispatch::grpc_stub_impl_edges),
+    ("rnEventEdgesList", jsx::gate, react_native::rn_event_edges),
+    (
+        "fabricNativeEdges",
+        always,
+        react_native::fabric_native_impl_edges,
+    ),
+    (
+        "expoXPlatEdges",
+        |languages| languages.contains(&Language::Swift) && languages.contains(&Language::Kotlin),
+        react_native::expo_cross_platform_edges,
+    ),
+    (
+        "rnXPlatEdges",
+        jsx::gate,
+        react_native::rn_cross_platform_edges,
+    ),
     (
         "mybatisEdges",
         |languages| {

@@ -852,6 +852,32 @@ pub trait ResolutionContext {
     fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
         Arc::new(crate::frameworks::route_href::RouteTables::default())
     }
+
+    /// The nodes of `kind` whose language is one of `languages`, in
+    /// [`Self::get_nodes_by_kind_shared`]'s order (W7-21). The store context
+    /// reads only those rows.
+    fn get_nodes_by_kind_in_languages_shared(
+        &self,
+        kind: codegraph_core::types::NodeKind,
+        languages: &[Language],
+    ) -> Vec<Arc<Node>> {
+        self.get_nodes_by_kind_shared(kind)
+            .into_iter()
+            .filter(|node| languages.contains(&node.language))
+            .collect()
+    }
+
+    /// The non-empty bridge facts of `files`, in `files`' order: what the
+    /// React Native and Expo bridges read of each file (W7-21). The default
+    /// reads the files' text; a sync's store context reads a file's
+    /// `rn_bridge_surface:` row instead, but for the files the sync changed
+    /// ([`crate::context::StoreResolutionContext::with_recorded_bridge_rows`]).
+    fn bridge_facts_of_files(
+        &self,
+        files: &[String],
+    ) -> Vec<(String, Arc<crate::frameworks::react_native::BridgeFacts>)> {
+        crate::frameworks::react_native::bridge_facts_from_text(self, files)
+    }
 }
 
 /// Go module info parsed from `go.mod`.

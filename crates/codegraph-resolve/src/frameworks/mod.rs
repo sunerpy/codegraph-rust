@@ -26,8 +26,10 @@ pub mod aspnet;
 pub mod astro;
 pub mod cargo_workspace;
 pub mod drupal;
+pub mod expo_modules;
 pub mod expo_router;
 pub mod express;
+pub mod fabric;
 pub mod go;
 pub mod godot;
 pub(crate) mod godot_common;
@@ -50,6 +52,7 @@ pub mod play;
 pub mod python;
 pub mod rails;
 pub mod react;
+pub mod react_native;
 pub mod react_router;
 pub(crate) mod react_tables;
 pub mod route_href;
@@ -58,6 +61,7 @@ pub mod spring;
 pub mod svelte;
 pub mod sveltekit_router;
 pub mod swift;
+pub mod swift_objc;
 pub mod tanstack_router;
 pub mod tauri;
 pub mod vue;
@@ -79,8 +83,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// between Angular Router
 /// and Expo Router, the Python frameworks after Astro, Rails, Spring and Play
 /// after them, Go between Expo Router and GoFrame, Rust and ASP.NET after
-/// GoFrame, SwiftUI, UIKit and Vapor after ASP.NET); the entries already
-/// here keep their places. A port
+/// GoFrame, SwiftUI, UIKit and Vapor after ASP.NET, the React Native and
+/// Expo modules' JavaScript bridges just before Expo Router, the
+/// Swift-Objective-C bridge, Expo modules and React Native's view components
+/// after Vapor); the entries already here keep their places. A port
 /// placed ahead of others must not take a reference they resolved before:
 /// it answers below `0.9`, or only for references they do not claim.
 pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn FrameworkResolver>> {
@@ -177,6 +183,20 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         // those, so their place changes no other reference's resolution.
         Box::new(spring::SpringResolver),
         Box::new(play::PlayResolver),
+        // The React Native bridge (#430, #708) and Expo modules' JavaScript
+        // side (#2134), immediately before Expo Router as upstream registers
+        // them (W7-21). Both read JavaScript-family references only, and
+        // answer a call through a native-module binding
+        // (`NativeModules.Mod.m()` or an alias of it,
+        // `requireNativeModule('Mod')`) at `0.95`, which Strategy 1 takes
+        // before asking a later resolver: Expo Router, the only resolver
+        // below them that reads such a reference, answers `Nav.navigate('/x')`
+        // with a `0.95` `navigates` edge when `/x` is a screen, and upstream
+        // gives the call to the bridge. The resolvers above them keep the
+        // first answer, as upstream's do. The bridge's other answer, a
+        // method name at `0.6`, loses to any answer of `0.9` or more.
+        Box::new(react_native::ReactNativeBridgeResolver),
+        Box::new(expo_modules::ExpoModulesJsResolver),
         // Expo Router screens and navigation (F2), after Next.js as upstream
         // registers it. It claims navigation calls only where their href
         // names one of its own screens.
@@ -218,6 +238,17 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         Box::new(swift::SwiftUiResolver),
         Box::new(swift::UikitResolver),
         Box::new(swift::VaporResolver),
+        // The Swift-Objective-C bridge (#430), then Expo modules' native
+        // declarations and React Native's view components (#430, #708), after
+        // Vapor as upstream registers them (W7-21). The bridge reads Swift and
+        // Objective-C references and answers `0.6` only, so it takes nothing
+        // an answer of `0.9` or more above it takes, and on a tie with
+        // SwiftUI, UIKit or Vapor the earlier wins, as upstream's order has
+        // it. Expo modules and the view components extract nodes and resolve
+        // no reference, so their place changes no resolution.
+        Box::new(swift_objc::SwiftObjcBridgeResolver),
+        Box::new(expo_modules::ExpoModulesResolver),
+        Box::new(fabric::FabricViewResolver),
     ];
     candidates
         .into_iter()
