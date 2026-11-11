@@ -14641,6 +14641,382 @@ pub fn rust_handler_moves_out_of_handlers() -> Case {
         )
 }
 
+// ---- W7-19i: Go ----
+
+const GO_SHOP_MOD: &str = "module example.com/shop\n\ngo 1.22\n";
+
+/// A router file and its handler, with and without the route line.
+const GO_ROUTES_FILE: &str = "server/routes.go";
+const GO_ROUTES_NONE: &str =
+    "package server\n\nfunc listUsers(c int) {}\n\nfunc setup(r Router) {\n}\n";
+const GO_ROUTES: &str = "package server\n\nfunc listUsers(c int) {}\n\nfunc setup(r Router) {\n\tr.GET(\"/users\", listUsers)\n}\n";
+const GO_ROUTES_RELATIVE: &str = "package server\n\nfunc listUsers(c int) {}\n\nfunc setup(r Router) {\n\tr.GET(\"users\", listUsers)\n}\n";
+const GO_USERS_ROUTE: &str = "route server/routes.go::route:/users";
+
+/// W7-19i: a router file gains a route line: a route node and its
+/// reference to the handler.
+pub fn go_router_gains_a_route_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_NONE)
+        .write(GO_ROUTES_FILE, GO_ROUTES)
+        .named_after("route", "GET /users")
+        .edge_after(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// W7-19i: the route line goes, with its node and reference.
+pub fn go_router_loses_a_route_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES)
+        .write(GO_ROUTES_FILE, GO_ROUTES_NONE)
+        .named_before("route", "GET /users")
+        .edge_before(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// W7-19i (#1259): the route's path loses its leading `/`: the call is no
+/// route.
+pub fn go_route_path_loses_its_leading_slash() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES)
+        .write(GO_ROUTES_FILE, GO_ROUTES_RELATIVE)
+        .named_before("route", "GET /users")
+        .edge_before(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// W7-19i (#1259): the path gets its leading `/` back: the route returns.
+pub fn go_route_path_regains_its_leading_slash() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_RELATIVE)
+        .write(GO_ROUTES_FILE, GO_ROUTES)
+        .named_after("route", "GET /users")
+        .edge_after(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// A `net/http` mux registration, with and without a Go 1.22 method.
+const GO_MUX_METHOD: &str = "package main\n\nfunc h(w int, r int) {}\n\nfunc main() {\n\tmux.HandleFunc(\"GET /x\", h)\n}\n";
+const GO_MUX_ANY: &str =
+    "package main\n\nfunc h(w int, r int) {}\n\nfunc main() {\n\tmux.HandleFunc(\"/x\", h)\n}\n";
+const GO_MUX_ROUTE: &str = "route main.go::route:/x";
+
+/// W7-19i (`e1f339f`): the pattern drops its method: the route serves
+/// `ANY`, under a new id and name.
+pub fn go_mux_pattern_loses_its_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file("main.go", GO_MUX_METHOD)
+        .write("main.go", GO_MUX_ANY)
+        .named_before("route", "GET /x")
+        .named_after("route", "ANY /x")
+        .edge_throughout(GO_MUX_ROUTE, "references", "function h")
+}
+
+/// W7-19i (`e1f339f`): the pattern gains the method `GET`.
+pub fn go_mux_pattern_gains_a_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file("main.go", GO_MUX_ANY)
+        .write("main.go", GO_MUX_METHOD)
+        .named_before("route", "ANY /x")
+        .named_after("route", "GET /x")
+        .edge_throughout(GO_MUX_ROUTE, "references", "function h")
+}
+
+/// A route whose handler another file of its package declares.
+const GO_ROUTES_ONLY: &str =
+    "package server\n\nfunc setup(r Router) {\n\tr.GET(\"/users\", listUsers)\n}\n";
+const GO_USERS_FILE: &str = "server/users.go";
+const GO_USERS: &str = "package server\n\nfunc listUsers(c int) {}\n";
+const GO_LIST_USERS_ELSEWHERE: &str = "function listUsers @server/users.go";
+
+/// W7-19i: the handler appears in another file of the route's package.
+pub fn go_route_handler_appears_in_another_file_of_its_package() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_ONLY)
+        .write(GO_USERS_FILE, GO_USERS)
+        .edge_after(GO_USERS_ROUTE, "references", GO_LIST_USERS_ELSEWHERE)
+}
+
+/// W7-19i: the handler's file is deleted.
+pub fn go_route_handler_leaves_another_file_of_its_package() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_ONLY)
+        .file(GO_USERS_FILE, GO_USERS)
+        .remove(GO_USERS_FILE)
+        .edge_before(GO_USERS_ROUTE, "references", GO_LIST_USERS_ELSEWHERE)
+}
+
+/// A bare parameter type `Order`, its package's own `type Order` (and a
+/// build-tag twin of it) perhaps beside it, and namesakes in other
+/// packages; once with the type written through `model`.
+const GO_SHIP_FILE: &str = "api/ship.go";
+const GO_SHIP: &str = "package api\n\nfunc Ship(o Order) int { return 0 }\n";
+const GO_SHIP_QUALIFIED: &str = "package api\n\nimport \"example.com/shop/model\"\n\nfunc Ship(o model.Order) int { return 0 }\n";
+const GO_API_ORDER_FILE: &str = "api/order.go";
+const GO_API_ORDER: &str = "package api\n\ntype Order struct{}\n";
+const GO_API_ORDER_TWIN_FILE: &str = "api/order_windows.go";
+const GO_API_ORDER_TWIN: &str = "//go:build windows\n\npackage api\n\ntype Order struct{}\n";
+const GO_MODEL_ORDER_FILE: &str = "model/order.go";
+const GO_MODEL_ORDER: &str = "package model\n\ntype Order struct{}\n";
+const GO_STORE_ORDER_FILE: &str = "store/order.go";
+const GO_STORE_ORDER: &str = "package store\n\ntype Order struct{}\n";
+const GO_SHIP_API_ORDER: (&str, &str, &str) =
+    ("function Ship", "references", "struct Order @api/order.go");
+const GO_SHIP_MODEL_ORDER: (&str, &str, &str) = (
+    "function Ship",
+    "references",
+    "struct Order @model/order.go",
+);
+const GO_SHIP_ORDER_TWIN: (&str, &str, &str) = (
+    "function Ship",
+    "references",
+    "struct Order @api/order_windows.go",
+);
+
+/// W7-19i (#2408): the bare type's own package comes to declare it: Pattern
+/// 4 takes the package's own, where name matching linked `model/`'s.
+pub fn go_bare_type_gains_a_namesake_in_its_own_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_API_ORDER_FILE, GO_API_ORDER)
+        .edge_before(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the package's own declaration goes: no convention
+/// guesses `model/`'s.
+pub fn go_bare_type_loses_its_own_package_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .remove(GO_API_ORDER_FILE)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_after(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .no_edge_metadata_after(GO_SHIP_MODEL_ORDER, "framework", "go")
+}
+
+/// W7-19i (KEEP-RUST): the picked type gains a build-tag twin: of two
+/// candidates in the package Pattern 4 takes neither, leaving the
+/// reference to name matching.
+pub fn go_picked_type_gains_a_build_tag_twin() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_API_ORDER_TWIN_FILE, GO_API_ORDER_TWIN)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .no_edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+        .no_edge_metadata_after(GO_SHIP_ORDER_TWIN, "framework", "go")
+}
+
+/// W7-19i: the twin goes again: Pattern 4 takes the one left.
+pub fn go_picked_type_loses_its_build_tag_twin() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_API_ORDER_TWIN_FILE, GO_API_ORDER_TWIN)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .remove(GO_API_ORDER_TWIN_FILE)
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): another package comes to declare the picked type's
+/// name: nothing changes.
+pub fn go_picked_type_gains_a_namesake_in_another_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_STORE_ORDER_FILE, GO_STORE_ORDER)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the other package's namesake goes: nothing changes.
+pub fn go_picked_type_loses_a_namesake_in_another_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .file(GO_STORE_ORDER_FILE, GO_STORE_ORDER)
+        .remove(GO_STORE_ORDER_FILE)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the bare type comes to be written through `model`: no
+/// convention reads it, and the import names `model/`'s.
+pub fn go_bare_type_is_written_through_a_package() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_SHIP_FILE, GO_SHIP_QUALIFIED)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_after(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .no_edge_metadata_after(GO_SHIP_MODEL_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the type is written bare again: Pattern 4 takes the
+/// package's own.
+pub fn go_qualified_type_is_written_bare() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP_QUALIFIED)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_SHIP_FILE, GO_SHIP)
+        .edge_before(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// A struct embedding the bare interface `Reader`, which `model/` declares
+/// and its own package perhaps too.
+const GO_STORE_FILE: &str = "api/store.go";
+const GO_STORE: &str = "package api\n\ntype Store struct {\n\tReader\n}\n";
+const GO_API_READER_FILE: &str = "api/reader.go";
+const GO_API_READER: &str = "package api\n\ntype Reader interface{ Read() }\n";
+const GO_MODEL_READER_FILE: &str = "model/reader.go";
+const GO_MODEL_READER: &str = "package model\n\ntype Reader interface{ Read() }\n";
+const GO_STORE_API_READER: (&str, &str, &str) = (
+    "struct Store",
+    "implements",
+    "interface Reader @api/reader.go",
+);
+const GO_STORE_MODEL_READER: (&str, &str, &str) = (
+    "struct Store",
+    "implements",
+    "interface Reader @model/reader.go",
+);
+
+/// W7-19i (#2397): the embedded type's own package comes to declare it:
+/// name matching links it, never a convention.
+pub fn go_embedded_type_gains_a_namesake_in_its_own_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_STORE_FILE, GO_STORE)
+        .file(GO_MODEL_READER_FILE, GO_MODEL_READER)
+        .write(GO_API_READER_FILE, GO_API_READER)
+        .edge_before(
+            GO_STORE_MODEL_READER.0,
+            GO_STORE_MODEL_READER.1,
+            GO_STORE_MODEL_READER.2,
+        )
+        .edge_after(
+            GO_STORE_API_READER.0,
+            GO_STORE_API_READER.1,
+            GO_STORE_API_READER.2,
+        )
+        .no_edge_metadata_after(GO_STORE_API_READER, "framework", "go")
+}
+
+/// W7-19i (#2397): the own package's declaration goes again.
+pub fn go_embedded_type_loses_its_own_package_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_STORE_FILE, GO_STORE)
+        .file(GO_MODEL_READER_FILE, GO_MODEL_READER)
+        .file(GO_API_READER_FILE, GO_API_READER)
+        .remove(GO_API_READER_FILE)
+        .edge_before(
+            GO_STORE_API_READER.0,
+            GO_STORE_API_READER.1,
+            GO_STORE_API_READER.2,
+        )
+        .edge_after(
+            GO_STORE_MODEL_READER.0,
+            GO_STORE_MODEL_READER.1,
+            GO_STORE_MODEL_READER.2,
+        )
+        .no_edge_metadata_after(GO_STORE_MODEL_READER, "framework", "go")
+}
+
+/// A JavaScript project, perhaps with a Go tool or a root `go.mod`.
+const GO_WEB_PACKAGE: &str = "{\"name\":\"web\"}\n";
+const GO_WEB_APP_FILE: &str = "src/app.js";
+const GO_WEB_APP: &str = "export const ready = true;\n";
+const GO_TOOL_FILE: &str = "tools/gen.go";
+const GO_TOOL: &str = "package main\n\nfunc main() {}\n";
+
+/// W7-19i: a JavaScript project's first `.go` file appears: Go is
+/// detected.
+pub fn go_first_go_file_appears_in_a_javascript_project() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Go],
+    )
+    .file("package.json", GO_WEB_PACKAGE)
+    .file(GO_WEB_APP_FILE, GO_WEB_APP)
+    .write(GO_TOOL_FILE, GO_TOOL)
+    .detected_before("go", false)
+    .detected_after("go", true)
+}
+
+/// W7-19i: its last `.go` file is deleted: Go is not detected.
+pub fn go_last_go_file_leaves_a_javascript_project() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Go],
+    )
+    .file("package.json", GO_WEB_PACKAGE)
+    .file(GO_WEB_APP_FILE, GO_WEB_APP)
+    .file(GO_TOOL_FILE, GO_TOOL)
+    .remove(GO_TOOL_FILE)
+    .detected_before("go", true)
+    .detected_after("go", false)
+}
+
+/// W7-19i: a root `go.mod`, never indexed, appears in a project without a
+/// `.go` file: Go is detected.
+pub fn go_root_go_mod_appears_in_a_project_without_go_files() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", GO_WEB_PACKAGE)
+        .file(GO_WEB_APP_FILE, GO_WEB_APP)
+        .write("go.mod", GO_SHOP_MOD)
+        .detected_before("go", false)
+        .detected_after("go", true)
+}
+
+/// W7-19i: the root `go.mod` is deleted: Go is not detected.
+pub fn go_root_go_mod_leaves_a_project_without_go_files() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", GO_WEB_PACKAGE)
+        .file(GO_WEB_APP_FILE, GO_WEB_APP)
+        .file("go.mod", GO_SHOP_MOD)
+        .remove("go.mod")
+        .detected_before("go", true)
+        .detected_after("go", false)
+}
+
 /// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
 /// detected, and its `pages/` become routes served by their components.
 pub fn vue_nuxt_config_appears() -> Case {

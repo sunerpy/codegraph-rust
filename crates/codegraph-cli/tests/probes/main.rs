@@ -12404,7 +12404,9 @@ mod go {
     /// import's — and nothing for a type from outside the project (`io.Closer`,
     /// `sync.Mutex`, `yaml.Node` under `go.yaml.in/yaml/v3`) or through a
     /// package none of the file's imports is named (`clientv3.KV`), whose
-    /// references stay unresolved. Upstream's fixture, less its viewer half.
+    /// references stay unresolved; and the Go framework resolver, detected
+    /// here, guesses none of them (the framework half). Upstream's fixture,
+    /// less its viewer half.
     #[test]
     fn pr2397_an_indexed_go_module_links_embedded_types_in_their_package() {
         let gin = "package gin\n\ntype HandlerFunc func(*Context)\n\ntype IRoutes interface {\n\tUse(...HandlerFunc) IRoutes\n\tHandle(string, string, ...HandlerFunc) IRoutes\n}\n\ntype IRouter interface {\n\tIRoutes\n\tGroup(string, ...HandlerFunc) *RouterGroup\n}\n";
@@ -12502,6 +12504,23 @@ mod go {
                     && other.contains(&e.target.as_str())),
             "{report}"
         );
+        // The framework half: with the Go framework resolver detected, an
+        // embedded type is still name matching's and the import resolver's,
+        // never a convention's guess.
+        assert!(
+            super::support::project_metadata_with_prefix(&project.db(), "frameworks_detected")
+                .iter()
+                .any(|(_, value)| value.contains("\"go\"")),
+            "{report}"
+        );
+        let guessed: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "extends" | "implements"))
+            .filter(|e| e.resolved_by() == Some("framework"))
+            .map(|e| graph.describe_edge(e))
+            .collect();
+        assert!(guessed.is_empty(), "{guessed:?}\n{report}");
     }
 
     /// Upstream #2408: Go reads a name from one package only — a bare one
@@ -12512,9 +12531,9 @@ mod go {
     /// struct, a result type its package's type and not the method the line
     /// declares, a variadic `...pkg.T` that import's type, and a conversion or
     /// a composite literal still its own package's struct. Upstream's fixture,
-    /// less the route handler (a Go framework resolver's route: W7-19i) and
-    /// `var _ error = (*Error)(nil)`'s conversion (a package-level `var`
-    /// initializer's calls are not extracted here: pre-existing).
+    /// less the route handler and `var _ error = (*Error)(nil)`'s conversion,
+    /// which the Go framework resolver links: `go_frameworks` checks the
+    /// whole fixture.
     #[test]
     fn pr2408_a_go_name_is_read_from_the_package_go_reads_it_from() {
         let project = Project::new()
@@ -23853,6 +23872,304 @@ mod rust_frameworks {
                 .and_then(|value| value.as_f64()),
             Some(0.95),
             "{edge:?}"
+        );
+    }
+}
+
+mod go_frameworks {
+    use super::support::{Graph, Indexed, Project, project_metadata_with_prefix};
+
+    fn project_of(files: &[(&str, &str)]) -> Project {
+        files.iter().fold(Project::new(), |project, (path, text)| {
+            project.file(path, text)
+        })
+    }
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// A Go project of `files`, in which the Go framework resolver is
+    /// detected.
+    fn go(files: &[(&str, &str)]) -> Indexed {
+        let project = project_of(files).index();
+        assert!(
+            detected(&project.db()).contains("\"go\""),
+            "{}",
+            detected(&project.db())
+        );
+        project
+    }
+
+    /// `kind file:qualifiedName` of each edge out of `file`'s nodes (those of
+    /// kind `from_kind`, or named `from_name`, when given) to a target named
+    /// `name`, deduplicated and sorted (upstream's `linksFrom`).
+    fn links(
+        graph: &Graph,
+        file: &str,
+        name: &str,
+        from_kind: Option<&str>,
+        from_name: Option<&str>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph.node(&edge.source).is_some_and(|node| {
+                    node.file_path == file
+                        && from_kind.is_none_or(|kind| node.kind == kind)
+                        && from_name.is_none_or(|from| node.name == from)
+                })
+            })
+            .filter_map(|edge| graph.node(&edge.target).map(|target| (edge, target)))
+            .filter(|(_, target)| target.name == name)
+            .map(|(edge, target)| {
+                format!(
+                    "{} {}:{}",
+                    edge.kind, target.file_path, target.qualified_name
+                )
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Upstream `go-framework-own-package.test.ts` (#2408 with #2397): the
+    /// conventions guess only for a name written bare, and only in the
+    /// reference's own package. A bare type is its own package's interface,
+    /// not another package's struct `Node` (the plan's embedding probe); a
+    /// type written through an outside import is no struct of its own file; a
+    /// method called through an expression no instantiation of a namesake
+    /// struct; a result type its package's type, not the method the line
+    /// declares; a variadic `...pkg.T` that import's type; a conversion and a
+    /// composite literal their own package's struct; a route's handler
+    /// written through a value that value's method, not the model struct
+    /// `Follow`. Upstream's whole fixture; upstream records the conversion
+    /// `(*Error)(nil)` as `references` since #2784, not ported: here it is
+    /// still the call that instantiates the struct.
+    #[test]
+    fn own_package_conventions_pick_only_in_the_package_go_reads_the_name_from() {
+        let project = go(&[
+            ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+            (
+                "promql/parser/ast.go",
+                "package parser\n\ntype Node interface {\n\tString() string\n}\n\ntype Visitor interface {\n\tVisit(node Node, path []Node) (Visitor, error)\n}\n\nfunc Walk(v Visitor, node Node, path []Node) error {\n\treturn nil\n}\n",
+            ),
+            (
+                "discovery/kubernetes/node.go",
+                "package kubernetes\n\nimport apiv1 \"k8s.io/api/core/v1\"\n\ntype Node struct {\n\tname string\n}\n\nfunc nodeSource(n *apiv1.Node) string {\n\treturn n.Name\n}\n",
+            ),
+            (
+                "storage/interface.go",
+                "package storage\n\ntype Appender interface {\n\tAppend(ref uint64) error\n}\n\ntype Filter interface {\n\tAccept(value string) bool\n}\n",
+            ),
+            (
+                "storage/fanout.go",
+                "package storage\n\ntype fanout struct{}\n\nfunc (f *fanout) Appender() Appender {\n\treturn nil\n}\n",
+            ),
+            (
+                "discovery/aws/aws.go",
+                "package aws\n\ntype Filter struct {\n\tName string\n}\n",
+            ),
+            (
+                "web/api/v1/search.go",
+                "package v1\n\nimport \"example.com/app/storage\"\n\ntype ChainFilter struct{}\n\nfunc NewChainFilter(filters ...storage.Filter) *ChainFilter {\n\treturn &ChainFilter{}\n}\n",
+            ),
+            (
+                "errors.go",
+                "package gin\n\ntype Error struct {\n\tErr error\n}\n\nfunc (msg *Error) Error() string {\n\treturn msg.Err.Error()\n}\n\nvar _ error = (*Error)(nil)\n\nfunc newError(err error) *Error {\n\treturn &Error{Err: err}\n}\n",
+            ),
+            (
+                "binding/validator.go",
+                "package binding\n\nimport \"strings\"\n\ntype SliceValidationError []error\n\nfunc (err SliceValidationError) Error() string {\n\tvar b strings.Builder\n\tfor i := range err {\n\t\tb.WriteString(err[i].Error())\n\t}\n\treturn b.String()\n}\n",
+            ),
+            (
+                "handler/handler.go",
+                "package handler\n\ntype Handler struct{}\n\nfunc (h *Handler) Follow(c Context) error {\n\treturn nil\n}\n\ntype Context interface{}\n",
+            ),
+            (
+                "handler/routes.go",
+                "package handler\n\ntype Group interface {\n\tPOST(path string, h func(Context) error)\n}\n\nfunc (h *Handler) Register(g Group) {\n\tg.POST(\"/:username/follow\", h.Follow)\n}\n",
+            ),
+            (
+                "model/user.go",
+                "package model\n\ntype Follow struct {\n\tFollowerID uint\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let report = graph.report();
+        assert_eq!(
+            links(graph, "promql/parser/ast.go", "Node", None, None),
+            ["references promql/parser/ast.go:Node"],
+            "{report}"
+        );
+        assert!(
+            links(graph, "discovery/kubernetes/node.go", "Node", None, None).is_empty(),
+            "{report}"
+        );
+        let errors = links(graph, "binding/validator.go", "Error", None, None);
+        assert!(
+            !errors.iter().any(|link| link.starts_with("instantiates")),
+            "{errors:?}\n{report}"
+        );
+        assert!(
+            !errors.contains(&"calls errors.go:Error".to_string()),
+            "{errors:?}\n{report}"
+        );
+        assert_eq!(
+            links(graph, "storage/fanout.go", "Appender", None, None),
+            ["references storage/interface.go:Appender"],
+            "{report}"
+        );
+        assert_eq!(
+            links(graph, "web/api/v1/search.go", "Filter", None, None),
+            ["references storage/interface.go:Filter"],
+            "{report}"
+        );
+        // Upstream (6a): `references` there since #2784.
+        assert_eq!(
+            links(graph, "errors.go", "Error", None, Some("_")),
+            ["instantiates errors.go:Error"],
+            "{report}"
+        );
+        assert_eq!(
+            links(graph, "errors.go", "Error", None, Some("newError")),
+            ["instantiates errors.go:Error", "references errors.go:Error"],
+            "{report}"
+        );
+        assert_eq!(
+            links(graph, "handler/routes.go", "Follow", Some("route"), None),
+            ["references handler/handler.go:Handler::Follow"],
+            "{report}"
+        );
+    }
+
+    /// The plan's cross-package probe: `OrderHandler`, `AuthMiddleware`,
+    /// `OrderService` and `Order`, written bare in a package that declares
+    /// none of them, are no convention's guess, though `model/` declares each
+    /// with the kinds its convention takes. `util/` declares each with
+    /// another kind, so name matching links `model/`'s at 0.4, below every
+    /// convention's confidence: a guess outside the reference's package would
+    /// win.
+    #[test]
+    fn a_convention_guesses_no_name_from_another_package() {
+        let project = go(&[
+            ("go.mod", "module example.com/shop\n\ngo 1.22\n"),
+            (
+                "api/routes.go",
+                "package api\n\nfunc Serve(w int) {\n\tOrderHandler(w)\n\tAuthMiddleware(w)\n\ts := OrderService{}\n\t_ = s\n}\n\nfunc Ship(o Order) {}\n",
+            ),
+            (
+                "model/order.go",
+                "package model\n\nfunc OrderHandler(w int) {}\n\nfunc AuthMiddleware(w int) {}\n\ntype OrderService struct{}\n\ntype Order struct{}\n",
+            ),
+            (
+                "util/util.go",
+                "package util\n\ntype OrderHandler struct{}\n\ntype AuthMiddleware struct{}\n\nfunc OrderService() {}\n\nfunc Order() {}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let report = graph.report();
+        let from_api = |edge: &&super::support::EdgeRow| {
+            graph
+                .node(&edge.source)
+                .is_some_and(|node| node.file_path == "api/routes.go")
+        };
+        let framework: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(from_api)
+            .filter(|edge| {
+                edge.resolved_by() == Some("framework") || edge.metadata.get("framework").is_some()
+            })
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        assert!(framework.is_empty(), "{framework:?}\n{report}");
+        // Each name is read: name matching links it, outside the package.
+        let mut linked: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(from_api)
+            .filter(|edge| edge.kind != "contains")
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| format!("{}@{}", target.name, target.file_path))
+            .collect();
+        linked.sort();
+        assert_eq!(
+            linked,
+            [
+                "AuthMiddleware@model/order.go",
+                "Order@model/order.go",
+                "OrderHandler@model/order.go",
+                "OrderService@model/order.go",
+            ],
+            "{report}"
+        );
+    }
+
+    /// The bare check on its own (#2408): `items[0].HandleEvent(e)` and
+    /// `logs[0].LogRequest(e)`, calls through values of unknown type, are
+    /// recorded by their bare names at the expression's column, and the
+    /// package-level `func HandleEvent` and `func LogRequest` beside them are
+    /// no guess of Patterns 1 and 3, whose function targets every other gate
+    /// passes. The plan's `srv.HandleEvent(e)` and `l.LogRequest(e)` are
+    /// recorded dotted, so no convention reads them either.
+    #[test]
+    fn a_name_called_through_a_value_is_no_guess() {
+        let project = go(&[
+            ("go.mod", "module example.com/app\n\ngo 1.22\n"),
+            (
+                "srv/events.go",
+                "package srv\n\ntype Server struct{}\n\nfunc HandleEvent(e int) error {\n\treturn nil\n}\n\nfunc LogRequest(r int) {\n}\n\nfunc (s *Server) Run(srv *Remote, l *Logger, e int) {\n\tsrv.HandleEvent(e)\n\tl.LogRequest(e)\n\titems[0].HandleEvent(e)\n\tlogs[0].LogRequest(e)\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        graph.assert_unresolved("method Server::Run", "calls", "HandleEvent");
+        graph.assert_unresolved("method Server::Run", "calls", "LogRequest");
+        graph.assert_no_edge("method Server::Run", "calls", "function HandleEvent");
+        graph.assert_no_edge("method Server::Run", "calls", "function LogRequest");
+    }
+
+    /// Upstream `frameworks.test.ts`'s Go routes through a whole index: a Gin
+    /// route references its handler, a Go 1.22 mux pattern names its method,
+    /// `cache.Put("key", 1)` is no route (#1259), nor is a route in a comment.
+    #[test]
+    fn go_routes_reach_their_handlers() {
+        let project = go(&[(
+            "main.go",
+            "package main\n\nfunc listUsers(c int) {}\n\nfunc getUser(w int, r int) {}\n\nfunc setup(r Router, mux Mux, cache Cache) {\n\tr.GET(\"/users\", listUsers)\n\tmux.HandleFunc(\"GET /users/{id}\", getUser)\n\tcache.Put(\"key\", 1)\n\t// r.POST(\"/users\", listUsers)\n}\n",
+        )]);
+        let graph = project.graph();
+        let mut routes: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route")
+            .map(|node| node.name.as_str())
+            .collect();
+        routes.sort();
+        assert_eq!(
+            routes,
+            ["GET /users", "GET /users/{id}"],
+            "{}",
+            graph.report()
+        );
+        graph.assert_edge(
+            "route main.go::route:/users",
+            "references",
+            "function listUsers",
+            None,
+        );
+        graph.assert_edge(
+            "route main.go::route:/users/{id}",
+            "references",
+            "function getUser",
+            None,
         );
     }
 }
