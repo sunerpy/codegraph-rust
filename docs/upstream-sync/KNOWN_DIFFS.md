@@ -84,7 +84,8 @@ colby behaviors are intentionally NOT ported in v1:
   expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
   Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
-  passes, the Vue and Angular template passes, the SvelteKit loader and page
+  passes, the cross-tier and test-request passes (`tier-synthesizer.ts`), the
+  Vue and Angular template passes, the SvelteKit loader and page
   passes, the Expo Router return pass and the Next.js, React Router, TanStack
   Router, Vue Router and SvelteKit link passes, and the Go prerequisites
   (`go-method-contains`, `go-implements`) are ported
@@ -905,6 +906,16 @@ regex engine), is not listed.
   deep resolves there when the type past the third step was resolved first,
   and that type, written in the same file, resolves to nothing once the
   chain was followed first (`synthesis/go_func_field.rs`).
+- **Cross-tier channels and test requests: what is read (W7-20).** A
+  receiver's imported client and queue bindings, and a Laravel request
+  helper's body, are read through the view: the indexed files whose text is
+  the one their file rows record, as the other passes read them (W7-14).
+  colby reads them from disk, a file outside the index or drifted since it
+  was indexed included. The import of a receiver's head resolves among the
+  indexed files only: when its candidates include a JavaScript file the
+  configuration excludes or the size limit keeps out, colby takes that file
+  and reads its bindings from disk, and this pass skips it for the next
+  indexed candidate (`synthesis/tier.rs`, `synthesis/context.rs`).
 
 ### Extraction
 

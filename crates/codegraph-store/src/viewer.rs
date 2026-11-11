@@ -196,16 +196,19 @@ impl Store {
         self.batched_edges("target", ids, kinds)
     }
 
+    /// Edge counts per id in `column`, the edges `filter` (an `AND …`
+    /// clause, or empty) keeps.
     fn batched_counts(
         &self,
         column: &str,
+        filter: &str,
         ids: &[String],
     ) -> rusqlite::Result<HashMap<String, i64>> {
         let ids = unique(ids);
         let mut out = HashMap::new();
         for chunk in ids.chunks(SQLITE_PARAM_CHUNK_SIZE) {
             let sql = format!(
-                "SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({}) GROUP BY {column}",
+                "SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({}) {filter} GROUP BY {column}",
                 placeholders(chunk.len())
             );
             let values: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
@@ -221,14 +224,21 @@ impl Store {
         Ok(out)
     }
 
-    /// `countIncomingEdges` (`getFanIn`): incoming edge count per id.
+    /// `countIncomingEdges` (`getFanIn`): incoming edge count per id, a
+    /// test's request onto a route left out (upstream #2100): forty tests
+    /// hitting one endpoint make it no hub. The condition is upstream's; the
+    /// metadata is compact JSON, so the key and value appear as written.
     pub fn count_incoming_edges(&self, ids: &[String]) -> rusqlite::Result<HashMap<String, i64>> {
-        self.batched_counts("target", ids)
+        self.batched_counts(
+            "target",
+            "AND (metadata IS NULL OR metadata NOT LIKE '%\"synthesizedBy\":\"test-request\"%')",
+            ids,
+        )
     }
 
     /// `countOutgoingEdges` (`getFanOut`): outgoing edge count per id.
     pub fn count_outgoing_edges(&self, ids: &[String]) -> rusqlite::Result<HashMap<String, i64>> {
-        self.batched_counts("source", ids)
+        self.batched_counts("source", "", ids)
     }
 
     /// `getTopDependedOn`: the nodes with the most distinct dependents.
@@ -798,5 +808,93 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![format!("%{substring}%"), limit], row_to_node)?;
         rows.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codegraph_core::types::Language;
+
+    use super::*;
+
+    fn node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: format!("src/{id}.ts"),
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 1,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: true,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    /// A test's request onto a route is left out of the route's fan-in;
+    /// every other edge counts, another synthesized one, one without
+    /// metadata and one whose metadata is no JSON alike. Fan-out is not
+    /// filtered.
+    #[test]
+    fn fan_in_leaves_out_a_tests_requests() {
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-store-viewer-fan-in-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store
+            .upsert_nodes(&["route", "test", "client", "plain", "broken"].map(node))
+            .unwrap();
+        for (source, metadata) in [
+            (
+                "test",
+                Some(r#"{"callee":"$this->get","channel":"http","synthesizedBy":"test-request"}"#),
+            ),
+            (
+                "client",
+                Some(r#"{"channel":"http","synthesizedBy":"http-client"}"#),
+            ),
+            ("plain", None),
+            ("broken", Some("not json")),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO edges (source, target, kind, metadata, line, col) VALUES (?1, 'route', 'calls', ?2, 1, 0)",
+                    params![source, metadata],
+                )
+                .unwrap();
+        }
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let fan_in = store
+            .count_incoming_edges(&ids(&["route", "test"]))
+            .unwrap();
+        assert_eq!(fan_in.get("route"), Some(&3));
+        assert_eq!(fan_in.get("test"), None);
+        let fan_out = store
+            .count_outgoing_edges(&ids(&["test", "client", "plain", "broken"]))
+            .unwrap();
+        for source in ["test", "client", "plain", "broken"] {
+            assert_eq!(fan_out.get(source), Some(&1), "{source}");
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

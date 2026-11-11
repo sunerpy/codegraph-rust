@@ -291,7 +291,9 @@ sync rewrote, as it already lists the base edges a sync rewrote after the
 ones it kept; a fresh index's stage writes into an empty set. The ported
 passes are the field observer (`callback`), the Swift and Kotlin closure
 collection (`closure-collection`),
-the string-keyed emitter (`event-emitter`), and the structural ones: a React
+the string-keyed emitter (`event-emitter`), the cross-tier channels
+(`http-client`, `queue-job`, `event-bus`) and test requests (`test-request`)
+described below, and the structural ones: a React
 class component's or a Flutter `State`'s re-render (`react-render`,
 `flutter-build`), the components a function's JSX tags render
 (`jsx-render`), a C++ virtual override (`cpp-override`), a call through
@@ -379,6 +381,43 @@ context: the texts of indexed files the stage reads, no edge, and the
 store's node, file and configuration lookups for the rest, whose
 `tsconfig.json`, `jsconfig.json`, workspace and `package.json` files are
 JavaScript's control inputs, so a change to one recomputes the stage.
+The cross-tier pass joins the programs of a web app, which talk over a wire
+the graph cannot see with a string on both sides of each hop (upstream
+`tier-synthesizer.ts`). It reads each indexed JavaScript or TypeScript file
+that is no test or generated file, through its comment-stripped text
+aligned byte for byte with the source, so a column counts the source's
+UTF-16 code units. A client call inside a function (`fetch`, `$fetch`,
+`ofetch`, `axios`, `ky`, `got`, `useFetch`, `useSWR`, or a member call on a
+client: an instance `axios.create(…)` or `ky.extend(…)` binds in the file or
+in the file an import of its head resolves to, or a receiver whose last
+segment names a client and whose head and last segment name no router)
+whose first argument is a
+literal path reaches the one route node `METHOD /path` the path denotes
+(`http-client`): the path is joined to the instance's base URL, a template
+hole fills a route parameter and a hole before the path matches a route by
+its tail, while a tie, a variable URL, a path no route serves and a call on
+a registration's line draw nothing. A job a function adds to a queue, named
+by a `new Queue('…')` or `@InjectQueue('…')` binding or by a receiver shaped
+like a queue, reaches the queue's most specific consumers, at most six
+(`queue-job`): an `@Process('job')` method of the `@Processor('queue')`
+class, else its `process` method, a `new Worker('queue', handler)` or a
+`queue.process('job', handler)`. An event a function emits on a bus or a
+socket reaches the handlers of its name, at most six, an event dispatched
+more than six times drawing nothing (`event-bus`): a bus's `@OnEvent`
+handlers, globs honoured, and for a socket client's emit the server's
+`@SubscribeMessage` and `socket.on` handlers, for a socket server's the
+client's. A handler a registration names is the one function or method of
+that name in its file (several there: none), else in the file its head is
+imported from, else in the project. The test-request pass reads each Java, Kotlin or PHP test file
+the same way: a MockMvc builder in a file naming `MockMvcRequestBuilders`,
+Kotlin's MockMvc DSL, `WebTestClient`, RestAssured and `restTemplate` calls,
+a Laravel request on `$this` (`$this->postJson(…)`, `->json('POST', …)`, or
+a test's own helper whose body makes one, directly or one call deeper) and,
+in a file naming `Pest\Laravel`, Pest's request functions, each reaching
+the route its literal path names from the test method, or from the file
+node for a Pest closure (`test-request`). Both read an imported file and a
+helper's body as the view holds them, and resolve an import among the
+indexed files only, the first indexed candidate in resolution's order.
 Two SvelteKit passes join the halves of a route the file system pairs: a
 `+page.svelte` or `+layout.svelte` component calls each function and method
 of the loaders beside it (`+page.server.ts`, `.server.js`, `.ts` or `.js`
@@ -425,7 +464,7 @@ Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, C++, interface,
 Kotlin, gRPC, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
-Laravel, C function-pointer, GoFrame, Go func-field, link, Vue, Angular and SvelteKit passes run only when the index
+Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular and SvelteKit passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, found a recorded

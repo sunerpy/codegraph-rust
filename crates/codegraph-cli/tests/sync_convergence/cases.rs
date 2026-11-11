@@ -22683,3 +22683,572 @@ pub fn vue_package_json_declares_an_imported_tags_package() -> Case {
         "component src/components/ui/Card.vue::Card",
     )
 }
+
+// --- W7-20: cross-tier channels and test requests (upstream
+// `tier-synthesizer.ts` at e8ddc4e2). The passes read indexed text, nodes,
+// route names and JavaScript's control inputs; no lane, marker or control
+// kind of their own. ---
+
+/// An Express app serving `POST /api/users` and `GET /api/orders`.
+const TIER_APP: &str = "import express from 'express';\nconst app = express();\napp.post('/api/users', createUser);\napp.get('/api/orders', listOrders);\nfunction createUser(req, res) {}\nfunction listOrders(req, res) {}\n";
+const TIER_FORM: &str =
+    "export function submit() {\n  return fetch('/api/users', { method: 'POST' });\n}\n";
+const TIER_USERS_ROUTE: &str = "route apps/api/app.ts::POST:/api/users";
+
+/// W7-20: the client's path changes: its call reaches the other route.
+pub fn typescript_tier_client_path_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .write(
+            "apps/web/form.ts",
+            "export function submit() {\n  return fetch('/api/orders');\n}\n",
+        )
+        .edge_metadata_before(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .edge_metadata_after(
+            (
+                "function submit",
+                "calls",
+                "route apps/api/app.ts::GET:/api/orders",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the route's path changes under an unchanged client: the call
+/// reaches nothing.
+pub fn typescript_tier_route_path_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .write(
+            "apps/api/app.ts",
+            "import express from 'express';\nconst app = express();\napp.post('/api/people', createUser);\napp.get('/api/orders', listOrders);\nfunction createUser(req, res) {}\nfunction listOrders(req, res) {}\n",
+        )
+        .edge_metadata_before(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .named_after("route", "POST /api/people")
+        .no_edge_metadata_after(
+            ("function submit", "calls", "route apps/api/app.ts::POST:/api/people"),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_MOUNTED_APP: &str = "import express from 'express'\nconst app = express()\nconst v1 = require('./v1')\napp.use('/api/v1', authenticate, v1)\nexport default app\n";
+const TIER_ORDERS_ROUTE: &str = "route apps/api/src/orders.routes.ts::GET:/";
+
+/// W7-20: the mount's prefix changes (upstream `ui-steps-cross-tier`'s
+/// tree): the mounted route is renamed before the stage runs, and the
+/// client's call, in an unchanged file, reaches it no more.
+pub fn typescript_tier_mount_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/src/app.ts", TIER_MOUNTED_APP)
+        .file(
+            "apps/api/src/v1/index.ts",
+            "import { Router } from 'express'\nimport ordersRouter from '../orders.routes'\nconst router = Router()\nrouter.use('/orders', ordersRouter)\nexport default router\n",
+        )
+        .file(
+            "apps/api/src/orders.routes.ts",
+            "import { Router } from 'express'\nconst router = Router()\nrouter.get('/', listAllOrders)\nexport async function listAllOrders(req, res) {\n  res.json([])\n}\nexport default router\n",
+        )
+        .file(
+            "apps/web/orders.ts",
+            "export async function loadOrders() {\n  const res = await fetch('/api/v1/orders')\n  return res.json()\n}\n",
+        )
+        .write(
+            "apps/api/src/app.ts",
+            "import express from 'express'\nconst app = express()\nconst v1 = require('./v1')\napp.use('/api/v2', authenticate, v1)\nexport default app\n",
+        )
+        .named_before("route", "GET /api/v1/orders")
+        .named_after("route", "GET /api/v2/orders")
+        .edge_metadata_before(
+            ("function loadOrders", "calls", TIER_ORDERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function loadOrders", "calls", TIER_ORDERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_NEST_MAIN: &str = "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n";
+const TIER_NEST_MAIN_PREFIXED: &str = "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n";
+const TIER_NEST_MODULE: &str = "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n";
+const TIER_NEST_CLIENT: &str =
+    "export function fetchUser() {\n  return fetch('/api/v1/users/1');\n}\n";
+const TIER_NEST_ROUTE: &str = "route src/users/users.controller.ts::GET:/users/:id";
+
+/// W7-20: the NestJS bootstrap comes to set a global prefix: a client's
+/// request for the prefixed path, in an unchanged file, reaches the
+/// renamed route.
+pub fn typescript_tier_nestjs_global_prefix_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/main.ts", TIER_NEST_MAIN)
+        .file("src/app.module.ts", TIER_NEST_MODULE)
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .file("src/client/users.ts", TIER_NEST_CLIENT)
+        .write("src/main.ts", TIER_NEST_MAIN_PREFIXED)
+        .named_after("route", "GET /api/v1/users/:id")
+        .edge_metadata_after(
+            ("function fetchUser", "calls", TIER_NEST_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the global prefix goes: the client's request reaches nothing.
+pub fn typescript_tier_nestjs_global_prefix_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/main.ts", TIER_NEST_MAIN_PREFIXED)
+        .file("src/app.module.ts", TIER_NEST_MODULE)
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .file("src/client/users.ts", TIER_NEST_CLIENT)
+        .write("src/main.ts", TIER_NEST_MAIN)
+        .edge_metadata_before(
+            ("function fetchUser", "calls", TIER_NEST_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .named_after("route", "GET /users/:id")
+        .no_edge_metadata_after(
+            ("function fetchUser", "calls", TIER_NEST_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_ADMIN_FILE: &str = "apps/admin/app.ts";
+const TIER_ADMIN_APP: &str = "import express from 'express';\nconst app = express();\napp.post('/api/users', createAdmin);\nfunction createAdmin(req, res) {}\n";
+
+/// W7-20: a second app serves the same route: two routes serve the call
+/// alike, and a tie draws nothing.
+pub fn typescript_tier_second_route_ties_the_call() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .write(TIER_ADMIN_FILE, TIER_ADMIN_APP)
+        .edge_metadata_before(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            (
+                "function submit",
+                "calls",
+                "route apps/admin/app.ts::POST:/api/users",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the second app goes: the call reaches its route again.
+pub fn typescript_tier_second_route_goes() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .file(TIER_ADMIN_FILE, TIER_ADMIN_APP)
+        .remove(TIER_ADMIN_FILE)
+        .edge_metadata_after(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// An Express app serving `GET /api/users/:id`, a client instance with a
+/// base URL, and a card calling through it.
+const TIER_USER_APP: &str = "import express from 'express';\nconst app = express();\napp.get('/api/users/:id', getUser);\nfunction getUser(req, res) {}\n";
+const TIER_API_INSTANCE: &str =
+    "import axios from 'axios';\nexport const api = axios.create({ baseURL: '/api' });\n";
+const TIER_CARD: &str = "import { api } from './lib/api';\nexport function load(id: string) {\n  return api.get(`/users/${id}`);\n}\n";
+const TIER_USER_ROUTE: &str = "route apps/api/app.ts::GET:/api/users/:id";
+
+/// W7-20: the imported instance's base URL changes: the call, in an
+/// unchanged file, reaches its route no more.
+pub fn typescript_tier_imported_base_url_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_USER_APP)
+        .file("apps/web/lib/api.ts", TIER_API_INSTANCE)
+        .file("apps/web/card.ts", TIER_CARD)
+        .write(
+            "apps/web/lib/api.ts",
+            "import axios from 'axios';\nexport const api = axios.create({ baseURL: '/v2' });\n",
+        )
+        .edge_metadata_before(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the instance's module is deleted: `api` is a client by its name
+/// alone, with no base URL, and the call reaches nothing.
+pub fn typescript_tier_imported_instance_module_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_USER_APP)
+        .file("apps/web/lib/api.ts", TIER_API_INSTANCE)
+        .file("apps/web/card.ts", TIER_CARD)
+        .remove("apps/web/lib/api.ts")
+        .edge_metadata_before(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the `tsconfig.json` alias the card imports its instance through
+/// comes to point at a module that makes none: `api` is a client by its
+/// name alone, and the call reaches nothing.
+pub fn typescript_tier_import_alias_points_elsewhere() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"apps/web/lib/*\"]}}}\n",
+        )
+        .file("apps/api/app.ts", TIER_USER_APP)
+        .file("apps/web/lib/api.ts", TIER_API_INSTANCE)
+        .file(
+            "apps/web/other/api.ts",
+            "export const api = {\n  get(path: string) {\n    return path;\n  },\n};\n",
+        )
+        .file(
+            "apps/web/card.ts",
+            "import { api } from '@lib/api';\nexport function load(id: string) {\n  return api.get(`/users/${id}`);\n}\n",
+        )
+        .write(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"apps/web/other/*\"]}}}\n",
+        )
+        .edge_metadata_before(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_PAGES_JS: &str =
+    "export async function loadPages() {\n  return await fetch('/api/pages');\n}\n";
+const TIER_LARAVEL_PAGES_ROUTE: &str = "route routes/api.php::route:/pages";
+
+/// W7-20: `withRouting` comes to mount `routes/api.php` under an
+/// `apiPrefix`: a front end's `fetch('/api/pages')`, in an unchanged file,
+/// reaches the renamed route no more.
+pub fn php_tier_laravel_api_prefix_moves_the_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::JavaScript])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .file("resources/js/pages.js", TIER_PAGES_JS)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_API_PREFIX)
+        .named_after("route", "GET /v2/pages")
+        .edge_metadata_before(
+            ("function loadPages", "calls", TIER_LARAVEL_PAGES_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function loadPages", "calls", TIER_LARAVEL_PAGES_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_LOGIN_TEST: &str = "<?php\nclass LoginTest extends TestCase {\n    public function testLoginViaHelper() { $this->postAs('api/me', []); }\n}\n";
+const TIER_LOGIN_EDGE: (&str, &str, &str) = (
+    "method LoginTest::testLoginViaHelper",
+    "calls",
+    "route routes/api.php::route:/me",
+);
+
+/// W7-20: the project's request helper stops making a request: the test
+/// calling it, in an unchanged file, reaches the route no more.
+pub fn php_tier_request_helper_stops_requesting() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", "<?php\n\nRoute::post('me', 'AuthController@login');\n")
+        .file(
+            "app/Http/Controllers/AuthController.php",
+            "<?php\n\nclass AuthController\n{\n    public function login() { return 1; }\n}\n",
+        )
+        .file(
+            "tests/TestCase.php",
+            "<?php\nabstract class TestCase {\n    protected function postAs(string $url, array $data) {\n        return $this->postJson($url, $data);\n    }\n}\n",
+        )
+        .file("tests/Feature/LoginTest.php", TIER_LOGIN_TEST)
+        .write(
+            "tests/TestCase.php",
+            "<?php\nabstract class TestCase {\n    protected function postAs(string $url, array $data) {\n        return [$url, $data];\n    }\n}\n",
+        )
+        .edge_metadata_before(TIER_LOGIN_EDGE, "synthesizedBy", "test-request")
+        .no_edge_metadata_after(TIER_LOGIN_EDGE, "synthesizedBy", "test-request")
+}
+
+/// W7-20: the client moves into a test directory: a test is never a
+/// client.
+pub fn javascript_tier_client_moves_under_tests() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file(
+            "server/app.js",
+            "const express = require('express');\nconst app = express();\napp.get('/api/users', listUsers);\nfunction listUsers(req, res) {}\n",
+        )
+        .file(
+            "src/client.js",
+            "export function loadUsers() {\n  return fetch('/api/users');\n}\n",
+        )
+        .rename("src/client.js", "src/__tests__/client.js")
+        .edge_metadata_before(
+            (
+                "function loadUsers @src/client.js",
+                "calls",
+                "route server/app.js::GET:/api/users",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            (
+                "function loadUsers @src/__tests__/client.js",
+                "calls",
+                "route server/app.js::GET:/api/users",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_QUEUE_PACKAGE: &str = "{\"name\":\"api\",\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\",\"@nestjs/bull\":\"^10.0.0\",\"bullmq\":\"^5.0.0\"}}\n";
+const TIER_WELCOME_EMAIL: (&str, &str, &str) = (
+    "function createUser",
+    "calls",
+    "method EmailProcessor::sendWelcome",
+);
+
+/// W7-20: the queue the producer's binding names changes: its job, put on
+/// in an unchanged file, reaches the other queue's consumer.
+pub fn typescript_tier_queue_binding_names_another_queue() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", TIER_QUEUE_PACKAGE)
+        .file(
+            "src/queue.ts",
+            "import { Queue } from 'bullmq';\nexport const q = new Queue('email');\n",
+        )
+        .file(
+            "src/email.processor.ts",
+            "import { Processor, Process } from '@nestjs/bull';\n@Processor('email')\nexport class EmailProcessor {\n  @Process('welcome')\n  async sendWelcome(job) {\n    return job;\n  }\n}\n",
+        )
+        .file(
+            "src/sms.processor.ts",
+            "import { Processor, Process } from '@nestjs/bull';\n@Processor('sms')\nexport class SmsProcessor {\n  @Process('welcome')\n  async textWelcome(job) {\n    return job;\n  }\n}\n",
+        )
+        .file(
+            "src/users.ts",
+            "import { q } from './queue';\nexport async function createUser() {\n  await q.add('welcome', {});\n}\n",
+        )
+        .write(
+            "src/queue.ts",
+            "import { Queue } from 'bullmq';\nexport const q = new Queue('sms');\n",
+        )
+        .edge_metadata_before(TIER_WELCOME_EMAIL, "queue", "email")
+        .edge_metadata_after(
+            (
+                "function createUser",
+                "calls",
+                "method SmsProcessor::textWelcome",
+            ),
+            "queue",
+            "sms",
+        )
+        .no_edge_metadata_after(TIER_WELCOME_EMAIL, "synthesizedBy", "queue-job")
+}
+
+const TIER_CHAT: &str = "import { io } from 'socket.io-client'\nconst socket = io()\nexport function Chat() {\n  function send(text) {\n    socket.emit('message', text)\n  }\n  return null\n}\n";
+const TIER_CHAT_SEND: (&str, &str, &str) = (
+    "function Chat::send",
+    "calls",
+    "method ChatGateway::handleMessage",
+);
+
+/// W7-20: the chat file comes to hold a socket server
+/// (`io.on('connection')`): its `socket.emit`, now a server's, reaches the
+/// gateway's handler no more.
+pub fn tsx_tier_chat_becomes_a_socket_server() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx, Language::TypeScript])
+        .file("apps/web/chat.tsx", TIER_CHAT)
+        .file(
+            "apps/api/chat.gateway.ts",
+            "import { WebSocketGateway, SubscribeMessage } from '@nestjs/websockets'\n@WebSocketGateway()\nexport class ChatGateway {\n  @SubscribeMessage('message')\n  handleMessage(client, payload) {\n    return payload\n  }\n}\n",
+        )
+        .write(
+            "apps/web/chat.tsx",
+            "import { io } from 'socket.io-client'\nconst socket = io()\nio.on('connection', () => {})\nexport function Chat() {\n  function send(text) {\n    socket.emit('message', text)\n  }\n  return null\n}\n",
+        )
+        .edge_metadata_before(TIER_CHAT_SEND, "tier", "client→server")
+        .no_edge_metadata_after(TIER_CHAT_SEND, "synthesizedBy", "event-bus")
+}
+
+const TIER_CREATED: (&str, &str, &str) = (
+    "method UsersService::create",
+    "calls",
+    "method NotificationsListener::handleUserCreated",
+);
+
+/// W7-20: the listener loses its `@OnEvent`: the pair the tier pass drew
+/// first, and the merge kept as `event-bus`, is the emitter pass's
+/// `event-emitter` edge.
+pub fn typescript_tier_on_event_goes_and_the_emitter_pass_keeps_the_pair() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/users.service.ts",
+            "import { EventEmitter2 } from '@nestjs/event-emitter'\nexport class UsersService {\n  constructor(private readonly eventEmitter: EventEmitter2) {}\n  create(dto) {\n    this.eventEmitter.emit('user.created', dto)\n    return dto\n  }\n}\n",
+        )
+        .file(
+            "src/listener.ts",
+            "import { OnEvent } from '@nestjs/event-emitter'\nexport class NotificationsListener {\n  @OnEvent('user.created')\n  handleUserCreated(user) {\n    return user\n  }\n}\n",
+        )
+        .file(
+            "src/wire.ts",
+            "export function wire(emitter) {\n  emitter.on('user.created', handleUserCreated)\n}\n",
+        )
+        .write(
+            "src/listener.ts",
+            "import { OnEvent } from '@nestjs/event-emitter'\nexport class NotificationsListener {\n  handleUserCreated(user) {\n    return user\n  }\n}\n",
+        )
+        .edge_metadata_before(TIER_CREATED, "synthesizedBy", "event-bus")
+        .edge_metadata_after(TIER_CREATED, "synthesizedBy", "event-emitter")
+}
+
+const TIER_OWNER_TEST_FILE: &str = "src/test/java/demo/OwnerControllerTests.java";
+
+/// W7-20: a Spring test comes to import the MockMvc builders: its bare
+/// `get("/owners")` is a request, and reaches its route.
+pub fn java_tier_spring_test_imports_its_request_builders() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(
+            "src/main/java/demo/OwnerController.java",
+            "package demo;\n\n@Controller\nclass OwnerController {\n    @GetMapping(\"/owners\")\n    public String processFindForm() {\n        return \"owners/list\";\n    }\n}\n",
+        )
+        .file(
+            TIER_OWNER_TEST_FILE,
+            "package demo;\n\nclass OwnerControllerTests {\n    void testFindByPage() throws Exception {\n        mockMvc.perform(get(\"/owners\"));\n    }\n}\n",
+        )
+        .write(
+            TIER_OWNER_TEST_FILE,
+            "package demo;\n\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;\n\nclass OwnerControllerTests {\n    void testFindByPage() throws Exception {\n        mockMvc.perform(get(\"/owners\"));\n    }\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "method demo::OwnerControllerTests::testFindByPage",
+                "calls",
+                "route src/main/java/demo/OwnerController.java::route:/owners",
+            ),
+            "synthesizedBy",
+            "test-request",
+        )
+}
+
+/// The configuration keeps `src/api.ts` out of the index; an indexed
+/// `src/api/index.ts` beside it is `./api`'s next candidate.
+const TIER_EXCLUDE_API: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"src/api.ts\"]\n";
+const TIER_TWO_USER_APPS: &str = "import express from 'express';\nconst app = express();\napp.get('/api/users/:id', getUser);\napp.get('/legacy/users/:id', getLegacyUser);\nfunction getUser(req, res) {}\nfunction getLegacyUser(req, res) {}\n";
+const TIER_LEGACY_INSTANCE: &str =
+    "import axios from 'axios';\nexport const api = axios.create({ baseURL: '/legacy' });\n";
+const TIER_DOT_API_CLIENT: &str = "import { api } from './api';\nexport function load(id: string) {\n  return api.get(`/users/${id}`);\n}\n";
+const TIER_LOAD_API: (&str, &str, &str) = (
+    "function load",
+    "calls",
+    "route server/app.ts::GET:/api/users/:id",
+);
+const TIER_LOAD_LEGACY: (&str, &str, &str) = (
+    "function load",
+    "calls",
+    "route server/app.ts::GET:/legacy/users/:id",
+);
+
+/// W7-20 (KEEP-RUST): an excluded `src/api.ts` appears beside the indexed
+/// `src/api/index.ts` an unchanged client imports as `./api`. The index
+/// does not change; the tier pass resolves the import among the indexed
+/// files, so the client keeps `src/api/index.ts`'s instance (upstream reads
+/// the excluded file from disk). A known gap all the same: base import
+/// resolution probes the disk for the excluded candidate, so a fresh index
+/// leaves `./api` unresolved where the sync keeps its old resolution.
+pub fn typescript_tier_excluded_import_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(".codegraph/config.toml", TIER_EXCLUDE_API)
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.ts", TIER_TWO_USER_APPS)
+        .file("src/api/index.ts", TIER_API_INSTANCE)
+        .file("src/client.ts", TIER_DOT_API_CLIENT)
+        .write("src/api.ts", TIER_LEGACY_INSTANCE)
+        .edge_metadata_before(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .edge_metadata_after(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .no_edge_metadata_after(TIER_LOAD_LEGACY, "synthesizedBy", "http-client")
+}
+
+/// W7-20 (KEEP-RUST): the excluded `src/api.ts` goes: the tier pass keeps
+/// `src/api/index.ts`'s instance for the client, as a fresh index does. A
+/// known gap for base import resolution, as when it appears.
+pub fn typescript_tier_excluded_import_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file(".codegraph/config.toml", TIER_EXCLUDE_API)
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.ts", TIER_TWO_USER_APPS)
+        .file("src/api/index.ts", TIER_API_INSTANCE)
+        .file("src/api.ts", TIER_LEGACY_INSTANCE)
+        .file("src/client.ts", TIER_DOT_API_CLIENT)
+        .remove("src/api.ts")
+        .edge_metadata_before(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .edge_metadata_after(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .no_edge_metadata_after(TIER_LOAD_LEGACY, "synthesizedBy", "http-client")
+}

@@ -20604,6 +20604,26 @@ mod express {
                 project.graph().report()
             );
         }
+        // W7-20 (upstream `nestjs-global-prefix.test.ts` 204-212): the
+        // client's request reaches the prefixed route, and only it.
+        let graph = project.graph();
+        let reached: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && edge
+                        .metadata
+                        .get("channel")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("http")
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.name == "fetchUser")
+            })
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.name.as_str()))
+            .collect();
+        assert_eq!(reached, ["GET /api/v1/user"], "{}", graph.report());
     }
 
     /// Upstream `postExtract`: prefixes compose down a mount tree three
@@ -22526,6 +22546,50 @@ mod php_frameworks {
             graph.report()
         );
         assert_eq!(served_by(graph, "/menus"), [format!("list {controller}")]);
+    }
+
+    /// W7-20 (upstream `laravel-route-paths.test.ts` 226-243): a front end's
+    /// `fetch('/api/pages')` reaches the `api.php` route it names.
+    #[test]
+    fn a_front_end_fetch_reaches_its_api_route() {
+        let project = laravel(&[
+            API,
+            (
+                "resources/js/pages.js",
+                "export async function loadPages() {\n  return await fetch('/api/pages');\n}\n",
+            ),
+            ("package.json", "{\"dependencies\":{\"vue\":\"^3.0.0\"}}"),
+        ]);
+        let graph = project.graph();
+        let hops: Vec<(String, Option<i64>, Option<i64>)> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == "calls"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.kind == "function" && node.name == "loadPages")
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.kind == "route" && node.name == "GET /api/pages")
+            })
+            .map(|edge| {
+                (
+                    edge.metadata["synthesizedBy"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    edge.line,
+                    edge.col,
+                )
+            })
+            .collect();
+        assert_eq!(
+            hops,
+            [("http-client".to_string(), Some(2), Some(15))],
+            "{}",
+            graph.report()
+        );
     }
 }
 
@@ -29204,7 +29268,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "17".to_string())]
+            [("synthesis_version".to_string(), "18".to_string())]
         );
     }
 
@@ -31047,6 +31111,882 @@ mod synthesis {
                 && !link.contains("Widget")),
             "{links:?}"
         );
+    }
+
+    /// W7-20 (upstream `resolution/tier-synthesizer.ts` at `e8ddc4e2`): the
+    /// cross-tier channels and the test requests, on upstream's fixtures
+    /// (`ui-steps-cross-tier.test.ts`, `test-request-edges.test.ts`,
+    /// `ui-steps-api-servers.test.ts`), each edge with its line and the
+    /// UTF-16 column of its call.
+    mod tier {
+        use super::super::support::{EdgeRow, Graph, Indexed, Project};
+        use serde_json::{Value, json};
+
+        fn project_of(files: &[(&str, &str)]) -> Project {
+            files.iter().fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+        }
+
+        /// `files` and `more`, one tree.
+        fn with<'a>(
+            files: &[(&'a str, &'a str)],
+            more: &[(&'a str, &'a str)],
+        ) -> Vec<(&'a str, &'a str)> {
+            files.iter().chain(more).copied().collect()
+        }
+
+        fn pass(edge: &EdgeRow) -> Option<&str> {
+            edge.metadata.get("synthesizedBy").and_then(Value::as_str)
+        }
+
+        fn name(graph: &Graph, id: &str) -> String {
+            graph
+                .node(id)
+                .map_or_else(|| format!("<no node {id}>"), |node| node.name.clone())
+        }
+
+        /// Every edge `by` synthesized, as `source → target` by the nodes'
+        /// names, sorted (upstream's `requests()`).
+        fn pairs(graph: &Graph, by: &str) -> Vec<String> {
+            let mut out: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == "calls" && pass(edge) == Some(by))
+                .map(|edge| {
+                    format!(
+                        "{} → {}",
+                        name(graph, &edge.source),
+                        name(graph, &edge.target)
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        /// The edges `by` synthesized out of the symbol named `source`, in a
+        /// file whose path ends with `file` when given (upstream's `sym()`).
+        fn out_of<'g>(
+            graph: &'g Graph,
+            source: &str,
+            file: Option<&str>,
+            by: &str,
+        ) -> Vec<&'g EdgeRow> {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "calls"
+                        && pass(edge) == Some(by)
+                        && graph.node(&edge.source).is_some_and(|node| {
+                            node.name == source
+                                && node.kind != "route"
+                                && node.kind != "file"
+                                && file.is_none_or(|file| node.file_path.ends_with(file))
+                        })
+                })
+                .collect()
+        }
+
+        /// The one edge `by` synthesized out of `source`.
+        #[track_caller]
+        fn one<'g>(graph: &'g Graph, source: &str, file: Option<&str>, by: &str) -> &'g EdgeRow {
+            let edges = out_of(graph, source, file, by);
+            assert_eq!(
+                edges.len(),
+                1,
+                "one {by} edge out of {source}:\n{}",
+                graph.report()
+            );
+            edges[0]
+        }
+
+        /// `edge`'s target by name, line, column and provenance.
+        fn at(graph: &Graph, edge: &EdgeRow) -> (String, Option<i64>, Option<i64>, Option<String>) {
+            (
+                name(graph, &edge.target),
+                edge.line,
+                edge.col,
+                edge.provenance.clone(),
+            )
+        }
+
+        /// A target by name, a line and a column, on a heuristic edge.
+        fn heuristic(
+            target: &str,
+            line: i64,
+            col: i64,
+        ) -> (String, Option<i64>, Option<i64>, Option<String>) {
+            (
+                target.to_string(),
+                Some(line),
+                Some(col),
+                Some("heuristic".to_string()),
+            )
+        }
+
+        const CROSS_TIER: &[(&str, &str)] = &[
+            (
+                "package.json",
+                "{\"name\": \"mono\", \"workspaces\": [\"apps/*\"], \"dependencies\": {\"next\": \"15\", \"react\": \"19\", \"express\": \"4\", \"axios\": \"1\", \"bullmq\": \"5\", \"@nestjs/common\": \"10\", \"@nestjs/core\": \"10\", \"@nestjs/bull\": \"10\", \"@nestjs/event-emitter\": \"2\", \"@nestjs/websockets\": \"10\", \"socket.io\": \"4\", \"socket.io-client\": \"4\", \"@prisma/client\": \"5\"}}",
+            ),
+            (
+                "apps/web/app/users/page.tsx",
+                "import { NewUserForm } from '../../components/new-user-form'\nexport default function UsersPage() {\n  return <NewUserForm />\n}\n",
+            ),
+            (
+                "apps/web/components/new-user-form.tsx",
+                "'use client'\nimport { useCallback, useState } from 'react'\nimport { createUserAction } from '../app/actions'\nexport function NewUserForm() {\n  const [email, setEmail] = useState('')\n  const handleSubmit = useCallback(async (e) => {\n    e.preventDefault()\n    if (!email) return\n    const res = await fetch('/api/users', { method: 'POST', body: JSON.stringify({ email }) })\n    if (res.ok) await createUserAction({ email })\n  }, [email])\n  return <form onSubmit={handleSubmit}><input value={email} onChange={(e) => setEmail(e.target.value)} /></form>\n}\n",
+            ),
+            (
+                "apps/web/app/actions.ts",
+                "'use server'\nimport { prisma } from '../lib/db'\nimport { redirect } from 'next/navigation'\nexport async function createUserAction(data) {\n  await prisma.user.create({ data })\n  redirect('/users')\n}\n",
+            ),
+            (
+                "apps/web/lib/db.ts",
+                "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+            ),
+            (
+                "apps/web/lib/api.ts",
+                "import axios from 'axios'\nexport const api = axios.create({ baseURL: '/api' })\n",
+            ),
+            (
+                "apps/web/components/user-card.tsx",
+                "'use client'\nimport { api } from '../lib/api'\nexport function UserCard({ id, url }) {\n  async function load() {\n    const { data } = await api.get(`/users/${id}`)\n    const external = await fetch('https://api.stripe.com/v1/charges')\n    const dynamic = await fetch(url)\n    const orders = await fetch(`${process.env.API_URL}/api/users/${id}/orders`)\n    return [data, external, dynamic, orders]\n  }\n  return null\n}\n",
+            ),
+            (
+                "apps/web/components/chat.tsx",
+                "'use client'\nimport { useEffect, useState } from 'react'\nimport { io } from 'socket.io-client'\nconst socket = io()\nexport function Chat() {\n  const [messages, setMessages] = useState([])\n  useEffect(() => {\n    socket.on('message', (m) => {\n      setMessages((prev) => [...prev, m])\n    })\n  }, [])\n  function send(text) {\n    socket.emit('message', text)\n  }\n  return null\n}\n",
+            ),
+            (
+                "apps/api/src/app.ts",
+                "import express from 'express'\nimport { createUser, getUser, listOrders } from './users'\nconst app = express()\napp.post('/api/users', createUser)\napp.get('/api/users/:id', getUser)\napp.get('/api/users/:id/orders', listOrders)\nconst v1 = require('./v1')\napp.use('/api/v1', authenticate, v1)\nexport default app\n",
+            ),
+            (
+                "apps/api/src/v1/index.ts",
+                "import { Router } from 'express'\nimport ordersRouter from '../orders.routes'\nconst router = Router()\nrouter.use('/orders', ordersRouter)\nexport default router\n",
+            ),
+            (
+                "apps/api/src/orders.routes.ts",
+                "import { Router } from 'express'\nimport { prisma } from './db'\nconst router = Router()\nrouter.get('/', listAllOrders)\nrouter.post('/:id/refund', refund)\nexport async function listAllOrders(req, res) {\n  res.json(await prisma.order.findMany())\n}\nexport async function refund(req, res) {\n  res.status(202).end()\n}\nexport default router\n",
+            ),
+            (
+                "apps/web/components/orders.tsx",
+                "'use client'\nimport useSWR from 'swr'\nexport function Orders() {\n  const { data } = useSWR<Order[]>('/api/v1/orders', fetcher)\n  async function loadOrders() {\n    const res = await fetch('/api/v1/orders')\n    return res.json()\n  }\n  return data\n}\n",
+            ),
+            (
+                "apps/api/src/users.ts",
+                "import { prisma } from './db'\nimport { emailQueue, reportQueue } from './queue'\nexport async function createUser(req, res) {\n  const user = await prisma.user.create({ data: req.body })\n  await emailQueue.add('welcome', { userId: user.id })\n  if (req.body.plan) {\n    await reportQueue.add('monthly', { userId: user.id })\n  }\n  res.status(201).json(user)\n}\nexport async function getUser(req, res) {\n  const user = await prisma.user.findUnique({ where: { id: req.params.id } })\n  res.json(user)\n}\nexport async function listOrders(req, res) {\n  res.json(await prisma.order.findMany({ where: { userId: req.params.id } }))\n}\n",
+            ),
+            (
+                "apps/api/src/db.ts",
+                "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+            ),
+            (
+                "apps/api/src/queue.ts",
+                "import { Queue } from 'bullmq'\nexport const emailQueue = new Queue('email')\nexport const reportQueue = new Queue('reports')\n",
+            ),
+            (
+                "apps/api/src/email.processor.ts",
+                "import { Processor, Process } from '@nestjs/bull'\n@Processor('email')\nexport class EmailProcessor {\n  constructor(private readonly mailer: MailerService) {}\n  @Process('welcome')\n  async sendWelcome(job) {\n    await this.mailer.sendMail({ to: job.data.email })\n  }\n}\n",
+            ),
+            (
+                "apps/api/src/reports.worker.ts",
+                "import { Worker } from 'bullmq'\nexport const reportWorker = new Worker('reports', async (job) => {\n  await buildReport(job.data)\n})\nexport async function buildReport(data) {\n  return data\n}\n",
+            ),
+            (
+                "apps/api/src/users.service.ts",
+                "import { Injectable } from '@nestjs/common'\nimport { EventEmitter2 } from '@nestjs/event-emitter'\n@Injectable()\nexport class UsersService {\n  constructor(private readonly eventEmitter: EventEmitter2) {}\n  async create(dto) {\n    const user = { id: 1, ...dto }\n    this.eventEmitter.emit('user.created', user)\n    return user\n  }\n}\n",
+            ),
+            (
+                "apps/api/src/notifications.listener.ts",
+                "import { Injectable } from '@nestjs/common'\nimport { OnEvent } from '@nestjs/event-emitter'\n@Injectable()\nexport class NotificationsListener {\n  @OnEvent('user.created')\n  handleUserCreated(user) {\n    return notify(user)\n  }\n  @OnEvent('user.*')\n  audit(payload) {\n    return log(payload)\n  }\n  @OnEvent('order.paid')\n  handleOrderPaid(order) {\n    return order\n  }\n}\n",
+            ),
+            (
+                "apps/api/src/chat.gateway.ts",
+                "import { WebSocketGateway, SubscribeMessage, WebSocketServer } from '@nestjs/websockets'\n@WebSocketGateway()\nexport class ChatGateway {\n  @WebSocketServer() server\n  @SubscribeMessage('message')\n  handleMessage(client, payload) {\n    this.server.emit('message', payload)\n    return payload\n  }\n}\n",
+            ),
+            (
+                "apps/api/src/__tests__/users.test.ts",
+                "import { it } from 'vitest'\nit('creates a user', async () => {\n  await fetch('/api/users', { method: 'POST' })\n})\n",
+            ),
+        ];
+
+        const SPRING_POM: &str = "<project><dependencies><dependency><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>";
+
+        const SPRING_CONTROLLER: &str = "package app.owner;\nimport org.springframework.web.bind.annotation.*;\n@Controller\nclass OwnerController {\n    @GetMapping(\"/owners/new\")\n    public String initCreationForm() { return \"owners/form\"; }\n    @PostMapping(\"/owners/new\")\n    public String processCreationForm() { return \"redirect:/owners\"; }\n    @GetMapping(\"/owners/{ownerId}/edit\")\n    public String initUpdateOwnerForm(@PathVariable int ownerId) { return \"owners/form\"; }\n    @GetMapping(\"/owners\")\n    public String processFindForm() { return \"owners/list\"; }\n}\n";
+
+        const SPRING_MOCKMVC: &[(&str, &str)] = &[(
+            "src/test/java/app/owner/OwnerControllerTests.java",
+            "package app.owner;\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;\nclass OwnerControllerTests {\n    private MockMvc mockMvc;\n    void testProcessCreationFormSuccess() throws Exception {\n        mockMvc.perform(post(\"/owners/new\").param(\"firstName\", \"Joe\")).andExpect(status().is3xxRedirection());\n    }\n    void testInitUpdateOwnerForm() throws Exception {\n        mockMvc.perform(get(\"/owners/{ownerId}/edit\", 1)).andExpect(status().isOk());\n    }\n    void testFindByPage() throws Exception {\n        mockMvc.perform(get(\"/owners?page=1\")).andExpect(status().isOk());\n    }\n}\n",
+        )];
+
+        const SPRING_BADGE: &[(&str, &str)] = &[(
+            "src/test/java/app/owner/OwnerControllerTests.java",
+            "package app.owner;\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;\nclass OwnerControllerTests {\n    void creates() throws Exception { mockMvc.perform(post(\"/owners/new\")); }\n}\n",
+        )];
+
+        const SPRING_CLIENTS: &[(&str, &str)] = &[
+            (
+                "src/test/java/app/owner/ClientTests.java",
+                "package app.owner;\nclass ClientTests {\n    void viaWebTestClient() { webTestClient.get().uri(\"/owners/{ownerId}/edit\", 7).exchange(); }\n    void viaRestTemplate() { restTemplate.getForEntity(\"/owners\", String.class); }\n    void viaExchange() { restTemplate.exchange(\"/owners/new\", HttpMethod.POST, entity, String.class); }\n    void viaRestAssured() { given().contentType(\"json\").when().get(\"/owners/new\").then().statusCode(200); }\n}\n",
+            ),
+            (
+                "src/test/kotlin/app/owner/OwnerDslTests.kt",
+                "package app.owner\nclass OwnerDslTests {\n    fun viaKotlinDsl() { mockMvc.post(\"/owners/new\") { param(\"name\", \"x\") } }\n}\n",
+            ),
+        ];
+
+        const SPRING_NEGATIVES: &[(&str, &str)] = &[
+            (
+                "src/test/java/app/owner/HelperTests.java",
+                "package app.owner;\nclass HelperTests {\n    String get(String key) { return key; }\n    void usesHelper() { get(\"/owners/new\"); }\n}\n",
+            ),
+            (
+                "src/main/java/app/owner/Client.java",
+                "package app.owner;\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;\nclass Client { void send() { mockMvc.perform(post(\"/owners/new\")); } }\n",
+            ),
+            (
+                "src/test/java/app/owner/HoleTests.java",
+                "package app.owner;\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;\nclass HoleTests { void showsOwner() { mockMvc.perform(get(\"/owners/{ownerId}\", 1)); } }\n",
+            ),
+        ];
+
+        const LARAVEL: &[(&str, &str)] = &[
+            ("artisan", "#!/usr/bin/env php\n<?php\n"),
+            (
+                "composer.json",
+                "{\"require\":{\"laravel/framework\":\"^11.0\"}}",
+            ),
+            (
+                "routes/api.php",
+                "<?php\nRoute::post('me', [AuthController::class, 'login']);\nRoute::delete('songs/{song}', [SongController::class, 'destroy']);\nRoute::put('songs/{song}/rating', [SongController::class, 'rate']);\nRoute::get('settings', [SettingController::class, 'show']);\n",
+            ),
+            (
+                "routes/web.php",
+                "<?php\nRoute::get('/books/{slug}', [BookController::class, 'show']);\nRoute::get('/about', [PageController::class, 'about']);\n",
+            ),
+            (
+                "app/Http/Controllers/AuthController.php",
+                "<?php\nclass AuthController { public function login() {} }\n",
+            ),
+            (
+                "app/Http/Controllers/SongController.php",
+                "<?php\nclass SongController { public function destroy() {} public function rate() {} }\n",
+            ),
+            (
+                "app/Http/Controllers/BookController.php",
+                "<?php\nclass BookController { public function show() {} }\n",
+            ),
+            (
+                "app/Http/Controllers/PageController.php",
+                "<?php\nclass PageController { public function about() {} }\n",
+            ),
+            (
+                "app/Http/Controllers/SettingController.php",
+                "<?php\nclass SettingController { public function show() {} }\n",
+            ),
+        ];
+
+        const LARAVEL_THIS: &[(&str, &str)] = &[(
+            "tests/Feature/SongTest.php",
+            "<?php\nclass SongTest extends TestCase {\n    public function testLogin() { $this->postJson('api/me', ['email' => 'a@b.c']); }\n    public function testDelete() { $this->actingAs($user)->json('DELETE', 'api/songs/1'); }\n    public function testRate() { $this->withToken($t)->put(\"api/songs/{$song->id}/rating\", []); }\n    public function testRateAgain() { $this->put(\"api/songs/$song->public_id/rating\", []); }\n    public function testBook() { $this->get('/books/' . $book->slug)->assertOk(); }\n}\n",
+        )];
+
+        const LARAVEL_HELPERS: &[(&str, &str)] = &[
+            (
+                "tests/Concerns/MakesHttpRequests.php",
+                "<?php\ntrait MakesHttpRequests {\n    private function jsonAs($user, string $method, $uri, array $data = []) {\n        return $this->withToken('t')->json($method, $uri, $data);\n    }\n    protected function postAs(string $url, array $data, $user = null) { return $this->jsonAs($user, 'post', $url, $data); }\n    protected function getFixture(string $name) { return file_get_contents(__DIR__ . '/' . $name); }\n}\n",
+            ),
+            (
+                "tests/Feature/AuthTest.php",
+                "<?php\nclass AuthTest extends TestCase {\n    use MakesHttpRequests;\n    public function testLoginViaHelper() { $this->postAs('api/me', []); }\n    public function testFixtureIsNotARequest() { $this->getFixture('settings'); }\n}\n",
+            ),
+        ];
+
+        const LARAVEL_PEST: &[(&str, &str)] = &[
+            (
+                "tests/Feature/AboutTest.php",
+                "<?php\nuse function Pest\\Laravel\\{get};\nit('shows the about page', function () {\n    get('/about')->assertOk();\n});\n",
+            ),
+            (
+                "tests/Feature/NotRequestsTest.php",
+                "<?php\nclass NotRequestsTest extends TestCase {\n    public function testContainer() { $this->app->get('settings'); }\n    public function testNamedRoute() { $this->get(route('about')); }\n}\n",
+            ),
+            (
+                "app/Services/Proxy.php",
+                "<?php\nclass Proxy { public function run() { $this->get('/about'); } }\n",
+            ),
+        ];
+
+        const NEST_QUEUE: &[(&str, &str)] = &[
+            (
+                "package.json",
+                "{\"name\": \"api\", \"dependencies\": {\"express\": \"4\", \"@nestjs/core\": \"10\", \"@nestjs/common\": \"10\", \"bullmq\": \"5\", \"@prisma/client\": \"5\", \"typeorm\": \"0.3\"}}",
+            ),
+            (
+                "src/nest/cats.service.ts",
+                "import { Injectable } from '@nestjs/common'\nimport { InjectRepository } from '@nestjs/typeorm'\nimport { Repository } from 'typeorm'\nimport { InjectQueue } from '@nestjs/bullmq'\nimport { Queue } from 'bullmq'\nimport { Cat } from './cat.entity'\n@Injectable()\nexport class CatsService {\n  constructor(\n    @InjectRepository(Cat) private readonly catsRepository: Repository<Cat>,\n    @InjectQueue('cats') private readonly catsQueue: Queue\n  ) {}\n  async create(dto) {\n    const cat = await this.catsRepository.save(dto)\n    await this.catsQueue.add('index', { id: cat.id })\n    return cat\n  }\n  async findOne(id: string) {\n    return this.catsRepository.findOne({ where: { id } })\n  }\n}\n",
+            ),
+            (
+                "src/nest/cats.processor.ts",
+                "import { Processor, Process } from '@nestjs/bull'\n@Processor('cats')\nexport class CatsProcessor {\n  @Process('index')\n  async handleIndex(job) {\n    await searchClient.index(job.data)\n  }\n}\n",
+            ),
+        ];
+
+        const SPRING_BASE: &[(&str, &str)] = &[
+            ("pom.xml", SPRING_POM),
+            (
+                "src/main/java/app/owner/OwnerController.java",
+                SPRING_CONTROLLER,
+            ),
+        ];
+
+        fn spring(files: &[(&str, &str)]) -> Indexed {
+            project_of(&with(SPRING_BASE, files)).index()
+        }
+
+        fn laravel(files: &[(&str, &str)]) -> Indexed {
+            project_of(&with(LARAVEL, files)).index()
+        }
+
+        /// `ui-steps-cross-tier.test.ts` 303-359: a literal path in a client
+        /// call reaches its own route, remembering the registration; an
+        /// axios instance's base URL joins the path, a template hole fills a
+        /// parameter and a base-URL hole matches a route by its tail; an
+        /// external URL, a variable URL and a test suite's call draw
+        /// nothing; a mounted router's route is reached by the path a
+        /// request takes, through a type argument too.
+        #[test]
+        fn w720_a_client_call_reaches_its_own_route() {
+            let project = project_of(CROSS_TIER).index();
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "http-client"),
+                [
+                    "Orders → GET /api/v1/orders",
+                    "handleSubmit → POST /api/users",
+                    "load → GET /api/users/:id",
+                    "load → GET /api/users/:id/orders",
+                    "loadOrders → GET /api/v1/orders",
+                ],
+                "{}",
+                graph.report()
+            );
+            let submit = one(graph, "handleSubmit", None, "http-client");
+            assert_eq!(at(graph, submit), heuristic("POST /api/users", 9, 22));
+            assert_eq!(
+                submit.metadata,
+                json!({
+                    "synthesizedBy": "http-client",
+                    "channel": "http",
+                    "callee": "fetch",
+                    "tier": "client→server",
+                    "method": "POST",
+                    "href": "/api/users",
+                    "registeredAt": "apps/api/src/app.ts:4",
+                })
+            );
+            let mut load: Vec<_> = out_of(graph, "load", None, "http-client")
+                .into_iter()
+                .map(|edge| {
+                    (
+                        edge.metadata["href"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        name(graph, &edge.target),
+                        edge.metadata["method"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        edge.line,
+                        edge.col,
+                    )
+                })
+                .collect();
+            load.sort();
+            let site = |href: &str, route: &str, line: i64, col: i64| {
+                (
+                    href.to_string(),
+                    route.to_string(),
+                    "GET".to_string(),
+                    Some(line),
+                    Some(col),
+                )
+            };
+            assert_eq!(
+                load,
+                [
+                    site("/api/users/${…}", "GET /api/users/:id", 5, 27),
+                    site("/api/users/${…}/orders", "GET /api/users/:id/orders", 8, 25),
+                ]
+            );
+            assert!(
+                graph
+                    .edges
+                    .iter()
+                    .all(|edge| pass(edge) != Some("http-client")
+                        || graph.node(&edge.source).is_none_or(|node| {
+                            node.file_path != "apps/api/src/__tests__/users.test.ts"
+                        })),
+                "{}",
+                graph.report()
+            );
+            let incoming: Vec<String> = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "calls"
+                        && edge.provenance.as_deref() == Some("heuristic")
+                        && graph.node(&edge.target).is_some_and(|node| {
+                            node.kind == "route" && node.name == "POST /api/users"
+                        })
+                })
+                .map(|edge| name(graph, &edge.source))
+                .collect();
+            assert_eq!(incoming, ["handleSubmit"]);
+            // The mounts compose onto the route names first.
+            let routes: Vec<&str> = graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind == "route")
+                .map(|node| node.name.as_str())
+                .collect();
+            for route in ["GET /api/v1/orders", "POST /api/v1/orders/:id/refund"] {
+                assert!(routes.contains(&route), "{route}: {routes:?}");
+            }
+            assert!(!routes.contains(&"GET /"), "{routes:?}");
+            let orders = one(graph, "loadOrders", None, "http-client");
+            assert_eq!(at(graph, orders), heuristic("GET /api/v1/orders", 6, 22));
+            assert_eq!(
+                orders.metadata["registeredAt"],
+                "apps/api/src/orders.routes.ts:4"
+            );
+            let hook = one(graph, "Orders", None, "http-client");
+            assert_eq!(at(graph, hook), heuristic("GET /api/v1/orders", 4, 19));
+            assert_eq!(hook.metadata["callee"], "useSWR");
+        }
+
+        /// `ui-steps-cross-tier.test.ts` 361-401: a job put on a named queue
+        /// reaches its consumer (a `@Process` method, a BullMQ worker's
+        /// value); an emitted event reaches its `@OnEvent` listeners, globs
+        /// included; a socket message crosses the tiers both ways.
+        #[test]
+        fn w720_a_job_and_an_event_reach_their_consumers() {
+            let project = project_of(CROSS_TIER).index();
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "queue-job"),
+                ["createUser → reportWorker", "createUser → sendWelcome"],
+                "{}",
+                graph.report()
+            );
+            let jobs = out_of(graph, "createUser", None, "queue-job");
+            let job = |event: &str| {
+                *jobs
+                    .iter()
+                    .find(|edge| edge.metadata["event"] == event)
+                    .unwrap_or_else(|| panic!("no {event} job:\n{}", graph.report()))
+            };
+            let welcome = job("welcome");
+            assert_eq!(at(graph, welcome), heuristic("sendWelcome", 5, 8));
+            assert_eq!(
+                welcome.metadata,
+                json!({
+                    "synthesizedBy": "queue-job",
+                    "channel": "queue",
+                    "callee": "emailQueue.add",
+                    "event": "welcome",
+                    "queue": "email",
+                    "registeredAt": "apps/api/src/email.processor.ts:5",
+                })
+            );
+            let monthly = job("monthly");
+            assert_eq!(
+                graph
+                    .node(&monthly.target)
+                    .map(|node| node.file_path.as_str()),
+                Some("apps/api/src/reports.worker.ts")
+            );
+            assert_eq!((monthly.line, monthly.col), (Some(7), Some(10)));
+            assert_eq!(monthly.metadata["queue"], "reports");
+            assert_eq!(
+                monthly.metadata["registeredAt"],
+                "apps/api/src/reports.worker.ts:2"
+            );
+            assert_eq!(
+                pairs(graph, "event-bus"),
+                [
+                    "create → audit",
+                    "create → handleUserCreated",
+                    "handleMessage → Chat",
+                    "send → handleMessage",
+                ],
+                "{}",
+                graph.report()
+            );
+            let created = out_of(graph, "create", Some("users.service.ts"), "event-bus");
+            let direct = created
+                .iter()
+                .find(|edge| name(graph, &edge.target) == "handleUserCreated")
+                .expect("create reaches handleUserCreated");
+            assert_eq!(at(graph, direct), heuristic("handleUserCreated", 8, 4));
+            assert_eq!(
+                direct.metadata,
+                json!({
+                    "synthesizedBy": "event-bus",
+                    "channel": "event",
+                    "callee": "this.eventEmitter.emit",
+                    "event": "user.created",
+                    "registeredAt": "apps/api/src/notifications.listener.ts:5",
+                })
+            );
+            let send = one(graph, "send", None, "event-bus");
+            assert_eq!(at(graph, send), heuristic("handleMessage", 13, 4));
+            assert_eq!(
+                send.metadata,
+                json!({
+                    "synthesizedBy": "event-bus",
+                    "channel": "socket",
+                    "callee": "socket.emit",
+                    "event": "message",
+                    "tier": "client→server",
+                    "registeredAt": "apps/api/src/chat.gateway.ts:5",
+                })
+            );
+            let reply = one(graph, "handleMessage", None, "event-bus");
+            assert_eq!(at(graph, reply), heuristic("Chat", 7, 4));
+            assert_eq!(
+                reply.metadata,
+                json!({
+                    "synthesizedBy": "event-bus",
+                    "channel": "socket",
+                    "callee": "this.server.emit",
+                    "event": "message",
+                    "tier": "server→client",
+                    "registeredAt": "apps/web/components/chat.tsx:8",
+                })
+            );
+        }
+
+        /// `ui-steps-api-servers.test.ts`: the queue `@InjectQueue('cats')`
+        /// binds reaches the `@Process('index')` method of the
+        /// `@Processor('cats')` class.
+        #[test]
+        fn w720_an_injected_queue_reaches_its_processor() {
+            let project = project_of(NEST_QUEUE).index();
+            let graph = project.graph();
+            let job = one(graph, "create", Some("cats.service.ts"), "queue-job");
+            assert_eq!(at(graph, job), heuristic("handleIndex", 15, 10));
+            assert_eq!(
+                job.metadata,
+                json!({
+                    "synthesizedBy": "queue-job",
+                    "channel": "queue",
+                    "callee": "this.catsQueue.add",
+                    "event": "index",
+                    "queue": "cats",
+                    "registeredAt": "src/nest/cats.processor.ts:4",
+                })
+            );
+        }
+
+        /// What the passes leave alone: a generated file's call, a path two
+        /// routes serve alike, a project method named `fetch`.
+        #[test]
+        fn w720_a_generated_file_a_tie_and_a_fetch_method_draw_nothing() {
+            let project = project_of(&[
+                ("package.json", "{\"name\":\"app\",\"private\":true,\"dependencies\":{\"express\":\"^4.0.0\"}}"),
+                (
+                    "src/server.ts",
+                    "import express from 'express';\nconst app = express();\napp.get('/api/items', listItems);\napp.get('/api/:kind/:id', showOne);\napp.get('/api/:type/:key', showOther);\nfunction listItems(req, res) {}\nfunction showOne(req, res) {}\nfunction showOther(req, res) {}\n",
+                ),
+                (
+                    "src/client.ts",
+                    "export function load() {\n  return fetch('/api/items');\n}\nexport function tied() {\n  return fetch('/api/x/1');\n}\nexport class Repo {\n  fetch(url: string) {\n    return url;\n  }\n  find() {\n    return this.fetch('/api/items');\n  }\n}\n",
+                ),
+                (
+                    "src/api.gen.ts",
+                    "export function generated() {\n  return fetch('/api/items');\n}\n",
+                ),
+            ])
+            .index();
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "http-client"),
+                ["load → GET /api/items"],
+                "{}",
+                graph.report()
+            );
+        }
+
+        /// `test-request-edges.test.ts` 69: MockMvc requests reach their
+        /// routes, URI templates and query strings included.
+        #[test]
+        fn w720_mockmvc_requests_reach_their_routes() {
+            let project = spring(SPRING_MOCKMVC);
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "test-request"),
+                [
+                    "testFindByPage → GET /owners",
+                    "testInitUpdateOwnerForm → GET /owners/{ownerId}/edit",
+                    "testProcessCreationFormSuccess → POST /owners/new",
+                ],
+                "{}",
+                graph.report()
+            );
+            let created = one(
+                graph,
+                "testProcessCreationFormSuccess",
+                None,
+                "test-request",
+            );
+            assert_eq!(at(graph, created), heuristic("POST /owners/new", 7, 24));
+            assert_eq!(
+                created.metadata,
+                json!({
+                    "synthesizedBy": "test-request",
+                    "channel": "http",
+                    "callee": "post",
+                    "method": "POST",
+                    "href": "/owners/new",
+                    "registeredAt": "src/main/java/app/owner/OwnerController.java:7",
+                })
+            );
+            let edit = one(graph, "testInitUpdateOwnerForm", None, "test-request");
+            assert_eq!(
+                at(graph, edit),
+                heuristic("GET /owners/{ownerId}/edit", 10, 24)
+            );
+            assert_eq!(edit.metadata["href"], "/owners/${…}/edit");
+            let page = one(graph, "testFindByPage", None, "test-request");
+            assert_eq!(at(graph, page), heuristic("GET /owners", 13, 24));
+            assert_eq!(page.metadata["href"], "/owners");
+        }
+
+        /// `test-request-edges.test.ts` 101: the test reaches the route,
+        /// whose own edge reaches the handler (the badge is the viewer's).
+        #[test]
+        fn w720_a_spring_test_reaches_the_handlers_route() {
+            let project = spring(SPRING_BADGE);
+            assert_eq!(
+                pairs(project.graph(), "test-request"),
+                ["creates → POST /owners/new"],
+                "{}",
+                project.graph().report()
+            );
+        }
+
+        /// `test-request-edges.test.ts` 127: WebTestClient, TestRestTemplate,
+        /// RestAssured and the Kotlin MockMvc DSL.
+        #[test]
+        fn w720_spring_clients_reach_their_routes() {
+            let project = spring(SPRING_CLIENTS);
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "test-request"),
+                [
+                    "viaExchange → POST /owners/new",
+                    "viaKotlinDsl → POST /owners/new",
+                    "viaRestAssured → GET /owners/new",
+                    "viaRestTemplate → GET /owners",
+                    "viaWebTestClient → GET /owners/{ownerId}/edit",
+                ],
+                "{}",
+                graph.report()
+            );
+            for (source, line, col, callee) in [
+                ("viaWebTestClient", 3, 43, "get().uri"),
+                ("viaRestTemplate", 4, 29, "restTemplate.getForEntity"),
+                ("viaExchange", 5, 25, "restTemplate.exchange"),
+                ("viaRestAssured", 6, 55, "get"),
+                ("viaKotlinDsl", 3, 25, "mockMvc.post"),
+            ] {
+                let edge = one(graph, source, None, "test-request");
+                assert_eq!(
+                    (edge.line, edge.col, edge.metadata["callee"].as_str()),
+                    (Some(line), Some(col), Some(callee)),
+                    "{source}"
+                );
+            }
+        }
+
+        /// `test-request-edges.test.ts` 158: no MockMvc builders, no test
+        /// source, or a hole standing for a literal: nothing.
+        #[test]
+        fn w720_spring_requests_need_builders_tests_and_parameters() {
+            let project = spring(SPRING_NEGATIVES);
+            assert!(
+                pairs(project.graph(), "test-request").is_empty(),
+                "{}",
+                project.graph().report()
+            );
+        }
+
+        /// `test-request-edges.test.ts` 209: `$this` requests, through
+        /// chained helpers, `json()` / `call()`, interpolation and
+        /// concatenation.
+        #[test]
+        fn w720_laravel_this_requests_reach_their_routes() {
+            let project = laravel(LARAVEL_THIS);
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "test-request"),
+                [
+                    "testBook → GET /books/{slug}",
+                    "testDelete → DELETE /api/songs/{song}",
+                    "testLogin → POST /api/me",
+                    "testRate → PUT /api/songs/{song}/rating",
+                    "testRateAgain → PUT /api/songs/{song}/rating",
+                ],
+                "{}",
+                graph.report()
+            );
+            for (source, line, col, callee, href, registered) in [
+                (
+                    "testLogin",
+                    3,
+                    39,
+                    "$this->postJson",
+                    "/api/me",
+                    "routes/api.php:2",
+                ),
+                (
+                    "testDelete",
+                    4,
+                    57,
+                    "$this->json",
+                    "/api/songs/1",
+                    "routes/api.php:3",
+                ),
+                (
+                    "testRate",
+                    5,
+                    53,
+                    "$this->put",
+                    "/api/songs/${…}/rating",
+                    "routes/api.php:4",
+                ),
+                (
+                    "testRateAgain",
+                    6,
+                    43,
+                    "$this->put",
+                    "/api/songs/${…}/rating",
+                    "routes/api.php:4",
+                ),
+                (
+                    "testBook",
+                    7,
+                    38,
+                    "$this->get",
+                    "/books/${…}",
+                    "routes/web.php:2",
+                ),
+            ] {
+                let edge = one(graph, source, None, "test-request");
+                assert_eq!(
+                    (
+                        edge.line,
+                        edge.col,
+                        edge.metadata["callee"].as_str(),
+                        edge.metadata["href"].as_str(),
+                        edge.metadata["registeredAt"].as_str()
+                    ),
+                    (
+                        Some(line),
+                        Some(col),
+                        Some(callee),
+                        Some(href),
+                        Some(registered)
+                    ),
+                    "{source}"
+                );
+            }
+        }
+
+        /// `test-request-edges.test.ts` 235: the project's own request
+        /// helpers (koel's `getAs` → `jsonAs` → `$this->json`), and nothing
+        /// else named for a verb.
+        #[test]
+        fn w720_a_laravel_request_helper_reaches_its_route() {
+            let project = laravel(LARAVEL_HELPERS);
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "test-request"),
+                ["testLoginViaHelper → POST /api/me"],
+                "{}",
+                graph.report()
+            );
+            let edge = one(graph, "testLoginViaHelper", None, "test-request");
+            assert_eq!(at(graph, edge), heuristic("POST /api/me", 4, 48));
+            assert_eq!(edge.metadata["callee"], "$this->postAs");
+            assert_eq!(edge.metadata["method"], "POST");
+        }
+
+        /// `test-request-edges.test.ts` 262: Pest's helpers from the test
+        /// file; container lookups, `route()` names and app code draw
+        /// nothing.
+        #[test]
+        fn w720_pest_requests_come_from_the_test_file() {
+            let project = laravel(LARAVEL_PEST);
+            let graph = project.graph();
+            assert_eq!(
+                pairs(graph, "test-request"),
+                ["AboutTest.php → GET /about"],
+                "{}",
+                graph.report()
+            );
+            let edge = graph
+                .edges
+                .iter()
+                .find(|edge| pass(edge) == Some("test-request"))
+                .unwrap();
+            assert_eq!(
+                graph.node(&edge.source).map(|node| node.kind.as_str()),
+                Some("file")
+            );
+            assert_eq!(at(graph, edge), heuristic("GET /about", 4, 4));
+            assert_eq!(edge.metadata["callee"], "get");
+        }
+
+        /// Pest's helpers are read only where the file imports them.
+        #[test]
+        fn w720_pest_without_its_import_requests_nothing() {
+            let project = laravel(&[(
+                "tests/Feature/AboutTest.php",
+                "<?php\nit('shows the about page', function () {\n    get('/about')->assertOk();\n});\n",
+            )]);
+            assert!(
+                pairs(project.graph(), "test-request").is_empty(),
+                "{}",
+                project.graph().report()
+            );
+        }
+
+        /// `test-request-edges.test.ts` 286 (the edges; the fan-in is the
+        /// viewer's): forty-five tests reach one route.
+        #[test]
+        fn w720_forty_five_tests_reach_one_route() {
+            let tests: Vec<String> = (0..45)
+                .map(|at| {
+                    format!("    public function testAbout{at}() {{ $this->get('/about'); }}")
+                })
+                .collect();
+            let many = format!(
+                "<?php\nclass ManyTest extends TestCase {{\n{}\n}}\n",
+                tests.join("\n")
+            );
+            let project = laravel(&[("tests/Feature/ManyTest.php", many.as_str())]);
+            let reaching = pairs(project.graph(), "test-request")
+                .into_iter()
+                .filter(|pair| pair.ends_with("→ GET /about"))
+                .count();
+            assert_eq!(reaching, 45, "{}", project.graph().report());
+        }
     }
 }
 

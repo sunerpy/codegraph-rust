@@ -156,6 +156,24 @@ a member, with `via`, the binding as written (`[name]`, <span v-pre>`{{ }}`</spa
 `angular-router-link` `navigates` edge to a route, with `href`, `navMethod`
 `routerLink` and, for a template's link, `template: true`.
 
+The tier passes' `calls` edges (W7-20) carry the call's `line` and `col`,
+`col` in UTF-16 code units, `channel`, the wire crossed, and `callee`, the
+call as written without white space or a trailing type argument. An
+`http-client` edge goes from the function making a client call to the route
+its path reaches, with `channel` `http`, `tier` `client→server`, `method`,
+`href`, the path joined to its client's base URL (a hole as `${…}`), and
+`registeredAt`, the route's `path:line`. A `queue-job` edge goes from the
+function adding a job to a consumer, with `channel` `queue`, `event`, the
+job's name, `queue` when the producer or the consumer names one, and
+`registeredAt`, the `path:line` of the consumer's registration. An
+`event-bus` edge goes from the function emitting an event to a handler, with
+`channel` `event` for a bus and `socket` for a socket, `event`, a socket's
+`tier` (`client→server` or `server→client`), and `registeredAt`, the
+handler's registration. A `test-request` edge goes from a test method, or a
+Pest file's file node, to the route its request names, with `channel`
+`http`, `method`, `href` and `registeredAt`, and no `tier`; the viewer leaves
+these out of a node's fan-in.
+
 An edge a framework resolver made (`resolvedBy: "framework"`) names that
 resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
 as a synthesized edge names its pass. When one reference reaches several
@@ -549,7 +567,7 @@ whose resolution is persisted, and withdrawn with the others before a sync's fir
 change. A sync that finds it missing or at another version re-resolves every Rust
 file. It is not a canonical surface.
 
-`synthesis_version` (17) vouches that the synthesized edges are the synthesis
+`synthesis_version` (18) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the

@@ -186,17 +186,18 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   resolvers draw are not drawn as screens yet.
 - Branch conditions on call sites (`when`) are absent from every edge: the
   builders that attach them are not ported either.
-- Routes come from the framework resolvers this port has — React Router,
-  TanStack Router, Vue Router and Angular Router routes, Next.js pages and
-  route handlers, SvelteKit pages, Expo Router screens and API routes, Nuxt
-  pages, NestJS controllers.
-  Express and Go HTTP routers are not among them, so those projects are not
-  routed apps here.
+- Routes come from the framework resolvers of this port's registry that make
+  route nodes: the client routers and file-route frameworks (React Router,
+  TanStack Router, Vue Router, Angular Router, Next.js, Nuxt, SvelteKit,
+  Astro and Expo Router) and the server frameworks (Laravel, Drupal,
+  Express, NestJS, Django, Flask, FastAPI, Rails, Spring, Play, Go, GoFrame,
+  Rust's axum and actix, ASP.NET and Vapor).
 - The Rust index synthesizes the field-observer, closure-collection,
   event-emitter, React and Flutter re-render, JSX render, C++ override, interface
   override, Kotlin expect/actual, Delphi form, MyBatis mapper and object
-  registry dispatch edges, so a flow shows a dashed `via …` hop for those and for no other
-  upstream synthesis pass. A Go interface's implicit implementations are in
+  registry dispatch edges, and the cross-tier HTTP client, queue job, event
+  bus and test request edges, so a flow shows a dashed `via …` hop for those
+  and for no other upstream synthesis pass. A Go interface's implicit implementations are in
   its type hierarchy, marked synthesized (`go-implements`).
 - An unresolved import is recorded by the binding it names, not by the module
   specifier, and the File view lists it that way.

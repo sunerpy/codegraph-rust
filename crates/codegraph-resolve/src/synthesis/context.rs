@@ -18,7 +18,9 @@
 //!   edges only through the view;
 //! - **everything else, from the store context**: node, name, kind and id
 //!   lookups, the file list, `file_exists` and `is_indexed_file` (the files
-//!   table, then a probe on disk within the root), the per-file callables
+//!   table, then a probe on disk within the root; a context made
+//!   [`ViewContext::indexed_files_only`], the tier pass's, answers
+//!   `file_exists` from the files table alone), the per-file callables
 //!   and methods, every language's tables and the Go, Rust and C++ module
 //!   readers, and the configuration loaders, which read the project's
 //!   `tsconfig.json` / `jsconfig.json` aliases, workspace packages and
@@ -51,6 +53,8 @@ pub(super) struct ViewContext<'v, 'a> {
     imports: RefCell<HashMap<(String, Language), Vec<ImportMapping>>>,
     re_exports: RefCell<HashMap<(String, Language), Vec<ReExport>>>,
     facts: RefCell<HashMap<String, Option<Arc<SourceFacts>>>>,
+    /// Whether `file_exists` answers from the files table alone.
+    indexed_only: bool,
 }
 
 impl<'v, 'a> ViewContext<'v, 'a> {
@@ -63,7 +67,19 @@ impl<'v, 'a> ViewContext<'v, 'a> {
             imports: RefCell::new(HashMap::new()),
             re_exports: RefCell::new(HashMap::new()),
             facts: RefCell::new(HashMap::new()),
+            indexed_only: false,
         }
+    }
+
+    /// This context with `file_exists` answering from the files table alone
+    /// (W7-20's tier pass): import resolution keeps its candidate order and
+    /// takes the first candidate the index holds. A file the configuration
+    /// excludes or the size limit keeps out appears and goes without a change
+    /// to the index, which would not withdraw the stage's marker, so a probe
+    /// on disk would leave a sync's edges different from a fresh index's.
+    pub(super) fn indexed_files_only(mut self) -> Self {
+        self.indexed_only = true;
+        self
     }
 }
 
@@ -176,7 +192,11 @@ impl ResolutionContext for ViewContext<'_, '_> {
     }
 
     fn file_exists(&self, file_path: &str) -> bool {
-        self.store.file_exists(file_path)
+        if self.indexed_only {
+            self.store.is_indexed_file(file_path)
+        } else {
+            self.store.file_exists(file_path)
+        }
     }
 
     fn is_indexed_file(&self, file_path: &str) -> bool {
@@ -533,6 +553,42 @@ mod tests {
         );
         assert!(context.recorded_heads(&derived).is_none());
         drop(context);
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The tier pass's context answers `file_exists` from the files table
+    /// alone: import resolution keeps its candidate order and takes the
+    /// first candidate the index holds, never a file only on disk.
+    #[test]
+    fn an_indexed_only_context_takes_the_first_indexed_candidate() {
+        let dir = temp_dir("indexed-only");
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        let api = "export const api = 1;\n";
+        index_file(&store, &dir, "src/api/index.ts", api, api);
+        std::fs::write(dir.join("src/api.ts"), api).unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        let probing = view.context();
+        let indexed = view.context().indexed_files_only();
+        assert!(probing.file_exists("src/api.ts"));
+        assert!(!indexed.file_exists("src/api.ts"));
+        for context in [&probing, &indexed] {
+            assert!(context.file_exists("src/api/index.ts"));
+            assert!(!context.is_indexed_file("src/api.ts"));
+        }
+        let resolve = |context: &dyn ResolutionContext| {
+            crate::import_resolver::resolve_import_path(
+                "./api",
+                "src/client.ts",
+                Language::TypeScript,
+                context,
+            )
+        };
+        assert_eq!(resolve(&probing).as_deref(), Some("src/api.ts"));
+        assert_eq!(resolve(&indexed).as_deref(), Some("src/api/index.ts"));
+        drop(probing);
+        drop(indexed);
         drop(view);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();

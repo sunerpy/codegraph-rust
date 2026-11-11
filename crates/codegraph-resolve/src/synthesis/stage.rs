@@ -22,7 +22,7 @@ use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     angular, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe,
-    iface, is_synthesized, jsx, links, registry, sveltekit, vue,
+    iface, is_synthesized, jsx, links, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -69,6 +69,14 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "closureCollEdges",
         always,
         callback::closure_collection_edges,
+    ),
+    // Before the in-process emitter pass: a pair both draw keeps the edge
+    // that says which tier it crosses (upstream CS:5081-5084).
+    ("tierEdges", jsx::gate, tier::cross_tier_edges),
+    (
+        "testRequestEdges",
+        tier::test_request_gate,
+        tier::test_request_edges,
     ),
     ("emitterEdges", always, callback::event_emitter_edges),
     ("renderEdges", always, dispatch::react_render_edges),
@@ -819,6 +827,24 @@ pub(super) fn enclosing_fn(nodes: &[Node], line: i64) -> Option<&Node> {
     best
 }
 
+/// The latest-starting constant or variable whose lines hold `line`
+/// (upstream `enclosingValue`): the value a top-level registration is
+/// written inside, a later one in `nodes`' order winning a tie.
+pub(super) fn enclosing_value(nodes: &[Node], line: i64) -> Option<&Node> {
+    let mut best: Option<&Node> = None;
+    for node in nodes {
+        if !matches!(node.kind, NodeKind::Constant | NodeKind::Variable) {
+            continue;
+        }
+        if node.start_line <= line && node.end_line.max(node.start_line) >= line {
+            if best.is_none_or(|best| node.start_line >= best.start_line) {
+                best = Some(node);
+            }
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,5 +1361,31 @@ mod tests {
         assert_eq!(LineAt::new(source, 10).line(5), 12);
         assert_eq!(slice_lines(source, 2, 3).as_deref(), Some("bb\nccc"));
         assert_eq!(slice_lines(source, 0, 3), None);
+    }
+
+    /// The latest-starting constant or variable holding the line, a later
+    /// one in the nodes' order winning a tie; a function is no value, and a
+    /// value whose end precedes its start holds its start line.
+    #[test]
+    fn the_enclosing_value_is_the_latest_starting_value() {
+        let value = |id: &str, kind: NodeKind, lines: (i64, i64)| Node {
+            kind,
+            start_line: lines.0,
+            end_line: lines.1,
+            ..function(id, "src/a.ts")
+        };
+        let nodes = [
+            value("outer", NodeKind::Constant, (1, 10)),
+            value("inner", NodeKind::Variable, (3, 5)),
+            value("callable", NodeKind::Function, (4, 4)),
+            value("later", NodeKind::Constant, (3, 6)),
+            value("line", NodeKind::Variable, (8, 0)),
+        ];
+        let at = |line: i64| enclosing_value(&nodes, line).map(|node| node.id.as_str());
+        assert_eq!(at(2), Some("outer"));
+        assert_eq!(at(4), Some("later"));
+        assert_eq!(at(8), Some("line"));
+        assert_eq!(at(9), Some("outer"));
+        assert_eq!(at(11), None);
     }
 }
