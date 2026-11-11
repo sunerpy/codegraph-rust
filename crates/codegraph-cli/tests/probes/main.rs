@@ -23445,6 +23445,418 @@ mod swift_frameworks {
     }
 }
 
+/// W7-19h: Rust's framework resolver `rust` (upstream `rust.ts` and
+/// `cargo-workspace.ts` at `e8ddc4e2`): axum and actix routes and the
+/// handlers they reference (#2359), the name heuristics' reach (#2224,
+/// #2214), and a Cargo workspace's crates (#151). Upstream's fixtures.
+mod rust_frameworks {
+    use super::support::{Graph, Indexed, Project, project_metadata_with_prefix};
+
+    /// The frameworks the index records as detected.
+    fn detected(db: &std::path::Path) -> String {
+        project_metadata_with_prefix(db, "frameworks_detected")
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// A project of `files` the `rust` resolver is detected in.
+    fn rust_project(files: &[(&str, &str)]) -> Indexed {
+        let project = files
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index();
+        assert!(
+            detected(&project.db()).contains("\"rust\""),
+            "{}",
+            detected(&project.db())
+        );
+        project
+    }
+
+    const MAIN_RS: &str = "mod actix_app;\nmod handlers;\nmod keys;\nuse axum::{routing::{delete, get, post}, Router};\nuse crate::handlers::used_handler;\n\npub fn app() -> Router {\n    Router::new()\n        .route(\"/single\", get(handlers::single_line_handler))\n        .route(\n            \"/multi\",\n            get(handlers::multi_line_handler),\n        )\n        .route(\n            \"/deep\",\n            get(\n                handlers::deep_line_handler,\n            ),\n        )\n        .route(\n            \"/items\",\n            get(handlers::list_items)\n                .post(handlers::create_item)\n                .delete(handlers::delete_item),\n        )\n        .route(\n            \"/used\",\n            post(used_handler),\n        )\n        .route(\n            \"/other\",\n            get(metrics::render_handler),\n        )\n        .route(\"/login\", post(handlers::login))\n        .route(\"/account\", delete(handlers::delete))\n        .route(\"/closure-inline\", get(|| async { cache().get(keys::session_key) }))\n        .route(\n            \"/closure\",\n            get(|| async move {\n                cache().get(keys::session_key)\n            }),\n        )\n}\n";
+
+    const ACTIX_RS: &str = "use actix_web::{web, App};\nuse crate::handlers;\n\npub fn actix() {\n    App::new()\n        .service(\n            web::resource(\"/index/with/a/rather/long/path/{id}\")\n                .to(handlers::actix_index),\n        )\n        .service(\n            web::resource(\"/user/{id}\")\n                .route(\n                    web::get()\n                        .to(handlers::actix_get_user),\n                ),\n        )\n        .route(\n            \"/hey\",\n            web::get().to(handlers::actix_hello),\n        );\n}\n";
+
+    /// Upstream's `rust-route-handler-line.test.ts` project.
+    fn route_project() -> Indexed {
+        rust_project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"repro\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\naxum = \"0.7\"\nactix-web = \"4\"\nmetrics = \"0.23\"\n",
+            ),
+            ("src/main.rs", MAIN_RS),
+            ("src/actix_app.rs", ACTIX_RS),
+            (
+                "src/handlers/mod.rs",
+                "pub async fn single_line_handler() {}\npub async fn multi_line_handler() {}\npub async fn deep_line_handler() {}\npub async fn list_items() {}\npub async fn create_item() {}\npub async fn delete_item() {}\npub async fn used_handler() {}\npub async fn render_handler() {}\npub async fn login() {}\npub async fn delete() {}\npub async fn actix_index() {}\npub async fn actix_get_user() {}\npub async fn actix_hello() {}\n",
+            ),
+            (
+                "src/keys.rs",
+                "pub fn session_key() -> &'static str { \"s\" }\n",
+            ),
+        ])
+    }
+
+    /// `METHOD /path -> file:handler` for every `references` edge out of
+    /// `file`'s routes, sorted (upstream's `routeEdges`).
+    fn route_edges(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "references")
+            .filter_map(|edge| {
+                let route = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                (route.kind == "route" && route.file_path == file)
+                    .then(|| format!("{} -> {}:{}", route.name, target.file_path, target.name))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Upstream #2359 (`rust-route-handler-line.test.ts`, axum): a handler
+    /// written below `.route(` (rustfmt's wrapping, a method router's own
+    /// line, a chain over several lines, through a `use`) links its route;
+    /// another module's namesake and a name the line writes elsewhere do
+    /// not mislead it; a call inside a closure handler is no route.
+    #[test]
+    fn pr2359_an_axum_route_links_the_handler_where_it_is_written() {
+        let project = route_project();
+        let graph = project.graph();
+        let report = graph.report();
+        let edges = route_edges(graph, "src/main.rs");
+        for expected in [
+            "GET /single -> src/handlers/mod.rs:single_line_handler",
+            "GET /multi -> src/handlers/mod.rs:multi_line_handler",
+            "GET /deep -> src/handlers/mod.rs:deep_line_handler",
+            "GET /items -> src/handlers/mod.rs:list_items",
+            "POST /items -> src/handlers/mod.rs:create_item",
+            "DELETE /items -> src/handlers/mod.rs:delete_item",
+            "POST /used -> src/handlers/mod.rs:used_handler",
+            "POST /login -> src/handlers/mod.rs:login",
+            "DELETE /account -> src/handlers/mod.rs:delete",
+        ] {
+            assert!(
+                edges.iter().any(|edge| edge == expected),
+                "{expected}\n{report}"
+            );
+        }
+        assert!(
+            !edges.iter().any(|edge| edge.contains("render_handler")),
+            "{edges:?}"
+        );
+        assert!(
+            !edges.iter().any(|edge| edge.contains("closure")),
+            "{edges:?}"
+        );
+        let closures: Vec<&str> = graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "route" && node.name.contains("closure"))
+            .map(|node| node.name.as_str())
+            .collect();
+        assert!(closures.is_empty(), "{closures:?}");
+    }
+
+    /// Upstream #2359 (axum): the route stays on its `.route(` line and the
+    /// reference sits where the handler is written.
+    #[test]
+    fn pr2359_an_axum_route_stays_on_its_line_and_references_from_the_handler() {
+        let project = route_project();
+        let graph = project.graph();
+        let lines: Vec<&str> = MAIN_RS.lines().collect();
+        let line_of = |text: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(text))
+                .expect("the line") as i64
+                + 1
+        };
+        let route = |name: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == "route" && node.name == name)
+                .unwrap_or_else(|| panic!("{name}\n{}", graph.report()))
+        };
+        let reference = |route_id: &str, handler: &str| {
+            graph
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.source == route_id
+                        && graph
+                            .node(&edge.target)
+                            .is_some_and(|target| target.name == handler)
+                })
+                .unwrap_or_else(|| panic!("{handler}\n{}", graph.report()))
+        };
+        let multi = route("GET /multi");
+        assert_eq!(multi.start_line, line_of("\"/multi\"") - 1);
+        let edge = reference(&multi.id, "multi_line_handler");
+        let line = edge.line.expect("the reference's line");
+        assert_eq!(line, line_of("handlers::multi_line_handler"));
+        let column = usize::try_from(edge.col.expect("the reference's column")).unwrap();
+        assert!(
+            lines[usize::try_from(line - 1).unwrap()][column..].starts_with("multi_line_handler"),
+            "{edge:?}"
+        );
+        let single = route("GET /single");
+        assert_eq!(
+            reference(&single.id, "single_line_handler").line,
+            Some(single.start_line)
+        );
+    }
+
+    /// Upstream #2359 (`rust-route-handler-line.test.ts`, actix): a wrapped
+    /// `web::resource(..).to(handler)`, a `web::get().to(handler)` inside the
+    /// resource's `.route(`, and an App-level `.route("/path", …)` link their
+    /// handlers; the App-level route after a `.service(..)` is not read into
+    /// the resource.
+    #[test]
+    fn pr2359_an_actix_route_links_the_handler_where_it_is_written() {
+        let project = route_project();
+        let graph = project.graph();
+        let report = graph.report();
+        let edges = route_edges(graph, "src/actix_app.rs");
+        for expected in [
+            "ANY /index/with/a/rather/long/path/{id} -> src/handlers/mod.rs:actix_index",
+            "GET /user/{id} -> src/handlers/mod.rs:actix_get_user",
+            "GET /hey -> src/handlers/mod.rs:actix_hello",
+        ] {
+            assert!(
+                edges.iter().any(|edge| edge == expected),
+                "{expected}\n{report}"
+            );
+        }
+        let user: Vec<&String> = edges
+            .iter()
+            .filter(|edge| edge.starts_with("GET /user/{id}"))
+            .collect();
+        assert_eq!(
+            user,
+            ["GET /user/{id} -> src/handlers/mod.rs:actix_get_user"],
+            "{report}"
+        );
+    }
+
+    /// The `qualified_name`s, by file, of what the edges out of `file`'s
+    /// nodes land on (upstream's `targetsFrom`).
+    fn targets_from(graph: &Graph, file: &str) -> Vec<String> {
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|source| source.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| format!("{}:{}", target.file_path, target.qualified_name))
+            .collect()
+    }
+
+    /// Upstream #2224 (`rust-framework-name-scope.test.ts`): the Rust
+    /// name heuristics never reach an item declared inside a function body
+    /// (axum's examples' `Uri`, imported from `http`, is no `struct Uri` a
+    /// routing test declares inside itself), and a file's own item comes
+    /// first (globset's `Ok(Glob { … })` is its own `Glob`).
+    #[test]
+    fn pr2224_the_rust_name_heuristics_reach_no_item_in_a_function_body() {
+        let project = rust_project(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/core\", \"crates/globset\", \"crates/web\", \"examples/tls\"]\n",
+            ),
+            ("crates/core/Cargo.toml", "[package]\nname = \"rg-core\"\n"),
+            ("crates/web/Cargo.toml", "[package]\nname = \"web\"\n"),
+            ("crates/web/src/lib.rs", "pub mod http;\n"),
+            ("crates/web/src/http.rs", "pub use ::http::Uri;\n"),
+            (
+                "crates/web/src/routing/tests.rs",
+                "fn outer_middleware_still_see_whole_url() {\n    struct Uri;\n    let _ = Uri;\n}\n",
+            ),
+            (
+                "examples/tls/Cargo.toml",
+                "[package]\nname = \"example-tls\"\n\n[dependencies]\nweb = { path = \"../../crates/web\" }\n",
+            ),
+            (
+                "examples/tls/src/main.rs",
+                "use web::http::Uri;\n\nfn make_https(uri: Uri, port: u16) -> Uri {\n    uri\n}\n",
+            ),
+            (
+                "crates/core/src/flags/defs.rs",
+                "pub struct Glob;\n\npub fn glob_flag() -> Glob {\n    Glob\n}\n",
+            ),
+            (
+                "crates/globset/Cargo.toml",
+                "[package]\nname = \"globset\"\n",
+            ),
+            (
+                "crates/globset/src/glob.rs",
+                "pub struct Glob {\n    glob: String,\n}\n\nimpl Glob {\n    pub fn new(glob: &str) -> Result<Glob, ()> {\n        Ok(Glob { glob: glob.to_string() })\n    }\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let report = graph.report();
+        let tls = targets_from(graph, "examples/tls/src/main.rs");
+        assert!(
+            !tls.iter().any(|target| target.contains("outer_middleware")),
+            "{tls:?}\n{report}"
+        );
+        let globs: std::collections::BTreeSet<String> =
+            targets_from(graph, "crates/globset/src/glob.rs")
+                .into_iter()
+                .filter(|target| target.ends_with(":Glob"))
+                .collect();
+        assert_eq!(
+            globs,
+            std::collections::BTreeSet::from(["crates/globset/src/glob.rs:Glob".to_string()]),
+            "{report}"
+        );
+    }
+
+    /// The files the edges out of `file`'s nodes land in.
+    fn target_files(graph: &Graph, file: &str) -> Vec<String> {
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains")
+            .filter(|edge| {
+                graph
+                    .node(&edge.source)
+                    .is_some_and(|source| source.file_path == file)
+            })
+            .filter_map(|edge| graph.node(&edge.target))
+            .map(|target| target.file_path.clone())
+            .collect()
+    }
+
+    /// Upstream #2214 (`rust-type-scope.test.ts`) with the Rust resolver
+    /// detected: an outside import (`use std::task::{Context, Poll}`), or a
+    /// path through one (`io::Result` under `use std::io`), is never a
+    /// project item, whatever the model rule's name; a crate-local `use` and
+    /// an inline test module still reach the project's item.
+    #[test]
+    fn pr2214_a_rust_framework_heuristic_takes_only_a_name_in_scope() {
+        let project = rust_project(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nfutures = \"0.3\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod runtime;\npub mod io;\npub mod net;\n",
+            ),
+            (
+                "src/runtime/mod.rs",
+                "pub mod context;\npub mod task;\npub mod driver;\n",
+            ),
+            (
+                "src/runtime/context.rs",
+                "pub struct Context {\n    pub depth: u8,\n}\n",
+            ),
+            (
+                "src/runtime/task/mod.rs",
+                "pub type Result<T> = std::result::Result<T, ()>;\n",
+            ),
+            ("src/io/mod.rs", "pub mod copy;\n"),
+            ("src/io/copy.rs", "pub struct Error;\n"),
+            (
+                "src/net.rs",
+                "use std::io;\nuse std::task::{Context, Poll};\n\npub fn poll_ready(cx: &mut Context<'_>) -> Poll<io::Result<()>> {\n    let _ = cx;\n    Poll::Ready(Ok(()))\n}\n\npub fn fail() -> std::io::Error {\n    std::io::Error::other(\"x\")\n}\n",
+            ),
+            (
+                "src/runtime/driver.rs",
+                "use crate::runtime::context::Context;\n\npub fn enter(ctx: &Context) -> u8 {\n    ctx.depth\n}\n",
+            ),
+            ("tests/support/panic.rs", "pub fn test_panic() {}\n"),
+            (
+                "tests/io_panic.rs",
+                "mod support {\n    pub mod panic;\n}\nuse support::panic::test_panic;\n\n#[test]\nfn panics() {\n    test_panic();\n}\n",
+            ),
+        ]);
+        let graph = project.graph();
+        let report = graph.report();
+        let net = target_files(graph, "src/net.rs");
+        for outside in [
+            "src/runtime/context.rs",
+            "src/runtime/task/mod.rs",
+            "src/io/copy.rs",
+        ] {
+            assert!(!net.contains(&outside.to_string()), "{outside}\n{report}");
+        }
+        assert!(
+            target_files(graph, "src/runtime/driver.rs")
+                .contains(&"src/runtime/context.rs".to_string()),
+            "{report}"
+        );
+        assert!(
+            target_files(graph, "tests/io_panic.rs")
+                .contains(&"tests/support/panic.rs".to_string()),
+            "{report}"
+        );
+    }
+
+    /// Upstream #151: a workspace member's `use beta::Thing;` imports the
+    /// crate `beta`, whose root is its member's `src/lib.rs`; the edge lands
+    /// on that file's node at 0.95, on the `use`'s line.
+    #[test]
+    fn pr151_a_workspace_crate_import_links_the_crate_root() {
+        let project = rust_project(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+            ),
+            (
+                "crates/alpha/Cargo.toml",
+                "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n\n[dependencies]\nbeta = { path = \"../beta\" }\n",
+            ),
+            (
+                "crates/alpha/src/lib.rs",
+                "use beta::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n",
+            ),
+            (
+                "crates/beta/Cargo.toml",
+                "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+            ),
+            ("crates/beta/src/lib.rs", "pub struct Thing;\n"),
+        ]);
+        let graph = project.graph();
+        let report = graph.report();
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.kind == "imports"
+                    && edge.source == "file:crates/alpha/src/lib.rs"
+                    && edge.target == "file:crates/beta/src/lib.rs"
+            })
+            .unwrap_or_else(|| panic!("the crate root edge\n{report}"));
+        assert_eq!((edge.line, edge.col), (Some(1), Some(0)), "{edge:?}");
+        assert_eq!(edge.resolved_by(), Some("framework"), "{edge:?}");
+        assert_eq!(
+            edge.metadata
+                .get("framework")
+                .and_then(|value| value.as_str()),
+            Some("rust"),
+            "{edge:?}"
+        );
+        assert_eq!(
+            edge.metadata
+                .get("confidence")
+                .and_then(|value| value.as_f64()),
+            Some(0.95),
+            "{edge:?}"
+        );
+    }
+}
+
 mod expo_router {
     use super::support::{Graph, Project};
 

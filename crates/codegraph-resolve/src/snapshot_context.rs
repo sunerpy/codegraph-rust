@@ -214,6 +214,8 @@ struct SnapshotCaches {
     go_tables: OnceLock<Arc<crate::go_packages::GoTables>>,
     solidity_tables: OnceLock<Arc<crate::solidity_scope::SolidityTables>>,
     route_tables: OnceLock<Arc<crate::frameworks::route_href::RouteTables>>,
+    /// The Cargo workspace's crates for the run (W7-19h).
+    cargo_workspace_crates: OnceLock<Arc<crate::frameworks::cargo_workspace::CrateMap>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -253,6 +255,7 @@ impl SnapshotCaches {
             go_tables: OnceLock::new(),
             solidity_tables: OnceLock::new(),
             route_tables: OnceLock::new(),
+            cargo_workspace_crates: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -963,6 +966,21 @@ impl ResolutionContext for SnapshotResolutionContext {
 
     fn get_rust_crates(&self) -> Arc<crate::rust_scope::RustCrates> {
         Arc::clone(&self.snapshot.rust_crates)
+    }
+
+    fn list_directories(&self, dir: &str) -> Vec<String> {
+        crate::frameworks::cargo_workspace::list_directories_within(
+            &self.snapshot.project_root,
+            dir,
+        )
+    }
+
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        Arc::clone(
+            self.caches
+                .cargo_workspace_crates
+                .get_or_init(|| Arc::new(crate::frameworks::cargo_workspace::crate_map(self))),
+        )
     }
 
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {

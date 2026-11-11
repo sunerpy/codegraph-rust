@@ -1,7 +1,8 @@
 //! A file's source and its comment-stripped text, byte for byte aligned
 //! (W7-19a's Express text, shared with the Python frameworks in W7-19b,
 //! with Spring in W7-19c, with Laravel in W7-19d, with Rails in W7-19e,
-//! with ASP.NET in W7-19f and with Vapor in W7-19g).
+//! with ASP.NET in W7-19f, with Vapor in W7-19g and with Rust's frameworks
+//! in W7-19h).
 //!
 //! Upstream strips comments one space per UTF-16 code unit and measures
 //! columns, match lengths and windows in code units; the strippers here
@@ -14,7 +15,7 @@ use std::cell::OnceCell;
 use crate::strip_comments::{
     strip_java_comments_keeping_offsets, strip_js_comments_keeping_offsets,
     strip_php_comments_keeping_offsets, strip_python_comments_keeping_offsets,
-    strip_ruby_comments_keeping_offsets,
+    strip_ruby_comments_keeping_offsets, strip_rust_comments_keeping_offsets,
 };
 
 /// A file's source and its comment-stripped text, byte for byte aligned.
@@ -74,6 +75,11 @@ impl<'a> OffsetText<'a> {
         Self::new(content, strip_ruby_comments_keeping_offsets(content))
     }
 
+    /// Rust source ([`strip_rust_comments_keeping_offsets`]).
+    pub(crate) fn rust(content: &'a str) -> Self {
+        Self::new(content, strip_rust_comments_keeping_offsets(content))
+    }
+
     /// `start..end` of the stripped text as upstream's holds it: a blanked
     /// character is a space per UTF-16 code unit there, a byte here.
     pub(crate) fn upstream(&self, start: usize, end: usize) -> String {
@@ -91,6 +97,20 @@ impl<'a> OffsetText<'a> {
     /// is the source's there.
     pub(crate) fn units(&self, start: usize, end: usize) -> i64 {
         self.content[start..end].encode_utf16().count() as i64
+    }
+
+    /// The offset `units` UTF-16 code units of the source past `start`
+    /// (upstream's `start + units`), or the text's end when it is nearer; a
+    /// character the bound cuts in two ends the text before it.
+    pub(crate) fn offset_after_units(&self, start: usize, units: usize) -> usize {
+        let mut taken = 0;
+        for (offset, ch) in self.content[start..].char_indices() {
+            taken += ch.len_utf16();
+            if taken > units {
+                return start + offset;
+            }
+        }
+        self.content.len()
     }
 
     /// The 1-based line of `offset` (upstream `split('\n').length`).
@@ -168,5 +188,29 @@ impl<'a> OffsetText<'a> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bound counts UTF-16 code units: an emoji is two and four bytes,
+    /// `é` one and two; a character the bound cuts in two is left out.
+    #[test]
+    fn an_offset_after_units_counts_code_units_from_its_start() {
+        let content = "ab\u{1F600}\u{e9}c";
+        let text = OffsetText::new(content, content.to_string());
+        assert_eq!(text.offset_after_units(0, 0), 0);
+        assert_eq!(text.offset_after_units(0, 2), 2);
+        // Three units would cut the emoji.
+        assert_eq!(text.offset_after_units(0, 3), 2);
+        assert_eq!(text.offset_after_units(0, 4), 6);
+        assert_eq!(text.offset_after_units(0, 5), 8);
+        assert_eq!(text.offset_after_units(2, 3), 8);
+        assert_eq!(text.offset_after_units(6, 1), 8);
+        // Past the end: the end.
+        assert_eq!(text.offset_after_units(0, 500), content.len());
+        assert_eq!(text.offset_after_units(content.len(), 5), content.len());
     }
 }

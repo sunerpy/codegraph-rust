@@ -452,6 +452,74 @@ pub(crate) fn strip_ruby_comments_keeping_offsets(content: &str) -> String {
     out
 }
 
+/// [`strip_comments_for_regex`] for Rust with each blanked BYTE but a
+/// newline a space (W7-19h), the way [`strip_js_comments_keeping_offsets`]
+/// blanks JavaScript: a `/* */` comment, the nested ones in it counted, and
+/// a `//` comment to the end of its line become spaces, a `"` string stays
+/// across lines, a `'` literal (a lifetime too, as upstream reads it) stays
+/// to the next `'` or the end of its line, and every byte offset of
+/// `content` is an offset of the result. The scan is `strip_rust`'s, byte by
+/// byte: every byte it looks for is ASCII, and a backslash skips the byte
+/// after it, the first of its character; any more are bytes no delimiter
+/// equals.
+pub(crate) fn strip_rust_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        let c2 = bytes.get(i + 1).copied().unwrap_or(0);
+        if c == b'/' && c2 == b'*' {
+            let start = i;
+            i += 2;
+            let mut depth = 1;
+            while i < n && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if c == b'/' && c2 == b'/' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if c == b'\'' && bytes[i] == b'\n' {
+                    break;
+                }
+                i += 1;
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
 /// How a comment's text is blanked: one space per character, or per byte.
 #[derive(Clone, Copy)]
 enum Blanking {
@@ -1437,6 +1505,67 @@ mod tests {
         let out = strip_ruby_comments_keeping_offsets(escaped);
         assert_eq!(out.find('#'), None);
         assert!(out.starts_with("s = 'a\\é'"));
+    }
+
+    /// `stripped`, a character-for-character stripping of `input`, with each
+    /// character it blanked a space per byte of it.
+    fn blanked_by_bytes(input: &str, stripped: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        for (original, kept) in input.chars().zip(stripped.chars()) {
+            if kept == original {
+                out.push(original);
+            } else {
+                assert_eq!(kept, ' ', "{input:?}");
+                out.extend(std::iter::repeat_n(' ', original.len_utf8()));
+            }
+        }
+        out
+    }
+
+    /// W7-19h: the Rust twin blanks what `strip_rust` blanks, one space per
+    /// byte: on ASCII text the two agree, and on any text each character
+    /// `strip_rust` blanks is a space per byte of it.
+    #[test]
+    fn rust_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "// .route(\"/fake\", get(fake_handler))\nlet app = Router::new().route(\"/real\", get(list_users));\n",
+            "/* outer /* inner .route(\"/x\", get(x)) */ still */ let b = 2;",
+            "let s = \"a//b /* c */\"; // trailing\nlet x = 1;",
+            "let s = \"multi\nline // kept\"; // gone\n",
+            "let c = 'x'; let s = \"esc\\\"y\"; // note",
+            "fn f<'a>(x: &'a str) // not a comment\n// a comment\n",
+            "let c = 'a\nlet x = 1; // c\n",
+            "code /* open /* nested\nlet s = \"open",
+            "let e = '\\''; // c\n",
+            "let s = \"a\\\n// kept\"; // gone\n",
+            "x /* a */ y /**/ z /*/ w */ v\n",
+            "",
+        ] {
+            assert_eq!(
+                strip_rust_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Rust),
+                "{ascii:?}"
+            );
+        }
+        for input in [
+            "// caf\u{e9} \u{2014} \u{fc} \u{1F600}\nlet s = \"/\u{e9} // \u{e9}\"; /* \u{65e5}\u{672c} /* \u{1F600} */ \u{fc} */ let t = '\u{e9}';\n",
+            "fn f<'\u{e9}>(x: &'\u{e9} str) // \u{e9}\n// \u{1F600}\n",
+            "let s = \"a\\\u{e9}\" // c\n",
+            "/* never closed \u{1F600}\n",
+        ] {
+            let out = strip_rust_comments_keeping_offsets(input);
+            assert_eq!(out.len(), input.len(), "{input:?}");
+            assert_eq!(
+                out,
+                blanked_by_bytes(input, &strip_comments_for_regex(input, CommentLang::Rust)),
+                "{input:?}"
+            );
+        }
+        // A string keeps its text; a comment's goes.
+        let input = "let s = \"/\u{e9}\"; // \u{e9}\n";
+        let out = strip_rust_comments_keeping_offsets(input);
+        assert_eq!(out.matches('\u{e9}').count(), 1);
+        assert_eq!(out.find("let"), input.find("let"));
     }
 
     #[test]

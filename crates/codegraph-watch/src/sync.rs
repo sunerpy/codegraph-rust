@@ -723,6 +723,12 @@ fn sync_paths_with_store(
     // changes moved (W7-19g), the same way.
     let vapor_bootstrap = crate::vapor_routes::needs_bootstrap(store)?;
     changed_names.vapor.track = recorded("vapor");
+    // And for the Rust references the module rule links to a crate root a
+    // failed sync's changes added or removed (W7-19h): every Rust file is
+    // re-resolved once. The lane retries only when the index recorded Rust,
+    // as Play's does.
+    let rust_crate_roots_bootstrap = crate::rust_crate_roots::needs_bootstrap(store)?;
+    let mut rust_crate_roots_track = recorded("rust");
     // And for the Dart files whose bare calls read other files' class heads:
     // every Dart file is re-resolved once (W4-DART-01). A rebuild for an
     // unreadable row starts with the marker current: withdraw it before
@@ -875,6 +881,7 @@ fn sync_paths_with_store(
         || drupal_bootstrap
         || rails_bootstrap
         || vapor_bootstrap
+        || rust_crate_roots_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
     // A bootstrap re-resolves dependents without `begin_mutation`: the
@@ -912,6 +919,7 @@ fn sync_paths_with_store(
         changed_names.drupal.track = false;
         changed_names.rails.track = false;
         changed_names.vapor.track = false;
+        rust_crate_roots_track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
                 continue;
@@ -1497,6 +1505,16 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if rust_crate_roots_bootstrap {
+            for file in crate::rust_receivers::every_rust_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -1673,6 +1691,39 @@ fn sync_paths_with_store(
             }
             changed_names.note_any(retries.names);
         }
+        // The Rust module rule's targets, the crate roots the changes added
+        // or removed or whose file node came or went (W7-19h): a target is a
+        // file node named for its file, so no name the changes touched
+        // reaches the references naming its module or crate. They are read
+        // the same way.
+        if rust_crate_roots_track && frameworks.iter().any(|name| name == "rust") {
+            let names: Vec<String> = {
+                let context = codegraph_resolve::StoreResolutionContext::new(
+                    store,
+                    project_root.to_string_lossy(),
+                )
+                .with_max_file_size(scope.options.max_file_size);
+                let crates = codegraph_resolve::ResolutionContext::cargo_workspace_crates(&context);
+                crate::rust_crate_roots::names_reaching(
+                    changed_names
+                        .added_files
+                        .iter()
+                        .chain(&changed_names.removed_files)
+                        .chain(&changed_names.file_nodes_changed),
+                    &crates,
+                )
+                .into_iter()
+                .collect()
+            };
+            if !names.is_empty() {
+                for found in store.resolved_reference_sites_named(&names)? {
+                    if !reindexed.contains(&found.file_path) {
+                        merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                    }
+                }
+                changed_names.note_any(names);
+            }
+        }
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -1774,6 +1825,7 @@ fn sync_paths_with_store(
         crate::drupal_refs::write_marker(store)?;
         crate::rails_routes::write_marker(store)?;
         crate::vapor_routes::write_marker(store)?;
+        crate::rust_crate_roots::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
         crate::resolved_refs::restore_marker(
@@ -2224,6 +2276,15 @@ fn sync_one(
             .namespaces
             .before_change(store, relative)?;
     }
+    // Whether a tracked file the Rust module rule may target has its file
+    // node, before and after: crossing `max_file_size` changes that
+    // without adding or removing the file (W7-19h).
+    let file_node = (!added && crate::rust_crate_roots::may_be_module_target(relative))
+        .then(|| codegraph_core::node_id::file_node_id(relative));
+    let had_file_node = match &file_node {
+        Some(id) => store.node_by_id(id)?.is_some(),
+        None => false,
+    };
     reextract_into_store(
         store,
         relative,
@@ -2231,6 +2292,13 @@ fn sync_one(
         changed_names,
         (&metadata, &source, content_hash),
     )?;
+    if let Some(id) = &file_node
+        && store.node_by_id(id)?.is_some() != had_file_node
+    {
+        changed_names
+            .file_nodes_changed
+            .insert(relative.to_string());
+    }
     changed_names
         .cpp
         .after_change(store, relative, c_family, c_family_after)?;
@@ -2955,6 +3023,11 @@ struct ChangedNames {
     js_surfaces: BTreeMap<String, crate::module_surfaces::SurfaceChange>,
     /// The files this sync removed.
     removed_files: BTreeSet<String>,
+    /// The tracked files the Rust module rule may target whose file node
+    /// came or went as the sync re-extracted them: a file over
+    /// `max_file_size` is recorded without nodes, so crossing the limit
+    /// adds or removes its file node while the file stays tracked (W7-19h).
+    file_nodes_changed: BTreeSet<String>,
     /// Whether this sync already withdrew the surface version marker, as it
     /// does before its first mutation and restores once everything persisted.
     surface_dirty: bool,
@@ -3126,6 +3199,7 @@ impl ChangedNames {
             crate::drupal_refs::withdraw_marker(store)?;
             crate::rails_routes::withdraw_marker(store)?;
             crate::vapor_routes::withdraw_marker(store)?;
+            crate::rust_crate_roots::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
@@ -7632,6 +7706,150 @@ pub(crate) mod tests {
         assert_ne!(edge_projection(&db), expected);
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(lane_marker(&db, crate::vapor_routes::VERSION_KEY), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const RUST_WORKSPACE: (&str, &str) = (
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+    );
+    const RUST_ALPHA_MANIFEST: (&str, &str) = (
+        "crates/alpha/Cargo.toml",
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+    );
+    const RUST_ALPHA: (&str, &str) = ("crates/alpha/src/lib.rs", "use beta::Thing;\n");
+    const RUST_BETA_MANIFEST: (&str, &str) = (
+        "crates/beta/Cargo.toml",
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+    );
+    const RUST_BETA_MAIN: (&str, &str) = ("crates/beta/src/main.rs", "fn main() {}\n");
+    const RUST_BETA_LIB: (&str, &str) = ("crates/beta/src/lib.rs", "pub struct Thing;\n");
+
+    /// Whether the member `alpha`'s `use beta::…` links the crate root at
+    /// `root`.
+    fn rust_use_links(db: &Path, root: &str) -> bool {
+        edge_projection(db).iter().any(|edge| {
+            edge.starts_with(&format!("{}:", RUST_ALPHA.0))
+                && edge.contains(&format!("-[imports]-> {root}:"))
+                && edge.contains("\"framework\":\"rust\"")
+        })
+    }
+
+    /// W7-19h: a sync failing after it gave the member `beta` its
+    /// `src/lib.rs`, before resolving, leaves the Rust crate roots marker
+    /// away, and the next sync, with nothing changed, links `alpha`'s
+    /// `use beta::…` to that `lib.rs`, as a fresh index has it. (The Rust
+    /// receivers marker the failure also withdrew re-resolves every Rust file
+    /// too, so the marker itself is what this test reads.)
+    #[test]
+    fn a_rust_crate_root_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::rust_crate_roots::VERSION.to_string());
+        let dir = TestDir::new("rust-crate-roots-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            RUST_WORKSPACE,
+            RUST_ALPHA_MANIFEST,
+            RUST_ALPHA,
+            RUST_BETA_MANIFEST,
+            RUST_BETA_MAIN,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+        assert!(
+            rust_use_links(&db, RUST_BETA_MAIN.0),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[RUST_BETA_LIB]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [RUST_BETA_LIB.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [
+            RUST_WORKSPACE,
+            RUST_ALPHA_MANIFEST,
+            RUST_ALPHA,
+            RUST_BETA_MANIFEST,
+            RUST_BETA_MAIN,
+            RUST_BETA_LIB,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("rust-crate-roots-fresh", &fresh)
+        );
+        assert!(
+            rust_use_links(&db, RUST_BETA_LIB.0),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+    }
+
+    /// W7-19h: an index without the Rust crate roots marker (built before
+    /// it, or a sync that stopped) has every Rust file re-resolved by its
+    /// next sync, with nothing changed: the crate root edge an older sync
+    /// lost comes back.
+    #[test]
+    fn an_index_without_the_rust_crate_roots_marker_re_resolves_every_rust_file() {
+        let version = Some(crate::rust_crate_roots::VERSION.to_string());
+        let dir = TestDir::new("rust-crate-roots-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            RUST_WORKSPACE,
+            RUST_ALPHA_MANIFEST,
+            RUST_ALPHA,
+            RUST_BETA_MANIFEST,
+            RUST_BETA_LIB,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+        assert!(
+            rust_use_links(&db, RUST_BETA_LIB.0),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'imports' \
+                     AND source = 'file:crates/alpha/src/lib.rs' \
+                     AND target = 'file:crates/beta/src/lib.rs'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the crate root edge an older sync lost");
+            store
+                .delete_project_metadata(crate::rust_crate_roots::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
         assert_eq!(edge_projection(&db), expected);
     }
 
