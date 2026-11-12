@@ -17,14 +17,15 @@
 //! the nodes, `resolved_refs`, and for Go the `extends` rows resolution
 //! left in `unresolved_refs`), the indexed files' text, the files the C
 //! function-pointer pass `#include`s that the index does not hold, which it
-//! records under [`INPUTS_KEY`] (W7-17b), and, for the link passes' import
-//! resolution, the JavaScript configuration resolution reads (`tsconfig.json`
-//! and `jsconfig.json` aliases, workspace packages, `package.json`
-//! manifests), JavaScript's control inputs (W7-18a), so a sync that changes
-//! none of them keeps its edges. Its Go prerequisite steps add edges the passes read
-//! as base edges first (W7-15b). `codegraph-watch` recomputes them whole
-//! after any sync that changes the index or finds a recorded file reading
-//! differently, under [`VERSION_KEY`].
+//! records under [`INPUTS_KEY`] (W7-17b), and, for the import resolution of
+//! the link passes and the tier pass (W7-20), the JavaScript configuration
+//! resolution reads (`tsconfig.json` and `jsconfig.json` aliases, workspace
+//! packages, `package.json` manifests), JavaScript's control inputs
+//! (W7-18a), so a sync that changes none of them keeps its edges. Its Go
+//! prerequisite steps add edges the passes read as base edges first
+//! (W7-15b). `codegraph-watch` recomputes them whole after any sync that
+//! changes the index or finds a recorded file reading differently, under
+//! [`VERSION_KEY`].
 
 mod angular;
 mod c_fnptr;
@@ -43,6 +44,7 @@ mod links;
 mod registry;
 mod stage;
 mod sveltekit;
+mod tier;
 mod vue;
 
 // `path.posix`, for the Laravel resolver's route-file mounts too (W7-19d).
@@ -62,7 +64,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "17";
+pub const VERSION: &str = "18";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

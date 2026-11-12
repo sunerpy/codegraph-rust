@@ -2006,6 +2006,27 @@ matrix! {
     pascal_include_flips_from_php_and_its_routine_is_called,
     pascal_include_flips_to_php_and_its_routine_leaves,
     javascript_file_gains_the_flow_pragma,
+    typescript_tier_client_path_changes,
+    typescript_tier_route_path_changes,
+    typescript_tier_mount_prefix_changes,
+    typescript_tier_nestjs_global_prefix_appears,
+    typescript_tier_nestjs_global_prefix_goes,
+    typescript_tier_second_route_ties_the_call,
+    typescript_tier_second_route_goes,
+    typescript_tier_imported_base_url_changes,
+    typescript_tier_imported_instance_module_is_deleted,
+    typescript_tier_import_alias_points_elsewhere,
+    php_tier_laravel_api_prefix_moves_the_route,
+    php_tier_request_helper_stops_requesting,
+    javascript_tier_client_moves_under_tests,
+    typescript_tier_queue_binding_names_another_queue,
+    tsx_tier_chat_becomes_a_socket_server,
+    typescript_tier_on_event_goes_and_the_emitter_pass_keeps_the_pair,
+    java_tier_spring_test_imports_its_request_builders,
+    #[ignore = "unscheduled: base import resolution probes the disk for an import candidate the index lacks (pre-existing, not the tier pass)"]
+    typescript_tier_excluded_import_candidate_appears,
+    #[ignore = "unscheduled: base import resolution probes the disk for an import candidate the index lacks (pre-existing, not the tier pass)"]
+    typescript_tier_excluded_import_candidate_goes,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -2120,6 +2141,178 @@ fn surface_bootstrap_reconciles_an_index_built_before_the_rows() {
             surface_rows,
             "[{driver}] module-surface rows"
         );
+    }
+}
+
+/// W7-20: an index whose synthesis marker is the last version's (17, before
+/// the tier passes) recomputes the stage on its next sync, with nothing
+/// changed: the test fakes that index (its tier edges deleted, the marker
+/// set back), and both drivers must draw the tier edge, match a fresh
+/// index and write this version's marker.
+#[test]
+fn tier_passes_recompute_an_index_of_the_last_synthesis_version() {
+    const APP: &str = "import express from 'express';\nconst app = express();\napp.post('/api/users', createUser);\nfunction createUser(req, res) {}\n";
+    const FORM: &str =
+        "export function submit() {\n  return fetch('/api/users', { method: 'POST' });\n}\n";
+    let tree = [
+        (
+            "package.json",
+            "{\"name\":\"app\",\"private\":true,\"dependencies\":{\"express\":\"^4.0.0\"}}\n",
+        ),
+        ("apps/api/app.ts", APP),
+        ("apps/web/form.ts", FORM),
+    ];
+    let edge = |graph: &Graph| {
+        graph
+            .edges_matching(
+                "function submit",
+                "calls",
+                "route apps/api/app.ts::POST:/api/users",
+            )
+            .into_iter()
+            .any(|edge| edge.metadata["synthesizedBy"] == "http-client")
+    };
+    let index_old = |label: &str| {
+        let mut project = tree
+            .iter()
+            .fold(
+                support::Project::named(label),
+                |project, (path, contents)| project.file(path, contents),
+            )
+            .index();
+        let conn = rusqlite::Connection::open(project.db()).unwrap();
+        let deleted = conn
+            .execute(
+                "DELETE FROM edges WHERE metadata LIKE '%\"synthesizedBy\":\"http-client\"%'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1, "the fresh index draws the tier edge");
+        let updated = conn
+            .execute(
+                "UPDATE project_metadata SET value = '17' WHERE key = 'synthesis_version'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        conn.close().unwrap();
+        project.reload();
+        assert!(!edge(project.graph()), "{}", project.graph().report());
+        project
+    };
+
+    let mut cli = index_old("cli");
+    cli.sync();
+    let mut watch = index_old("watch");
+    watcher_sync(&watch, &[]);
+    watch.reload();
+
+    let fresh = tree
+        .iter()
+        .fold(
+            support::Project::named("fresh"),
+            |project, (path, contents)| project.file(path, contents),
+        )
+        .index();
+    assert!(edge(fresh.graph()), "{}", fresh.graph().report());
+    let expected = canonicalize_db(&fresh.db()).expect("canonicalize the fresh index");
+    for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+        assert!(
+            edge(project.graph()),
+            "[{driver}]\n{}",
+            project.graph().report()
+        );
+        let actual = canonicalize_db(&project.db()).expect("canonicalize the synced index");
+        if let Err(diff) = diff_canonical(&expected, &actual, None) {
+            panic!(
+                "[{driver}] the recomputed index differs from a fresh one\n{}{diff}",
+                readable_difference(fresh.graph(), project.graph()),
+            );
+        }
+        assert_eq!(
+            support::project_metadata_with_prefix(&project.db(), "synthesis_version"),
+            [("synthesis_version".to_string(), "18".to_string())],
+            "[{driver}]"
+        );
+    }
+}
+
+/// The edges the tier passes synthesize (`http-client`, `queue-job`,
+/// `event-bus`, `test-request`), each by its ends' natural keys, with its
+/// line, column and metadata.
+fn tier_edges(graph: &Graph) -> BTreeSet<String> {
+    graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.metadata
+                    .get("synthesizedBy")
+                    .and_then(serde_json::Value::as_str),
+                Some("http-client" | "queue-job" | "event-bus" | "test-request")
+            )
+        })
+        .map(|edge| {
+            format!(
+                "{} -[{}]-> {} at {:?}:{:?} {}",
+                graph.describe(&edge.source),
+                edge.kind,
+                graph.describe(&edge.target),
+                edge.line,
+                edge.col,
+                edge.metadata
+            )
+        })
+        .collect()
+}
+
+/// W7-20 (KEEP-RUST): the tier pass resolves a client's import among the
+/// indexed files, so an excluded import candidate appearing beside the
+/// indexed one, or going, leaves the tier passes' edges as a fresh index
+/// draws them, through both drivers and in both directions. The whole index
+/// is a known gap there (`typescript_tier_excluded_import_candidate_appears`
+/// and `…_goes`): base import resolution probes the disk for the excluded
+/// candidate.
+#[test]
+fn tier_edges_converge_beside_an_excluded_import_candidate() {
+    for (name, case) in [
+        (
+            "appears",
+            cases::typescript_tier_excluded_import_candidate_appears(),
+        ),
+        (
+            "goes",
+            cases::typescript_tier_excluded_import_candidate_goes(),
+        ),
+    ] {
+        let final_tree = case.final_tree();
+        let mut cli = case.index_before("cli");
+        case.apply(&mut cli);
+        cli.sync();
+        let mut watch = case.index_before("watch");
+        let changed = case.apply(&mut watch);
+        watcher_sync(&watch, &changed);
+        watch.reload();
+        let fresh = final_tree
+            .iter()
+            .fold(Project::named("fresh"), |project, (path, contents)| {
+                project.file(path, contents)
+            })
+            .index();
+        let expected = tier_edges(fresh.graph());
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.contains("route server/app.ts::GET:/api/users/:id")),
+            "[{name}] the fresh index draws the client's edge: {expected:#?}"
+        );
+        for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+            assert_eq!(
+                tier_edges(project.graph()),
+                expected,
+                "[{name}] [{driver}] the tier edges differ from a fresh index's"
+            );
+        }
     }
 }
 
