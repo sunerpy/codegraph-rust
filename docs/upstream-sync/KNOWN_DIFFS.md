@@ -785,6 +785,20 @@ regex engine), is not listed.
   scores by its words (`fooValue`), calls an instance or extension member of
   that name, or nothing, where colby's member lookup and receiver guesses take
   the constructor (`dart_members.rs`, `name_matcher.rs`).
+- **Import candidates are indexed files (W7-27, OD-B31).** An import, an
+  include or a module path takes the first of its candidates, in colby's
+  order, that the files table holds; a file over the size limit, which the
+  table records without nodes, still is one. colby's `fileExists` falls back
+  to the disk (`resolution/index.ts` at `e8ddc4e2`, 834-860), so there a
+  candidate the index does not hold can win: a file the configuration
+  excludes, one in a language the index does not hold, or a directory. An
+  excluded `api.ts` wins over `api/index.ts`, `util.py` over
+  `util/__init__.py`, a Rust module's `util.rs` over `util/mod.rs`, a PHP
+  include's path as written over its `.php` form, and a quoted C include's
+  header beside the includer over the indexed header of that name, whose
+  macros then decide whether a call is a macro expansion. Such a file comes
+  and goes without changing the index, so no sync would resolve the import
+  again (`import_resolver.rs`, `c_macro_visibility.rs`).
 
 ### Synthesis
 
@@ -994,11 +1008,11 @@ regex engine), is not listed.
   helper's body, are read through the view: the indexed files whose text is
   the one their file rows record, as the other passes read them (W7-14).
   colby reads them from disk, a file outside the index or drifted since it
-  was indexed included. The import of a receiver's head resolves among the
-  indexed files only: when its candidates include a JavaScript file the
-  configuration excludes or the size limit keeps out, colby takes that file
-  and reads its bindings from disk, and this pass skips it for the next
-  indexed candidate (`synthesis/tier.rs`, `synthesis/context.rs`).
+  was indexed included. The import of a receiver's head resolves as every
+  import does, among the indexed files (W7-27, under Resolution above):
+  where colby takes a file the configuration excludes and reads its bindings
+  from disk, this pass reads the next indexed candidate's
+  (`synthesis/tier.rs`).
 
 ### Extraction
 
@@ -1213,3 +1227,12 @@ both. ASP.NET's route names (W7-19f) need none either: every sync recomputes
 a constant route's and an endpoint group's names from their qualified
 names, and a route whose constant or group head went away gets its file's
 name back (`frameworks/aspnet.rs`), where colby's sync keeps the old name.
+
+Outside import resolution, a few readers still probe or read a file the
+index does not hold, so a file that comes or goes without changing the index
+can leave their answer where a fresh index moves it (W7-27, left for a later
+round): Laravel's default `routes/api.php` prefix and a routes file's include
+target (`frameworks/laravel.rs`), a Godot autoload's script
+(`frameworks/godot.rs`), the same-stem header a C or C++ receiver's
+declaration is read from (`name_matcher.rs`), and a Shopify theme's root,
+found by probing for its folders (`shopify_themes.rs`).

@@ -23220,9 +23220,8 @@ const TIER_LOAD_LEGACY: (&str, &str, &str) = (
 /// `src/api/index.ts` an unchanged client imports as `./api`. The index
 /// does not change; the tier pass resolves the import among the indexed
 /// files, so the client keeps `src/api/index.ts`'s instance (upstream reads
-/// the excluded file from disk). A known gap all the same: base import
-/// resolution probes the disk for the excluded candidate, so a fresh index
-/// leaves `./api` unresolved where the sync keeps its old resolution.
+/// the excluded file from disk). Base import resolution takes the indexed
+/// candidate too (W7-27), so the whole index converges.
 pub fn typescript_tier_excluded_import_candidate_appears() -> Case {
     Case::new(Change::AddImportTarget, &[Language::TypeScript])
         .file(".codegraph/config.toml", TIER_EXCLUDE_API)
@@ -23237,8 +23236,8 @@ pub fn typescript_tier_excluded_import_candidate_appears() -> Case {
 }
 
 /// W7-20 (KEEP-RUST): the excluded `src/api.ts` goes: the tier pass keeps
-/// `src/api/index.ts`'s instance for the client, as a fresh index does. A
-/// known gap for base import resolution, as when it appears.
+/// `src/api/index.ts`'s instance for the client, as a fresh index does, and
+/// base import resolution keeps its import (W7-27).
 pub fn typescript_tier_excluded_import_candidate_goes() -> Case {
     Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
         .file(".codegraph/config.toml", TIER_EXCLUDE_API)
@@ -23251,6 +23250,164 @@ pub fn typescript_tier_excluded_import_candidate_goes() -> Case {
         .edge_metadata_before(TIER_LOAD_API, "synthesizedBy", "http-client")
         .edge_metadata_after(TIER_LOAD_API, "synthesizedBy", "http-client")
         .no_edge_metadata_after(TIER_LOAD_LEGACY, "synthesizedBy", "http-client")
+}
+
+// ----- import candidates are the indexed files (W7-27) ---------------------
+
+/// The configuration keeps the Python module `pkg/util.py` out of the index;
+/// the indexed package `pkg/util/__init__.py` beside it is `.util`'s next
+/// candidate.
+const PY_EXCLUDE_UTIL: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"pkg/util.py\"]\n";
+const PY_UTIL_MAIN: &str = "from .util import helper\n\n\ndef main():\n    return helper()\n";
+const PY_UTIL_PACKAGE: &str = "def helper():\n    return 1\n";
+const PY_UTIL_MODULE: &str = "def helper():\n    return 2\n";
+
+/// W7-27 (KEEP-RUST): an excluded `pkg/util.py` appears beside the indexed
+/// package `pkg/util/__init__.py` an unchanged module imports as `.util`.
+/// The index does not change, and an import's candidates are the indexed
+/// files, so the import keeps the package, as a fresh index takes it
+/// (colby takes the module from disk).
+pub fn python_excluded_import_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file(".codegraph/config.toml", PY_EXCLUDE_UTIL)
+        .file("pkg/main.py", PY_UTIL_MAIN)
+        .file("pkg/util/__init__.py", PY_UTIL_PACKAGE)
+        .write("pkg/util.py", PY_UTIL_MODULE)
+        .edge_before(
+            "function main",
+            "calls",
+            "function helper @pkg/util/__init__.py",
+        )
+}
+
+/// W7-27 (KEEP-RUST): the excluded `pkg/util.py` goes: the import takes the
+/// package, before and after.
+pub fn python_excluded_import_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file(".codegraph/config.toml", PY_EXCLUDE_UTIL)
+        .file("pkg/main.py", PY_UTIL_MAIN)
+        .file("pkg/util.py", PY_UTIL_MODULE)
+        .file("pkg/util/__init__.py", PY_UTIL_PACKAGE)
+        .remove("pkg/util.py")
+        .edge_after(
+            "function main",
+            "calls",
+            "function helper @pkg/util/__init__.py",
+        )
+}
+
+/// The configuration keeps the Rust module file `src/util.rs` out of the
+/// index; the indexed `src/util/mod.rs` beside it is `util`'s next
+/// candidate.
+const RUST_EXCLUDE_UTIL: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"src/util.rs\"]\n";
+const RUST_UTIL_LIB: &str =
+    "mod util;\n\nuse crate::util::helper;\n\npub fn run() -> u32 {\n    helper(1)\n}\n";
+const RUST_UTIL_MOD: &str = "pub fn helper(value: u32) -> u32 {\n    value + 1\n}\n";
+const RUST_UTIL_FILE: &str = "pub fn helper(value: u32) -> u32 {\n    value + 2\n}\n";
+
+/// W7-27 (KEEP-RUST): an excluded `src/util.rs` appears beside the indexed
+/// `src/util/mod.rs` an unchanged crate root's `use crate::util::helper`
+/// reaches: the use keeps `src/util/mod.rs`, as a fresh index takes it.
+pub fn rust_excluded_module_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file(".codegraph/config.toml", RUST_EXCLUDE_UTIL)
+        .file("src/lib.rs", RUST_UTIL_LIB)
+        .file("src/util/mod.rs", RUST_UTIL_MOD)
+        .write("src/util.rs", RUST_UTIL_FILE)
+        .edge_before("function run", "calls", "function helper @src/util/mod.rs")
+}
+
+/// W7-27 (KEEP-RUST): the excluded `src/util.rs` goes: the use reaches
+/// `src/util/mod.rs`, before and after.
+pub fn rust_excluded_module_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file(".codegraph/config.toml", RUST_EXCLUDE_UTIL)
+        .file("src/lib.rs", RUST_UTIL_LIB)
+        .file("src/util.rs", RUST_UTIL_FILE)
+        .file("src/util/mod.rs", RUST_UTIL_MOD)
+        .remove("src/util.rs")
+        .edge_after("function run", "calls", "function helper @src/util/mod.rs")
+}
+
+/// The configuration keeps the header `src/trace.h`, beside the C file that
+/// includes `"trace.h"`, out of the index; the indexed `include/trace.h` is
+/// the include's next candidate. No production context lists include
+/// directories, so the include's own directory comes first and the header
+/// the index holds under that name after it. `debug/trace_macro.h`, which
+/// the C file does not include, makes `TRACE` a macro the index knows, so
+/// the call's translation unit decides whether it is one.
+const C_EXCLUDE_TRACE: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"src/trace.h\"]\n";
+const C_TRACE_MAIN: &str = "#include \"trace.h\"\n\nint main(void) {\n    return TRACE(1);\n}\n";
+const C_TRACE_DECLARATION: &str = "int TRACE(int value);\n";
+const C_TRACE_DEFINITION: &str = "int TRACE(int value) {\n    return value;\n}\n";
+/// A function-like `TRACE`: in the excluded header it would hide the call.
+const C_TRACE_MACRO: &str = "#define TRACE(value) (value)\n";
+
+/// W7-27 (KEEP-RUST): an excluded `src/trace.h`, whose function-like macro
+/// `TRACE` would make `TRACE(1)` a macro expansion, appears beside an
+/// unchanged C file that includes `"trace.h"`. The include's candidates are
+/// the indexed files, so the translation unit keeps `include/trace.h`, and
+/// the call keeps its function, as a fresh index draws it.
+pub fn c_excluded_include_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file(".codegraph/config.toml", C_EXCLUDE_TRACE)
+        .file("src/main.c", C_TRACE_MAIN)
+        .file("include/trace.h", C_TRACE_DECLARATION)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .file("debug/trace_macro.h", C_TRACE_MACRO)
+        .write("src/trace.h", C_TRACE_MACRO)
+        .edge_before("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27 (KEEP-RUST): the excluded `src/trace.h` goes: the call reaches its
+/// function, before and after.
+pub fn c_excluded_include_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file(".codegraph/config.toml", C_EXCLUDE_TRACE)
+        .file("src/main.c", C_TRACE_MAIN)
+        .file("src/trace.h", C_TRACE_MACRO)
+        .file("include/trace.h", C_TRACE_DECLARATION)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .file("debug/trace_macro.h", C_TRACE_MACRO)
+        .remove("src/trace.h")
+        .edge_after("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// The configuration keeps `inc/db.inc` out of the index; the indexed
+/// `inc/db.inc.php` is the include's next candidate.
+const PHP_EXCLUDE_DB_INC: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"inc/db.inc\"]\n";
+const PHP_DB_INC_INDEX: &str =
+    "<?php\nrequire 'inc/db.inc';\n\nfunction boot() {\n    return connect();\n}\n";
+const PHP_DB_INC_PHP: &str = "<?php\nfunction connect() {\n    return 1;\n}\n";
+const PHP_DB_INC: &str = "<?php\nfunction connect() {\n    return 2;\n}\n";
+
+/// W7-27 (KEEP-RUST): an excluded `inc/db.inc`, the path an unchanged
+/// `require 'inc/db.inc'` names, appears beside the indexed
+/// `inc/db.inc.php`: the include keeps `inc/db.inc.php`, as a fresh index
+/// takes it.
+pub fn php_excluded_include_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file(".codegraph/config.toml", PHP_EXCLUDE_DB_INC)
+        .file("index.php", PHP_DB_INC_INDEX)
+        .file("inc/db.inc.php", PHP_DB_INC_PHP)
+        .write("inc/db.inc", PHP_DB_INC)
+        .edge_before("file:index.php", "imports", "file:inc/db.inc.php")
+}
+
+/// W7-27 (KEEP-RUST): the excluded `inc/db.inc` goes: the include takes
+/// `inc/db.inc.php`, before and after.
+pub fn php_excluded_include_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file(".codegraph/config.toml", PHP_EXCLUDE_DB_INC)
+        .file("index.php", PHP_DB_INC_INDEX)
+        .file("inc/db.inc", PHP_DB_INC)
+        .file("inc/db.inc.php", PHP_DB_INC_PHP)
+        .remove("inc/db.inc")
+        .edge_after("file:index.php", "imports", "file:inc/db.inc.php")
 }
 
 // ----- React Native, Expo modules, Fabric and Swift-ObjC bridges (W7-21) ---

@@ -2090,10 +2090,16 @@ matrix! {
     tsx_tier_chat_becomes_a_socket_server,
     typescript_tier_on_event_goes_and_the_emitter_pass_keeps_the_pair,
     java_tier_spring_test_imports_its_request_builders,
-    #[ignore = "unscheduled: base import resolution probes the disk for an import candidate the index lacks (pre-existing, not the tier pass)"]
     typescript_tier_excluded_import_candidate_appears,
-    #[ignore = "unscheduled: base import resolution probes the disk for an import candidate the index lacks (pre-existing, not the tier pass)"]
     typescript_tier_excluded_import_candidate_goes,
+    python_excluded_import_candidate_appears,
+    python_excluded_import_candidate_goes,
+    rust_excluded_module_candidate_appears,
+    rust_excluded_module_candidate_goes,
+    c_excluded_include_candidate_appears,
+    c_excluded_include_candidate_goes,
+    php_excluded_include_candidate_appears,
+    php_excluded_include_candidate_goes,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -2337,9 +2343,9 @@ fn tier_edges(graph: &Graph) -> BTreeSet<String> {
 /// indexed files, so an excluded import candidate appearing beside the
 /// indexed one, or going, leaves the tier passes' edges as a fresh index
 /// draws them, through both drivers and in both directions. The whole index
-/// is a known gap there (`typescript_tier_excluded_import_candidate_appears`
-/// and `…_goes`): base import resolution probes the disk for the excluded
-/// candidate.
+/// converges there too (`typescript_tier_excluded_import_candidate_appears`
+/// and `…_goes`), since base import resolution takes the indexed candidates
+/// alone as well (W7-27).
 #[test]
 fn tier_edges_converge_beside_an_excluded_import_candidate() {
     for (name, case) in [

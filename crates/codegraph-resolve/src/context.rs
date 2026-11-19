@@ -86,9 +86,10 @@ struct Caches {
     /// The dependency names the project's manifests declare, for the pass.
     declared_dependencies: Option<Arc<std::collections::BTreeSet<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
-    /// Existence answers for the pass: import resolution probes every extension
-    /// of a specifier from every importing file, and neither the borrowed store
-    /// nor the tree changes within a pass (upstream `fileExistsMemo`).
+    /// Existence answers for the pass: the same paths are probed again and
+    /// again, and neither the borrowed store nor the tree changes within a
+    /// pass (upstream `fileExistsMemo`, which import resolution reads there;
+    /// here import resolution asks `is_indexed_file`, W7-27).
     file_exists: HashMap<String, bool>,
     /// The Python write index for the pass (upstream #2332).
     python_write_index: Option<Arc<crate::python_globals::PythonWriteIndex>>,
@@ -496,7 +497,9 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             return exists;
         }
         // Known-file fast path then filesystem fallback (index.ts:358-374).
-        // The store is the index of known files.
+        // The store is the index of known files. Import resolution asks
+        // `is_indexed_file` of its candidates instead (W7-27), so only the
+        // callers that are not import resolution read the fallback.
         let normalized = file_path.replace('\\', "/");
         let exists = self.store.file_by_path(file_path).ok().flatten().is_some()
             || (normalized != file_path

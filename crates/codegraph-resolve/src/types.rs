@@ -475,7 +475,8 @@ pub trait ResolutionContext {
     fn file_exists(&self, file_path: &str) -> bool;
     /// Whether `file_path` (project-relative) is one of the files the index
     /// holds. Unlike [`Self::file_exists`], which also answers from the
-    /// filesystem, a directory or a `node_modules` file is never one.
+    /// filesystem, a directory or a `node_modules` file is never one. Import
+    /// resolution asks it of every candidate (W7-27).
     fn is_indexed_file(&self, file_path: &str) -> bool {
         let normalized = file_path.replace('\\', "/");
         let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
@@ -1278,6 +1279,96 @@ mod tests {
         assert!(ctx.get_go_module().is_none());
         assert!(ctx.get_re_exports("f.ts", Language::TypeScript).is_empty());
         assert!(ctx.get_cpp_include_dirs().is_empty());
+    }
+
+    /// Files the index holds, by basename, for the default
+    /// [`ResolutionContext::is_indexed_file`]; `file_exists` says yes to every
+    /// path, as a probe of a tree holding everything would.
+    struct BasenameContext {
+        by_basename: std::collections::HashMap<&'static str, Vec<&'static str>>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ResolutionContext for BasenameContext {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, _name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, _file_path: &str) -> bool {
+            true
+        }
+        fn read_file(&self, _file_path: &str) -> Option<String> {
+            None
+        }
+        fn get_project_root(&self) -> &str {
+            "/proj"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
+            self.asked.borrow_mut().push(basename.to_string());
+            Arc::new(
+                self.by_basename
+                    .get(basename)
+                    .map(|files| files.iter().map(|file| file.to_string()).collect())
+                    .unwrap_or_default(),
+            )
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    /// W7-27: the default `is_indexed_file`, which import resolution asks of
+    /// every candidate, looks the path's basename up through
+    /// `get_files_by_basename_shared` and takes only that exact path, `\`
+    /// read as `/` on either side; `file_exists` plays no part, so a path
+    /// only on disk or a directory is not one.
+    #[test]
+    fn default_is_indexed_file_looks_the_basename_up() {
+        let ctx = BasenameContext {
+            by_basename: [
+                ("index.ts", vec!["src/api/index.ts"]),
+                ("win.ts", vec!["lib\\win.ts"]),
+            ]
+            .into_iter()
+            .collect(),
+            asked: std::cell::RefCell::new(Vec::new()),
+        };
+        for (path, expected) in [
+            ("src/api/index.ts", true),
+            ("src\\api\\index.ts", true),
+            ("lib/win.ts", true),
+            ("lib\\win.ts", true),
+            ("index.ts", false),
+            ("src/other/index.ts", false),
+            ("src/api.ts", false),
+            ("src/api", false),
+        ] {
+            assert!(ctx.file_exists(path));
+            assert_eq!(ctx.is_indexed_file(path), expected, "{path}");
+        }
+        assert_eq!(
+            *ctx.asked.borrow(),
+            [
+                "index.ts", "index.ts", "win.ts", "win.ts", "index.ts", "index.ts", "api.ts", "api"
+            ]
+        );
     }
 
     #[test]

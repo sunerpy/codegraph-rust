@@ -309,10 +309,13 @@ impl MacroVisibility {
         } else {
             format!("{dir}/{spec_slash}")
         });
+        // A quoted include's own directory first, then the import
+        // resolver's candidates, then the one indexed file of its name:
+        // each a file the index holds, as every import candidate is (W7-27).
         let mut target = if quote == b'"'
             && !local.starts_with("../")
             && !local.starts_with('/')
-            && context.file_exists(&local)
+            && context.is_indexed_file(&local)
         {
             Some(local)
         } else {
@@ -1355,9 +1358,11 @@ mod tests {
 
     /// In-memory files where every name is both a function-like macro and a
     /// function, so a call's visibility is read from its translation unit
-    /// (upstream #2292's `contextOver`).
+    /// (upstream #2292's `contextOver`). `files` are the index's; `disk_only`
+    /// exist and read only on disk, as a file the configuration excludes.
     struct FilesContext {
         files: HashMap<String, String>,
+        disk_only: HashMap<String, String>,
     }
 
     impl ResolutionContext for FilesContext {
@@ -1400,10 +1405,13 @@ mod tests {
             Vec::new()
         }
         fn file_exists(&self, file_path: &str) -> bool {
-            self.files.contains_key(file_path)
+            self.files.contains_key(file_path) || self.disk_only.contains_key(file_path)
         }
         fn read_file(&self, file_path: &str) -> Option<String> {
-            self.files.get(file_path).cloned()
+            self.files
+                .get(file_path)
+                .or_else(|| self.disk_only.get(file_path))
+                .cloned()
         }
         fn get_project_root(&self) -> &str {
             "/proj"
@@ -1464,8 +1472,21 @@ mod tests {
     }
 
     fn visible(files: &[(String, String)], name: &str, line: i64) -> bool {
+        visible_in(files, &[], "unit.cpp", name, line)
+    }
+
+    /// [`visible`] for a call in `file`, with `disk_only` files beside the
+    /// index's `files`.
+    fn visible_in(
+        files: &[(String, String)],
+        disk_only: &[(String, String)],
+        file: &str,
+        name: &str,
+        line: i64,
+    ) -> bool {
         let context = FilesContext {
             files: files.iter().cloned().collect(),
+            disk_only: disk_only.iter().cloned().collect(),
         };
         let cache = std::sync::Mutex::new(MacroVisibility::default());
         let reference = RefView {
@@ -1475,12 +1496,47 @@ mod tests {
             reference_kind: EdgeKind::Calls,
             line,
             column: 0,
-            file_path: "unit.cpp".to_string(),
+            file_path: file.to_string(),
             language: Language::Cpp,
             is_function_ref: false,
             reference_subkind: None,
         };
         is_visible_macro(&cache, &reference, &context)
+    }
+
+    /// W7-27: a quoted include's own directory is a candidate only when the
+    /// index holds the header there. One only on disk, as a header the
+    /// configuration excludes, gives way to the header the index holds under
+    /// that name, so its macro hides no call.
+    #[test]
+    fn a_quoted_include_beside_the_file_only_on_disk_is_no_candidate() {
+        let unit = (
+            "src/unit.cpp".to_string(),
+            "#include \"trace.h\"\nint unit() { return TRACE(1); }\n".to_string(),
+        );
+        let declared = (
+            "include/trace.h".to_string(),
+            "int TRACE(int value);\n".to_string(),
+        );
+        let beside = (
+            "src/trace.h".to_string(),
+            "#define TRACE(v) (v)\n".to_string(),
+        );
+        let indexed = [unit.clone(), declared.clone()];
+        assert!(!visible_in(
+            &indexed,
+            std::slice::from_ref(&beside),
+            "src/unit.cpp",
+            "TRACE",
+            2
+        ));
+        assert!(visible_in(
+            &[unit, declared, beside],
+            &[],
+            "src/unit.cpp",
+            "TRACE",
+            2
+        ));
     }
 
     fn deep_unit(depth: usize, guard: Guard) -> Vec<(String, String)> {

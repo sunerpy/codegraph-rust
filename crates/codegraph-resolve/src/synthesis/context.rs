@@ -17,10 +17,12 @@
 //!   keep the trait's defaults, so no edge is read here and a pass reads
 //!   edges only through the view;
 //! - **everything else, from the store context**: node, name, kind and id
-//!   lookups, the file list, `file_exists` and `is_indexed_file` (the files
-//!   table, then a probe on disk within the root; a context made
-//!   [`ViewContext::indexed_files_only`], the tier pass's, answers
-//!   `file_exists` from the files table alone), the per-file callables
+//!   lookups, the file list, `is_indexed_file` (the files table, which
+//!   import resolution asks of every candidate, W7-27) and `file_exists`
+//!   (the files table, then a probe on disk within the root, for the
+//!   callers that are not import resolution; a context made
+//!   [`ViewContext::indexed_files_only`], the tier pass's, answers it from
+//!   the files table alone), the per-file callables
 //!   and methods, every language's tables and the Go, Rust and C++ module
 //!   readers, and the configuration loaders, which read the project's
 //!   `tsconfig.json` / `jsconfig.json` aliases, workspace packages and
@@ -72,11 +74,12 @@ impl<'v, 'a> ViewContext<'v, 'a> {
     }
 
     /// This context with `file_exists` answering from the files table alone
-    /// (W7-20's tier pass): import resolution keeps its candidate order and
-    /// takes the first candidate the index holds. A file the configuration
-    /// excludes or the size limit keeps out appears and goes without a change
-    /// to the index, which would not withdraw the stage's marker, so a probe
-    /// on disk would leave a sync's edges different from a fresh index's.
+    /// (W7-20's tier pass). A file the configuration excludes appears and
+    /// goes without a change to the index, which would not withdraw the
+    /// stage's marker, so a probe on disk would leave a sync's edges
+    /// different from a fresh index's. Import resolution no longer reads
+    /// `file_exists`: it takes the first candidate the index holds through
+    /// any context (W7-27).
     pub(super) fn indexed_files_only(mut self) -> Self {
         self.indexed_only = true;
         self
@@ -559,8 +562,9 @@ mod tests {
     }
 
     /// The tier pass's context answers `file_exists` from the files table
-    /// alone: import resolution keeps its candidate order and takes the
-    /// first candidate the index holds, never a file only on disk.
+    /// alone, and import resolution keeps its candidate order and takes the
+    /// first candidate the index holds, never a file only on disk, through
+    /// that context and the probing one alike (W7-27).
     #[test]
     fn an_indexed_only_context_takes_the_first_indexed_candidate() {
         let dir = temp_dir("indexed-only");
@@ -585,11 +589,85 @@ mod tests {
                 context,
             )
         };
-        assert_eq!(resolve(&probing).as_deref(), Some("src/api.ts"));
+        assert_eq!(resolve(&probing).as_deref(), Some("src/api/index.ts"));
         assert_eq!(resolve(&indexed).as_deref(), Some("src/api/index.ts"));
         drop(probing);
         drop(indexed);
         drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// W7-27: an import's candidates are the files the index holds. The
+    /// store, snapshot and view contexts (the tier pass's too) answer
+    /// `is_indexed_file` alike for each path: an indexed file, written with
+    /// `\` as well, a file only on disk, a directory, a missing path. So does
+    /// import resolution over each: the indexed `src/api/index.ts` past
+    /// `src/api.ts` only on disk, and nothing for a directory, which is no
+    /// candidate.
+    #[test]
+    fn every_context_takes_import_candidates_from_the_index() {
+        let dir = temp_dir("indexed-candidates");
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        let api = "export const api = 1;\n";
+        index_file(&store, &dir, "src/api/index.ts", api, api);
+        std::fs::write(dir.join("src/api.ts"), api).unwrap();
+        for directory in ["src/lib", "pkg/sub"] {
+            std::fs::create_dir_all(dir.join(directory)).unwrap();
+        }
+        let root = dir.to_str().unwrap();
+        let plain = crate::context::StoreResolutionContext::new(&store, root);
+        let snapshot =
+            crate::snapshot_context::SnapshotResolutionContext::from_store(&store, root).unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        let probing = view.context();
+        let indexed = view.context().indexed_files_only();
+        let contexts: [(&str, &dyn ResolutionContext); 4] = [
+            ("store", &plain),
+            ("snapshot", &snapshot),
+            ("view", &probing),
+            ("tier view", &indexed),
+        ];
+        for (name, context) in contexts {
+            for (path, expected) in [
+                ("src/api/index.ts", true),
+                ("src\\api\\index.ts", true),
+                ("src/api.ts", false),
+                ("src/lib", false),
+                ("pkg/sub", false),
+                ("src/missing.ts", false),
+            ] {
+                assert_eq!(context.is_indexed_file(path), expected, "{name}: {path}");
+            }
+            if name != "tier view" {
+                for on_disk in ["src/api.ts", "src/lib", "pkg/sub"] {
+                    assert!(context.file_exists(on_disk), "{name}: {on_disk}");
+                }
+            }
+            let resolve = |specifier: &str, from: &str, language: Language| {
+                crate::import_resolver::resolve_import_path(specifier, from, language, context)
+            };
+            assert_eq!(
+                resolve("./api", "src/client.ts", Language::TypeScript).as_deref(),
+                Some("src/api/index.ts"),
+                "{name}"
+            );
+            assert_eq!(
+                resolve("./lib", "src/client.ts", Language::TypeScript),
+                None,
+                "{name}"
+            );
+            assert_eq!(
+                resolve(".sub", "pkg/app.py", Language::Python),
+                None,
+                "{name}"
+            );
+        }
+        drop(probing);
+        drop(indexed);
+        drop(view);
+        drop(snapshot);
+        drop(plain);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

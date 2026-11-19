@@ -152,7 +152,10 @@ translation unit's own classes), never by the strategies below:
    namespace alone, a namespace import's `z.core.fn()` continues into it, and
    `import { default as X }` is the default import; a Python name imported
    from a package follows the package's named and star re-exports to its
-   definition, three modules deep);
+   definition, three modules deep; an import, an include or a module path
+   takes the first of its candidates, in its language's order, that the index
+   holds, never a file only on disk, such as one the configuration excludes,
+   nor a directory);
 2. qualified, scoped, receiver/type, lexical, and exact-name matching (a
    receiver written as, or inferred to be, a type the project does not declare
    stops the name guesses, except that a C# call still reaches the one
@@ -432,8 +435,8 @@ a test's own helper whose body makes one, directly or one call deeper) and,
 in a file naming `Pest\Laravel`, Pest's request functions, each reaching
 the route its literal path names from the test method, or from the file
 node for a Pest closure (`test-request`). Both read an imported file and a
-helper's body as the view holds them, and resolve an import among the
-indexed files only, the first indexed candidate in resolution's order.
+helper's body as the view holds them, and resolve an import as resolution
+does.
 Two SvelteKit passes join the halves of a route the file system pairs: a
 `+page.svelte` or `+layout.svelte` component calls each function and method
 of the loaders beside it (`+page.server.ts`, `.server.js`, `.ts` or `.js`

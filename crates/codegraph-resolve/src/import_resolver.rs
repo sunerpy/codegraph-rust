@@ -99,6 +99,9 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
     }
 }
 
+/// The first of `base_path`'s candidates the index holds (see
+/// [`resolve_import_path`]): a TypeScript `.js`-family specifier's own
+/// sources, then `language`'s extensions, then the path as written.
 fn resolve_source_candidate(
     base_path: &str,
     language: Language,
@@ -129,7 +132,7 @@ fn resolve_source_candidate(
     if let Some((stem, extensions)) = substitution {
         for extension in extensions {
             let candidate = format!("{stem}{extension}");
-            if context.file_exists(&candidate) {
+            if context.is_indexed_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -137,18 +140,26 @@ fn resolve_source_candidate(
 
     for extension in extension_resolution(language) {
         let candidate = format!("{base_path}{extension}");
-        if context.file_exists(&candidate) {
+        if context.is_indexed_file(&candidate) {
             return Some(candidate);
         }
     }
 
     context
-        .file_exists(base_path)
+        .is_indexed_file(base_path)
         .then(|| base_path.to_string())
 }
 
 /// Resolve an import path to an actual file (`resolveImportPath`,
 /// `import-resolver.ts:42-76`).
+///
+/// Every candidate is a file the files table holds
+/// ([`ResolutionContext::is_indexed_file`]), in the order colby tries them;
+/// a file over the size limit, which the table records without nodes, is
+/// one. colby's `fileExists` also answers from the disk, so a file the
+/// configuration excludes, one in a language the index does not hold, or a
+/// directory can win there; such a path appears or goes without a change to
+/// the index, which no sync would resolve again (KEEP-RUST, W7-27).
 pub fn resolve_import_path(
     import_path: &str,
     from_file: &str,
@@ -502,11 +513,11 @@ fn resolve_relative_import(
         let py_rel = pathutil::relative(project_root, &py_base);
         for ext in extensions {
             let candidate = format!("{py_rel}{ext}");
-            if context.file_exists(&candidate) {
+            if context.is_indexed_file(&candidate) {
                 return Some(candidate);
             }
         }
-        if !py_rel.is_empty() && context.file_exists(&py_rel) {
+        if !py_rel.is_empty() && context.is_indexed_file(&py_rel) {
             return Some(py_rel);
         }
         return None;
@@ -520,7 +531,7 @@ fn resolve_relative_import(
         return extension_resolution(language)
             .iter()
             .filter_map(|extension| extension.strip_prefix('/'))
-            .find(|candidate| context.file_exists(candidate))
+            .find(|candidate| context.is_indexed_file(candidate))
             .map(str::to_string);
     }
     resolve_source_candidate(&relative_path, language, context)
@@ -596,12 +607,12 @@ fn resolve_cpp_include_path(
         let normalized_dir = dir.replace('\\', "/");
         for ext in extensions {
             let candidate = format!("{normalized_dir}/{import_path}{ext}");
-            if context.file_exists(&candidate) {
+            if context.is_indexed_file(&candidate) {
                 return Some(candidate);
             }
         }
         let candidate = format!("{normalized_dir}/{import_path}");
-        if context.file_exists(&candidate) {
+        if context.is_indexed_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -689,12 +700,12 @@ fn resolve_php_include_path(
     let from_dir = pathutil::dirname(&pathutil::resolve(&project_root, from_file));
     let base_path = pathutil::resolve(&from_dir, include_path);
     let relative_path = pathutil::relative(&project_root, &base_path);
-    if context.file_exists(&relative_path) {
+    if context.is_indexed_file(&relative_path) {
         return Some(relative_path);
     }
     for ext in extension_resolution(Language::Php) {
         let candidate = format!("{relative_path}{ext}");
-        if context.file_exists(&candidate) {
+        if context.is_indexed_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -3685,8 +3696,8 @@ fn resolve_rust_path_reference(
     ))
 }
 
-/// The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file.
-/// Paths are project-relative POSIX. Ports `rustCrateRootDir`.
+/// The crate-root directory (holds an indexed `lib.rs`/`main.rs`), walking up
+/// from a file. Paths are project-relative POSIX. Ports `rustCrateRootDir`.
 fn rust_crate_root_dir(from_file: &str, context: &dyn ResolutionContext) -> Option<String> {
     let mut dir = pathutil::dirname(from_file);
     for _ in 0..64 {
@@ -3700,7 +3711,7 @@ fn rust_crate_root_dir(from_file: &str, context: &dyn ResolutionContext) -> Opti
         } else {
             format!("{dir}/main.rs")
         };
-        if context.file_exists(&lib) || context.file_exists(&main) {
+        if context.is_indexed_file(&lib) || context.is_indexed_file(&main) {
             return Some(dir);
         }
         if dir.is_empty() {
@@ -3727,7 +3738,8 @@ fn rust_self_module_dir(from_file: &str) -> String {
     }
 }
 
-/// Walk module segments to the leaf module's file. Ports `resolveRustModuleFile`.
+/// Walk module segments to the leaf module's file, each an indexed
+/// `{segment}.rs` or else `{segment}/mod.rs`. Ports `resolveRustModuleFile`.
 fn resolve_rust_module_file(
     segments: &[&str],
     from_file: &str,
@@ -3753,9 +3765,9 @@ fn resolve_rust_module_file(
             } else {
                 format!("{dir}/{seg}/mod.rs")
             };
-            if context.file_exists(&as_file) {
+            if context.is_indexed_file(&as_file) {
                 target_file = Some(as_file);
-            } else if context.file_exists(&as_mod) {
+            } else if context.is_indexed_file(&as_mod) {
                 target_file = Some(as_mod);
             } else {
                 return None;
@@ -7138,6 +7150,213 @@ export default defaultTarget;
             Some("src/sibling.rs".to_string())
         );
         assert!(resolve_rust_module_file(&[], "src/app.rs", &ctx).is_none());
+    }
+
+    // ---- Import candidates are the indexed files (W7-27) ---------------------
+
+    /// A context whose `indexed` files are the index's and whose `disk` files
+    /// exist only on disk: `file_exists` answers for both, the trait's
+    /// `is_indexed_file` for the first alone.
+    fn indexed_and_on_disk(indexed: &[&str], disk: &[&str]) -> TestContext {
+        TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: indexed.iter().map(|path| path.to_string()).collect(),
+            disk_only_files: disk.iter().map(|path| path.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The `.ts` a TypeScript `.js` specifier stands for is a candidate only
+    /// when the index holds it.
+    #[test]
+    fn a_typescript_source_for_a_js_specifier_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| {
+            resolve_import_path("./foo.js", "src/a.ts", Language::TypeScript, ctx)
+        };
+        let ctx = indexed_and_on_disk(&["src/foo.js"], &["src/foo.ts"]);
+        assert!(ctx.file_exists("src/foo.ts"));
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo.js"));
+        let ctx = indexed_and_on_disk(&["src/foo.js", "src/foo.ts"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo.ts"));
+    }
+
+    /// A specifier's extension candidates are the indexed files: `./foo.ts`
+    /// only on disk gives way to the indexed `./foo/index.ts`.
+    #[test]
+    fn an_extension_candidate_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path("./foo", "src/a.ts", Language::TypeScript, ctx);
+        let ctx = indexed_and_on_disk(&["src/foo/index.ts"], &["src/foo.ts"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo/index.ts"));
+        let ctx = indexed_and_on_disk(&["src/foo/index.ts", "src/foo.ts"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo.ts"));
+    }
+
+    /// The path as written is a candidate only when the index holds it: a
+    /// JSON file the index does not hold names no file.
+    #[test]
+    fn the_written_path_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| {
+            resolve_import_path("./data.json", "src/a.ts", Language::TypeScript, ctx)
+        };
+        assert_eq!(resolve(&indexed_and_on_disk(&[], &["src/data.json"])), None);
+        assert_eq!(
+            resolve(&indexed_and_on_disk(&["src/data.json"], &[])).as_deref(),
+            Some("src/data.json")
+        );
+    }
+
+    /// A Python relative import's module and package candidates are the
+    /// indexed files: `pkg/util.py` only on disk gives way to the indexed
+    /// package `pkg/util/__init__.py`.
+    #[test]
+    fn a_python_relative_module_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path(".util", "pkg/main.py", Language::Python, ctx);
+        let ctx = indexed_and_on_disk(&["pkg/util/__init__.py"], &["pkg/util.py"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("pkg/util/__init__.py"));
+        let ctx = indexed_and_on_disk(&["pkg/util/__init__.py", "pkg/util.py"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("pkg/util.py"));
+    }
+
+    /// A Python relative import's bare path (a namespace package's
+    /// directory) is a candidate only when the index holds that path.
+    #[test]
+    fn a_python_relative_bare_path_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path(".sub", "pkg/app.py", Language::Python, ctx);
+        assert_eq!(resolve(&indexed_and_on_disk(&[], &["pkg/sub"])), None);
+        assert_eq!(
+            resolve(&indexed_and_on_disk(&["pkg/sub"], &[])).as_deref(),
+            Some("pkg/sub")
+        );
+    }
+
+    /// `require('..')` up to the project root takes the first `index` file
+    /// the index holds there.
+    #[test]
+    fn a_root_index_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path("..", "lib/a.js", Language::JavaScript, ctx);
+        let ctx = indexed_and_on_disk(&["index.jsx"], &["index.js"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("index.jsx"));
+        let ctx = indexed_and_on_disk(&["index.jsx", "index.js"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("index.js"));
+    }
+
+    /// An include directory's candidate with an inferred extension is one
+    /// only when the index holds it: the next directory's header answers.
+    #[test]
+    fn an_include_directory_header_only_on_disk_is_no_candidate() {
+        let resolve = |indexed: &[&str], disk: &[&str]| {
+            let ctx = TestContext {
+                cpp_include_dirs: vec!["inc1".to_string(), "inc2".to_string()],
+                ..indexed_and_on_disk(indexed, disk)
+            };
+            resolve_import_path("util", "src/a.c", Language::C, &ctx)
+        };
+        assert_eq!(
+            resolve(&["inc2/util.h"], &["inc1/util.h"]).as_deref(),
+            Some("inc2/util.h")
+        );
+        assert_eq!(
+            resolve(&["inc2/util.h", "inc1/util.h"], &[]).as_deref(),
+            Some("inc1/util.h")
+        );
+    }
+
+    /// An include directory's candidate as written is one only when the
+    /// index holds it: the next directory's header answers.
+    #[test]
+    fn an_include_directory_path_only_on_disk_is_no_candidate() {
+        let resolve = |indexed: &[&str], disk: &[&str]| {
+            let ctx = TestContext {
+                cpp_include_dirs: vec!["inc1".to_string(), "inc2".to_string()],
+                ..indexed_and_on_disk(indexed, disk)
+            };
+            resolve_import_path("util.h", "src/a.c", Language::C, &ctx)
+        };
+        assert_eq!(
+            resolve(&["inc2/util.h"], &["inc1/util.h"]).as_deref(),
+            Some("inc2/util.h")
+        );
+        assert_eq!(
+            resolve(&["inc2/util.h", "inc1/util.h"], &[]).as_deref(),
+            Some("inc1/util.h")
+        );
+    }
+
+    /// A PHP include's path as written is a candidate only when the index
+    /// holds it: `inc/db.inc` only on disk gives way to `inc/db.inc.php`.
+    #[test]
+    fn a_php_include_path_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| resolve_php_include_path("inc/db.inc", "index.php", ctx);
+        let ctx = indexed_and_on_disk(&["inc/db.inc.php"], &["inc/db.inc"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("inc/db.inc.php"));
+        let ctx = indexed_and_on_disk(&["inc/db.inc.php", "inc/db.inc"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("inc/db.inc"));
+    }
+
+    /// A PHP include's `.php` candidate is one only when the index holds it.
+    #[test]
+    fn a_php_include_with_its_extension_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| resolve_php_include_path("inc/db", "index.php", ctx);
+        assert_eq!(resolve(&indexed_and_on_disk(&[], &["inc/db.php"])), None);
+        assert_eq!(
+            resolve(&indexed_and_on_disk(&["inc/db.php"], &[])).as_deref(),
+            Some("inc/db.php")
+        );
+    }
+
+    /// A crate root is a `lib.rs` the index holds.
+    #[test]
+    fn a_crate_root_lib_only_on_disk_is_no_candidate() {
+        let root = |ctx: &TestContext| rust_crate_root_dir("src/deep/mod.rs", ctx);
+        assert_eq!(root(&indexed_and_on_disk(&[], &["src/lib.rs"])), None);
+        assert_eq!(
+            root(&indexed_and_on_disk(&["src/lib.rs"], &[])).as_deref(),
+            Some("src")
+        );
+    }
+
+    /// A crate root is a `main.rs` the index holds.
+    #[test]
+    fn a_crate_root_main_only_on_disk_is_no_candidate() {
+        let root = |ctx: &TestContext| rust_crate_root_dir("src/deep/mod.rs", ctx);
+        assert_eq!(root(&indexed_and_on_disk(&[], &["src/main.rs"])), None);
+        assert_eq!(
+            root(&indexed_and_on_disk(&["src/main.rs"], &[])).as_deref(),
+            Some("src")
+        );
+    }
+
+    /// A module's `{name}.rs` is a candidate only when the index holds it:
+    /// `src/util.rs` only on disk gives way to the indexed
+    /// `src/util/mod.rs`.
+    #[test]
+    fn a_rust_module_file_only_on_disk_is_no_candidate() {
+        let module =
+            |ctx: &TestContext| resolve_rust_module_file(&["self", "util"], "src/lib.rs", ctx);
+        let ctx = indexed_and_on_disk(&["src/util/mod.rs"], &["src/util.rs"]);
+        assert_eq!(module(&ctx).as_deref(), Some("src/util/mod.rs"));
+        let ctx = indexed_and_on_disk(&["src/util/mod.rs", "src/util.rs"], &[]);
+        assert_eq!(module(&ctx).as_deref(), Some("src/util.rs"));
+    }
+
+    /// A module's `{name}/mod.rs` is a candidate only when the index holds
+    /// it.
+    #[test]
+    fn a_rust_module_directory_file_only_on_disk_is_no_candidate() {
+        let module =
+            |ctx: &TestContext| resolve_rust_module_file(&["self", "util"], "src/lib.rs", ctx);
+        assert_eq!(
+            module(&indexed_and_on_disk(&[], &["src/util/mod.rs"])),
+            None
+        );
+        assert_eq!(
+            module(&indexed_and_on_disk(&["src/util/mod.rs"], &[])).as_deref(),
+            Some("src/util/mod.rs")
+        );
     }
 
     // ---- Imported-singleton instance-method calls (#1292 / upstream 2ec877b) --

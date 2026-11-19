@@ -176,8 +176,8 @@ struct SnapshotCaches {
     import_mappings: BoundedFileMemo<Arc<Vec<ImportMapping>>>,
     re_exports: BoundedFileMemo<Arc<Vec<ReExport>>>,
     /// Filesystem existence probes for paths the snapshot does not know: the
-    /// same candidates are probed from every importing file, and the tree does
-    /// not change within a pass (upstream `fileExistsMemo`).
+    /// same paths are probed again and again, and the tree does not change
+    /// within a pass (upstream `fileExistsMemo`).
     fs_exists: BoundedFileMemo<bool>,
     /// Each directory's package.json / Deno import-map scope (upstream
     /// #2128 `manifestScopes`).
@@ -582,6 +582,9 @@ impl ResolutionContext for SnapshotResolutionContext {
     fn file_exists(&self, file_path: &str) -> bool {
         // Known-file fast path then filesystem fallback (matches the store
         // context: store-known files, normalized variant, then FS probe).
+        // Import resolution asks `is_indexed_file` of its candidates instead
+        // (W7-27), so only the callers that are not import resolution read
+        // the fallback.
         if self.snapshot.known_file_paths.contains(file_path) {
             return true;
         }

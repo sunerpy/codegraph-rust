@@ -6234,6 +6234,16 @@ mod tests {
         store
             .upsert_nodes(&[imported.clone(), decoy, caller.clone()])
             .expect("nodes");
+        // The index's file rows: an import's candidates are the indexed
+        // files (W7-27), not whatever lies on disk.
+        for path in ["models.py", "decoy.py", "consumer.py"] {
+            store
+                .upsert_file(&FileRecord {
+                    language: Language::Python,
+                    ..file_rec(path)
+                })
+                .expect("file");
+        }
 
         let project_root = root.to_string_lossy().into_owned();
         let mut resolver = ReferenceResolver::new(project_root.clone());
