@@ -490,6 +490,39 @@ fn refuses_to_move_off_a_port_the_user_pinned_with_port() {
     assert!(!output.contains("panicked"));
 }
 
+/// Steps and Screens from the real binary: `/api` lists `/api/steps`, and
+/// the Steps picture of a function in the project and the Screens picture
+/// come back as JSON.
+#[test]
+fn answers_steps_and_screens_as_json() {
+    let project = indexed_project("steps");
+    let viewer = Viewer::start(
+        &["--no-open", "--port", "0", project.path.to_str().unwrap()],
+        &[],
+    );
+    let json = |path: &str| {
+        let (status, body) = get(viewer.port, path, None);
+        assert_eq!(status, 200, "{path}: {body}");
+        serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap_or_else(|error| panic!("{path} is not JSON ({error}): {body}"))
+    };
+    let index = json("/api");
+    assert!(
+        index["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|endpoint| endpoint["path"] == "/api/steps"),
+        "{index}"
+    );
+    let steps = json("/api/steps?symbol=parseToken");
+    assert_eq!(steps["anchor"]["name"], "parseToken", "{steps}");
+    assert!(steps["steps"].is_array(), "{steps}");
+    let screens = json("/api/screens");
+    assert_eq!(screens["routed"], false, "{screens}");
+    viewer.stop();
+}
+
 #[test]
 fn refuses_a_foreign_host_end_to_end() {
     let project = indexed_project("host");

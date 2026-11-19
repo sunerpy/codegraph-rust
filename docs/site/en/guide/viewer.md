@@ -4,8 +4,9 @@ This page shows how to open CodeGraph's browser viewer and what each of its view
 
 The viewer reads a project's existing index and shows it in a browser on your own computer: a symbol with its callers,
 source and callees side by side, a file's outline, the call path from one function to another, the repository as a
-map of modules, a type's hierarchy and the code nothing reaches. It is a **preview**: it is switched off unless you
-turn it on, and the views may still change.
+map of modules, a type's hierarchy, the code nothing reaches, an app's screens and what happens from a screen, an
+endpoint or a function. It is a **preview**: it is switched off unless you turn it on, and the views may still
+change.
 
 ## Open it
 
@@ -50,6 +51,13 @@ the right, which lists what it calls. The left column lists its callers, grouped
 counts what a change would reach: direct callers, callers within three hops, and the production and test files among
 them. Every name opens that symbol, and the trail bar at the top keeps the path you took.
 
+<ScreenFigure src="/screens/viewer-symbol-when-light.webp" dark="/screens/viewer-symbol-when-dark.webp" width="1440" height="900" alt="The Symbol view of FollowButtonComponent::toggleFollowing in the Angular RealWorld app: its source in the middle, and on the right its navigation to /login and its calls to follow and unfollow, each with the condition it runs under." caption="Code from the Angular RealWorld example app (gothinkster/angular-realworld-example-app, MIT)." />
+
+A call that runs only under a condition carries it in the column on the right: here the navigation to `/login` runs
+when the reader is not signed in, `follow` when `isAuthenticated && !this.profile.following`, and `unfollow` in the
+other branch. The conditions are read from the current source of TypeScript, JavaScript, Swift, Python, Java, Kotlin,
+C#, Go, C, C++ and Objective-C files.
+
 ## Type hierarchy
 
 <ScreenFigure src="/screens/viewer-hierarchy-light.webp" dark="/screens/viewer-hierarchy-dark.webp" width="1440" height="900" alt="The Symbol view of the trait FrameworkResolver, with a type hierarchy listing the eight types that implement it." />
@@ -75,6 +83,10 @@ below lists every hop with where the call is and how confidently it was resolved
 `codegraph explore` command reaching the engine that also serves the MCP tool. When no chain of calls connects the
 two, the view says so and names the usual reasons, such as a callback or a reflective call.
 
+<ScreenFigure src="/screens/viewer-flow-when-light.webp" dark="/screens/viewer-flow-when-dark.webp" width="1440" height="900" alt="The Flow view from toggleFollowing to follow in the Angular RealWorld app: two cards, the link between them labelled with the condition the call runs under, and the same condition in the Runs when column of the table below." caption="Code from the Angular RealWorld example app (gothinkster/angular-realworld-example-app, MIT)." />
+
+A hop that runs under a condition says so on its link and in the table's **Runs when** column.
+
 ## Map
 
 <ScreenFigure src="/screens/viewer-map-light.webp" dark="/screens/viewer-map-dark.webp" width="1440" height="900" alt="The architecture map of the crates directory: each crate is a box with its symbol and file counts, layered so that every crate sits above the crates it depends on." />
@@ -98,9 +110,25 @@ reflection can still reach it.
 The start page summarises the index: what it holds, the most depended-on symbols, where execution starts, and the
 tests that reach furthest. **Entry points** lists those starting places in full, with saved trails first.
 
-**Screens** and **Steps** need graph facts this version does not record yet: Screens reports that it found no screen
-navigation, and Steps says it cannot draw steps. The [viewer reference](../../../ui.md#differences-from-upstream)
-lists what is still missing.
+<ScreenFigure src="/screens/viewer-screens-light.webp" dark="/screens/viewer-screens-dark.webp" width="1440" height="900" alt="The Screens view of the Angular RealWorld app: its ten screens in rows below the entry screen, the components that navigate from several screens in dashed boxes above them, and the most connected screens on the right." caption="Code from the Angular RealWorld example app (gothinkster/angular-realworld-example-app, MIT)." />
+
+**Screens** draws an app as its user meets it: one box per screen, a line for every way from one screen to another,
+and on each line the condition under which it happens. Select a screen to light its ways. It needs client-side
+routes, such as React Router, Next.js, SvelteKit, Vue Router, Angular Router or Expo Router; for any other project it
+says it found no screen navigation.
+
+<ScreenFigure src="/screens/viewer-steps-light.webp" dark="/screens/viewer-steps-dark.webp" width="1440" height="900" alt="The Steps view from the /login screen of the Angular RealWorld app: the submitForm handler that the form's ngSubmit fires, the two requests it can send, and the screens it leads to." caption="Code from the Angular RealWorld example app (gothinkster/angular-realworld-example-app, MIT)." />
+
+**Steps** draws what happens from a screen, an endpoint or a function: the handlers that fire and what fires them,
+calls that cross into native code or to the server, store writes, and calls that leave the code, such as a request, a
+database write or a reply, each with the condition it runs under. Calls between plain functions fold into the lines
+between the steps.
+
+<ScreenFigure src="/screens/viewer-steps-order-light.webp" dark="/screens/viewer-steps-order-dark.webp" width="1440" height="900" alt="The Steps view of submitForm read in order: an early-exit check on its first line, a decision on this.authType === 'login' with a yes and a no arm that each send a request, and both arms ending at the home screen." caption="Code from the Angular RealWorld example app (gothinkster/angular-realworld-example-app, MIT)." />
+
+**In order** reads a handler or an endpoint the way its code runs: a line means _and then_, and a decision box asks the
+condition once while each line out of it answers. The [viewer reference](../../../ui.md#api) describes what both
+views read.
 
 ## Themes
 

@@ -772,6 +772,50 @@ impl Store {
         Ok(found)
     }
 
+    /// The names the references that resolved at these sites were written
+    /// with — `prisma.user.create` where the edge only says `create` — by
+    /// `(from_node_id, line, col)`, each site's names in id order. Upstream
+    /// keeps the name on a `calls` edge's metadata (`refName`); this index
+    /// keeps it on the resolved reference. One query per chunk of sources,
+    /// through `idx_resolved_refs_site`.
+    pub fn resolved_reference_names_at(
+        &self,
+        sites: &[(String, i64, i64)],
+    ) -> rusqlite::Result<HashMap<(String, i64, i64), Vec<String>>> {
+        let mut out: HashMap<(String, i64, i64), Vec<String>> = HashMap::new();
+        if sites.is_empty() {
+            return Ok(out);
+        }
+        let wanted: std::collections::HashSet<(&str, i64, i64)> = sites
+            .iter()
+            .map(|(source, line, col)| (source.as_str(), *line, *col))
+            .collect();
+        let sources: Vec<String> = sites.iter().map(|(source, _, _)| source.clone()).collect();
+        for chunk in unique(&sources).chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let sql = format!(
+                "SELECT from_node_id, line, col, reference_name FROM resolved_refs WHERE from_node_id IN ({}) ORDER BY from_node_id, line, col, id",
+                placeholders(chunk.len())
+            );
+            let values: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
+            let mut stmt = self.connection().prepare(&sql)?;
+            let rows = stmt.query_map(values.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (source, line, col, name) = row?;
+                if wanted.contains(&(source.as_str(), line, col)) {
+                    out.entry((source, line, col)).or_default().push(name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// `getUnresolvedReferencesFrom`: references from one symbol that never
     /// resolved to an indexed node, in line order.
     pub fn unresolved_refs_from(&self, from_node_id: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
@@ -841,6 +885,69 @@ mod tests {
             return_type: None,
             updated_at: 0,
         }
+    }
+
+    /// The names written at a resolved site come back for that site only,
+    /// in id order, through the site index.
+    #[test]
+    fn resolved_reference_names_come_back_by_site() {
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-store-viewer-ref-names-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store.upsert_nodes(&["caller", "other"].map(node)).unwrap();
+        for (id, source, name, line, col) in [
+            (1, "caller", "prisma.user.create", 3, 4),
+            (2, "caller", "user.create", 3, 4),
+            (3, "caller", "log", 5, 2),
+            (4, "other", "prisma.user.create", 3, 4),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO resolved_refs (id, from_node_id, reference_name, reference_kind, line, col, file_path, language) VALUES (?1, ?2, ?3, 'calls', ?4, ?5, 'src/caller.ts', 'typescript')",
+                    params![id, source, name, line, col],
+                )
+                .unwrap();
+        }
+        let names = store
+            .resolved_reference_names_at(&[
+                ("caller".to_string(), 3, 4),
+                ("caller".to_string(), 9, 9),
+            ])
+            .unwrap();
+        assert_eq!(
+            names.get(&("caller".to_string(), 3, 4)),
+            Some(&vec![
+                "prisma.user.create".to_string(),
+                "user.create".to_string()
+            ])
+        );
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(store.resolved_reference_names_at(&[]).unwrap().is_empty());
+        let plan: Vec<String> = store
+            .connection()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT from_node_id, line, col, reference_name FROM resolved_refs WHERE from_node_id IN (?, ?) ORDER BY from_node_id, line, col, id",
+            )
+            .unwrap()
+            .query_map(params!["caller", "other"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_resolved_refs_site")),
+            "{plan:?}"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A test's request onto a route is left out of the route's fan-in;

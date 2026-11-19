@@ -48,6 +48,7 @@ import {
   type WireNodeRef,
   type WireSource,
   type WireStats,
+  type WireStepsPayload,
   type WireHierarchy,
   type WireSymbolPayload,
 } from '../src/index';
@@ -586,6 +587,44 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     expect(text).toContain('parseToken');
   });
 
+  it('StepsView says what the walk looked for when the anchor is all it found (#2274)', async () => {
+    const { adapter, calls } = mockAdapter();
+    const anchor = nodeRef();
+    const lone: WireStepsPayload = {
+      anchor,
+      ambiguous: [],
+      project: 'web',
+      steps: [{ id: anchor.id, kind: 'anchor', anchor: true, node: anchor, label: 'parseToken', sub: '', depth: 0, cut: null }],
+      links: [],
+      program: null,
+      defaultView: 'tree',
+      depth: 8,
+      limit: 120,
+      through: false,
+      truncated: { steps: 0, hubs: 0, chrome: 0 },
+      index: { lastIndexedAt: null, edges: 0, files: 1 },
+      timing: { elapsedMs: 1 },
+    };
+    setGraphAdapter({
+      ...adapter,
+      steps: (request) => {
+        calls.push(`steps:${request.anchor}`);
+        return Promise.resolve(lone);
+      },
+    });
+
+    // Not on the package entry: the app shell routes to it.
+    const { default: StepsView } = await import('../src/views/StepsView.svelte');
+    await render(StepsView, { anchor: anchor.id, symbol: null, depth: null, through: false, reading: null });
+
+    expect(calls).toContain(`steps:${anchor.id}`);
+    const text = host.textContent ?? '';
+    expect(text).toContain('Nothing this sets in motion is a step the picture draws');
+    expect(text).toContain('within 8 calls');
+    const back = [...host.querySelectorAll('a')].find((a) => a.textContent?.includes('Its callers and callees'));
+    expect(back?.getAttribute('href')).toBe(symbolHref(anchor.id));
+  });
+
   it('ArchitectureMap draws modules and their dependency from a mock adapter', async () => {
     const { adapter, calls } = mockAdapter();
     setGraphAdapter(adapter);
@@ -735,6 +774,24 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
     expect(asked[2]).toBe('api/source?file=src%2Fa.ts&from=1&to=4');
     // Repeated `id` params, never a comma-joined list.
     expect(asked[3]).toBe('api/nodes?id=a&id=b');
+  });
+
+  it('the default adapter asks `api/steps` for the picture: the anchor or a name, the depth, `through=1`', async () => {
+    const asked: string[] = [];
+    const adapter = createHttpAdapter({
+      fetch: async (input) => {
+        asked.push(String(input));
+        return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+    });
+    // Without `steps` the Steps view says it cannot draw; this server answers it.
+    expect(typeof adapter.steps).toBe('function');
+    await adapter.steps?.({ anchor: 'route:GET /users', depth: 6, through: true });
+    await adapter.steps?.({ symbol: 'parseToken', limit: 40 });
+    expect(asked).toEqual([
+      'api/steps?anchor=route%3AGET+%2Fusers&depth=6&through=1',
+      'api/steps?symbol=parseToken&limit=40',
+    ]);
   });
 
   it('an adapter with no live channel never connects and never polls', () => {

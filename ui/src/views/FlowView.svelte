@@ -400,7 +400,7 @@
     <section class="hops island" aria-label="Every hop">
       <div class="hh">
         <span class="title">Every hop</span>
-        <span class="dim">the calls on this path, in order · conditions arrive with the branch-guard port</span>
+        <span class="dim">the calls on this path, in order</span>
       </div>
       {#if payload.reason !== null || payload.ambiguous.length > 0 || payload.unresolved.length > 0}
         <div class="fnote">

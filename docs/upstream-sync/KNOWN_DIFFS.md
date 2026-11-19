@@ -925,7 +925,9 @@ regex engine), is not listed.
   a method. colby scans a file's text for `<Name` and finds the child by
   name (`jsxChild`, `declaredComponent` and its local-binding and export
   lookups). The tags are the ones the syntax tree gives in tsx and jsx
-  files, so JSX in a `.js` file renders nothing here, and a type argument
+  files, so JSX in a `.js` file renders nothing here: the walker's
+  `extract_jsx_component_ref` records a tag's `references` edge for the
+  `tsx` and `jsx` languages only (`walker.rs`). A type argument
   (`Array<Box>`, `useState<Box>()`) is no tag, where colby's pattern reads
   one. A tag outside every function renders from the value or the file
   the syntax tree gives it to; colby decides by line, and a line a value

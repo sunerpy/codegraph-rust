@@ -14,14 +14,14 @@
 //! furthest from the focal symbol unlabelled, never the focal file's own.
 //!
 //! The endpoints that walk chains rather than annotate rails (the Screens
-//! view's transitions) read one site at a time through a [`WhenReader`]:
-//! each file looked up and read once per request, drifted files unread, and
-//! the sites it labels counted against a budget.
+//! view's transitions, the Steps view) read one site at a time through a
+//! [`SiteReader`]: each file looked up and read once per request, drifted
+//! files unread, and the sites it reads counted against a budget.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
-use codegraph_core::types::Language;
+use codegraph_core::types::{Language, Node, NodeKind};
 use codegraph_graph::branch_guards::{
     BranchGuard, MAX_PARSE_BYTES, guard_label, guards_at, supports_branch_guards,
 };
@@ -32,6 +32,7 @@ use super::source::{
 };
 use super::wire::WireEdge;
 use crate::security::resolve_project_file;
+use codegraph_graph::call_sites;
 
 /// Distinct files parsed per request.
 pub const MAX_FILES: usize = 24;
@@ -150,25 +151,104 @@ pub(crate) fn annotate_batches<R, T>(
     }
 }
 
-/// A per-request reader of the conditions ONE call site sits under, for the
-/// endpoints that walk chains rather than annotate rails — the Screens
-/// view's transitions (upstream `createWhenReader`, the `when` half of
-/// `createSiteReader`, `when.ts:150-200`). Each file is looked up and read
-/// once; a file that is not indexed, has no rules, drifted since the index
-/// or cannot be read yields no label; and the sites labelled are counted, so
-/// a wide walk cannot turn one request into a parse of the repository.
-pub struct WhenReader<'c, 'a> {
+/// The `'use server'` / `'use client'` a JS-family file opens with, and
+/// whether a definition itself opens with `'use server'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Directive {
+    pub file: Option<&'static str>,
+    pub own: bool,
+}
+
+/// A file read for its directives or declarations, at most.
+const MAX_DIRECTIVE_FILE: u64 = 512 * 1024;
+
+/// A file a [`SiteReader`] may read: where it is, its text for the parser,
+/// and — read when first asked — its whole text and its line facts.
+struct ReadFile {
+    site: SiteFile,
+    text: Option<String>,
+    full: Option<Option<String>>,
+    facts: Option<Option<codegraph_resolve::source_facts::SourceFacts>>,
+}
+
+/// A per-request reader of what ONE call site, or one definition, says —
+/// its conditions, loops, arguments, trigger, the call as written, the
+/// decorators, member types, returns and directives — for the endpoints that
+/// walk chains rather than annotate rails: the Screens view's transitions and
+/// the Steps view (upstream `createSiteReader`, `when.ts:96-281`). Each file
+/// is looked up and read once; a file that is not indexed, has no rules,
+/// drifted since the index or cannot be read yields nothing; and the sites
+/// whose conditions, arguments or call are read are counted against a
+/// budget, so a wide walk cannot turn one request into a parse of the
+/// repository. The other readings are not counted: they climb trees the
+/// counted ones parsed anyway.
+pub struct SiteReader<'c, 'a> {
     ctx: &'c Ctx<'a>,
     max_sites: usize,
     max_bytes: u64,
     sites: usize,
     /// Lookups only, never iterated: a file's answer, by the path asked.
-    files: HashMap<String, Option<(SiteFile, Option<String>)>>,
+    files: HashMap<String, Option<ReadFile>>,
 }
 
-impl<'c, 'a> WhenReader<'c, 'a> {
-    /// A reader that labels at most `max_sites` sites (upstream's default is
-    /// 600).
+/// A site's 1-based line, when it has one (upstream's `!site.line`).
+fn site_line(line: Option<i64>) -> Option<usize> {
+    line.filter(|line| *line > 0)
+        .and_then(|line| usize::try_from(line).ok())
+}
+
+fn site_column(column: Option<i64>) -> Option<usize> {
+    column.and_then(|column| usize::try_from(column).ok())
+}
+
+fn is_js_family(language: Language) -> bool {
+    matches!(
+        language,
+        Language::JavaScript | Language::TypeScript | Language::Tsx | Language::Jsx
+    )
+}
+
+/// The directive a file opens with, past whitespace and comments (upstream's
+/// `^(?:\s|//[^\n]*\n|/\*[\s\S]*?\*/)*(['"])use (server|client)\1`, whose
+/// back-reference is checked by hand).
+fn file_directive(text: &str) -> Option<&'static str> {
+    let mut rest = text;
+    loop {
+        let trimmed = rest.trim_start();
+        if trimmed.len() != rest.len() {
+            rest = trimmed;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("//") {
+            rest = &after[after.find('\n')? + 1..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            rest = &after[after.find("*/")? + 2..];
+            continue;
+        }
+        break;
+    }
+    let quote = rest.chars().next().filter(|ch| matches!(ch, '\'' | '"'))?;
+    let body = &rest[1..];
+    ["server", "client"].into_iter().find(|word| {
+        body.strip_prefix("use ")
+            .and_then(|rest| rest.strip_prefix(word))
+            .is_some_and(|rest| rest.starts_with(quote))
+    })
+}
+
+/// A line that is the `'use server'` directive alone (upstream's
+/// `^\s*(['"])use server\1\s*;?\s*$`, per line).
+fn is_own_directive(line: &str) -> bool {
+    let line = line.trim();
+    let line = line.strip_suffix(';').map_or(line, str::trim_end);
+    matches!(line, "'use server'" | "\"use server\"")
+}
+
+impl<'c, 'a> SiteReader<'c, 'a> {
+    /// A reader that reads at most `max_sites` counted sites (upstream's
+    /// default is 600).
     pub fn new(ctx: &'c Ctx<'a>, max_sites: usize) -> Self {
         Self {
             ctx,
@@ -179,10 +259,69 @@ impl<'c, 'a> WhenReader<'c, 'a> {
         }
     }
 
+    /// The file `file` names, looked up once per request.
+    fn resolve(&mut self, file: &str) -> Option<&mut ReadFile> {
+        let (ctx, max_bytes) = (self.ctx, self.max_bytes);
+        self.files
+            .entry(to_request_path(file))
+            .or_insert_with_key(|posix| {
+                site_file(ctx, posix, max_bytes).map(|site| {
+                    let text = read_indexed_file_text(ctx, &site.stored, MAX_PARSE_BYTES as u64);
+                    ReadFile {
+                        site,
+                        text,
+                        full: None,
+                        facts: None,
+                    }
+                })
+            })
+            .as_mut()
+    }
+
+    /// Count a site of `file` when the budget allows and the file resolves:
+    /// whether it was counted (upstream counts it before reading the tree).
+    fn count(&mut self, file: &str, language: Language) -> bool {
+        if self.sites >= self.max_sites || !supports_branch_guards(language) {
+            return false;
+        }
+        if self.resolve(file).is_none() {
+            return false;
+        }
+        self.sites += 1;
+        true
+    }
+
+    /// Whether `file` may be read for a reading that is not counted.
+    fn readable(&mut self, file: &str, language: Language) -> bool {
+        supports_branch_guards(language) && self.resolve(file).is_some()
+    }
+
+    /// The parse key, text and language of a file already resolved.
+    fn cached(&self, file: &str) -> Option<(&str, &str, Language)> {
+        let read = self.files.get(&to_request_path(file))?.as_ref()?;
+        Some((
+            read.site.key.as_str(),
+            read.text.as_deref()?,
+            read.site.language,
+        ))
+    }
+
+    /// A file's whole text, once, for the directive and declaration reads.
+    fn full_text(&mut self, file: &str) -> Option<String> {
+        let ctx = self.ctx;
+        let read = self.resolve(file)?;
+        if read.full.is_none() {
+            read.full = Some(read_indexed_file_text(
+                ctx,
+                &read.site.stored,
+                MAX_DIRECTIVE_FILE,
+            ));
+        }
+        read.full.clone().flatten()
+    }
+
     /// The conditions a site in `file` runs under, outermost first; empty
-    /// when it is unconditional, unreadable or past the budget. A site
-    /// without a line is not counted; one whose file resolves is, whether
-    /// or not its text can be read.
+    /// when it is unconditional, unreadable or past the budget.
     pub fn guards(
         &mut self,
         file: &str,
@@ -190,34 +329,16 @@ impl<'c, 'a> WhenReader<'c, 'a> {
         line: Option<i64>,
         column: Option<i64>,
     ) -> Vec<BranchGuard> {
-        let Some(line) = line
-            .filter(|line| *line > 0)
-            .and_then(|line| usize::try_from(line).ok())
-        else {
+        let Some(line) = site_line(line) else {
             return Vec::new();
         };
-        if self.sites >= self.max_sites || !supports_branch_guards(language) {
+        if !self.count(file, language) {
             return Vec::new();
         }
-        let (ctx, max_bytes) = (self.ctx, self.max_bytes);
-        let entry = self
-            .files
-            .entry(to_request_path(file))
-            .or_insert_with_key(|posix| {
-                site_file(ctx, posix, max_bytes).map(|site| {
-                    let text = read_indexed_file_text(ctx, &site.stored, MAX_PARSE_BYTES as u64);
-                    (site, text)
-                })
-            });
-        let Some((site, text)) = entry.as_ref() else {
+        let Some((key, text, language)) = self.cached(file) else {
             return Vec::new();
         };
-        self.sites += 1;
-        let Some(text) = text else {
-            return Vec::new();
-        };
-        let column = column.and_then(|column| usize::try_from(column).ok());
-        guards_at(&site.key, text, site.language, line, column)
+        guards_at(key, text, language, line, site_column(column))
     }
 
     /// [`Self::guards`], joined the way a label prints them; empty when
@@ -230,6 +351,174 @@ impl<'c, 'a> WhenReader<'c, 'a> {
         column: Option<i64>,
     ) -> String {
         guard_label(&self.guards(file, language, line, column))
+    }
+
+    /// The loops a site is written inside, outermost first. Not counted.
+    pub fn loops(
+        &mut self,
+        file: &str,
+        language: Language,
+        line: Option<i64>,
+        column: Option<i64>,
+    ) -> Vec<call_sites::SiteLoop> {
+        let Some(line) = site_line(line) else {
+            return Vec::new();
+        };
+        if !self.readable(file, language) {
+            return Vec::new();
+        }
+        let Some((key, text, language)) = self.cached(file) else {
+            return Vec::new();
+        };
+        call_sites::loops_at(key, text, language, line, site_column(column))
+    }
+
+    /// What the site passes, abbreviated; `None` when unreadable, `''` for
+    /// an empty list.
+    pub fn args(
+        &mut self,
+        file: &str,
+        language: Language,
+        line: Option<i64>,
+        column: Option<i64>,
+    ) -> Option<String> {
+        let line = site_line(line)?;
+        if !self.count(file, language) {
+            return None;
+        }
+        let (key, text, language) = self.cached(file)?;
+        call_sites::call_arguments_at(key, text, language, line, site_column(column))
+    }
+
+    /// What fires the site. Not counted.
+    pub fn trigger(
+        &mut self,
+        file: &str,
+        language: Language,
+        line: Option<i64>,
+        column: Option<i64>,
+    ) -> Option<call_sites::SiteTrigger> {
+        let line = site_line(line)?;
+        if !self.readable(file, language) {
+            return None;
+        }
+        let (key, text, language) = self.cached(file)?;
+        call_sites::trigger_at(key, text, language, line, site_column(column))
+    }
+
+    /// The call as written and what it passes; `callee` names the call when
+    /// a position is shared.
+    pub fn call_site(
+        &mut self,
+        file: &str,
+        language: Language,
+        line: Option<i64>,
+        column: Option<i64>,
+        callee: Option<&str>,
+    ) -> Option<call_sites::CallSite> {
+        let line = site_line(line)?;
+        if !self.count(file, language) {
+            return None;
+        }
+        let (key, text, language) = self.cached(file)?;
+        call_sites::call_site_at(key, text, language, line, site_column(column), callee)
+    }
+
+    /// The decorators on a definition and on its class. Not counted.
+    pub fn decorators(
+        &mut self,
+        file: &str,
+        language: Language,
+        start_line: i64,
+    ) -> Option<call_sites::DefinitionDecorators> {
+        let line = site_line(Some(start_line))?;
+        if !self.readable(file, language) {
+            return None;
+        }
+        let (key, text, language) = self.cached(file)?;
+        call_sites::decorators_of(key, text, language, line)
+    }
+
+    /// The declared types of the members of a definition's class. Not
+    /// counted.
+    pub fn member_types(
+        &mut self,
+        file: &str,
+        language: Language,
+        start_line: i64,
+    ) -> BTreeMap<String, String> {
+        let Some(line) = site_line(Some(start_line)) else {
+            return BTreeMap::new();
+        };
+        if !self.readable(file, language) {
+            return BTreeMap::new();
+        }
+        let Some((key, text, language)) = self.cached(file) else {
+            return BTreeMap::new();
+        };
+        call_sites::member_types_of(key, text, language, line)
+    }
+
+    /// The returns a definition makes itself. Not counted.
+    pub fn returns(
+        &mut self,
+        file: &str,
+        language: Language,
+        start_line: i64,
+    ) -> Vec<call_sites::ReturnSite> {
+        let Some(line) = site_line(Some(start_line)) else {
+            return Vec::new();
+        };
+        if !self.readable(file, language) {
+            return Vec::new();
+        }
+        let Some((key, text, language)) = self.cached(file) else {
+            return Vec::new();
+        };
+        call_sites::returns_of(key, text, language, line)
+    }
+
+    /// The directive a JS-family file opens with, and whether the definition
+    /// at `start_line` opens with `'use server'` itself. Not counted.
+    pub fn directive(&mut self, file: &str, language: Language, start_line: i64) -> Directive {
+        if !is_js_family(language) {
+            return Directive::default();
+        }
+        let Some(text) = self.full_text(file) else {
+            return Directive::default();
+        };
+        let own = start_line > 0
+            && text
+                .split('\n')
+                .skip(start_line as usize - 1)
+                .take(4)
+                .any(is_own_directive);
+        Directive {
+            file: file_directive(&text),
+            own,
+        }
+    }
+
+    /// A Swift `extension X {}` node — the index keeps it as a class, but it
+    /// declares no type.
+    pub fn swift_extension(&mut self, node: &Node) -> bool {
+        if node.language != Language::Swift || node.kind != NodeKind::Class {
+            return false;
+        }
+        let Some(text) = self.full_text(&node.file_path) else {
+            return false;
+        };
+        let Some(read) = self.resolve(&node.file_path) else {
+            return false;
+        };
+        let facts = read.facts.get_or_insert_with(|| {
+            Some(codegraph_resolve::source_facts::SourceFacts::new(
+                std::sync::Arc::from(text.as_str()),
+            ))
+        });
+        facts.as_ref().is_some_and(|facts| {
+            codegraph_resolve::swift_type_visibility::declares_extension(facts, node)
+        })
     }
 }
 

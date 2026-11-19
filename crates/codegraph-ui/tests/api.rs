@@ -170,8 +170,18 @@ async fn lists_the_endpoints_it_answers() {
     ] {
         assert!(paths.iter().any(|p| p == path), "{path}");
     }
-    // Steps is not built by this server, so it is not listed.
-    assert!(!paths.iter().any(|p| p == "/api/steps"));
+    // Steps is listed with upstream's parameters (`through` unlisted, as
+    // upstream lists it).
+    let steps = body["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|endpoint| endpoint["path"] == "/api/steps")
+        .unwrap_or_else(|| panic!("/api/steps is listed: {body}"));
+    assert_eq!(
+        steps["params"],
+        serde_json::json!(["anchor", "symbol", "depth", "limit"])
+    );
 }
 
 #[tokio::test]
@@ -180,9 +190,43 @@ async fn _404s_an_unknown_endpoint_as_json_never_as_the_app_shell() {
     let reply = project.viewer().get("/api/nope").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(reply.json()["code"], "not-found");
-    let steps = project.viewer().get("/api/steps").await;
-    assert_eq!(steps.status, StatusCode::NOT_FOUND);
-    assert!(steps.json()["hint"].as_str().unwrap().contains("Steps"));
+}
+
+/* ------------------------------------------------------------ /api/steps -- */
+
+#[tokio::test]
+async fn steps_refuses_a_missing_anchor_an_unknown_id_or_name_and_a_depth_past_the_cap() {
+    let project = fixture();
+    let viewer = project.viewer();
+    let missing = viewer.get("/api/steps").await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json()["code"], "bad-request");
+    assert!(
+        missing.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Give the picture an anchor"),
+        "{}",
+        missing.text()
+    );
+    let unknown = viewer.get("/api/steps?anchor=function%3Anope").await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert!(
+        unknown.text().contains("No symbol with id"),
+        "{}",
+        unknown.text()
+    );
+    let unnamed = viewer.get("/api/steps?symbol=nothingNamedThis").await;
+    assert_eq!(unnamed.status, StatusCode::NOT_FOUND);
+    assert!(
+        unnamed.text().contains("Nothing in this index is named"),
+        "{}",
+        unnamed.text()
+    );
+    let deep = viewer
+        .get("/api/steps?symbol=nothingNamedThis&depth=15")
+        .await;
+    assert_eq!(deep.status, StatusCode::BAD_REQUEST, "{}", deep.text());
 }
 
 #[tokio::test]

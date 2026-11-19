@@ -645,3 +645,357 @@ pub fn angular_app() -> Vec<(String, String)> {
         ),
     ]
 }
+
+/// Upstream `ui-steps-api.test.e8ddc4e2.ts:30-158`, file for file.
+pub const STEPS_MOBILE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react-native\":\"0.76\"}}",
+    ),
+    (
+        "src/app/_layout.tsx",
+        "export default function Layout() { return null }\n",
+    ),
+    (
+        "src/app/index.tsx",
+        "import { router } from 'expo-router'\nexport default function Home() {\n  return null\n}\n",
+    ),
+    (
+        "src/components/capture/capture-view.tsx",
+        "import { NativeModules, NativeEventEmitter } from 'react-native'\nexport const captureView = NativeModules.CaptureView\nexport const nativeEmitter = new NativeEventEmitter(NativeModules.CaptureEvents)\n",
+    ),
+    (
+        "src/api/client.ts",
+        "import axios from 'axios'\nexport const client = axios.create({ baseURL: 'x' })\n",
+    ),
+    (
+        "src/api/frames.ts",
+        "import { client } from './client'\nexport async function uploadARCapture(uri: string) {\n  await client.post('/frames', { uri })\n  return client.get('/frames/status')\n}\n",
+    ),
+    (
+        "src/storage/capture.storage.ts",
+        "import { create } from 'zustand'\nconst useCaptureStorage = create<State>((set) => ({\n  zipUri: null,\n  setZipUri: (zipUri: string) => set({ zipUri }),\n}))\nexport default useCaptureStorage\n",
+    ),
+    (
+        "src/app/capture/review.tsx",
+        "import { useCallback, useEffect } from 'react'\nimport { router } from 'expo-router'\nimport { captureView, nativeEmitter } from '../../components/capture/capture-view'\nimport { uploadARCapture } from '../../api/frames'\nimport useCaptureStorage from '../../storage/capture.storage'\nexport default function ReviewScreen({ unlimited }: { unlimited: boolean }) {\n  const setZipUri = useCaptureStorage((s) => s.setZipUri)\n  const handleApprove = useCallback(() => {\n    captureView.finalizeCaptureSession()\n  }, [])\n  const handleZipComplete = useCallback(async (data: { uri: string }) => {\n    setZipUri(data.uri)\n    await uploadARCapture(data.uri)\n    Alert.alert('Uploaded', data.uri, [{ text: 'OK' }])\n    if (unlimited) router.replace('/')\n  }, [unlimited])\n  useEffect(() => {\n    const sub = nativeEmitter.addListener('onZipComplete', handleZipComplete)\n    return () => sub.remove()\n  }, [handleZipComplete])\n  const form = useForm({ onSubmit: () => handleSubmit() })\n  function handleSubmit() {\n    captureView.finalizeCaptureSession()\n  }\n  return <Button onPress={handleApprove} />\n}\n",
+    ),
+    (
+        "src/app/capture/index.tsx",
+        "import { memo, useCallback } from 'react'\nimport { captureView } from '../../components/capture/capture-view'\nfunction CaptureComponent() {\n  const handleOpen = useCallback(() => {\n    captureView.finalizeCaptureSession()\n  }, [])\n  return <Button onPress={() => handleOpen()} />\n}\nconst MemoizedCaptureComponent = memo(CaptureComponent)\nexport default function CapturePage() {\n  return <MemoizedCaptureComponent />\n}\n",
+    ),
+    (
+        "ios/CaptureView.m",
+        "#import <React/RCTViewManager.h>\n@interface RCT_EXTERN_MODULE(CaptureView, RCTViewManager)\nRCT_EXTERN_METHOD(finalizeCaptureSession)\n@end\n",
+    ),
+    (
+        "ios/CaptureView.swift",
+        "import Foundation\nclass CaptureView: RCTViewManager {\n  @objc func finalizeCaptureSession() {\n    let result = zip()\n    if result {\n      CaptureEvents.shared.emitZipComplete()\n    }\n  }\n  func zip() -> Bool { return true }\n}\n",
+    ),
+    (
+        "ios/CaptureEvents.swift",
+        "import Foundation\nclass CaptureEvents: RCTEventEmitter {\n  static let shared = CaptureEvents()\n  func emitZipComplete() {\n    sendEvent(withName: \"onZipComplete\", body: nil)\n  }\n}\n",
+    ),
+    (
+        "src/api/remove-thing.ts",
+        "import { client } from './client'\nexport async function removeThing(name: string) {\n  await client.post('/things/remove', { name })\n}\n",
+    ),
+    (
+        "src/app/confirm.tsx",
+        "import { Alert, Button } from 'react-native'\nimport { removeThing } from '../api/remove-thing'\nexport default function ConfirmScreen() {\n  return (\n    <Button\n      title=\"remove\"\n      onPress={() =>\n        Alert.prompt('Remove thing', 'Which one?', [\n          { text: 'Cancel' },\n          { text: 'OK', onPress: (name) => { if (name) removeThing(name) } },\n        ])\n      }\n    />\n  )\n}\n",
+    ),
+];
+/// Upstream `ui-steps-api-servers.test.e8ddc4e2.ts:28-265`, file for file.
+pub const STEPS_SERVERS: &[(&str, &str)] = &[
+    (
+        "package.json",
+        "{\"name\":\"api\",\"dependencies\":{\"express\":\"4\",\"@nestjs/core\":\"10\",\"@nestjs/common\":\"10\",\"bullmq\":\"5\",\"@prisma/client\":\"5\",\"typeorm\":\"0.3\"}}",
+    ),
+    (
+        "src/server/db.ts",
+        "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+    ),
+    (
+        "src/server/queue.ts",
+        "import { Queue } from 'bullmq'\nexport const emailQueue = new Queue('email')\n",
+    ),
+    (
+        "src/server/errors.ts",
+        "export class NotFoundError extends Error {}\n",
+    ),
+    (
+        "src/server/auth.ts",
+        "export function authenticate(req, res, next) {\n  next()\n}\n",
+    ),
+    (
+        "src/server/validate.ts",
+        "export function validate(schema) {\n  return (req, res, next) => next()\n}\n",
+    ),
+    (
+        "src/server/users.service.ts",
+        "import { prisma } from './db'\nimport { emailQueue } from './queue'\nimport { NotFoundError } from './errors'\nexport async function createUser(req, res) {\n  const user = await prisma.user.create({ data: { email: req.body.email, name: req.body.name } })\n  await emailQueue.add('welcome', { userId: user.id })\n  if (!user.verified) {\n    await sendVerification(user)\n  }\n  res.status(201).json({\n    id: user.id,\n    token: signToken(user.id),\n  })\n}\nfunction signToken(id) {\n  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '1d' })\n}\nexport async function getUser(id: string) {\n  const user = await prisma.user.findUnique({ where: { id } })\n  if (!user) throw new NotFoundError('no such user')\n  return user\n}\nasync function sendVerification(user) {\n  await transporter.sendMail({ to: user.email })\n}\nexport async function acceptUser(req, res) {\n  const user = await prisma.user.update({ where: { id: req.params.id }, data: { accepted: true } })\n  res.status(202)\n  res.json(user)\n}\n",
+    ),
+    (
+        "src/server/users.routes.ts",
+        "import { Router } from 'express'\nimport { authenticate } from './auth'\nimport { validate } from './validate'\nimport { createUser, getUser, acceptUser } from './users.service'\nconst router = Router()\nrouter.post('/users', authenticate, validate(userSchema), createUser)\nrouter.post('/users/:id/accept', authenticate, acceptUser)\nrouter.get('/users/:id', authenticate, async (req, res) => {\n  const user = await getUser(req.params.id)\n  res.json(user)\n})\nexport default router\n",
+    ),
+    (
+        "src/nest/cats.service.ts",
+        "import { Injectable } from '@nestjs/common'\nimport { InjectRepository } from '@nestjs/typeorm'\nimport { Repository } from 'typeorm'\nimport { InjectQueue } from '@nestjs/bullmq'\nimport { Queue } from 'bullmq'\nimport { Cat } from './cat.entity'\n@Injectable()\nexport class CatsService {\n  constructor(\n    @InjectRepository(Cat) private readonly catsRepository: Repository<Cat>,\n    @InjectQueue('cats') private readonly catsQueue: Queue\n  ) {}\n  async create(dto) {\n    const cat = await this.catsRepository.save(dto)\n    await this.catsQueue.add('index', { id: cat.id })\n    return cat\n  }\n  async findOne(id: string) {\n    return this.catsRepository.findOne({ where: { id } })\n  }\n}\n",
+    ),
+    (
+        "src/nest/cat.entity.ts",
+        "import { Entity } from 'typeorm'\n@Entity()\nexport class Cat {\n  id: string\n}\n",
+    ),
+    (
+        "src/nest/cats.controller.ts",
+        "import { Controller, Get, Post, Body, Param, UseGuards, NotFoundException } from '@nestjs/common'\nimport { AuthGuard } from '@nestjs/passport'\nimport { CatsService } from './cats.service'\nimport { RolesGuard } from './roles.guard'\n@Controller('cats')\n@UseGuards(AuthGuard('jwt'))\nexport class CatsController {\n  constructor(private readonly catsService: CatsService) {}\n  @Post()\n  @UseGuards(RolesGuard)\n  async create(@Body() dto: CreateCatDto) {\n    return this.catsService.create(dto)\n  }\n  @Get(':id')\n  async findOne(@Param('id') id: string) {\n    const cat = await this.catsService.findOne(id)\n    if (!cat) throw new NotFoundException('no cat')\n    return cat\n  }\n}\n",
+    ),
+    (
+        "src/nest/roles.guard.ts",
+        "import { Injectable } from '@nestjs/common'\n@Injectable()\nexport class RolesGuard {\n  canActivate() { return true }\n}\n",
+    ),
+    (
+        "src/nest/cats.processor.ts",
+        "import { Processor, Process } from '@nestjs/bull'\n@Processor('cats')\nexport class CatsProcessor {\n  @Process('index')\n  async handleIndex(job) {\n    await searchClient.index(job.data)\n  }\n}\n",
+    ),
+    (
+        "api/items.py",
+        "from fastapi import APIRouter, Depends, HTTPException\nfrom sqlmodel import select\nfrom .deps import get_current_user, SessionDep\nfrom .models import Item, ItemCreate\nfrom .tasks import send_welcome\n\nrouter = APIRouter()\n\n@router.post(\"/items\", dependencies=[Depends(get_current_user)])\ndef create_item(session: SessionDep, item_in: ItemCreate):\n    item = Item.model_validate(item_in)\n    session.add(item)\n    session.commit()\n    if item.price < 0:\n        raise HTTPException(status_code=422, detail=\"bad price\")\n    send_welcome.delay(item.id)\n    return item\n",
+    ),
+    (
+        "api/deps.py",
+        "def get_current_user():\n    return None\n\nSessionDep = None\n",
+    ),
+    (
+        "api/models.py",
+        "class Item:\n    pass\n\nclass ItemCreate:\n    pass\n",
+    ),
+    (
+        "api/tasks.py",
+        "from celery import shared_task\n\n@shared_task\ndef send_welcome(item_id):\n    return item_id\n",
+    ),
+    (
+        "api/orders.py",
+        "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/orders\", tags=[\"orders\"])\n\n@router.get(\"/\")\ndef list_orders():\n    return []\n\n@router.get(\"/{order_id}\")\ndef get_order(order_id: int):\n    return order_id\n",
+    ),
+    (
+        "api/v1.py",
+        "from fastapi import APIRouter\nfrom .orders import router as orders_router\napi_router = APIRouter()\napi_router.include_router(orders_router)\n",
+    ),
+    (
+        "api/main.py",
+        "from fastapi import FastAPI\nfrom .items import router\nfrom .v1 import api_router\nfrom .config import settings\napp = FastAPI()\napp.include_router(router)\napp.include_router(api_router, prefix=\"/api/v1\")\napp.include_router(api_router, prefix=settings.LEGACY)\n",
+    ),
+    ("api/config.py", "settings = None\n"),
+    ("requirements.txt", "fastapi\nsqlmodel\ncelery\n"),
+    (
+        "src/main/java/demo/OwnerController.java",
+        "package demo;\nimport org.springframework.web.bind.annotation.*;\nimport org.springframework.http.*;\n@RestController\n@RequestMapping(\"/owners\")\npublic class OwnerController {\n  private final OwnerRepository owners;\n  public OwnerController(OwnerRepository owners) { this.owners = owners; }\n  @PostMapping(\"/new\")\n  @PreAuthorize(\"hasRole('ADMIN')\")\n  public ResponseEntity<Owner> create(@RequestBody Owner owner) {\n    if (owner.getName() == null) {\n      return ResponseEntity.badRequest().build();\n    }\n    Owner saved = owners.save(owner);\n    return ResponseEntity.status(HttpStatus.CREATED).body(saved);\n  }\n}\n",
+    ),
+    (
+        "src/main/java/demo/OwnerRepository.java",
+        "package demo;\nimport org.springframework.data.jpa.repository.JpaRepository;\npublic interface OwnerRepository extends JpaRepository<Owner, Integer> {\n}\n",
+    ),
+    (
+        "src/main/java/demo/Owner.java",
+        "package demo;\npublic class Owner {\n  private String name;\n  public String getName() { return name; }\n}\n",
+    ),
+    (
+        "src/Web/Endpoints/TodoItems.cs",
+        "using Microsoft.AspNetCore.Http.HttpResults;\nnamespace Demo.Web.Endpoints;\npublic class TodoItems : IEndpointGroup\n{\n    public static void Map(RouteGroupBuilder groupBuilder)\n    {\n        groupBuilder.RequireAuthorization();\n        groupBuilder.MapPost(CreateTodoItem);\n        groupBuilder.MapPut(UpdateTodoItem, \"{id}\");\n    }\n    public static async Task<Created<int>> CreateTodoItem(ISender sender, CreateTodoItemCommand command)\n    {\n        var id = await sender.Send(command);\n        return TypedResults.Created($\"/{nameof(TodoItems)}/{id}\", id);\n    }\n    public static async Task<Results<NoContent, BadRequest>> UpdateTodoItem(ISender sender, int id, UpdateTodoItemCommand command)\n    {\n        if (id != command.Id)\n            return TypedResults.BadRequest();\n        await sender.Send(command);\n        return TypedResults.NoContent();\n    }\n}\n",
+    ),
+    (
+        "src/Web/Infrastructure/WebApplicationExtensions.cs",
+        "using Microsoft.AspNetCore.Builder;\nnamespace Demo.Web.Infrastructure;\npublic static class WebApplicationExtensions\n{\n    public static WebApplication MapEndpoints(this WebApplication app)\n    {\n        var groupName = \"x\";\n        var group = app.MapGroup($\"/api/{groupName}\").WithTags(groupName);\n        return app;\n    }\n}\n",
+    ),
+];
+/// Upstream `ui-steps-cross-tier.test.e8ddc4e2.ts:30-278`, file for file.
+pub const CROSS_TIER: &[(&str, &str)] = &[
+    (
+        "package.json",
+        "{\"name\":\"mono\",\"workspaces\":[\"apps/*\"],\"dependencies\":{\"next\":\"15\",\"react\":\"19\",\"express\":\"4\",\"axios\":\"1\",\"bullmq\":\"5\",\"@nestjs/common\":\"10\",\"@nestjs/core\":\"10\",\"@nestjs/bull\":\"10\",\"@nestjs/event-emitter\":\"2\",\"@nestjs/websockets\":\"10\",\"socket.io\":\"4\",\"socket.io-client\":\"4\",\"@prisma/client\":\"5\"}}",
+    ),
+    (
+        "apps/web/app/users/page.tsx",
+        "import { NewUserForm } from '../../components/new-user-form'\nexport default function UsersPage() {\n  return <NewUserForm />\n}\n",
+    ),
+    (
+        "apps/web/components/new-user-form.tsx",
+        "'use client'\nimport { useCallback, useState } from 'react'\nimport { createUserAction } from '../app/actions'\nexport function NewUserForm() {\n  const [email, setEmail] = useState('')\n  const handleSubmit = useCallback(async (e) => {\n    e.preventDefault()\n    if (!email) return\n    const res = await fetch('/api/users', { method: 'POST', body: JSON.stringify({ email }) })\n    if (res.ok) await createUserAction({ email })\n  }, [email])\n  return <form onSubmit={handleSubmit}><input value={email} onChange={(e) => setEmail(e.target.value)} /></form>\n}\n",
+    ),
+    (
+        "apps/web/app/actions.ts",
+        "'use server'\nimport { prisma } from '../lib/db'\nimport { redirect } from 'next/navigation'\nexport async function createUserAction(data) {\n  await prisma.user.create({ data })\n  redirect('/users')\n}\n",
+    ),
+    (
+        "apps/web/lib/db.ts",
+        "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+    ),
+    (
+        "apps/web/lib/api.ts",
+        "import axios from 'axios'\nexport const api = axios.create({ baseURL: '/api' })\n",
+    ),
+    (
+        "apps/web/components/user-card.tsx",
+        "'use client'\nimport { api } from '../lib/api'\nexport function UserCard({ id, url }) {\n  async function load() {\n    const { data } = await api.get(`/users/${id}`)\n    const external = await fetch('https://api.stripe.com/v1/charges')\n    const dynamic = await fetch(url)\n    const orders = await fetch(`${process.env.API_URL}/api/users/${id}/orders`)\n    return [data, external, dynamic, orders]\n  }\n  return null\n}\n",
+    ),
+    (
+        "apps/web/components/chat.tsx",
+        "'use client'\nimport { useEffect, useState } from 'react'\nimport { io } from 'socket.io-client'\nconst socket = io()\nexport function Chat() {\n  const [messages, setMessages] = useState([])\n  useEffect(() => {\n    socket.on('message', (m) => {\n      setMessages((prev) => [...prev, m])\n    })\n  }, [])\n  function send(text) {\n    socket.emit('message', text)\n  }\n  return null\n}\n",
+    ),
+    (
+        "apps/api/src/app.ts",
+        "import express from 'express'\nimport { createUser, getUser, listOrders } from './users'\nconst app = express()\napp.post('/api/users', createUser)\napp.get('/api/users/:id', getUser)\napp.get('/api/users/:id/orders', listOrders)\nconst v1 = require('./v1')\napp.use('/api/v1', authenticate, v1)\nexport default app\n",
+    ),
+    (
+        "apps/api/src/v1/index.ts",
+        "import { Router } from 'express'\nimport ordersRouter from '../orders.routes'\nconst router = Router()\nrouter.use('/orders', ordersRouter)\nexport default router\n",
+    ),
+    (
+        "apps/api/src/orders.routes.ts",
+        "import { Router } from 'express'\nimport { prisma } from './db'\nconst router = Router()\nrouter.get('/', listAllOrders)\nrouter.post('/:id/refund', refund)\nexport async function listAllOrders(req, res) {\n  res.json(await prisma.order.findMany())\n}\nexport async function refund(req, res) {\n  res.status(202).end()\n}\nexport default router\n",
+    ),
+    (
+        "apps/web/components/orders.tsx",
+        "'use client'\nimport useSWR from 'swr'\nexport function Orders() {\n  const { data } = useSWR<Order[]>('/api/v1/orders', fetcher)\n  async function loadOrders() {\n    const res = await fetch('/api/v1/orders')\n    return res.json()\n  }\n  return data\n}\n",
+    ),
+    (
+        "apps/api/src/users.ts",
+        "import { prisma } from './db'\nimport { emailQueue, reportQueue } from './queue'\nexport async function createUser(req, res) {\n  const user = await prisma.user.create({ data: req.body })\n  await emailQueue.add('welcome', { userId: user.id })\n  if (req.body.plan) {\n    await reportQueue.add('monthly', { userId: user.id })\n  }\n  res.status(201).json(user)\n}\nexport async function getUser(req, res) {\n  const user = await prisma.user.findUnique({ where: { id: req.params.id } })\n  res.json(user)\n}\nexport async function listOrders(req, res) {\n  res.json(await prisma.order.findMany({ where: { userId: req.params.id } }))\n}\n",
+    ),
+    (
+        "apps/api/src/db.ts",
+        "import { PrismaClient } from '@prisma/client'\nexport const prisma = new PrismaClient()\n",
+    ),
+    (
+        "apps/api/src/queue.ts",
+        "import { Queue } from 'bullmq'\nexport const emailQueue = new Queue('email')\nexport const reportQueue = new Queue('reports')\n",
+    ),
+    (
+        "apps/api/src/email.processor.ts",
+        "import { Processor, Process } from '@nestjs/bull'\n@Processor('email')\nexport class EmailProcessor {\n  constructor(private readonly mailer: MailerService) {}\n  @Process('welcome')\n  async sendWelcome(job) {\n    await this.mailer.sendMail({ to: job.data.email })\n  }\n}\n",
+    ),
+    (
+        "apps/api/src/reports.worker.ts",
+        "import { Worker } from 'bullmq'\nexport const reportWorker = new Worker('reports', async (job) => {\n  await buildReport(job.data)\n})\nexport async function buildReport(data) {\n  return data\n}\n",
+    ),
+    (
+        "apps/api/src/users.service.ts",
+        "import { Injectable } from '@nestjs/common'\nimport { EventEmitter2 } from '@nestjs/event-emitter'\n@Injectable()\nexport class UsersService {\n  constructor(private readonly eventEmitter: EventEmitter2) {}\n  async create(dto) {\n    const user = { id: 1, ...dto }\n    this.eventEmitter.emit('user.created', user)\n    return user\n  }\n}\n",
+    ),
+    (
+        "apps/api/src/notifications.listener.ts",
+        "import { Injectable } from '@nestjs/common'\nimport { OnEvent } from '@nestjs/event-emitter'\n@Injectable()\nexport class NotificationsListener {\n  @OnEvent('user.created')\n  handleUserCreated(user) {\n    return notify(user)\n  }\n  @OnEvent('user.*')\n  audit(payload) {\n    return log(payload)\n  }\n  @OnEvent('order.paid')\n  handleOrderPaid(order) {\n    return order\n  }\n}\n",
+    ),
+    (
+        "apps/api/src/chat.gateway.ts",
+        "import { WebSocketGateway, SubscribeMessage, WebSocketServer } from '@nestjs/websockets'\n@WebSocketGateway()\nexport class ChatGateway {\n  @WebSocketServer() server\n  @SubscribeMessage('message')\n  handleMessage(client, payload) {\n    this.server.emit('message', payload)\n    return payload\n  }\n}\n",
+    ),
+    (
+        "apps/api/src/__tests__/users.test.ts",
+        "import { it } from 'vitest'\nit('creates a user', async () => {\n  await fetch('/api/users', { method: 'POST' })\n})\n",
+    ),
+];
+/// Upstream `steps-server-rendered-replies.test.e8ddc4e2.ts:91-139`, file for file.
+pub const REPLIES_SPRING: &[(&str, &str)] = &[
+    (
+        "pom.xml",
+        "<project><dependencies><dependency><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>",
+    ),
+    (
+        "src/main/java/app/owner/OwnerController.java",
+        "package app.owner;\n@Controller\nclass OwnerController {\n    private static final String VIEWS_FORM = \"owners/createOrUpdateOwnerForm\";\n    @PostMapping(\"/owners/new\")\n    public String processCreationForm(Owner owner, BindingResult result) {\n        if (result.hasErrors()) {\n            return VIEWS_FORM;\n        }\n        return \"redirect:/owners/\" + owner.getId();\n    }\n    @GetMapping(\"/owners/{ownerId}\")\n    public ModelAndView showOwner(@PathVariable int ownerId) {\n        ModelAndView mav = new ModelAndView(\"owners/ownerDetails\");\n        return mav;\n    }\n    @GetMapping(\"/owners/legacy\")\n    public RedirectView legacy() {\n        return new RedirectView(\"/owners\");\n    }\n}\n",
+    ),
+    (
+        "src/main/java/app/owner/StatusController.java",
+        "package app.owner;\n@RestController\nclass StatusController {\n    @GetMapping(\"/status\")\n    public String status() { return \"ok\"; }\n}\n",
+    ),
+];
+/// Upstream `steps-server-rendered-replies.test.e8ddc4e2.ts:140-178`, file for file.
+pub const REPLIES_LARAVEL: &[(&str, &str)] = &[
+    ("artisan", "#!/usr/bin/env php\n<?php\n"),
+    (
+        "composer.json",
+        "{\"require\":{\"laravel/framework\":\"^11.0\"}}",
+    ),
+    (
+        "routes/web.php",
+        "<?php\nRoute::get('/books/{slug}', [BookController::class, 'show']);\nRoute::post('/books', [BookController::class, 'store']);\n",
+    ),
+    (
+        "app/Http/Controllers/BookController.php",
+        "<?php\nclass BookController {\n    public function show(string $slug) {\n        $book = Book::findBySlug($slug);\n        if (is_null($book)) {\n            return redirect('/books');\n        }\n        return view('books.show', ['book' => $book]);\n    }\n    public function store() {\n        return redirect()->back()->withErrors(['name' => 'required']);\n    }\n}\n",
+    ),
+    (
+        "app/Http/Controllers/DocsController.php",
+        "<?php\nclass DocsController { public function redirect() { return 1; } }\n",
+    ),
+    (
+        "app/Views/Block.php",
+        "<?php\nclass Block { public $view; }\n",
+    ),
+    (
+        "app/Models/View.php",
+        "<?php\nclass View { public static function incrementFor($x) {} }\n",
+    ),
+];
+/// Upstream `steps-server-rendered-replies.test.e8ddc4e2.ts:179-201`, file for file.
+pub const REPLIES_LARAVEL_BINDS: &[(&str, &str)] = &[
+    ("artisan", "#!/usr/bin/env php\n<?php\n"),
+    (
+        "composer.json",
+        "{\"require\":{\"laravel/framework\":\"^11.0\"}}",
+    ),
+    (
+        "app/helpers.php",
+        "<?php\nfunction format_title($t) { return ucfirst($t); }\n",
+    ),
+    (
+        "app/Http/Controllers/PageController.php",
+        "<?php\nclass PageController {\n    public function show() {\n        $this->setTitle(format_title('x'));\n    }\n    protected function setTitle($t) {}\n}\n",
+    ),
+];
+/// Upstream `swiftui-viewer-noise.test.e8ddc4e2.ts:139-160`, file for file.
+pub const SWIFTUI_NOTIFICATIONS: &[(&str, &str)] = &[
+    (
+        "App/Endpoints.swift",
+        "enum Notifications {\n    case notificationsV2(sinceId: String?)\n}\n",
+    ),
+    (
+        "App/NotificationsViewModel.swift",
+        "final class NotificationsViewModel {\n    func refresh(client: Client) async {\n        _ = try? await client.get(endpoint: Notifications.notificationsV2(sinceId: nil))\n    }\n}\n",
+    ),
+];
+
+/// Upstream `angular-router.test.e8ddc4e2.ts:400-503`, file for file.
+pub const NG_BINDINGS: &[(&str, &str)] = &[
+    (
+        "package.json",
+        "{\"dependencies\":{\"@angular/core\":\"^19.0.0\",\"@angular/router\":\"^19.0.0\"}}",
+    ),
+    (
+        "src/app/app.routes.ts",
+        "import { Routes } from '@angular/router';\nimport { TasksComponent } from './tasks/tasks.component';\nexport const routes: Routes = [{ path: 'tasks', component: TasksComponent }];\n",
+    ),
+    (
+        "src/app/nav/nav.component.ts",
+        "import { Component, signal } from '@angular/core';\n@Component({\n  selector: 'app-nav',\n  template: `<nav>\n    <app-theme-toggle [class.open]=\"isOpen()\" />\n  </nav>`,\n})\nexport class NavComponent {\n  isOpen = signal(false);\n}\n",
+    ),
+    (
+        "src/app/theme-toggle/theme-toggle.component.ts",
+        "import { Component, computed, signal } from '@angular/core';\n@Component({ selector: 'app-theme-toggle', templateUrl: './theme-toggle.component.html' })\nexport class ThemeToggleComponent {\n  private readonly theme = signal<'light' | 'dark'>('light');\n  icon = computed(() => (this.theme() === 'dark' ? 'moon' : 'sun'));\n  label = computed(() => (this.theme() === 'dark' ? 'Dark' : 'Light'));\n  cycle(): void {\n    this.theme.set(this.theme() === 'dark' ? 'light' : 'dark');\n  }\n  unused(): void {}\n}\n",
+    ),
+    (
+        "src/app/theme-toggle/theme-toggle.component.html",
+        "<button (click)=\"cycle()\" [attr.aria-label]=\"label()\">\n  <lucide-icon [name]=\"icon()\"></lucide-icon>\n</button>\n",
+    ),
+    (
+        "src/app/tasks/tasks.component.ts",
+        "import { Component, computed, signal } from '@angular/core';\n@Component({ selector: 'app-tasks', templateUrl: './tasks.component.html' })\nexport class TasksComponent {\n  lists = signal<{ id: number; title: string; items: { done: boolean }[] }[]>([]);\n  selectedListId = signal<number | null>(null);\n  selected = computed(() => this.lists().find((l) => l.id === this.selectedListId()));\n  editing = signal(false);\n  title = 'Tasks';\n  form = { reset() {} };\n  days = Array.from({ length: 3 }, (_, i) => i + 1);\n  row = computed(() => 0);\n  nameInput = (value: string) => value;\n\n  get canSave(): boolean {\n    return this.lists().length > 0;\n  }\n  remainingItems(list: { items: { done: boolean }[] }): number {\n    return list.items.filter((i) => !i.done).length;\n  }\n  trackById(index: number, list: { id: number }): number {\n    return list.id;\n  }\n  displayFn(list: { title: string }): string {\n    return list.title;\n  }\n  format(value: string): string {\n    return value;\n  }\n  reset(): void {}\n  set(): void {}\n  legacy(): string {\n    return '';\n  }\n  quoted(): string {\n    return '';\n  }\n  save(): void {}\n}\n",
+    ),
+    (
+        "src/app/tasks/tasks.component.html",
+        "<!-- {{ legacy() }} -->\n<h1 [title]=\"title\">{{ 'quoted()' }}</h1>\n<input #nameInput [value]=\"nameInput.value\" (blur)=\"selected() && save()\" />\n@if (editing()) {\n  <span>editing</span>\n}\n<ul>\n  @for (list of lists(); track trackById($index, list)) {\n    <li [class.active]=\"list.id === selectedListId()\" (click)=\"selectedListId.set(list.id)\">\n      {{ list.title | format }} <small>{{ remainingItems(list) }}</small>\n    </li>\n  }\n</ul>\n@for (row of [selected()]; track row) {\n  <b>{{ row?.title }}</b>\n}\n@for (day of days; track day) {\n  <i>{{ day }}</i>\n}\n<mat-autocomplete [displayWith]=\"displayFn\"></mat-autocomplete>\n<button [disabled]=\"!canSave\" (click)=\"form.reset()\">Reset</button>\n",
+    ),
+];

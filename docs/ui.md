@@ -3,12 +3,15 @@
 `codegraph ui` opens a local, read-only reader of a project's existing index in
 the browser: a symbol with its callers, source and callees side by side, a file's
 outline and imports, the call path between two symbols, the repository as a map
-of modules, a type's hierarchy, the code nothing reaches, and the places to start
-reading an unfamiliar project. It is a Rust port of the upstream
-colbymchenry/codegraph `v1.6.1` viewer: the frontend is upstream's `ui/` (Svelte
-5 + Vite, MIT, see [`ui/LICENSE`](../ui/LICENSE)), restyled to the selected
-design ([`design/viewer-d.md`](design/viewer-d.md), direction D) with a dark and
-a light theme, and the JSON API behind it is the `codegraph-ui` crate.
+of modules, a type's hierarchy, the code nothing reaches, the places to start
+reading an unfamiliar project, an app's screens and the ways between them, and
+what happens from a screen, an endpoint or a function. It is a Rust port of the
+upstream colbymchenry/codegraph `v1.6.1` viewer, with Steps, Screens and the
+conditions on call sites taken from upstream `e8ddc4e2`: the frontend is
+upstream's `ui/` (Svelte 5 + Vite, MIT, see [`ui/LICENSE`](../ui/LICENSE)),
+restyled to the selected design ([`design/viewer-d.md`](design/viewer-d.md),
+direction D) with a dark and a light theme, and the JSON API behind it is the
+`codegraph-ui` crate.
 
 The viewer is a **preview**, gated exactly as upstream gates it: unless
 `CODEGRAPH_UI=1` is set, `ui`, its alias `web`, `help ui` and `ui --help` are
@@ -121,10 +124,55 @@ All answers are JSON; failures are `{error, code, hint?}` with `bad-request`
 | `GET /api/entrypoints?limit=&routes=`                         | routes, files that run something at their top level, the widest-reaching tests, hubs          |
 | `GET /api/map?root=&depth=`                                   | the repository by module: links with their declared subset, file-level cycles                 |
 | `GET /api/deadcode?limit=&kinds=&exported=&tests=&generated=` | what nothing reaches, grouped by file, with every exclusion counted                           |
-| `GET /api/flow?from=&to=` · `?symbols=` · `?hop=…`            | the call path as cards, with where the static graph stops and why                             |
-| `GET /api/screens`                                            | screens and the navigation between them                                                       |
+| `GET /api/flow?from=&to=` · `?symbols=` · `?hop=…`            | the call path as cards with each hop's condition, and where the static graph stops and why    |
+| `GET /api/screens`                                            | screens and the ways between them, each with the conditions it runs under                     |
+| `GET /api/steps?anchor=&symbol=&depth=&limit=&through=`       | what happens from a screen, an endpoint or a symbol, as typed steps and in the code's order   |
 | `GET /api/events`                                             | the live channel above                                                                        |
 | `GET/POST /api/trails`, `DELETE /api/trails/<id>`             | saved trails, re-resolved; the one write                                                      |
+
+A call's conditions (`when`) are read from the caller's current source with the
+extractor's grammars, never stored. The Symbol view's caller and callee rows
+carry them, a Flow hop carries them on its edge and in its label
+(`calls · when !busy && ready`), and every Screens and Steps site carries the
+conditions it runs under. A file that changed since it was indexed gives none,
+and so does a language without condition rules: the rules cover TypeScript,
+JavaScript, Swift, Python, Java, Kotlin, C#, Go, C, C++ and Objective-C. A
+Symbol request reads at most 24 files and 400 sites, the focal file first, and
+starts no new file after 40 ms.
+
+Screens draws an app as its user meets it. A screen is a route whose name starts
+with `/` (a Nuxt `server/api/` file is not one), and a way between two screens is
+a `navigates` edge a router resolver drew, filed on the screens whose code
+reaches it: from the code that navigates, the walk climbs back through calls,
+renders, function references and containing components to the component a
+route renders, or a layout the route renders inside, and never across a hop
+into another execution context (a cross-tier channel, a native event). The
+chain becomes the way's `via` and its call sites' conditions its `when`. A
+layout's ways are drawn on every screen inside it, a component three or more
+screens render is drawn once as shared chrome, and a navigation no screen
+reaches is drawn from the function that holds it. With no screen route, or no
+navigation into one, the answer is `routed: false`.
+
+Steps walks forward from its anchor, a node id (`anchor`) or a name (`symbol`):
+of several symbols with the name it takes a route, then a component, a
+function, a method, a class, a constant and a variable, and lists up to eight
+others as `ambiguous`. What it meets is typed: another screen; a handler, with
+what fires it (a prop, a template binding, a decorator, a request, a queue
+consumer); a call or an event that crosses a language, a tier or a channel
+(`bridge`, `event`); a store action; and a call that leaves the index (`effect`:
+the network, the database, a reply with its status, a queue, email, storage and
+the rest). Plain calls fold into the link between two steps, listed as its
+`via`. `depth` (1 to 14, 8 by default) is how many steps it walks, `limit` (20 to
+400, 120 by default) how many it draws, and `through=1` enters the screens and
+endpoints it reaches instead of drawing them as boundaries; `/api` lists the
+first four, as upstream does. A helper with forty or more incoming edges and a
+component five or more others render (a file rendering at its top level is no
+parent) are dead ends, counted in `truncated`, and a walk from production code
+never enters a test file. `program` is the anchor's body in the code's order,
+with its forks, loops and early ends, for the _in order_ reading, or `null`
+when the anchor has no body. A request without an anchor, or with a `depth` or
+`limit` out of range, is a `bad-request`; an id or a name the index does not
+hold is `not-found`.
 
 The entry points' hubs leave out symbols in test files and in generated files
 (the indexed flag or the path convention), so a vendored bundle's one-letter
@@ -174,18 +222,41 @@ TypeScript's only.
 
 ## Differences from upstream
 
-The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`. Where
-the Rust graph holds different facts, the viewer shows what this index holds:
+The wire shapes, limits, error codes and refusals follow upstream `v1.6.1`, and
+those of Steps, Screens and the conditions follow upstream `e8ddc4e2`. Where the
+Rust graph holds different facts, the viewer shows what this index holds:
 
-- **Steps** (`/api/steps`) is not served yet: its effect and program builders and
-  the branch conditions they use (UI families F1–F6 and F11) are a later port.
-  The frontend is built without it, so the Steps view says it cannot draw steps.
-- **Screens** answers upstream's own "no screen navigation" result: its
-  builder is not ported, so the `navigates` edges the React Router, TanStack
-  Router, Next.js, SvelteKit, Vue Router, Angular Router and Expo Router
-  resolvers draw are not drawn as screens yet.
-- Branch conditions on call sites (`when`) are absent from every edge: the
-  builders that attach them are not ported either.
+- Steps reads the name a call was written with (`prisma.user.create`, where the
+  edge says `create`) from the reference that resolved at the call's site.
+  Upstream keeps it on the `calls` edge (`metadata.refName`); this index keeps it
+  on the resolved reference, and the edge carries no copy. Of several names
+  resolved at one site the walk takes the one whose last segment is the target's
+  name; with none, or more than one, the target's name stands in, as upstream's
+  does for an edge without `refName`.
+- Screens and Steps visit the graph in a total order: edges by line and target,
+  then kind and column; a layer of callers target by target, each target's
+  edges by source, line, column and kind; names by the locale collation, then
+  bytes. A fresh index and a synced one draw the same picture. Upstream takes
+  the store's row order, so where two equally long ways reach one step, the one
+  drawn can differ from upstream's.
+- Each screen a navigation is filed on gets a site of its own, with that
+  screen's chain of conditions. Upstream reuses one site object for every
+  screen and rewrites its `when` for each, so its second screen repeats the
+  chain's conditions and every link holding the site shows the last value.
+- JSX in a `.js` file renders nothing here: the extractor reads a JSX component
+  reference in `tsx` and `jsx` files only (see JSX render in
+  [`KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md)). In a React app written in
+  `.js`, a way that runs through a rendered component is lost: a header's link
+  is drawn from the header, as an origin, rather than from every screen, and a
+  screen's Steps miss the screens its child components link to.
+- A component wrapped where it is declared (`memo(Capture)`,
+  `styled(Button)`) has no edge from the wrapper to what it wraps, upstream's
+  `wrapped` edge, and the reference to the wrapped component is made by the
+  file. A navigation inside it is filed on the screen of the file that holds
+  it, with an empty `via`, rather than through the wrapper.
+- The Symbol view's conditions keep upstream's 40 ms budget: past the focal
+  file, how many files are read depends on the machine, so a row from another
+  file can come back without its condition.
 - Routes come from the framework resolvers of this port's registry that make
   route nodes: the client routers and file-route frameworks (React Router,
   TanStack Router, Vue Router, Angular Router, Next.js, Nuxt, SvelteKit,
@@ -244,7 +315,7 @@ written. The icons are Lucide (ISC) geometry, copied into
 | rail foot                | keyboard and settings                          | the theme switch above them; keyboard opens the shortcut sheet, settings a panel of what this viewer reads (port, read-only and watching are command-line choices) |
 | Saved trails destination | a trails screen                                | opens Entry points, which lists saved trails first                                                                                                                 |
 | Start, entry card        | "Entry functions" with Flow buttons            | "Where it starts" — routes when the project is routed, else the files that run something at their top level — opening the row; a flow starts from Entry points     |
-| Flow                     | 190 × 168 step cards and a step-detail panel   | upstream's cards opened at each call window, restyled; Every hop table below; its Runs when column reads "—" until conditions are ported                           |
+| Flow                     | 190 × 168 step cards and a step-detail panel   | upstream's cards opened at each call window, restyled; Every hop table below; its Runs when column reads each hop's condition, "—" for a call that always runs     |
 | Map toolbar              | zoom readout and an Include tests switch       | the zoom controls; Include tests lives in the inspector's View section; Open crate is Open first file                                                              |
 | Map key                  | the one-line legend                            | the same, opening to upstream's full key on request (upstream opened the full key by default)                                                                      |
 | File, This file          | edges in and out, prod and test files          | how many files depend on it and it on them, its symbols, its size — no edge totals in the payload                                                                  |
@@ -254,6 +325,8 @@ written. The icons are Lucide (ISC) geometry, copied into
 | SVG export               | — (upstream: always light)                     | the theme on screen                                                                                                                                                |
 | ligatures                | the boards show `->` as an arrow               | off (§13 left it open; source fidelity decides)                                                                                                                    |
 | tablet Symbol            | blast radius as two stat tiles under the code  | the four tiles stay at the foot of the Called by drawer                                                                                                            |
+| Screens (D-08)           | cyan focus path, the rest dimmed, amber band   | upstream's canvas in D's colours: thin route frames, dashed origins on top, grey ways lit when a screen is selected; the key opens over the lower left             |
+| Steps (D-09)             | amber fork chip, green/red arms, step list     | upstream's canvas in D's colours: a framed decision box with neutral yes/no pills, dashed boxes for calls leaving the index; the key opens on the left             |
 
 Layout constants the components measure against moved with the design; the
 suites pin them by name: hierarchy rows 24 → 26 and indent 22 → 28; file

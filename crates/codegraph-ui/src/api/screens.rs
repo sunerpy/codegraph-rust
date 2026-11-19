@@ -37,7 +37,7 @@ use super::route_roots::{route_layouts, route_roots};
 use super::source::{
     find_indexed_file, has_drifted_on_disk, max_file_size, read_indexed_file_text,
 };
-use super::when::WhenReader;
+use super::when::SiteReader;
 use super::wire::{WireNodeRef, to_node_ref, to_posix_path};
 use crate::respond::ApiResult;
 
@@ -326,7 +326,7 @@ pub fn build(ctx: &Ctx<'_>) -> ApiResult<Value> {
         known,
         values_by_file: HashMap::new(),
     };
-    let mut reader = WhenReader::new(ctx, MAX_WHEN_SITES);
+    let mut reader = SiteReader::new(ctx, MAX_WHEN_SITES);
     // Lookups only; the output lists are sorted below.
     let mut links: HashMap<String, WireScreenLink> = HashMap::new();
     let mut origins: HashMap<String, WireScreenOrigin> = HashMap::new();
