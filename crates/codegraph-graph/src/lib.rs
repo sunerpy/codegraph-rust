@@ -1,5 +1,6 @@
 //! codegraph-graph crate
 pub mod branch_guards;
+pub mod call_sites;
 pub mod centrality;
 pub mod dead_code;
 pub mod export;

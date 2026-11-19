@@ -1,7 +1,9 @@
 //! Branch guards — the conditions under which a call site runs. A port of
 //! the guard half of upstream `src/graph/branch-guards.ts` (`b635dd46`,
-//! #1655); its call arguments, triggers, loops and return sites are the
-//! viewer's Steps (W7-22).
+//! #1655). The rest of that file — the call as written, its arguments, what
+//! fires it, its loops, and a definition's returns, decorators and member
+//! types — is [`crate::call_sites`], which parses through this module's
+//! tree cache (`with_tree`).
 //!
 //! An edge says `handlePress → openObjectDetail`. What a reader wants to know
 //! is that it happens **when `isCollected`** and **not while `isUploading`**:
@@ -286,8 +288,26 @@ pub fn guards_at(
     line: usize,
     column: Option<usize>,
 ) -> Vec<BranchGuard> {
+    with_tree(key, source, language, |root, source| {
+        guards_in_tree(root, source, language, line, column)
+    })
+    .unwrap_or_default()
+}
+
+/// `read` over the tree of `source`, the file `key` names, from the cache
+/// [`guards_at`] keeps: parsed once, and reused while the same source is
+/// asked about again. `None` for a language without rules, a source above
+/// [`MAX_PARSE_BYTES`] or one that does not parse. The readers in
+/// `call_sites` share it, so a file's guards and its call sites cost one
+/// parse.
+pub(crate) fn with_tree<R>(
+    key: &str,
+    source: &str,
+    language: Language,
+    read: impl FnOnce(Node<'_>, &str) -> R,
+) -> Option<R> {
     if !supports_branch_guards(language) || source.len() > MAX_PARSE_BYTES {
-        return Vec::new();
+        return None;
     }
     let mut cache = tree_cache()
         .lock()
@@ -298,9 +318,7 @@ pub fn guards_at(
     let entry = match hit {
         Some(index) => cache.remove(index),
         None => {
-            let Some(tree) = parse(source, language) else {
-                return Vec::new();
-            };
+            let tree = parse(source, language)?;
             cache.retain(|entry| entry.key != key);
             CachedTree {
                 key: key.to_string(),
@@ -310,18 +328,12 @@ pub fn guards_at(
             }
         }
     };
-    let guards = guards_in_tree(
-        entry.tree.root_node(),
-        &entry.source,
-        language,
-        line,
-        column,
-    );
+    let out = read(entry.tree.root_node(), &entry.source);
     cache.push(entry);
     if cache.len() > TREE_CACHE_SIZE {
         cache.remove(0);
     }
-    guards
+    Some(out)
 }
 
 /// Guards for one site in source text, parsed afresh — the test seam.
@@ -401,7 +413,7 @@ pub fn guards_in_tree(
     found
 }
 
-fn first_non_blank_column(source: &str, row: usize) -> usize {
+pub(crate) fn first_non_blank_column(source: &str, row: usize) -> usize {
     let line = source.split('\n').nth(row).unwrap_or("");
     line.find(|ch: char| !ch.is_whitespace()).unwrap_or(0)
 }
@@ -410,7 +422,7 @@ fn first_non_blank_column(source: &str, row: usize) -> usize {
 /// is the fast path, but some grammars (Swift's `statements`) answer with the
 /// container, so the result is refined by descending while a named child
 /// still contains the point.
-fn innermost_at(root: Node<'_>, row: usize, col: usize) -> Option<Node<'_>> {
+pub(crate) fn innermost_at(root: Node<'_>, row: usize, col: usize) -> Option<Node<'_>> {
     let point = Point { row, column: col };
     let mut node = root.descendant_for_point_range(point, point)?;
     loop {
@@ -434,18 +446,18 @@ fn innermost_at(root: Node<'_>, row: usize, col: usize) -> Option<Node<'_>> {
 
 type Visit = for<'t> fn(Node<'t>, Node<'t>, &str, &mut Vec<BranchGuard>);
 
-struct Rules {
+pub(crate) struct Rules {
     /// Node types the walk never climbs past: the function the site belongs
     /// to. An INLINE function — an arrow passed as an argument, a closure in
     /// an object literal, a trailing closure — is not a boundary: the
     /// conditions around its definition are the conditions under which it
     /// exists at all. A function that is declared, or assigned to a name,
     /// starts its own story.
-    boundaries: &'static [&'static str],
+    pub(crate) boundaries: &'static [&'static str],
     /// Function-expression types that are boundaries only when named/assigned.
-    inline_functions: &'static [&'static str],
+    pub(crate) inline_functions: &'static [&'static str],
     /// Parent types under which an inline function counts as named/assigned.
-    binding_parents: &'static [&'static str],
+    pub(crate) binding_parents: &'static [&'static str],
     /// Statement containers whose earlier children may be early exits.
     blocks: &'static [&'static str],
     /// `parent` encloses `child` (the node the walk came up through): record
@@ -455,7 +467,7 @@ struct Rules {
     early_exits: Visit,
 }
 
-fn rules_for(language: Language) -> Option<&'static Rules> {
+pub(crate) fn rules_for(language: Language) -> Option<&'static Rules> {
     match language {
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => Some(&JS),
         Language::Swift => Some(&SWIFT),
@@ -469,16 +481,16 @@ fn rules_for(language: Language) -> Option<&'static Rules> {
     }
 }
 
-fn text_of<'s>(node: Node<'_>, source: &'s str) -> &'s str {
+pub(crate) fn text_of<'s>(node: Node<'_>, source: &'s str) -> &'s str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-fn collapse(text: &str) -> String {
+pub(crate) fn collapse(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// `text`, cut to `max` UTF-16 code units with an ellipsis.
-fn cut(text: &str, max: usize) -> String {
+pub(crate) fn cut(text: &str, max: usize) -> String {
     if text.encode_utf16().count() <= max {
         return text.to_string();
     }
@@ -548,7 +560,7 @@ fn guard(
 }
 
 /// A branching construct's identity: where it starts, `line:column`.
-fn branch_key(node: Node<'_>) -> String {
+pub(crate) fn branch_key(node: Node<'_>) -> String {
     let start = node.start_position();
     format!("{}:{}", start.row + 1, start.column)
 }
@@ -557,7 +569,7 @@ fn branch_key(node: Node<'_>) -> String {
 /// block, and the clause wrappers a grammar puts an arm's block inside
 /// (`else_clause`, `except_clause`). A CONDITIONAL wrapper is not one of them:
 /// an `elif` whose body raises does not mean the arm it is in always raises.
-const BLOCKISH: &[&str] = &[
+pub(crate) const BLOCKISH: &[&str] = &[
     "statement_block",
     "block",
     "statement_list",
@@ -637,13 +649,13 @@ fn push(out: &mut Vec<BranchGuard>, guard: Option<BranchGuard>) {
     }
 }
 
-fn is_field(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
+pub(crate) fn is_field(parent: Node<'_>, field: &str, child: Node<'_>) -> bool {
     parent
         .child_by_field_name(field)
         .is_some_and(|node| node.id() == child.id())
 }
 
-fn last_named(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn last_named(node: Node<'_>) -> Option<Node<'_>> {
     let count = node.named_child_count();
     if count == 0 {
         return None;
@@ -652,21 +664,21 @@ fn last_named(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 /// The named children of a node, in order.
-fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
+pub(crate) fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     (0..node.named_child_count())
         .filter_map(|index| node.named_child(index as u32))
         .collect()
 }
 
 /// Every child of a node, named or not, in order.
-fn children(node: Node<'_>) -> Vec<Node<'_>> {
+pub(crate) fn children(node: Node<'_>) -> Vec<Node<'_>> {
     (0..node.child_count())
         .filter_map(|index| node.child(index))
         .collect()
 }
 
 /// The named children of `parent` that come before `child`, in source order.
-fn preceding_siblings<'t>(parent: Node<'t>, child: Node<'t>) -> Vec<Node<'t>> {
+pub(crate) fn preceding_siblings<'t>(parent: Node<'t>, child: Node<'t>) -> Vec<Node<'t>> {
     named_children(parent)
         .into_iter()
         .take_while(|sibling| sibling.id() != child.id())

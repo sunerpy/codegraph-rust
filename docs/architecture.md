@@ -499,9 +499,12 @@ control input's.
 `codegraph-graph` operates on persisted nodes and edges. It owns callers,
 callees, impact, paths, hierarchies, cycle detection, FTS candidates, fallback
 matching, filters, and deterministic scoring. Generated/ambient/deprioritized
-paths can affect ranking without removing graph facts. It also reads the
-conditions a call site runs under from the caller's current source, with the
-extractor's grammars (`branch_guards`); nothing of that is stored in the index.
+paths can affect ranking without removing graph facts. It also reads, from the
+caller's current source with the extractor's grammars, the conditions a call
+site runs under (`branch_guards`) and, for the viewer's Steps and Screens, the
+call as written, its arguments, what fires it, the loops around it, and a
+definition's returns, decorators and member types (`call_sites`); nothing of
+that is stored in the index.
 
 The CLI and MCP share the same query engine for `search`, `explore`, and `node`,
 so source selection, staleness handling, and relationship rendering do not drift
