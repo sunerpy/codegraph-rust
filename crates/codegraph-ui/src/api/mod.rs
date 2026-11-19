@@ -21,6 +21,7 @@ pub mod search;
 pub mod source;
 pub mod stats;
 pub mod trails;
+pub mod when;
 pub mod wire;
 
 use std::sync::Arc;

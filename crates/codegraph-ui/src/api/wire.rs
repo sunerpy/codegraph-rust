@@ -159,8 +159,9 @@ pub struct WireEdge {
     pub registered_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_ref: Option<bool>,
-    /// The conditions the call site runs under (family F11, phase 2). Never set
-    /// by this server yet.
+    /// The conditions the call site runs under (family F11), read from the
+    /// source by `api::when`; absent when the site is unconditional, its file
+    /// drifted, or its language has no rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
 }
