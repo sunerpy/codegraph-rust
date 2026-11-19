@@ -12,18 +12,23 @@
 //! read, no new file after [`BUDGET`] has passed. The batches are taken in
 //! order (the focal file first), so a budget that runs out leaves the rails
 //! furthest from the focal symbol unlabelled, never the focal file's own.
+//!
+//! The endpoints that walk chains rather than annotate rails (the Screens
+//! view's transitions) read one site at a time through a [`WhenReader`]:
+//! each file looked up and read once per request, drifted files unread, and
+//! the sites it labels counted against a budget.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use codegraph_core::types::Language;
 use codegraph_graph::branch_guards::{
-    MAX_PARSE_BYTES, guard_label, guards_at, supports_branch_guards,
+    BranchGuard, MAX_PARSE_BYTES, guard_label, guards_at, supports_branch_guards,
 };
 
 use super::Ctx;
 use super::source::{
-    find_indexed_file, has_drifted_on_disk, max_file_size, read_indexed_file_text,
+    find_indexed_file, has_drifted_on_disk, max_file_size, read_indexed_file_text, to_request_path,
 };
 use super::wire::WireEdge;
 use crate::security::resolve_project_file;
@@ -142,6 +147,89 @@ pub(crate) fn annotate_batches<R, T>(
                 edge.when = Some(label);
             }
         }
+    }
+}
+
+/// A per-request reader of the conditions ONE call site sits under, for the
+/// endpoints that walk chains rather than annotate rails — the Screens
+/// view's transitions (upstream `createWhenReader`, the `when` half of
+/// `createSiteReader`, `when.ts:150-200`). Each file is looked up and read
+/// once; a file that is not indexed, has no rules, drifted since the index
+/// or cannot be read yields no label; and the sites labelled are counted, so
+/// a wide walk cannot turn one request into a parse of the repository.
+pub struct WhenReader<'c, 'a> {
+    ctx: &'c Ctx<'a>,
+    max_sites: usize,
+    max_bytes: u64,
+    sites: usize,
+    /// Lookups only, never iterated: a file's answer, by the path asked.
+    files: HashMap<String, Option<(SiteFile, Option<String>)>>,
+}
+
+impl<'c, 'a> WhenReader<'c, 'a> {
+    /// A reader that labels at most `max_sites` sites (upstream's default is
+    /// 600).
+    pub fn new(ctx: &'c Ctx<'a>, max_sites: usize) -> Self {
+        Self {
+            ctx,
+            max_sites,
+            max_bytes: max_file_size(ctx),
+            sites: 0,
+            files: HashMap::new(),
+        }
+    }
+
+    /// The conditions a site in `file` runs under, outermost first; empty
+    /// when it is unconditional, unreadable or past the budget. A site
+    /// without a line is not counted; one whose file resolves is, whether
+    /// or not its text can be read.
+    pub fn guards(
+        &mut self,
+        file: &str,
+        language: Language,
+        line: Option<i64>,
+        column: Option<i64>,
+    ) -> Vec<BranchGuard> {
+        let Some(line) = line
+            .filter(|line| *line > 0)
+            .and_then(|line| usize::try_from(line).ok())
+        else {
+            return Vec::new();
+        };
+        if self.sites >= self.max_sites || !supports_branch_guards(language) {
+            return Vec::new();
+        }
+        let (ctx, max_bytes) = (self.ctx, self.max_bytes);
+        let entry = self
+            .files
+            .entry(to_request_path(file))
+            .or_insert_with_key(|posix| {
+                site_file(ctx, posix, max_bytes).map(|site| {
+                    let text = read_indexed_file_text(ctx, &site.stored, MAX_PARSE_BYTES as u64);
+                    (site, text)
+                })
+            });
+        let Some((site, text)) = entry.as_ref() else {
+            return Vec::new();
+        };
+        self.sites += 1;
+        let Some(text) = text else {
+            return Vec::new();
+        };
+        let column = column.and_then(|column| usize::try_from(column).ok());
+        guards_at(&site.key, text, site.language, line, column)
+    }
+
+    /// [`Self::guards`], joined the way a label prints them; empty when
+    /// unconditional.
+    pub fn when(
+        &mut self,
+        file: &str,
+        language: Language,
+        line: Option<i64>,
+        column: Option<i64>,
+    ) -> String {
+        guard_label(&self.guards(file, language, line, column))
     }
 }
 
