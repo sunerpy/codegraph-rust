@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codegraph_core::types::{
@@ -9,6 +10,24 @@ use rusqlite::{
 use serde_json::Value;
 
 use crate::connection::Store;
+
+/// Whether the edge row `$alias` names is one the synthesis stage owns
+/// (`metadata.synthesizedBy`, W7-14), in the expression schema 9's
+/// `idx_edges_synthesis_site` is partial on. Every other edge is the base
+/// graph: a fresh index resolves before any synthesized edge exists, so a
+/// sync's site machinery neither selects nor deletes one, and only
+/// [`Store::replace_synthesized_edges`] and node deletion remove them.
+macro_rules! synthesized_edge {
+    ($alias:literal) => {
+        concat!(
+            "CASE WHEN json_valid(",
+            $alias,
+            "metadata) THEN json_extract(",
+            $alias,
+            "metadata, '$.synthesizedBy') END IS NOT NULL"
+        )
+    };
+}
 
 pub(crate) const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
 
@@ -107,80 +126,135 @@ pub struct FileReferenceSite {
     pub site: Option<ReferenceSite>,
 }
 
+/// A family of references a framework lane of a sync reads in bulk
+/// ([`Store::lane_references`], W7-19d, W7-19e, W7-19g).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneReferences {
+    /// A PHP route's references: Laravel's, the only resolver that makes
+    /// PHP routes.
+    PhpRoutes,
+    /// A YAML route's references in a `*.routing.yml` file: Drupal's.
+    DrupalRoutingFiles,
+    /// The PHP references to a Drupal hook, named `hook_X`.
+    PhpHooks,
+    /// The PHP references named `{class}::...`, Laravel's `Model::method`.
+    PhpStaticCalls(String),
+    /// A Ruby route's references: Rails', the only resolver that makes Ruby
+    /// routes.
+    RubyRoutes,
+    /// A Swift route's references: Vapor's, the only resolver that makes
+    /// Swift routes.
+    SwiftRoutes,
+    /// The references written in one of these languages: what the React
+    /// Native and Swift-Objective-C bridges read, which their lane narrows
+    /// by name (W7-21).
+    Languages(Vec<Language>),
+}
+
+impl LaneReferences {
+    /// The family's `WHERE` clause and its parameters: a prefix is a range,
+    /// which an index on its column serves.
+    fn predicate(&self) -> (Cow<'static, str>, Vec<String>) {
+        // `:` is followed by `;`: the ids of the routes are the ones from
+        // `route:` up to `route;`.
+        match self {
+            Self::PhpRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'".into(),
+                Vec::new(),
+            ),
+            Self::DrupalRoutingFiles => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' \
+                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'"
+                    .into(),
+                Vec::new(),
+            ),
+            // `_` is followed by a backtick.
+            Self::PhpHooks => (
+                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'"
+                    .into(),
+                Vec::new(),
+            ),
+            // `:` is followed by `;`: the names starting `{class}::`.
+            Self::PhpStaticCalls(class) => (
+                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'".into(),
+                vec![format!("{class}::"), format!("{class}:;")],
+            ),
+            Self::RubyRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'".into(),
+                Vec::new(),
+            ),
+            Self::SwiftRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'"
+                    .into(),
+                Vec::new(),
+            ),
+            // No language is a clause that holds for no row.
+            Self::Languages(languages) if languages.is_empty() => ("0".into(), Vec::new()),
+            Self::Languages(languages) => (
+                format!(
+                    "language IN ({})",
+                    std::iter::repeat_n("?", languages.len())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+                .into(),
+                languages
+                    .iter()
+                    .map(|language| language.as_str().to_string())
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// A method's id, name, language, file and first line: what a pass pairing
+/// methods by name reads of each (W7-21's cost revision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodHeader {
+    pub id: String,
+    pub name: String,
+    pub language: Language,
+    pub file_path: String,
+    pub start_line: i64,
+}
+
+/// [`Store::methods_named`]'s query: each name's rows of `idx_nodes_name`,
+/// whose kind and language it tests unindexed (`+`). Left to itself the
+/// planner, which has no row statistics for these tables, walks the
+/// language index instead, every method of the language for each name.
+const METHODS_NAMED_SQL: &str = "SELECT n.* FROM json_each(?1) AS k CROSS JOIN nodes AS n \
+     ON n.name = k.value WHERE +n.kind = 'method' AND +n.language = ?2";
+
+/// [`Store::methods_by_first_keyword`]'s query: each keyword's rows of
+/// `idx_nodes_name` equal to it, and those from `keyword:` up to `keyword;`
+/// (`;` follows `:`), compared byte for byte; the kind and language tested
+/// as [`METHODS_NAMED_SQL`] tests them.
+const METHODS_BY_FIRST_KEYWORD_SQL: &str = "SELECT n.* FROM json_each(?1) AS k \
+     CROSS JOIN nodes AS n ON n.name = k.value \
+     WHERE +n.kind = 'method' AND +n.language = ?2 \
+     UNION ALL SELECT n.* FROM json_each(?1) AS k \
+     CROSS JOIN nodes AS n ON n.name >= k.value || ':' AND n.name < k.value || ';' \
+     WHERE +n.kind = 'method' AND +n.language = ?2";
+
+/// One reference of a [`LaneReferences`] family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneReference {
+    /// Where it is, always with its site: neither table holds a reference
+    /// without a line and column.
+    pub site: FileReferenceSite,
+    pub reference_name: String,
+    pub reference_kind: EdgeKind,
+    /// Whether it is a row of `resolved_refs` rather than `unresolved_refs`.
+    pub resolved: bool,
+}
+
 impl Store {
     /// Ports `insertNode` / `insertNodes` / `updateNode` from `upstream db/queries.ts:243-382`.
     /// Uses one batched transaction and an upsert that fires the FTS update trigger on conflicts.
     pub fn upsert_nodes(&mut self, nodes: &[Node]) -> rusqlite::Result<()> {
         validate_nodes(nodes)?;
         let tx = self.conn.transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO nodes (
-                  id, kind, name, qualified_name, file_path, language,
-                  start_line, end_line, start_column, end_column,
-                  docstring, signature, visibility,
-                  is_exported, is_async, is_static, is_abstract,
-                  decorators, type_parameters, return_type, updated_at
-                ) VALUES (
-                  @id, @kind, @name, @qualifiedName, @filePath, @language,
-                  @startLine, @endLine, @startColumn, @endColumn,
-                  @docstring, @signature, @visibility,
-                  @isExported, @isAsync, @isStatic, @isAbstract,
-                  @decorators, @typeParameters, @returnType, @updatedAt
-                )
-                ON CONFLICT(id) DO UPDATE SET
-                  kind = excluded.kind,
-                  name = excluded.name,
-                  qualified_name = excluded.qualified_name,
-                  file_path = excluded.file_path,
-                  language = excluded.language,
-                  start_line = excluded.start_line,
-                  end_line = excluded.end_line,
-                  start_column = excluded.start_column,
-                  end_column = excluded.end_column,
-                  docstring = excluded.docstring,
-                  signature = excluded.signature,
-                  visibility = excluded.visibility,
-                  is_exported = excluded.is_exported,
-                  is_async = excluded.is_async,
-                  is_static = excluded.is_static,
-                  is_abstract = excluded.is_abstract,
-                  decorators = excluded.decorators,
-                  type_parameters = excluded.type_parameters,
-                  return_type = excluded.return_type,
-                  updated_at = excluded.updated_at
-                "#,
-            )?;
-
-            for node in nodes {
-                let decorators = json_array_or_null(&node.decorators)?;
-                let type_parameters = json_array_or_null(&node.type_parameters)?;
-                stmt.execute(named_params! {
-                    "@id": node.id,
-                    "@kind": node.kind.as_str(),
-                    "@name": node.name,
-                    "@qualifiedName": node.qualified_name,
-                    "@filePath": node.file_path,
-                    "@language": node.language.as_str(),
-                    "@startLine": node.start_line,
-                    "@endLine": node.end_line,
-                    "@startColumn": node.start_column,
-                    "@endColumn": node.end_column,
-                    "@docstring": node.docstring,
-                    "@signature": node.signature,
-                    "@visibility": node.visibility,
-                    "@isExported": bool_to_i64(node.is_exported),
-                    "@isAsync": bool_to_i64(node.is_async),
-                    "@isStatic": bool_to_i64(node.is_static),
-                    "@isAbstract": bool_to_i64(node.is_abstract),
-                    "@decorators": decorators,
-                    "@typeParameters": type_parameters,
-                    "@returnType": node.return_type,
-                    "@updatedAt": node.updated_at,
-                })?;
-            }
-        }
+        upsert_nodes_in(&tx, nodes)?;
         tx.commit()
     }
 
@@ -225,6 +299,72 @@ impl Store {
         )
     }
 
+    /// The functions, methods and components of `file_path`, by start line:
+    /// the file's rows of [`Self::nodes_by_file_path`] a synthesis pass can
+    /// take as a call's enclosing function (W7-15d), read as
+    /// [`Self::callables_by_file_path`] reads its own.
+    pub fn enclosing_candidates_by_file_path(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? \
+             AND +kind IN ('function', 'method', 'component') ORDER BY start_line",
+            [file_path],
+        )
+    }
+
+    /// The structs, unions, functions and methods of `file_path`, by start
+    /// line: the file's rows of [`Self::nodes_by_file_path`] of those kinds,
+    /// read as [`Self::callables_by_file_path`] reads its own (W7-17a).
+    pub fn layouts_and_callables_by_file_path(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE file_path = ? \
+             AND +kind IN ('struct', 'union', 'function', 'method') ORDER BY start_line",
+            [file_path],
+        )
+    }
+
+    /// The classes, methods and properties of `file_paths`: each file's
+    /// rows of [`Self::nodes_by_file_path`] of those kinds, read a chunk of
+    /// [`SQLITE_PARAM_CHUNK_SIZE`] distinct paths at a time (W7-18d's cost
+    /// revision: the Angular pass reads its component files with this, not
+    /// with a query a file). The rows come in no promised order.
+    pub fn classes_and_members_by_file_paths(
+        &self,
+        file_paths: &[String],
+    ) -> rusqlite::Result<Vec<Node>> {
+        let mut out = Vec::new();
+        let mut unique = file_paths.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT * FROM nodes WHERE file_path IN ({placeholders}) \
+                 AND +kind IN ('class', 'method', 'property')"
+            );
+            let params = chunk.iter().map(|p| p as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            // Each field's column found once for the statement, as
+            // `query_nodes` does (W5-08): by name on every row, the read
+            // cost more than one query a file.
+            let columns = NodeColumns::of(&stmt)?;
+            let rows = stmt.query_map(params.as_slice(), |row| columns.node(row))?;
+            for node in rows {
+                out.push(node?);
+            }
+        }
+        Ok(out)
+    }
+
     /// The methods of `file_path` in the order [`Self::nodes_by_file_path`]
     /// lists them: the same walk of the file's own index, the other rows
     /// skipped (W5-08).
@@ -233,6 +373,217 @@ impl Store {
             &self.conn,
             "SELECT * FROM nodes WHERE file_path = ? AND +kind = 'method' ORDER BY start_line",
             [file_path],
+        )
+    }
+
+    /// The functions and methods whose name GLOBs one of `globs`, LIKEs one
+    /// of `likes` (case-insensitive in ASCII) or is one of `names`: the
+    /// superset of a synthesis pass's name pattern it narrows itself,
+    /// rather than every callable of the project (W7-14; upstream #610).
+    /// Unordered.
+    pub fn callables_named_like(
+        &self,
+        globs: &[&str],
+        likes: &[&str],
+        names: &[&str],
+    ) -> rusqlite::Result<Vec<Node>> {
+        let mut conditions = Vec::new();
+        conditions.extend(globs.iter().map(|_| "name GLOB ?".to_string()));
+        conditions.extend(likes.iter().map(|_| "name LIKE ?".to_string()));
+        if !names.is_empty() {
+            conditions.push(format!("name IN ({})", vec!["?"; names.len()].join(",")));
+        }
+        if conditions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT * FROM nodes WHERE kind IN ('function', 'method') AND ({})",
+            conditions.join(" OR ")
+        );
+        let values = globs.iter().chain(likes).chain(names);
+        query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// The functions and methods written in one of `languages` (W7-14).
+    /// Unordered.
+    pub fn callables_in_languages(&self, languages: &[Language]) -> rusqlite::Result<Vec<Node>> {
+        if languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT * FROM nodes WHERE kind IN ('function', 'method') AND language IN ({})",
+            std::iter::repeat_n("?", languages.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let values = languages.iter().map(|language| language.as_str());
+        query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// The nodes of `kinds` written in `languages` (the filter of upstream
+    /// `iterateNodesByKindIn`, W7-15). Unordered.
+    pub fn nodes_of_kinds_in_languages(
+        &self,
+        kinds: &[NodeKind],
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<Node>> {
+        if kinds.is_empty() || languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots = |count: usize| {
+            std::iter::repeat_n("?", count)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let sql = format!(
+            "SELECT * FROM nodes WHERE kind IN ({}) AND language IN ({})",
+            slots(kinds.len()),
+            slots(languages.len())
+        );
+        let values = kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .chain(languages.iter().map(|language| language.as_str()));
+        query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// The methods written in `language` named one of `names` (W7-21's cost
+    /// revision): the rows of the name index, no other method read.
+    /// Unordered.
+    pub fn methods_named(
+        &self,
+        language: Language,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<Node>> {
+        self.methods_keyed(METHODS_NAMED_SQL, language, names.iter())
+    }
+
+    /// The methods written in `language` whose name up to its first `:` is
+    /// one of `keywords`, an Objective-C selector's first keyword (W7-21's
+    /// cost revision): a name equal to the keyword, or one starting
+    /// `keyword:`. A keyword holding a `:` is no name's first keyword and
+    /// reads none. Unordered.
+    pub fn methods_by_first_keyword(
+        &self,
+        language: Language,
+        keywords: &[String],
+    ) -> rusqlite::Result<Vec<Node>> {
+        self.methods_keyed(
+            METHODS_BY_FIRST_KEYWORD_SQL,
+            language,
+            keywords.iter().filter(|keyword| !keyword.contains(':')),
+        )
+    }
+
+    /// The `language` methods `sql` reads for the distinct `keys`.
+    fn methods_keyed<'k>(
+        &self,
+        sql: &str,
+        language: Language,
+        keys: impl Iterator<Item = &'k String>,
+    ) -> rusqlite::Result<Vec<Node>> {
+        let keys: BTreeSet<&str> = keys.map(String::as_str).collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = serde_json::to_string(&keys)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        query_nodes(&self.conn, sql, params![keys, language.as_str()])
+    }
+
+    /// The [`MethodHeader`]s of the methods written in `languages` (W7-21's
+    /// cost revision): the rows [`Self::nodes_of_kinds_in_languages`] reads
+    /// for them, five columns of each. Unordered.
+    pub fn method_headers_in_languages(
+        &self,
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<MethodHeader>> {
+        if languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, name, language, file_path, start_line FROM nodes \
+             WHERE kind = 'method' AND language IN ({})",
+            std::iter::repeat_n("?", languages.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(languages.iter().map(|language| language.as_str())),
+            |row| {
+                Ok(MethodHeader {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    language: parse_language(row.get::<_, String>(2)?)?,
+                    file_path: row.get(3)?,
+                    start_line: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// The `calls` edges into any of `targets` whose source is written in
+    /// one of `languages` (W7-21's cost revision): from each distinct target
+    /// through `idx_edges_target_kind` to its source's row, of which the
+    /// language alone is read. Unordered.
+    pub fn calls_into_from_languages(
+        &self,
+        targets: &[String],
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<Edge>> {
+        let targets: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+        if targets.is_empty() || languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let targets = serde_json::to_string(&targets)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let sql = format!(
+            "SELECT e.* FROM json_each(?1) AS t \
+             CROSS JOIN edges AS e ON e.target = t.value AND e.kind = 'calls' \
+             CROSS JOIN nodes AS s ON s.id = e.source WHERE +s.language IN ({})",
+            (2..languages.len() + 2)
+                .map(|slot| format!("?{slot}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let values = std::iter::once(targets).chain(
+            languages
+                .iter()
+                .map(|language| language.as_str().to_string()),
+        );
+        query_edges(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// The nodes of `kind` whose signature holds `text` (W7-16a): a superset
+    /// the caller narrows by its own pattern. A node without a signature
+    /// holds nothing. Unordered.
+    pub fn nodes_of_kind_whose_signature_holds(
+        &self,
+        kind: NodeKind,
+        text: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE kind = ?1 AND instr(signature, ?2) > 0",
+            rusqlite::params![kind.as_str(), text],
+        )
+    }
+
+    /// The `language` nodes whose decorator list may hold `decorator`: its
+    /// JSON text contains the quoted name, a superset the caller narrows by
+    /// the exact list (upstream `iterateNodesByLanguageWithDecorator`, W7-14).
+    /// Unordered.
+    pub fn nodes_with_decorator(
+        &self,
+        language: Language,
+        decorator: &str,
+    ) -> rusqlite::Result<Vec<Node>> {
+        query_nodes(
+            &self.conn,
+            "SELECT * FROM nodes WHERE language = ?1 AND decorators LIKE '%' || ?2 || '%'",
+            rusqlite::params![language.as_str(), format!("\"{decorator}\"")],
         )
     }
 
@@ -703,11 +1054,6 @@ impl Store {
         if edges.is_empty() {
             return Ok(());
         }
-        let endpoint_ids = edges
-            .iter()
-            .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
-            .collect::<Vec<_>>();
-
         // Snapshot endpoint existence INSIDE a `BEGIN IMMEDIATE` transaction so the
         // FK filter and the inserts observe one write-locked, delete-free view.
         // Reading it before the transaction let a concurrent writer (daemon
@@ -718,38 +1064,91 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing_node_ids = existing_node_ids(&tx, &endpoint_ids)?;
+        insert_edges_in(&tx, edges)?;
+        tx.commit()
+    }
+
+    /// Replace every synthesized edge with `edges` in ONE `BEGIN IMMEDIATE`
+    /// transaction (W7-14, upstream `SynthesisStage.publish`), leaving the
+    /// rows that deleting the old ones and inserting `edges` as
+    /// [`Self::insert_edges`] inserts them would leave: an edge whose
+    /// identity (`idx_edges_identity`) a base edge holds is ignored, and of
+    /// two with one identity the first goes in. It writes only the
+    /// difference (W7-18c0): a stored synthesized row equal to the edge of
+    /// its identity keeps its row and id, the other stored ones go first, and
+    /// the rest of `edges` comes after them, so an unchanged stage rewrites
+    /// nothing. Returns how many rows went and how many came. The synthesis
+    /// marker is the caller's: a sync writes it only after its last other
+    /// write.
+    pub fn replace_synthesized_edges(
+        &mut self,
+        edges: &[Edge],
+    ) -> rusqlite::Result<(usize, usize)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The edge of each identity `INSERT OR IGNORE` writes: the first.
+        let mut wanted: Vec<(&Edge, Option<String>)> = Vec::with_capacity(edges.len());
+        let mut of_identity: HashMap<EdgeIdentity<'_>, usize> = HashMap::new();
+        for edge in edges {
+            let identity = EdgeIdentity::of_edge(edge);
+            if of_identity.contains_key(&identity) {
+                continue;
+            }
+            let metadata = edge
+                .metadata
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(json_to_sql_error)?;
+            of_identity.insert(identity, wanted.len());
+            wanted.push((edge, metadata));
+        }
+        let mut kept = vec![false; wanted.len()];
+        let mut stale = Vec::new();
         {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
-                VALUES (@source, @target, @kind, @metadata, @line, @col, @provenance)
-                "#,
-            )?;
-            for edge in edges {
-                if !existing_node_ids.contains(&edge.source)
-                    || !existing_node_ids.contains(&edge.target)
-                {
-                    continue;
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, source, target, kind, metadata, line, col, provenance \
+                 FROM edges WHERE {SYNTHESIZED}"
+            ))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let stored = StoredEdge {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    target: row.get(2)?,
+                    kind: row.get(3)?,
+                    metadata: row.get(4)?,
+                    line: row.get(5)?,
+                    col: row.get(6)?,
+                    provenance: row.get(7)?,
+                };
+                match of_identity.get(&stored.identity()) {
+                    Some(&at) if stored.writes(wanted[at].0, wanted[at].1.as_deref()) => {
+                        kept[at] = true;
+                    }
+                    _ => stale.push(stored.id),
                 }
-                let metadata = edge
-                    .metadata
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(json_to_sql_error)?;
-                stmt.execute(named_params! {
-                    "@source": edge.source,
-                    "@target": edge.target,
-                    "@kind": edge.kind.as_str(),
-                    "@metadata": metadata,
-                    "@line": edge.line,
-                    "@col": edge.col,
-                    "@provenance": edge.provenance,
-                })?;
             }
         }
-        tx.commit()
+        for chunk in stale.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                &format!("DELETE FROM edges WHERE id IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk),
+            )?;
+        }
+        let rest: Vec<&Edge> = wanted
+            .iter()
+            .zip(&kept)
+            .filter(|(_, kept)| !**kept)
+            .map(|((edge, _), _)| *edge)
+            .collect();
+        let inserted = insert_edge_refs_in(&tx, &rest)?;
+        tx.commit()?;
+        Ok((stale.len(), inserted))
     }
 
     /// Ports `getOutgoingEdges` from `upstream db/queries.ts:1310-1337`.
@@ -803,6 +1202,53 @@ impl Store {
                 params![target_id],
             ),
         }
+    }
+
+    /// The edges of `kind` into any of `targets`: what
+    /// [`Self::edges_by_target_kind`] returns for each, read with one query
+    /// a chunk of [`SQLITE_PARAM_CHUNK_SIZE`] distinct targets (W7-15b). The
+    /// rows into one target keep that query's order, as both read
+    /// `idx_edges_target_kind`; the targets come in no particular order.
+    pub fn edges_by_targets_kind(
+        &self,
+        targets: &[String],
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<Edge>> {
+        self.edges_by_ends_kind("target", targets, kind)
+    }
+
+    /// The edges of `kind` out of any of `sources`, as
+    /// [`Self::edges_by_targets_kind`] reads into its targets
+    /// (`idx_edges_source_kind`).
+    pub fn edges_by_sources_kind(
+        &self,
+        sources: &[String],
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<Edge>> {
+        self.edges_by_ends_kind("source", sources, kind)
+    }
+
+    fn edges_by_ends_kind(
+        &self,
+        end: &str,
+        ids: &[String],
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<Edge>> {
+        let mut unique: Vec<&str> = ids.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let kind = kind.as_str();
+        let mut edges = Vec::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT * FROM edges WHERE {end} IN ({placeholders}) AND kind = ?");
+            let mut params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
+            params.push(&kind);
+            edges.extend(query_edges(&self.conn, &sql, params.as_slice())?);
+        }
+        Ok(edges)
     }
 
     /// Ports `upsertFile` from `upstream db/queries.ts:1426-1455`.
@@ -870,6 +1316,22 @@ impl Store {
             .conn
             .prepare("SELECT path FROM files WHERE language = ?1 ORDER BY path")?;
         let rows = stmt.query_map([language.as_str()], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// Every file's path, in path order (upstream `getAllFilePaths`): the
+    /// synthesis stage's Delphi form pass needs no other column.
+    pub fn file_paths(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    }
+
+    /// The distinct languages of the files (upstream
+    /// `getDistinctFileLanguages`), which gate the synthesis passes.
+    pub fn file_languages(&self) -> rusqlite::Result<Vec<Language>> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT language FROM files")?;
+        let rows = stmt.query_map([], |row| parse_language(row.get::<_, String>(0)?))?;
         rows.collect()
     }
 
@@ -1036,26 +1498,7 @@ impl Store {
         &self,
         sites: &BTreeSet<ReferenceSite>,
     ) -> rusqlite::Result<Vec<UnresolvedRef>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs \
-             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3 \
-             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs \
-             WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"
-        ))?;
-        let mut out = Vec::new();
-        for site in sites {
-            for reference in stmt.query_map(
-                params![site.from_node_id, site.line, site.col],
-                row_to_unresolved_ref,
-            )? {
-                out.push(reference?);
-            }
-        }
-        out.sort_by_key(|reference| reference.id);
-        for reference in &mut out {
-            reference.id = None;
-        }
-        Ok(out)
+        stored_refs_at_sites_in(&self.conn, sites)
     }
 
     /// Every reference of `file_path`'s last extraction, the rows resolution
@@ -1064,19 +1507,7 @@ impl Store {
     /// give, as each site's multiset of references. Only valid while the
     /// `resolved_refs_version` marker is.
     pub fn stored_refs_of_file(&self, file_path: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE file_path = ?1 \
-             UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs WHERE file_path = ?1 \
-             ORDER BY id"
-        ))?;
-        let rows = stmt.query_map([file_path], row_to_unresolved_ref)?;
-        rows.map(|row| {
-            row.map(|mut reference| {
-                reference.id = None;
-                reference
-            })
-        })
-        .collect()
+        stored_refs_of_file_in(&self.conn, file_path)
     }
 
     /// Ports `getUnresolvedReferencesByFiles` from `upstream db/queries.ts:1663-1694`.
@@ -1432,24 +1863,9 @@ impl Store {
         unique.sort_unstable();
         unique.dedup();
         let languages: Vec<&str> = languages.iter().map(|language| language.as_str()).collect();
-        let language_slots = std::iter::repeat_n("?", languages.len())
-            .collect::<Vec<_>>()
-            .join(",");
         let mut out = BTreeSet::new();
         for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE - languages.len()) {
-            let name_slots = std::iter::repeat_n("lower(?)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                r#"SELECT src.file_path, e.source, e.line, e.col
-                FROM edges e
-                JOIN nodes tgt ON tgt.id = e.target
-                JOIN nodes src ON src.id = e.source
-                WHERE lower(tgt.name) IN ({name_slots})
-                  AND src.language IN ({language_slots})
-                  AND e.kind != 'contains'
-                ORDER BY src.file_path, e.source, e.line, e.col"#
-            );
+            let sql = folded_target_sites_sql(chunk.len(), languages.len());
             let mut params: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
             params.extend(languages.iter().map(|language| language as &dyn ToSql));
             let mut stmt = self.conn.prepare(&sql)?;
@@ -2046,22 +2462,101 @@ impl Store {
         &self,
         file_path: &str,
     ) -> rusqlite::Result<Vec<FileReferenceSite>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"SELECT src.file_path, e.source, e.line, e.col
             FROM edges e
             JOIN nodes tgt ON tgt.id = e.target
             JOIN nodes src ON src.id = e.source
             WHERE tgt.file_path = ?1
               AND e.kind != 'contains'
+              AND NOT ({SYNTHESIZED_E})
               AND src.file_path != ?1
             ORDER BY src.file_path, e.source, e.line, e.col"#,
-        )?;
+        ))?;
         let rows = stmt.query_map([file_path], row_to_file_reference_site)?;
         let mut out = BTreeSet::new();
         for row in rows {
             out.insert(row?);
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// The reference sites of the edges into the nodes `ids` names, other
+    /// than `contains` edges, each with its source's file (W7-09d); a NULL
+    /// coordinate gives its file whole (`site: None`). Sorted and
+    /// deduplicated.
+    pub fn reference_sites_of_edges_to_targets(
+        &self,
+        ids: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut unique = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut out = BTreeSet::new();
+        for chunk in unique.chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT src.file_path, e.source, e.line, e.col
+                FROM edges e
+                JOIN nodes src ON src.id = e.source
+                WHERE e.target IN ({placeholders})
+                  AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})
+                ORDER BY src.file_path, e.source, e.line, e.col"#
+            );
+            let params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), row_to_file_reference_site)?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Bring the nodes no single file's extraction makes in line with what
+    /// a framework's cross-file pass wants, in one transaction (W7-09d):
+    /// re-open the reference sites `reopen` names, each sibling group's
+    /// edges deleted and its stored references back in `unresolved_refs`
+    /// (a whole file for a `None` site), then delete the nodes `remove`
+    /// names, their edges and references going with them, and insert
+    /// `insert` with `refs` pending. A crash leaves the store as it was or
+    /// with every part applied.
+    pub fn replace_cross_file_nodes(
+        &mut self,
+        remove: &[String],
+        insert: &[Node],
+        refs: &[UnresolvedRef],
+        reopen: &[FileReferenceSite],
+    ) -> rusqlite::Result<()> {
+        validate_nodes(insert)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for affected in reopen {
+            match &affected.site {
+                Some(site) => {
+                    let sites = BTreeSet::from([site.clone()]);
+                    let stored = stored_refs_at_sites_in(&tx, &sites)?;
+                    replace_site_resolution_in(&tx, std::slice::from_ref(site), &stored)?;
+                }
+                None => {
+                    let stored = stored_refs_of_file_in(&tx, &affected.file_path)?;
+                    replace_file_resolution_in(&tx, &affected.file_path, &stored)?;
+                }
+            }
+        }
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM nodes WHERE id = ?")?;
+            for id in remove {
+                delete.execute([id])?;
+            }
+        }
+        upsert_nodes_in(&tx, insert)?;
+        insert_unresolved_refs_in_connection(&tx, refs)?;
+        tx.commit()
     }
 
     /// `(id, file_path, signature)` of every Python function and method, in
@@ -2098,7 +2593,8 @@ impl Store {
                     r#"SELECT src.file_path, e.source, e.line, e.col
                     FROM edges e
                     JOIN nodes src ON src.id = e.source
-                    WHERE e.kind != 'contains' AND e.source IN ({placeholders})"#
+                    WHERE e.kind != 'contains' AND NOT ({SYNTHESIZED_E})
+                      AND e.source IN ({placeholders})"#
                 ),
                 format!(
                     r#"SELECT file_path, from_node_id, line, col
@@ -2148,6 +2644,91 @@ impl Store {
             }
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// The names of the unresolved references a Spring config key can bind
+    /// ([`CONFIG_KEY_REFERENCE`]), sorted and deduplicated: a sync that
+    /// changed a config file retries them by their whole names (W7-19c).
+    /// One scan of `unresolved_refs`; no index holds the gate.
+    pub fn unresolved_config_key_names(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT reference_name FROM unresolved_refs \
+             WHERE {CONFIG_KEY_REFERENCE} ORDER BY reference_name"
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
+    /// The sites of the resolved references a Spring config key can bind
+    /// ([`CONFIG_KEY_REFERENCE`]), sorted and deduplicated: a sync that
+    /// changed a config file refreshes them (W7-19c). One scan of
+    /// `resolved_refs`.
+    pub fn resolved_config_key_sites(&self) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT DISTINCT file_path, from_node_id, line, col FROM resolved_refs \
+             WHERE {CONFIG_KEY_REFERENCE} ORDER BY file_path, from_node_id, line, col"
+        ))?;
+        let rows = stmt.query_map([], row_to_file_reference_site)?;
+        rows.collect()
+    }
+
+    /// The sites of the resolved references named one of `names`, sorted and
+    /// deduplicated: a sync refreshes the Play actions whose candidates
+    /// moved (W7-19c). One scan of `resolved_refs`, which no index holds by
+    /// name.
+    pub fn resolved_reference_sites_named(
+        &self,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = serde_json::to_string(names)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT file_path, from_node_id, line, col FROM resolved_refs \
+             WHERE reference_name IN (SELECT value FROM json_each(?1)) \
+             ORDER BY file_path, from_node_id, line, col",
+        )?;
+        let rows = stmt.query_map([names], row_to_file_reference_site)?;
+        rows.collect()
+    }
+
+    /// The references of one framework lane's family, the unresolved ones
+    /// then the resolved ones, each sorted by site and deduplicated: a sync
+    /// re-resolves the ones its changes moved, and an index without the
+    /// lane's marker every one (W7-19d). The route families read a range of
+    /// the tables' `from_node_id` indexes; the others scan `resolved_refs`,
+    /// which no index holds by name.
+    pub fn lane_references(&self, family: &LaneReferences) -> rusqlite::Result<Vec<LaneReference>> {
+        let (predicate, params) = family.predicate();
+        let mut out = Vec::new();
+        for (table, resolved) in [("unresolved_refs", false), ("resolved_refs", true)] {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT DISTINCT file_path, from_node_id, line, col, reference_name, \
+                 reference_kind FROM {table} WHERE {predicate} \
+                 ORDER BY file_path, from_node_id, line, col, reference_name, reference_kind"
+            ))?;
+            let map = |row: &Row<'_>| {
+                let raw_kind = row.get::<_, String>(5)?;
+                let reference_kind = if raw_kind == "function_ref" {
+                    EdgeKind::References
+                } else {
+                    parse_edge_kind(raw_kind)?
+                };
+                Ok(LaneReference {
+                    site: row_to_file_reference_site(row)?,
+                    reference_name: row.get(4)?,
+                    reference_kind,
+                    resolved,
+                })
+            };
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), map)?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
     }
 
     /// Ports `getDependencyFilePaths` from
@@ -2319,11 +2900,11 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut removed = 0;
         {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt = tx.prepare_cached(&format!(
                 r#"DELETE FROM edges
                 WHERE source = ?1 AND line = ?2 AND col = ?3
-                  AND kind != 'contains'"#,
-            )?;
+                  AND kind != 'contains' AND NOT ({SYNTHESIZED})"#
+            ))?;
             for site in unique {
                 removed += stmt.execute(params![site.from_node_id, site.line, site.col])?;
             }
@@ -2433,7 +3014,8 @@ impl Store {
                 JOIN nodes tgt ON tgt.id = e.target
                 JOIN nodes src ON src.id = e.source
                 WHERE tgt.name IN ({placeholders})
-                  AND e.kind != 'contains'"#
+                  AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})"#
             );
             let params = chunk.iter().map(|n| n as &dyn ToSql).collect::<Vec<_>>();
             let mut stmt = self.conn.prepare(&sql)?;
@@ -2454,15 +3036,16 @@ impl Store {
         &self,
         file_path: &str,
     ) -> rusqlite::Result<Vec<(String, i64, i64, String)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             r#"SELECT e.source, e.line, e.col, tgt.name
             FROM nodes src
             CROSS JOIN edges e ON e.source = src.id
             JOIN nodes tgt ON tgt.id = e.target
             WHERE src.file_path = ?1 AND e.kind = 'calls'
               AND e.line IS NOT NULL AND e.col IS NOT NULL
+              AND NOT ({SYNTHESIZED_E})
             ORDER BY e.source, e.line, e.col, tgt.name"#,
-        )?;
+        ))?;
         let rows = stmt.query_map([file_path], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?;
@@ -2522,6 +3105,7 @@ impl Store {
                 JOIN nodes src ON src.id = e.source
                 WHERE tgt.name IN ({placeholders})
                   AND e.kind != 'contains'
+                  AND NOT ({SYNTHESIZED_E})
                   AND src.file_path {file_relation} tgt.file_path
                 ORDER BY src.file_path, e.source, e.line, e.col"#
             );
@@ -2543,7 +3127,27 @@ impl Store {
 /// Extraction produces `contains` edges and same-file value references (a
 /// `references` edge with `{"valueRef": true}` and no coordinates), which a
 /// re-resolution of an unchanged file must keep.
-const RESOLUTION_EDGE: &str = "e.kind != 'contains' AND NOT (e.kind = 'references' AND e.line IS NULL AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.valueRef') END = 1)";
+const RESOLUTION_EDGE: &str = concat!(
+    "e.kind != 'contains' AND NOT (e.kind = 'references' AND e.line IS NULL AND CASE WHEN json_valid(e.metadata) THEN json_extract(e.metadata, '$.valueRef') END = 1) AND NOT (",
+    synthesized_edge!("e."),
+    ")"
+);
+
+/// [`synthesized_edge`] for an unaliased `edges` row.
+const SYNTHESIZED: &str = synthesized_edge!("");
+/// [`synthesized_edge`] for an `edges` row aliased `e`.
+const SYNTHESIZED_E: &str = synthesized_edge!("e.");
+
+/// The references a Spring config key can bind (upstream
+/// `springResolver.resolve`'s two gates, W7-19c): `references` written in
+/// Java or Kotlin whose names hold a `.` and no `::` (#1180), and the
+/// `:prefix` ones of the languages Spring reads.
+const CONFIG_KEY_REFERENCE: &str = "((reference_kind = 'references' \
+    AND language IN ('java', 'kotlin') \
+    AND instr(reference_name, '.') > 0 \
+    AND instr(reference_name, '::') = 0) \
+    OR (substr(reference_name, -7) = ':prefix' \
+    AND language IN ('java', 'kotlin', 'yaml', 'properties')))";
 
 fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
     let file_path = row.get(0)?;
@@ -2940,6 +3544,7 @@ fn edge_kind_named(value: &str) -> Option<EdgeKind> {
         "instantiates" => EdgeKind::Instantiates,
         "overrides" => EdgeKind::Overrides,
         "decorates" => EdgeKind::Decorates,
+        "navigates" => EdgeKind::Navigates,
         _ => return None,
     };
     Some(kind)
@@ -3021,6 +3626,125 @@ fn parse_language(value: String) -> rusqlite::Result<Language> {
     Ok(language)
 }
 
+/// The body of [`Store::stored_refs_at_sites`], in `conn`.
+fn stored_refs_at_sites_in(
+    conn: &Connection,
+    sites: &BTreeSet<ReferenceSite>,
+) -> rusqlite::Result<Vec<UnresolvedRef>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs \
+         WHERE from_node_id = ?1 AND line = ?2 AND col = ?3 \
+         UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs \
+         WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"
+    ))?;
+    let mut out = Vec::new();
+    for site in sites {
+        for reference in stmt.query_map(
+            params![site.from_node_id, site.line, site.col],
+            row_to_unresolved_ref,
+        )? {
+            out.push(reference?);
+        }
+    }
+    out.sort_by_key(|reference| reference.id);
+    for reference in &mut out {
+        reference.id = None;
+    }
+    Ok(out)
+}
+
+/// The body of [`Store::stored_refs_of_file`], in `conn`.
+fn stored_refs_of_file_in(
+    conn: &Connection,
+    file_path: &str,
+) -> rusqlite::Result<Vec<UnresolvedRef>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {UNRESOLVED_REF_COLUMNS} FROM unresolved_refs WHERE file_path = ?1 \
+         UNION ALL SELECT {UNRESOLVED_REF_COLUMNS} FROM resolved_refs WHERE file_path = ?1 \
+         ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([file_path], row_to_unresolved_ref)?;
+    rows.map(|row| {
+        row.map(|mut reference| {
+            reference.id = None;
+            reference
+        })
+    })
+    .collect()
+}
+
+/// The body of [`Store::upsert_nodes`], in `conn`: the nodes' own transaction
+/// or a caller's.
+fn upsert_nodes_in(conn: &Connection, nodes: &[Node]) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare_cached(
+        r#"
+                INSERT INTO nodes (
+                  id, kind, name, qualified_name, file_path, language,
+                  start_line, end_line, start_column, end_column,
+                  docstring, signature, visibility,
+                  is_exported, is_async, is_static, is_abstract,
+                  decorators, type_parameters, return_type, updated_at
+                ) VALUES (
+                  @id, @kind, @name, @qualifiedName, @filePath, @language,
+                  @startLine, @endLine, @startColumn, @endColumn,
+                  @docstring, @signature, @visibility,
+                  @isExported, @isAsync, @isStatic, @isAbstract,
+                  @decorators, @typeParameters, @returnType, @updatedAt
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                  kind = excluded.kind,
+                  name = excluded.name,
+                  qualified_name = excluded.qualified_name,
+                  file_path = excluded.file_path,
+                  language = excluded.language,
+                  start_line = excluded.start_line,
+                  end_line = excluded.end_line,
+                  start_column = excluded.start_column,
+                  end_column = excluded.end_column,
+                  docstring = excluded.docstring,
+                  signature = excluded.signature,
+                  visibility = excluded.visibility,
+                  is_exported = excluded.is_exported,
+                  is_async = excluded.is_async,
+                  is_static = excluded.is_static,
+                  is_abstract = excluded.is_abstract,
+                  decorators = excluded.decorators,
+                  type_parameters = excluded.type_parameters,
+                  return_type = excluded.return_type,
+                  updated_at = excluded.updated_at
+                "#,
+    )?;
+
+    for node in nodes {
+        let decorators = json_array_or_null(&node.decorators)?;
+        let type_parameters = json_array_or_null(&node.type_parameters)?;
+        stmt.execute(named_params! {
+            "@id": node.id,
+            "@kind": node.kind.as_str(),
+            "@name": node.name,
+            "@qualifiedName": node.qualified_name,
+            "@filePath": node.file_path,
+            "@language": node.language.as_str(),
+            "@startLine": node.start_line,
+            "@endLine": node.end_line,
+            "@startColumn": node.start_column,
+            "@endColumn": node.end_column,
+            "@docstring": node.docstring,
+            "@signature": node.signature,
+            "@visibility": node.visibility,
+            "@isExported": bool_to_i64(node.is_exported),
+            "@isAsync": bool_to_i64(node.is_async),
+            "@isStatic": bool_to_i64(node.is_static),
+            "@isAbstract": bool_to_i64(node.is_abstract),
+            "@decorators": decorators,
+            "@typeParameters": type_parameters,
+            "@returnType": node.return_type,
+            "@updatedAt": node.updated_at,
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_nodes(nodes: &[Node]) -> rusqlite::Result<()> {
     for node in nodes {
         if node.id.is_empty()
@@ -3035,6 +3759,139 @@ fn validate_nodes(nodes: &[Node]) -> rusqlite::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The body of [`Store::insert_edges`] in `tx`: every edge of `edges` whose
+/// endpoints both exist, `INSERT OR IGNORE`d; how many rows went in.
+fn insert_edges_in(tx: &Connection, edges: &[Edge]) -> rusqlite::Result<usize> {
+    insert_edge_refs_in(tx, &edges.iter().collect::<Vec<_>>())
+}
+
+/// [`insert_edges_in`] over borrowed edges.
+fn insert_edge_refs_in(tx: &Connection, edges: &[&Edge]) -> rusqlite::Result<usize> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    let endpoint_ids = edges
+        .iter()
+        .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
+        .collect::<Vec<_>>();
+    let existing_node_ids = existing_node_ids(tx, &endpoint_ids)?;
+    let mut stmt = tx.prepare_cached(
+        r#"
+        INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
+        VALUES (@source, @target, @kind, @metadata, @line, @col, @provenance)
+        "#,
+    )?;
+    let mut inserted = 0;
+    for &edge in edges {
+        if !existing_node_ids.contains(&edge.source) || !existing_node_ids.contains(&edge.target) {
+            continue;
+        }
+        let metadata = edge
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(json_to_sql_error)?;
+        inserted += stmt.execute(named_params! {
+            "@source": edge.source,
+            "@target": edge.target,
+            "@kind": edge.kind.as_str(),
+            "@metadata": metadata,
+            "@line": edge.line,
+            "@col": edge.col,
+            "@provenance": edge.provenance,
+        })?;
+    }
+    Ok(inserted)
+}
+
+/// An edge's identity, as `idx_edges_identity` keys it: `(source, target,
+/// kind, IFNULL(line, -1), IFNULL(col, -1))`.
+#[derive(PartialEq, Eq, Hash)]
+struct EdgeIdentity<'e> {
+    source: &'e str,
+    target: &'e str,
+    kind: &'e str,
+    line: i64,
+    col: i64,
+}
+
+impl<'e> EdgeIdentity<'e> {
+    fn of_edge(edge: &'e Edge) -> Self {
+        EdgeIdentity {
+            source: &edge.source,
+            target: &edge.target,
+            kind: edge.kind.as_str(),
+            line: edge.line.unwrap_or(-1),
+            col: edge.col.unwrap_or(-1),
+        }
+    }
+}
+
+/// A stored synthesized edge row, its metadata as the stored text.
+struct StoredEdge {
+    id: i64,
+    source: String,
+    target: String,
+    kind: String,
+    metadata: Option<String>,
+    line: Option<i64>,
+    col: Option<i64>,
+    provenance: Option<String>,
+}
+
+impl StoredEdge {
+    fn identity(&self) -> EdgeIdentity<'_> {
+        EdgeIdentity {
+            source: &self.source,
+            target: &self.target,
+            kind: &self.kind,
+            line: self.line.unwrap_or(-1),
+            col: self.col.unwrap_or(-1),
+        }
+    }
+
+    /// Whether inserting `edge`, its metadata serialized as `metadata`,
+    /// would write this row's every column but the id.
+    fn writes(&self, edge: &Edge, metadata: Option<&str>) -> bool {
+        self.source == edge.source
+            && self.target == edge.target
+            && self.kind == edge.kind.as_str()
+            && self.line == edge.line
+            && self.col == edge.col
+            && self.provenance == edge.provenance
+            && self.metadata.as_deref() == metadata
+    }
+}
+
+/// The query of [`Store::reference_sites_of_edges_to_folded_targets`] for
+/// `names` names and `languages` languages, its parameters in that order.
+/// `CROSS JOIN` keeps the targets the outer loop, found through the
+/// lower-name index: left to itself, with no row statistics for these
+/// tables, the planner takes the language filter for the selective one from
+/// four names on and walks every node of those languages and its edges
+/// (W7-19d cost revision). From the targets it costs what the exact-name
+/// query a sync runs for the same names costs.
+fn folded_target_sites_sql(names: usize, languages: usize) -> String {
+    let name_slots = std::iter::repeat_n("lower(?)", names)
+        .collect::<Vec<_>>()
+        .join(",");
+    let language_slots = std::iter::repeat_n("?", languages)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"SELECT src.file_path, e.source, e.line, e.col
+        FROM nodes tgt
+        CROSS JOIN edges e ON e.target = tgt.id
+        CROSS JOIN nodes src ON src.id = e.source
+        WHERE lower(tgt.name) IN ({name_slots})
+          AND src.language IN ({language_slots})
+          AND e.kind != 'contains'
+          AND NOT ({SYNTHESIZED_E})
+        ORDER BY src.file_path, e.source, e.line, e.col"#
+    )
 }
 
 fn existing_node_ids(
@@ -3124,11 +3981,11 @@ fn replace_site_resolution_in(
     }
     let mut removed = 0;
     {
-        let mut delete_edges = tx.prepare_cached(
+        let mut delete_edges = tx.prepare_cached(&format!(
             r#"DELETE FROM edges
                 WHERE source = ?1 AND line = ?2 AND col = ?3
-                  AND kind != 'contains'"#,
-        )?;
+                  AND kind != 'contains' AND NOT ({SYNTHESIZED})"#
+        ))?;
         let mut delete_refs = tx.prepare_cached(
             r#"DELETE FROM unresolved_refs
                 WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
@@ -3424,6 +4281,141 @@ mod tests {
                 "gen/f0000.go".to_string(),
                 format!("gen/f{:04}.go", total - 1),
             ])
+        );
+    }
+
+    #[test]
+    fn a_kinds_nodes_are_read_by_what_their_signature_holds() {
+        let mut store = store("signature-holds");
+        store.upsert_file(&file("src/thunks.ts")).unwrap();
+        let mut thunk = node("constant:thunk", "fetchUser", "src/thunks.ts");
+        thunk.kind = NodeKind::Constant;
+        thunk.signature = Some("= createAsyncThunk('user/fetch', async () => {".to_string());
+        let mut lower = node("constant:lower", "other", "src/thunks.ts");
+        lower.kind = NodeKind::Constant;
+        lower.signature = Some("= createasyncthunk()".to_string());
+        let mut unsigned = node("constant:unsigned", "bare", "src/thunks.ts");
+        unsigned.kind = NodeKind::Constant;
+        unsigned.signature = None;
+        let mut function = node("function:thunk", "makeThunk", "src/thunks.ts");
+        function.signature = Some("(Thunk t)".to_string());
+        store
+            .upsert_nodes(&[thunk.clone(), lower, unsigned, function])
+            .unwrap();
+        // Of the constants, the one whose signature holds the text, case
+        // and all; a function's signature is another kind's.
+        assert_eq!(
+            store
+                .nodes_of_kind_whose_signature_holds(NodeKind::Constant, "Thunk")
+                .unwrap(),
+            vec![thunk]
+        );
+        assert!(
+            store
+                .nodes_of_kind_whose_signature_holds(NodeKind::Constant, "missing")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_files_layouts_and_callables_are_its_rows_of_those_kinds() {
+        let mut store = store("layouts-and-callables");
+        store.upsert_file(&file("src/ops.c")).unwrap();
+        store.upsert_file(&file("src/other.c")).unwrap();
+        let mut nodes = Vec::new();
+        for (index, kind) in [
+            NodeKind::Function,
+            NodeKind::Struct,
+            NodeKind::Variable,
+            NodeKind::Union,
+            NodeKind::Method,
+            NodeKind::Field,
+            NodeKind::Import,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = node(&format!("{}:{index}", kind.as_str()), "n", "src/ops.c");
+            row.kind = kind;
+            // Later kinds start earlier: the rows come back by line.
+            row.start_line = 20 - index as i64;
+            nodes.push(row);
+        }
+        nodes.push(node("function:other", "n", "src/other.c"));
+        store.upsert_nodes(&nodes).unwrap();
+        let read = store
+            .layouts_and_callables_by_file_path("src/ops.c")
+            .unwrap();
+        let mut expected: Vec<Node> = store
+            .nodes_by_file_path("src/ops.c")
+            .unwrap()
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    NodeKind::Struct | NodeKind::Union | NodeKind::Function | NodeKind::Method
+                )
+            })
+            .collect();
+        expected.sort_by_key(|row| row.start_line);
+        assert_eq!(read, expected);
+        assert_eq!(read.len(), 4);
+    }
+
+    /// The classes, methods and properties of many files read at once
+    /// (W7-18d's cost revision) are each file's rows of those kinds, past a
+    /// chunk's worth of paths; a path asked twice is read once, a file not
+    /// asked is not read, and no path reads nothing.
+    #[test]
+    fn many_files_classes_and_members_are_their_rows_of_those_kinds() {
+        let mut store = store("classes-and-members");
+        let paths: Vec<String> = (0..SQLITE_PARAM_CHUNK_SIZE + 3)
+            .map(|at| format!("src/c{at:04}.ts"))
+            .collect();
+        let mut nodes = Vec::new();
+        for path in paths.iter().chain(["src/unasked.ts".to_string()].iter()) {
+            store.upsert_file(&file(path)).unwrap();
+            for (index, kind) in [
+                NodeKind::Class,
+                NodeKind::Method,
+                NodeKind::Property,
+                NodeKind::Function,
+                NodeKind::Field,
+                NodeKind::Import,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut row = node(&format!("{}:{path}:{index}", kind.as_str()), "n", path);
+                row.kind = kind;
+                row.start_line = 20 - index as i64;
+                nodes.push(row);
+            }
+        }
+        store.upsert_nodes(&nodes).unwrap();
+        let mut asked = paths.clone();
+        asked.push(paths[7].clone());
+        let mut read = store.classes_and_members_by_file_paths(&asked).unwrap();
+        let mut expected: Vec<Node> = paths
+            .iter()
+            .flat_map(|path| store.nodes_by_file_path(path).unwrap())
+            .filter(|row| {
+                matches!(
+                    row.kind,
+                    NodeKind::Class | NodeKind::Method | NodeKind::Property
+                )
+            })
+            .collect();
+        read.sort_by(|a, b| a.id.cmp(&b.id));
+        expected.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(read, expected);
+        assert_eq!(read.len(), 3 * paths.len());
+        assert!(
+            store
+                .classes_and_members_by_file_paths(&[])
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -3886,6 +4878,597 @@ mod tests {
         }
     }
 
+    fn synthesized(source: &str, target: &str, line: Option<i64>, col: Option<i64>) -> Edge {
+        Edge {
+            metadata: Some(
+                serde_json::json!({"synthesizedBy": "callback", "registeredAt": "src/a.rs:1"}),
+            ),
+            line,
+            col,
+            provenance: Some("heuristic".to_string()),
+            ..edge(source, target, EdgeKind::Calls)
+        }
+    }
+
+    /// An edge as `(source, target, kind, line, col, synthesized)`.
+    type EdgeRow = (String, String, String, Option<i64>, Option<i64>, bool);
+
+    fn edge_rows(store: &Store) -> Vec<EdgeRow> {
+        let mut rows: Vec<_> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge.kind != EdgeKind::Contains)
+            .map(|edge| {
+                let synthesized = edge
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.get("synthesizedBy").is_some());
+                (
+                    edge.source,
+                    edge.target,
+                    edge.kind.as_str().to_string(),
+                    edge.line,
+                    edge.col,
+                    synthesized,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The replacement swaps the synthesized edges alone (W7-14): the base
+    /// edge stays, the old synthesized edge goes, and a new one whose
+    /// identity the base edge holds is ignored.
+    #[test]
+    fn replace_synthesized_edges_swaps_only_synthesized_edges() {
+        let mut store = store("replace-synthesized");
+        store
+            .upsert_nodes(&[
+                node("function:a", "alpha", "src/a.rs"),
+                node("function:b", "beta", "src/b.rs"),
+                node("function:c", "gamma", "src/c.rs"),
+            ])
+            .unwrap();
+        let base = Edge {
+            line: Some(3),
+            col: Some(4),
+            ..edge("function:a", "function:b", EdgeKind::Calls)
+        };
+        store
+            .insert_edges(&[base, synthesized("function:a", "function:c", None, None)])
+            .unwrap();
+        let (removed, inserted) = store
+            .replace_synthesized_edges(&[
+                synthesized("function:a", "function:b", Some(3), Some(4)),
+                synthesized("function:b", "function:c", Some(1), None),
+            ])
+            .unwrap();
+        assert_eq!((removed, inserted), (1, 1));
+        let calls = |source: &str, target: &str, line, col, synthesized| {
+            (
+                source.to_string(),
+                target.to_string(),
+                "calls".to_string(),
+                line,
+                col,
+                synthesized,
+            )
+        };
+        assert_eq!(
+            edge_rows(&store),
+            [
+                calls("function:a", "function:b", Some(3), Some(4), false),
+                calls("function:b", "function:c", Some(1), None, true),
+            ]
+        );
+        // The delete reads the partial index schema 9 made for these rows.
+        let plan: Vec<String> = store
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN DELETE FROM edges WHERE {SYNTHESIZED}"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_edges_synthesis_site")),
+            "{plan:?}"
+        );
+    }
+
+    /// The replacement as W7-14 wrote it, the reference the difference write
+    /// must match row for row: every synthesized edge deleted, `edges`
+    /// inserted as `insert_edges` inserts them.
+    fn rewrite_synthesized_edges(store: &mut Store, edges: &[Edge]) {
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(&format!("DELETE FROM edges WHERE {SYNTHESIZED}"), [])
+            .unwrap();
+        insert_edges_in(&tx, edges).unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// An edge row's every column but the id.
+    type EdgeContent = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    );
+
+    fn edge_contents(store: &Store) -> Vec<EdgeContent> {
+        store
+            .conn
+            .prepare(
+                "SELECT source, target, kind, metadata, line, col, provenance FROM edges \
+                 ORDER BY source, target, kind, metadata, line, col, provenance",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Each edge row's id by `(source, target, line, col)`.
+    fn edge_ids(store: &Store) -> BTreeMap<(String, String, Option<i64>, Option<i64>), i64> {
+        store
+            .conn
+            .prepare("SELECT source, target, line, col, id FROM edges")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn registered_at(edge: Edge, at: &str) -> Edge {
+        Edge {
+            metadata: Some(serde_json::json!({"synthesizedBy": "callback", "registeredAt": at})),
+            ..edge
+        }
+    }
+
+    /// The difference write (W7-18c0): an unchanged synthesized edge keeps
+    /// its row and id; one whose metadata, provenance, line or column
+    /// changed is replaced; one the stage no longer makes goes; a new one
+    /// comes; and the rows are the full rewrite's.
+    #[test]
+    fn replace_synthesized_edges_keeps_the_rows_of_unchanged_edges() {
+        let nodes = [
+            node("function:a", "alpha", "src/a.rs"),
+            node("function:b", "beta", "src/b.rs"),
+            node("function:c", "gamma", "src/c.rs"),
+            node("function:d", "delta", "src/d.rs"),
+        ];
+        let base = Edge {
+            line: Some(3),
+            col: Some(4),
+            ..edge("function:a", "function:b", EdgeKind::Calls)
+        };
+        let before = [
+            synthesized("function:a", "function:c", Some(1), None),
+            synthesized("function:b", "function:c", Some(2), None),
+            synthesized("function:c", "function:d", None, None),
+            synthesized("function:a", "function:d", Some(5), Some(6)),
+            synthesized("function:b", "function:d", Some(1), Some(1)),
+        ];
+        let after = [
+            synthesized("function:a", "function:c", Some(1), None),
+            registered_at(
+                synthesized("function:b", "function:c", Some(2), None),
+                "src/b.rs:9",
+            ),
+            Edge {
+                provenance: None,
+                ..synthesized("function:c", "function:d", None, None)
+            },
+            synthesized("function:a", "function:d", Some(5), Some(7)),
+            synthesized("function:d", "function:a", Some(1), None),
+        ];
+        let mut reference = store("replace-difference-reference");
+        let mut store = store("replace-difference");
+        for target in [&mut store, &mut reference] {
+            target.upsert_nodes(&nodes).unwrap();
+            target.insert_edges(std::slice::from_ref(&base)).unwrap();
+        }
+        store.replace_synthesized_edges(&before).unwrap();
+        rewrite_synthesized_edges(&mut reference, &before);
+        let ids = edge_ids(&store);
+        let counts = store.replace_synthesized_edges(&after).unwrap();
+        rewrite_synthesized_edges(&mut reference, &after);
+        assert_eq!(counts, (4, 4));
+        assert_eq!(edge_contents(&store), edge_contents(&reference));
+        let now = edge_ids(&store);
+        let key = |source: &str, target: &str, line, col| {
+            (source.to_string(), target.to_string(), line, col)
+        };
+        // The base edge and the unchanged synthesized edge keep their rows.
+        for kept in [
+            key("function:a", "function:b", Some(3), Some(4)),
+            key("function:a", "function:c", Some(1), None),
+        ] {
+            assert_eq!(now[&kept], ids[&kept], "{kept:?}");
+        }
+        // The changed ones are new rows.
+        for changed in [
+            key("function:b", "function:c", Some(2), None),
+            key("function:c", "function:d", None, None),
+        ] {
+            assert!(now[&changed] > ids[&changed], "{changed:?}");
+        }
+        assert!(!now.contains_key(&key("function:b", "function:d", Some(1), Some(1))));
+        // Unchanged, the stage writes nothing.
+        assert_eq!(store.replace_synthesized_edges(&after).unwrap(), (0, 0));
+        assert_eq!(edge_ids(&store), now);
+    }
+
+    /// Of two edges with one identity the first is written, as `INSERT OR
+    /// IGNORE` writes it, even when the stored row is the second; an edge
+    /// whose identity a base edge holds is ignored and the base row stays;
+    /// an edge with an endpoint missing is skipped.
+    #[test]
+    fn replace_synthesized_edges_writes_what_insert_or_ignore_writes() {
+        let mut store = store("replace-first-of-identity");
+        store
+            .upsert_nodes(&[
+                node("function:a", "alpha", "src/a.rs"),
+                node("function:b", "beta", "src/b.rs"),
+                node("function:c", "gamma", "src/c.rs"),
+            ])
+            .unwrap();
+        let base = Edge {
+            line: Some(3),
+            col: Some(4),
+            ..edge("function:a", "function:b", EdgeKind::Calls)
+        };
+        store.insert_edges(&[base]).unwrap();
+        let first = registered_at(
+            synthesized("function:b", "function:c", Some(1), None),
+            "src/b.rs:1",
+        );
+        let second = registered_at(
+            synthesized("function:b", "function:c", Some(1), None),
+            "src/b.rs:2",
+        );
+        store
+            .replace_synthesized_edges(std::slice::from_ref(&second))
+            .unwrap();
+        let base_id = edge_ids(&store)[&(
+            "function:a".to_string(),
+            "function:b".to_string(),
+            Some(3),
+            Some(4),
+        )];
+        let counts = store
+            .replace_synthesized_edges(&[
+                first.clone(),
+                second,
+                synthesized("function:a", "function:b", Some(3), Some(4)),
+                synthesized("function:a", "function:missing", Some(1), None),
+            ])
+            .unwrap();
+        assert_eq!(counts, (1, 1));
+        let rows = edge_contents(&store);
+        let metadata = |at: &str| {
+            Some(
+                serde_json::to_string(
+                    &serde_json::json!({"synthesizedBy": "callback", "registeredAt": at}),
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            rows,
+            [
+                (
+                    "function:a".to_string(),
+                    "function:b".to_string(),
+                    "calls".to_string(),
+                    None,
+                    Some(3),
+                    Some(4),
+                    None,
+                ),
+                (
+                    "function:b".to_string(),
+                    "function:c".to_string(),
+                    "calls".to_string(),
+                    metadata("src/b.rs:1"),
+                    Some(1),
+                    None,
+                    Some("heuristic".to_string()),
+                ),
+            ]
+        );
+        assert_eq!(
+            edge_ids(&store)[&(
+                "function:a".to_string(),
+                "function:b".to_string(),
+                Some(3),
+                Some(4),
+            )],
+            base_id
+        );
+    }
+
+    /// The difference write leaves the rows the full rewrite leaves, over
+    /// generated histories: base edges, then stage runs, each keeping,
+    /// changing (metadata, provenance, line or column), dropping and
+    /// reordering the last run's edges and adding new ones, whose lists
+    /// repeat identities, collide with base edges and name missing nodes.
+    #[test]
+    fn replace_synthesized_edges_matches_the_full_rewrite() {
+        let mut seed: u64 = 0x5eed_7a18_c000_0001;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let ids = ["function:a", "function:b", "function:c", "function:d"];
+        let nodes: Vec<Node> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| node(id, &format!("n{i}"), &format!("src/n{i}.rs")))
+            .collect();
+        let pick = |next: &mut dyn FnMut(u64) -> u64, synthesized_edge: bool| {
+            let end = |next: &mut dyn FnMut(u64) -> u64| {
+                // One in nine names a node the store does not hold.
+                if next(9) == 0 {
+                    "function:missing"
+                } else {
+                    ids[next(ids.len() as u64) as usize]
+                }
+            };
+            let source = end(next);
+            let target = end(next);
+            let line = [None, Some(1), Some(-1)][next(3) as usize];
+            let col = [None, Some(0), Some(-1)][next(3) as usize];
+            let base = Edge {
+                line,
+                col,
+                ..edge(source, target, EdgeKind::Calls)
+            };
+            if !synthesized_edge {
+                return base;
+            }
+            Edge {
+                metadata: Some(serde_json::json!({
+                    "synthesizedBy": "callback",
+                    "registeredAt": format!("src/x.rs:{}", next(2)),
+                })),
+                provenance: [Some("heuristic".to_string()), None][next(2) as usize].clone(),
+                ..base
+            }
+        };
+        let synthesized_rows = |store: &Store| -> usize {
+            store
+                .conn
+                .query_row(
+                    &format!("SELECT count(*) FROM edges WHERE {SYNTHESIZED}"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap() as usize
+        };
+        let mut kept = 0;
+        for case in 0..120 {
+            let mut reference = store(&format!("replace-generated-{case}-reference"));
+            let mut store = store(&format!("replace-generated-{case}"));
+            let bases: Vec<Edge> = (0..next(4)).map(|_| pick(&mut next, false)).collect();
+            let mut runs: Vec<Vec<Edge>> =
+                vec![(0..next(8)).map(|_| pick(&mut next, true)).collect()];
+            for _ in 0..3 {
+                let mut run = Vec::new();
+                for edge in runs.last().unwrap() {
+                    match next(7) {
+                        0 => {}
+                        1 => run.push(registered_at(edge.clone(), "src/x.rs:9")),
+                        2 => run.push(Edge {
+                            provenance: None,
+                            ..edge.clone()
+                        }),
+                        3 => run.push(Edge {
+                            col: edge.col.map_or(Some(-1), |_| None),
+                            ..edge.clone()
+                        }),
+                        4 => run.push(Edge {
+                            line: edge.line.map_or(Some(-1), |_| None),
+                            ..edge.clone()
+                        }),
+                        _ => run.push(edge.clone()),
+                    }
+                }
+                for _ in 0..next(3) {
+                    let at = next(run.len() as u64 + 1) as usize;
+                    run.insert(at, pick(&mut next, true));
+                }
+                if run.len() > 1 && next(2) == 0 {
+                    let at = next(run.len() as u64) as usize;
+                    let moved = run.remove(at);
+                    run.push(moved);
+                }
+                runs.push(run);
+            }
+            for target in [&mut store, &mut reference] {
+                target.upsert_nodes(&nodes).unwrap();
+                target.insert_edges(&bases).unwrap();
+            }
+            for run in &runs {
+                let stored = synthesized_rows(&store);
+                let (removed, _) = store.replace_synthesized_edges(run).unwrap();
+                kept += stored - removed;
+                rewrite_synthesized_edges(&mut reference, run);
+                assert_eq!(
+                    edge_contents(&store),
+                    edge_contents(&reference),
+                    "case {case}"
+                );
+            }
+        }
+        // The histories keep rows, not only rewrite them.
+        assert!(kept > 100, "{kept} rows kept");
+    }
+
+    /// A sync's site machinery never selects or deletes a synthesized edge
+    /// (W7-14): a fresh index resolves before any exists.
+    #[test]
+    fn synthesized_edges_are_outside_the_sync_site_machinery() {
+        let mut store = store("synthesized-sites");
+        store
+            .upsert_nodes(&[
+                node("function:x", "xray", "src/x.rs"),
+                node("function:y", "yankee", "src/y.rs"),
+                node("function:z", "zulu", "src/z.rs"),
+            ])
+            .unwrap();
+        let base = Edge {
+            line: Some(2),
+            col: Some(1),
+            ..edge("function:x", "function:y", EdgeKind::Calls)
+        };
+        store
+            .insert_edges(&[
+                base,
+                synthesized("function:x", "function:y", Some(7), Some(3)),
+                synthesized("function:z", "function:y", None, None),
+            ])
+            .unwrap();
+        let base_site = FileReferenceSite {
+            file_path: "src/x.rs".to_string(),
+            site: Some(ReferenceSite {
+                from_node_id: "function:x".to_string(),
+                line: 2,
+                col: 1,
+            }),
+        };
+        assert_eq!(
+            store.reference_sites_dependent_on_file("src/y.rs").unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_of_edges_to_targets(&["function:y".to_string()])
+                .unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_of_edges_to_named_targets(&["yankee".to_string()])
+                .unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_of_edges_to_folded_targets(
+                    &[Language::Rust],
+                    &["YANKEE".to_string()]
+                )
+                .unwrap(),
+            std::slice::from_ref(&base_site)
+        );
+        assert_eq!(
+            store
+                .reference_sites_from_nodes(&["function:x".to_string(), "function:z".to_string()])
+                .unwrap(),
+            [base_site]
+        );
+        assert_eq!(
+            store
+                .source_files_of_edges_to_named_targets(&["yankee".to_string()])
+                .unwrap(),
+            ["src/x.rs".to_string()]
+        );
+        assert_eq!(
+            store.call_sites_in_file("src/x.rs").unwrap(),
+            [("function:x".to_string(), 2, 1, "yankee".to_string())]
+        );
+        let synthesized_site = ReferenceSite {
+            from_node_id: "function:x".to_string(),
+            line: 7,
+            col: 3,
+        };
+        assert_eq!(
+            store
+                .delete_resolved_edges_at_sites(std::slice::from_ref(&synthesized_site))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .replace_resolution_state_at_sites(&[synthesized_site], &[])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.delete_resolved_edges_from_file("src/z.rs").unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .replace_resolution_state_from_file("src/z.rs", &[])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.delete_resolved_edges_from_file("src/x.rs").unwrap(),
+            1
+        );
+        let left: Vec<_> = edge_rows(&store).into_iter().map(|row| row.5).collect();
+        assert_eq!(left, [true, true], "only the base edge went");
+    }
+
+    /// Every edge kind, `navigates` included, reads back as the kind written:
+    /// the parser and `EdgeKind::ALL` stay in step.
+    #[test]
+    fn every_edge_kind_reads_back_as_written() {
+        let mut store = store("edge-kinds");
+        let a = node("function:a", "alpha", "src/a.rs");
+        let b = node("function:b", "beta", "src/b.rs");
+        store.upsert_nodes(&[a, b]).unwrap();
+        let written: Vec<Edge> = EdgeKind::ALL
+            .into_iter()
+            .map(|kind| edge("function:a", "function:b", kind))
+            .collect();
+        store.insert_edges(&written).unwrap();
+        let mut read: Vec<&'static str> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .map(|edge| edge.kind.as_str())
+            .collect();
+        read.sort_unstable();
+        let mut expected = EdgeKind::ALL.map(EdgeKind::as_str).to_vec();
+        expected.sort_unstable();
+        assert_eq!(read, expected);
+    }
+
     #[test]
     fn node_lookups_by_kind_qualified_name_and_ids() {
         let mut store = store("node-lookups");
@@ -4294,6 +5877,27 @@ mod tests {
     }
 
     #[test]
+    fn file_paths_and_languages_read_one_column_each() {
+        let store = store("files-paths-languages");
+        for (path, language) in [
+            ("src/b.py", Language::Python),
+            ("src/a.rs", Language::Rust),
+            ("src/c.rs", Language::Rust),
+        ] {
+            let mut rec = file(path);
+            rec.language = language;
+            store.upsert_file(&rec).unwrap();
+        }
+        assert_eq!(
+            store.file_paths().unwrap(),
+            ["src/a.rs", "src/b.py", "src/c.rs"]
+        );
+        let mut languages = store.file_languages().unwrap();
+        languages.sort_by_key(|language| language.as_str());
+        assert_eq!(languages, [Language::Python, Language::Rust]);
+    }
+
+    #[test]
     fn unresolved_ref_batch_and_multi_key_reads() {
         let mut store = store("unresolved-batch");
         store
@@ -4344,6 +5948,124 @@ mod tests {
         assert_eq!(by_names[0].reference_name, "Target");
     }
 
+    /// W7-09d: the sites of the edges into chosen nodes, and the one
+    /// transaction that re-opens them, deletes the nodes and inserts their
+    /// replacements with pending references.
+    #[test]
+    fn cross_file_nodes_are_replaced_with_the_sites_into_them_reopened() {
+        let mut store = store("cross-file-nodes");
+        store
+            .upsert_nodes(&[
+                node("route:old", "/old", "routes.js"),
+                node("function:nav", "nav", "nav.js"),
+                node("function:other", "other", "nav.js"),
+            ])
+            .unwrap();
+        let edge = |source: &str, target: &str, line: Option<i64>| Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Calls,
+            metadata: None,
+            line,
+            col: line.map(|_| 4),
+            provenance: None,
+        };
+        store
+            .insert_edges(&[
+                edge("function:nav", "route:old", Some(2)),
+                // A sibling at the same site, which goes back with it.
+                edge("function:nav", "function:other", Some(2)),
+                edge("function:other", "route:old", None),
+            ])
+            .unwrap();
+        let reference = |from: &str, name: &str, file: &str, line: i64| UnresolvedRef {
+            id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: EdgeKind::Calls,
+            line,
+            col: 4,
+            candidates: None,
+            file_path: file.to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(&[reference("function:nav", "navigate", "nav.js", 2)])
+            .unwrap();
+        let row_ids: Vec<i64> = store
+            .all_unresolved_refs()
+            .unwrap()
+            .into_iter()
+            .filter_map(|reference| reference.id)
+            .collect();
+        store.delete_resolved_unresolved_refs(&row_ids).unwrap();
+        let sites = store
+            .reference_sites_of_edges_to_targets(&["route:old".to_string()])
+            .unwrap();
+        assert_eq!(
+            sites,
+            [
+                FileReferenceSite {
+                    file_path: "nav.js".to_string(),
+                    site: None,
+                },
+                FileReferenceSite {
+                    file_path: "nav.js".to_string(),
+                    site: Some(ReferenceSite {
+                        from_node_id: "function:nav".to_string(),
+                        line: 2,
+                        col: 4,
+                    }),
+                },
+            ]
+        );
+        assert!(
+            store
+                .reference_sites_of_edges_to_targets(&[])
+                .unwrap()
+                .is_empty()
+        );
+
+        let replacement = node("route:new", "/new", "routes.js");
+        store
+            .replace_cross_file_nodes(
+                &["route:old".to_string()],
+                std::slice::from_ref(&replacement),
+                &[reference("route:new", "Page", "routes.js", 1)],
+                &sites[1..],
+            )
+            .unwrap();
+        assert!(store.node_by_id("route:old").unwrap().is_none());
+        assert_eq!(store.node_by_id("route:new").unwrap(), Some(replacement));
+        // Every edge at the re-opened site went, and its reference is pending
+        // again; the new node's reference is pending too.
+        let edges: Vec<(String, String)> = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.source, edge.target))
+            .collect();
+        assert!(edges.is_empty(), "{edges:?}");
+        let mut pending: Vec<(String, String)> = store
+            .all_unresolved_refs()
+            .unwrap()
+            .into_iter()
+            .map(|reference| (reference.from_node_id, reference.reference_name))
+            .collect();
+        pending.sort();
+        assert_eq!(
+            pending,
+            [
+                ("function:nav".to_string(), "navigate".to_string()),
+                ("route:new".to_string(), "Page".to_string()),
+            ]
+        );
+        assert!(store.stored_refs_of_file("nav.js").unwrap().len() == 1);
+    }
+
     #[test]
     fn edge_sites_are_found_by_folded_target_names_in_both_file_relations() {
         let mut store = store("folded-targets");
@@ -4392,6 +6114,41 @@ mod tests {
         assert_eq!(sites(&["formatPRICE"]), [("view.php".to_string(), 2)]);
         assert_eq!(sites(&["LOCAL"]), [("view.php".to_string(), 3)]);
         assert!(sites(&["price"]).is_empty());
+    }
+
+    /// The folded-name site query walks from the targets, through the
+    /// lower-name index, whatever the number of names (W7-19d cost
+    /// revision): left to itself the planner, which has no row statistics
+    /// for these tables, takes the language filter for the selective one
+    /// from four names on and walks every node of those languages and its
+    /// edges, 25 ms on koel for names no edge reaches.
+    #[test]
+    fn folded_target_sites_walk_from_the_targets_through_the_lower_name_index() {
+        let store = store("folded-target-plan");
+        let names = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+        let languages = ["php", "pascal", "cfml"];
+        let sql = folded_target_sites_sql(names.len(), languages.len());
+        let mut params: Vec<&dyn ToSql> = names.iter().map(|name| name as &dyn ToSql).collect();
+        params.extend(languages.iter().map(|language| language as &dyn ToSql));
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let steps = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            steps
+                .first()
+                .is_some_and(|step| step.starts_with("SEARCH tgt USING INDEX idx_nodes_lower_name")),
+            "the targets are not the outer loop: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|step| step.contains("idx_nodes_language")),
+            "the language index drives the query: {steps:?}"
+        );
     }
 
     #[test]
@@ -4447,6 +6204,160 @@ mod tests {
             .map(|reference| reference.reference_name)
             .collect();
         assert_eq!(qualified, ["F\\FirstName.make"]);
+    }
+
+    /// W7-19c: the references a Spring config key can bind, unresolved by
+    /// name and resolved by site, and the resolved sites of a name set.
+    #[test]
+    fn config_key_references_and_named_resolved_sites() {
+        let mut store = store("config-key-refs");
+        store
+            .upsert_nodes(&[
+                node("constant:a", "a", "A.java"),
+                node("constant:k", "k", "B.kt"),
+                node("route:r", "r", "conf/routes"),
+            ])
+            .unwrap();
+        let mk =
+            |from: &str, name: &str, kind: EdgeKind, line: i64, file: &str, language: Language| {
+                UnresolvedRef {
+                    id: None,
+                    from_node_id: from.to_string(),
+                    reference_name: name.to_string(),
+                    reference_kind: kind,
+                    line,
+                    col: 0,
+                    candidates: None,
+                    file_path: file.to_string(),
+                    language,
+                    is_function_ref: false,
+                    reference_subkind: None,
+                }
+            };
+        let refs = vec![
+            mk(
+                "constant:a",
+                "jwt.secret",
+                EdgeKind::References,
+                1,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "app.cache:prefix",
+                EdgeKind::References,
+                2,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "list.add",
+                EdgeKind::Calls,
+                3,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "a::b.c",
+                EdgeKind::References,
+                4,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:a",
+                "Prefix",
+                EdgeKind::References,
+                5,
+                "A.java",
+                Language::Java,
+            ),
+            mk(
+                "constant:k",
+                "server.port",
+                EdgeKind::References,
+                1,
+                "B.kt",
+                Language::Kotlin,
+            ),
+            mk(
+                "constant:k",
+                "x:PREFIX",
+                EdgeKind::References,
+                2,
+                "B.kt",
+                Language::Kotlin,
+            ),
+            mk(
+                "route:r",
+                "Home.index",
+                EdgeKind::References,
+                1,
+                "conf/routes",
+                Language::Scala,
+            ),
+            mk(
+                "route:r",
+                "s:prefix",
+                EdgeKind::References,
+                2,
+                "conf/routes",
+                Language::Scala,
+            ),
+        ];
+        store.insert_unresolved_refs(&refs).unwrap();
+        assert_eq!(
+            store.unresolved_config_key_names().unwrap(),
+            ["app.cache:prefix", "jwt.secret", "server.port"]
+        );
+        assert!(store.resolved_config_key_sites().unwrap().is_empty());
+        // `jwt.secret`, `server.port` and `Home.index` resolve.
+        let ids: Vec<i64> = ["A.java", "B.kt", "conf/routes"]
+            .into_iter()
+            .flat_map(|file| store.unresolved_refs_by_file_path(file).unwrap())
+            .filter(|reference| {
+                matches!(
+                    reference.reference_name.as_str(),
+                    "jwt.secret" | "server.port" | "Home.index"
+                )
+            })
+            .map(|reference| reference.id.unwrap())
+            .collect();
+        store.delete_resolved_unresolved_refs(&ids).unwrap();
+        assert_eq!(
+            store.unresolved_config_key_names().unwrap(),
+            ["app.cache:prefix"]
+        );
+        let site = |file: &str, from: &str, line: i64| FileReferenceSite {
+            file_path: file.to_string(),
+            site: Some(ReferenceSite {
+                from_node_id: from.to_string(),
+                line,
+                col: 0,
+            }),
+        };
+        assert_eq!(
+            store.resolved_config_key_sites().unwrap(),
+            [
+                site("A.java", "constant:a", 1),
+                site("B.kt", "constant:k", 1)
+            ]
+        );
+        assert_eq!(
+            store
+                .resolved_reference_sites_named(&["Home.index".to_string(), "nope".to_string()])
+                .unwrap(),
+            [site("conf/routes", "route:r", 1)]
+        );
+        assert!(
+            store
+                .resolved_reference_sites_named(&[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// W5-09e: a reference resolution takes out of `unresolved_refs` moves
@@ -5722,5 +7633,222 @@ mod tests {
     fn node_by_id_missing_returns_none() {
         let store = store("missing-node");
         assert_eq!(store.node_by_id("nope").unwrap(), None);
+    }
+
+    /// A method of `language` named `name`, in `file` at `line`.
+    fn method(id: &str, name: &str, language: Language, file: &str, line: i64) -> Node {
+        Node {
+            kind: NodeKind::Method,
+            language,
+            start_line: line,
+            end_line: line,
+            ..node(id, name, file)
+        }
+    }
+
+    /// W7-21's cost revision: the methods of a language read by their
+    /// names, or by an Objective-C selector's first keyword: the keyword
+    /// itself and every `keyword:` selector, compared byte for byte, and no
+    /// other name starting with the keyword (`kwx:`). Another kind, another
+    /// language, a keyword holding a `:` and an empty list read none.
+    #[test]
+    fn methods_are_read_by_name_and_by_first_keyword() {
+        let mut store = store("methods-keyed");
+        let objc = |id: &str, name: &str, line: i64| method(id, name, Language::ObjC, "A.m", line);
+        store
+            .upsert_nodes(&[
+                objc("method:kw", "kw", 1),
+                objc("method:kw:", "kw:", 2),
+                objc("method:kw:with:", "kw:with:", 3),
+                objc("method:kwx:", "kwx:", 4),
+                objc("method:Kw:", "Kw:", 5),
+                objc("method:KW", "KW", 6),
+                objc("method:other:", "other:", 7),
+                Node {
+                    kind: NodeKind::Function,
+                    ..objc("function:kw:", "kw:", 8)
+                },
+                method("method:java-kw", "kw", Language::Java, "A.java", 1),
+                method("method:java-kw:", "kw:", Language::Java, "A.java", 2),
+            ])
+            .unwrap();
+        let ids = |nodes: Vec<Node>| -> Vec<String> {
+            let mut ids: Vec<String> = nodes.into_iter().map(|node| node.id).collect();
+            ids.sort();
+            ids
+        };
+        let names = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_string()).collect()
+        };
+        let by_keyword = |language: Language, keywords: &[&str]| {
+            ids(store
+                .methods_by_first_keyword(language, &names(keywords))
+                .unwrap())
+        };
+        let named = |language: Language, wanted: &[&str]| {
+            ids(store.methods_named(language, &names(wanted)).unwrap())
+        };
+        assert_eq!(
+            by_keyword(Language::ObjC, &["kw"]),
+            ["method:kw", "method:kw:", "method:kw:with:"]
+        );
+        assert_eq!(
+            by_keyword(Language::ObjC, &["Kw", "other"]),
+            ["method:Kw:", "method:other:"]
+        );
+        assert!(by_keyword(Language::ObjC, &["kw:with"]).is_empty());
+        assert!(by_keyword(Language::ObjC, &[]).is_empty());
+        assert_eq!(
+            by_keyword(Language::Java, &["kw"]),
+            ["method:java-kw", "method:java-kw:"]
+        );
+        assert_eq!(
+            named(Language::ObjC, &["kw", "other:", "KW:"]),
+            ["method:kw", "method:other:"]
+        );
+        assert_eq!(named(Language::Java, &["kw"]), ["method:java-kw"]);
+        assert!(named(Language::ObjC, &[]).is_empty());
+    }
+
+    /// W7-21's cost revision: both method lookups walk `idx_nodes_name`
+    /// from each listed name and test the kind and language on its rows.
+    /// Left to itself the planner, which has no row statistics for these
+    /// tables, may take the kind or language index instead and walk every
+    /// method of the language for each name.
+    #[test]
+    fn method_lookups_walk_the_name_index() {
+        let store = store("methods-keyed-plan");
+        for (sql, searches) in [(METHODS_NAMED_SQL, 1), (METHODS_BY_FIRST_KEYWORD_SQL, 2)] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let steps = stmt
+                .query_map(params!["[\"kw\"]", "objc"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let on_nodes: Vec<&str> = steps
+                .iter()
+                .map(String::as_str)
+                .filter(|step| step.starts_with("SEARCH n ") || step.starts_with("SCAN n"))
+                .collect();
+            assert_eq!(on_nodes.len(), searches, "{sql}: {steps:?}");
+            assert!(
+                on_nodes
+                    .iter()
+                    .all(|step| step.starts_with("SEARCH n USING INDEX idx_nodes_name (")),
+                "{sql}: {steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| step.contains("idx_nodes_kind")
+                        || step.contains("idx_nodes_language")),
+                "{sql}: {steps:?}"
+            );
+        }
+    }
+
+    /// W7-21's cost revision: a method's light row is its id, name,
+    /// language, file and first line; another language's methods and
+    /// another kind's nodes have none.
+    #[test]
+    fn method_headers_are_the_languages_methods() {
+        let mut store = store("method-headers");
+        store
+            .upsert_nodes(&[
+                method("method:objc", "run:", Language::ObjC, "ios/A.m", 4),
+                method("method:java", "run", Language::Java, "android/A.java", 9),
+                method("method:swift", "run", Language::Swift, "ios/A.swift", 2),
+                Node {
+                    kind: NodeKind::Function,
+                    ..method("function:java", "run", Language::Java, "android/B.java", 1)
+                },
+            ])
+            .unwrap();
+        let mut headers = store
+            .method_headers_in_languages(&[Language::ObjC, Language::Java])
+            .unwrap();
+        headers.sort_by(|a, b| a.id.cmp(&b.id));
+        let header =
+            |id: &str, name: &str, language: Language, file: &str, line: i64| MethodHeader {
+                id: id.to_string(),
+                name: name.to_string(),
+                language,
+                file_path: file.to_string(),
+                start_line: line,
+            };
+        assert_eq!(
+            headers,
+            [
+                header("method:java", "run", Language::Java, "android/A.java", 9),
+                header("method:objc", "run:", Language::ObjC, "ios/A.m", 4),
+            ]
+        );
+        assert!(store.method_headers_in_languages(&[]).unwrap().is_empty());
+    }
+
+    /// W7-21's cost revision: the `calls` edges into the targets whose
+    /// source is written in one of the languages, stored synthesized ones
+    /// among them, each once however often its target is listed; another
+    /// kind, another target and a source in another language read none.
+    #[test]
+    fn calls_into_targets_are_read_by_their_sources_language() {
+        let mut store = store("calls-from-languages");
+        let caller = |id: &str, language: Language| Node {
+            language,
+            ..node(id, id, "src/a.ts")
+        };
+        store
+            .upsert_nodes(&[
+                caller("function:ts", Language::TypeScript),
+                caller("function:tsx", Language::Tsx),
+                caller("function:java", Language::Java),
+                method("method:m1", "m1", Language::Java, "A.java", 1),
+                method("method:m2", "m2", Language::Java, "A.java", 2),
+                method("method:m3", "m3", Language::Java, "A.java", 3),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:ts", "method:m1", EdgeKind::Calls),
+                Edge {
+                    metadata: Some(serde_json::json!({ "synthesizedBy": "rn-cross-platform" })),
+                    ..edge("function:tsx", "method:m2", EdgeKind::Calls)
+                },
+                edge("function:java", "method:m2", EdgeKind::Calls),
+                edge("function:ts", "method:m2", EdgeKind::References),
+                edge("function:ts", "method:m3", EdgeKind::Calls),
+            ])
+            .unwrap();
+        let targets = ["method:m1", "method:m2", "method:m1"].map(String::from);
+        let scripts = [Language::TypeScript, Language::Tsx];
+        let mut found: Vec<(String, String, bool)> = store
+            .calls_into_from_languages(&targets, &scripts)
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.source, edge.target, edge.metadata.is_some()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("function:ts".to_string(), "method:m1".to_string(), false),
+                ("function:tsx".to_string(), "method:m2".to_string(), true),
+            ]
+        );
+        assert!(
+            store
+                .calls_into_from_languages(&[], &scripts)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .calls_into_from_languages(&targets, &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

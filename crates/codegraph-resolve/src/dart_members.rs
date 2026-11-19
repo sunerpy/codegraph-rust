@@ -351,12 +351,12 @@ pub fn match_dart_member_read(
         &|node| is_dart_getter(node, context),
         0,
     )?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: getter.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::InstanceMethod,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        getter.id.clone(),
+        0.9,
+        ResolvedBy::InstanceMethod,
+    ))
 }
 
 /// Whether a Dart method is a named constructor — `Foo.named(…)`, `factory
@@ -518,11 +518,13 @@ pub(crate) fn match_dart_type_member_call(
     let own = dart_static_member(type_name, member, &reference.file_path, context, &|_| true);
     Some(
         own.filter(|own| own.kind != NodeKind::EnumMember)
-            .map(|own| ResolvedRef {
-                original: reference.clone(),
-                target_node_id: own.id.clone(),
-                confidence: 0.85,
-                resolved_by: ResolvedBy::QualifiedName,
+            .map(|own| {
+                ResolvedRef::new(
+                    reference.clone(),
+                    own.id.clone(),
+                    0.85,
+                    ResolvedBy::QualifiedName,
+                )
             }),
     )
 }

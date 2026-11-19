@@ -265,12 +265,12 @@ pub(crate) fn resolve_cfml_component_path(
             .collect();
         found.sort_by(|a, b| a.id.cmp(&b.id));
         let target = found.into_iter().next()?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.95,
+            ResolvedBy::FilePath,
+        ));
     }
     let segments: Vec<&str> = name
         .split('.')
@@ -303,12 +303,12 @@ pub(crate) fn resolve_cfml_component_path(
         return None;
     }
     let best = best?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: best.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        best.id.clone(),
+        0.9,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// How many of a dotted component path's directories `file_path`'s own

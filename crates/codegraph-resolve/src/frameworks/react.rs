@@ -1,18 +1,29 @@
-//! React / Next.js [`FrameworkResolver`] — ports
-//! `upstream resolution/frameworks/react.ts`.
+//! React [`FrameworkResolver`] — ports
+//! `upstream resolution/frameworks/react.ts`. React Router's route scanner and
+//! navigation are [`super::react_router`]'s; Next.js pages, route handlers and
+//! navigation are [`super::nextjs`]'s.
 
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
-use codegraph_core::types::{EdgeKind, Language, NodeKind};
+use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 
-use super::{framework_node, js_language_for};
-use crate::framework::FrameworkResolver;
+use super::js_language_for;
+use super::js_scan::{self, JS_SPACE};
+use super::lazy_loader::{self, LoadedPage};
+use super::react_router::{self, LAYOUT_PREFIX, LAZY_ROUTE_PREFIX};
+use super::react_tables;
+use crate::alias_binding::{default_export_binding, extract_local_export_aliases};
+use crate::framework::{CrossFileNodes, FrameworkResolver};
+use crate::import_resolver::{extract_import_mappings, resolve_import_path, resolve_via_import};
+use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
-    FrameworkResolverExtractionResult, RefView, ResolutionContext, ResolvedBy, ResolvedRef,
+    EdgeShape, FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView,
+    ResolutionContext, ResolvedBy, ResolvedRef,
 };
 
-/// React / Next.js resolver (`reactResolver`, react.ts:10-269).
+/// React resolver (`reactResolver`, react.ts:10-269).
 pub struct ReactResolver;
 
 impl FrameworkResolver for ReactResolver {
@@ -20,18 +31,16 @@ impl FrameworkResolver for ReactResolver {
         "react"
     }
 
+    /// The languages React components, hooks and contexts are written and
+    /// used in. The JSX dialects are here so route extraction runs on the
+    /// `.tsx`/`.jsx` files a `<Route element={<X/>}>` lives in (upstream
+    /// #841), and `resolve` reads only a script's references, which its
+    /// `resolve_languages` default to (#2211): halo's Java `import
+    /// org.springframework…SecurityContext` is no React context.
     fn languages(&self) -> Option<&[Language]> {
-        // `languages: ['javascript', 'typescript']` (react.ts:12).
-        const LANGS: [Language; 2] = [Language::JavaScript, Language::TypeScript];
-        Some(&LANGS)
-    }
-
-    /// Components, hooks and contexts are a script's (upstream #2211): halo's
-    /// Java `import org.springframework…SecurityContext` is no React context.
-    fn resolve_languages(&self) -> Option<&[Language]> {
         const LANGS: [Language; 4] = [
-            Language::TypeScript,
             Language::JavaScript,
+            Language::TypeScript,
             Language::Tsx,
             Language::Jsx,
         ];
@@ -40,12 +49,10 @@ impl FrameworkResolver for ReactResolver {
 
     // Ports reactResolver.detect (react.ts:14-32).
     fn detect(&self, context: &dyn ResolutionContext) -> bool {
-        if let Some(package_json) = context.read_file("package.json") {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&package_json) {
-                if dep_present(&pkg, &["react", "next", "react-native"]) {
-                    return true;
-                }
-            }
+        // React in a package.json: the root's, or an app's (`frontend/`,
+        // `apps/web/`, `src/Web/ClientApp/`).
+        if super::package_deps::depends_on(context, &["react", "next", "react-native"]) {
+            return true;
         }
         context
             .get_all_files_shared()
@@ -53,31 +60,107 @@ impl FrameworkResolver for ReactResolver {
             .any(|f| f.ends_with(".jsx") || f.ends_with(".tsx"))
     }
 
-    // Ports reactResolver.resolve (react.ts:34-86).
+    /// A data-router `lazy: () => import('./routes/x')` route names a module,
+    /// not a symbol, and `import:./x#Page` the export its loader picks; a
+    /// route's `layout:MainLayout` names the component around it.
+    fn claims_reference(&self, name: &str) -> bool {
+        name.starts_with(LAZY_ROUTE_PREFIX)
+            || name.starts_with(LAYOUT_PREFIX)
+            || lazy_loader::picked_export_name(name).is_some()
+    }
+
+    // Ports reactResolver.resolve (react.ts:44-131).
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
         let name = &reference.reference_name;
-
-        // Pattern 1: PascalCase component refs, only from JSX-capable files
-        // (react.ts:43-57).
-        if matches!(reference.language, Language::Tsx | Language::Jsx)
+        if let Some(spec) = name.strip_prefix(LAZY_ROUTE_PREFIX) {
+            return lazy_route_component(spec, &reference.file_path, context)
+                .map(|target| framework_resolved(reference, target, 0.9));
+        }
+        // The export a lazy route's loader picks. Vue Router and Angular name
+        // a lazily loaded component the same way, and their routes' are
+        // theirs.
+        if let Some((spec, export)) = lazy_loader::picked_export_name(name) {
+            return is_react_route_ref(reference)
+                .then(|| picked_export(spec, export, &reference.file_path, context))
+                .flatten()
+                .map(|target| framework_resolved(reference, target, 0.9));
+        }
+        // The layout a route renders inside: what happens in it — its
+        // header's links, its logout — happens on the route's screen too.
+        if let Some(spec) = name.strip_prefix(LAYOUT_PREFIX) {
+            return layout_component(spec, reference, context).map(|target| {
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("layout".to_string(), serde_json::Value::Bool(true));
+                framework_resolved(reference, target, 0.9).with_edge(EdgeShape {
+                    edge_kind: None,
+                    metadata,
+                    also_targets: Vec::new(),
+                })
+            });
+        }
+        // Pattern 1 reads a component USED in markup, which only parses in
+        // .tsx/.jsx. Without this gate every PascalCase TYPE in a plain .ts
+        // file went through component resolution: in a monorepo with
+        // same-named classes per package (#764, amplication), a GraphQL-types
+        // file's own `Account` type lost to an arbitrary `Account` class in
+        // another package.
+        let component = matches!(reference.language, Language::Tsx | Language::Jsx)
             && is_pascal_case(name)
-            && !is_built_in_type(name)
+            && !is_built_in_type(name);
+        let hook = name.starts_with("use") && name.len() > 3;
+        let provided = name.ends_with("Context") || name.ends_with("Provider");
+        if !(component || hook || provided) {
+            return None;
+        }
+
+        // A component, hook or context the file IMPORTS is the import's: the
+        // package's (`useQuery` from `@tanstack/react-query`, `<Button>` from
+        // a UI kit, upstream #2120 and #2475), or the module the import
+        // names, which import resolution finds. Framework resolution runs
+        // first, and a name lookup here bound trpc's tests' `useQuery` to a
+        // hook nested in one of trpc's own factories. A component tag
+        // imported from a module of the project renders what that module
+        // exports under the name (#2563), which the import's own answer may
+        // miss.
+        if let Some(mapping) = context
+            .get_import_mappings(&reference.file_path, reference.language)
+            .into_iter()
+            .find(|mapping| mapping.local_name == *name)
         {
+            return (component && reference.reference_kind == EdgeKind::References)
+                .then(|| imported_component(reference, &mapping, context))
+                .flatten()
+                .map(|target| framework_resolved(reference, target, 0.9));
+        }
+
+        // Pattern 1: component references (PascalCase).
+        if component {
+            // A name the file declares itself as a value is that declaration,
+            // whatever refers to it (upstream #2420): the function the value
+            // wraps, or else the declaration, which name matching binds —
+            // never a same-named component in another app of the repository.
+            if let Some(own) = declared_component(name, &reference.file_path, context) {
+                return own
+                    .component
+                    .map(|component| framework_resolved(reference, component, 0.9));
+            }
             if let Some(target) = resolve_component(name, &reference.file_path, context) {
                 return Some(framework_resolved(reference, target, 0.8));
             }
         }
 
-        // Pattern 2: `use*` hooks (react.ts:59-70).
-        if name.starts_with("use") && name.len() > 3 {
-            if let Some(target) = resolve_hook(name, context) {
+        // Pattern 2: hook references (`use*`).
+        if hook {
+            if let Some(target) =
+                resolve_hook(name, &reference.file_path, context, reference.language)
+            {
                 return Some(framework_resolved(reference, target, 0.85));
             }
         }
 
-        // Pattern 3: `*Context` / `*Provider` (react.ts:72-83).
-        if name.ends_with("Context") || name.ends_with("Provider") {
-            if let Some(target) = resolve_context(name, context) {
+        // Pattern 3: context references (`*Context` / `*Provider`).
+        if provided {
+            if let Some(target) = resolve_context(name, reference, context) {
                 return Some(framework_resolved(reference, target, 0.8));
             }
         }
@@ -85,227 +168,48 @@ impl FrameworkResolver for ReactResolver {
         None
     }
 
-    // Ports reactResolver.extract (react.ts:88-268).
+    // Ports reactResolver.extract (react.ts:133-188).
     fn extract(
         &self,
         file_path: &str,
         content: &str,
         _context: &crate::framework::FrameworkExtractionContext,
     ) -> Option<FrameworkResolverExtractionResult> {
-        let mut nodes = Vec::new();
-        let mut references = Vec::new();
-        let jsx_lang = js_language_for(file_path);
-
-        // Component definitions (react.ts:95-133).
-        for pattern in component_patterns() {
-            for m in pattern.captures_iter(content) {
-                let full = m.get(0).expect("group 0");
-                let Some(name) = m.get(1) else { continue };
-                let full_match = full.as_str();
-                let line = line_of(content, full.start());
-
-                let after_start = full.end();
-                let after = byte_window(content, after_start, 500);
-                let has_jsx = after.contains('<') && (after.contains("/>") || after.contains("</"));
-                if !has_jsx {
-                    continue;
-                }
-                let is_exported = full_match.contains("export");
-                // Component nodes are tsx/jsx (react.ts:127).
-                let lang = if file_path.ends_with(".tsx") {
-                    Language::Tsx
-                } else {
-                    Language::Jsx
-                };
-                nodes.push(framework_node(
-                    format!("component:{file_path}:{}:{line}", name.as_str()),
-                    NodeKind::Component,
-                    name.as_str().to_string(),
-                    format!("{file_path}::{}", name.as_str()),
-                    file_path.to_string(),
-                    line,
-                    line,
-                    0,
-                    full_match.len() as i64,
-                    lang,
-                    is_exported,
-                ));
-            }
-        }
-
-        // Custom hooks (react.ts:135-156).
-        for m in hook_pattern().captures_iter(content) {
-            let full = m.get(0).expect("group 0");
-            let Some(name) = m.get(1) else { continue };
-            let full_match = full.as_str();
-            let line = line_of(content, full.start());
-            let is_exported = full_match.contains("export");
-            // Hook nodes are typescript/javascript (react.ts:152).
-            let lang = if file_path.ends_with(".ts") || file_path.ends_with(".tsx") {
-                Language::TypeScript
-            } else {
-                Language::JavaScript
-            };
-            nodes.push(framework_node(
-                format!("hook:{file_path}:{}:{line}", name.as_str()),
-                NodeKind::Function,
-                name.as_str().to_string(),
-                format!("{file_path}::{}", name.as_str()),
-                file_path.to_string(),
-                line,
-                line,
-                0,
-                full_match.len() as i64,
-                lang,
-                is_exported,
-            ));
-        }
-
-        // React Router <Route .../> (v5/v6) (react.ts:158-198).
-        for tag in route_tag_regex().find_iter(content) {
-            let window = route_opening_tag_window(content, tag.start());
-            let Some(path_match) = route_path_attr().captures(window) else {
-                continue;
-            };
-            let route_path = path_match.get(1).expect("path group").as_str();
-            let comp = route_component_attr()
-                .captures(window)
-                .or_else(|| route_element_attr().captures(window))
-                .map(|c| c.get(1).expect("comp group").as_str().to_string());
-            let line = line_of(content, tag.start());
-            let node = framework_node(
-                format!("route:{file_path}:{line}:{route_path}"),
-                NodeKind::Route,
-                route_path.to_string(),
-                format!("{file_path}::route:{route_path}"),
-                file_path.to_string(),
-                line,
-                line,
-                0,
-                0,
-                jsx_lang,
-                false,
-            );
-            let node_id = node.id.clone();
-            nodes.push(node);
-            if let Some(comp) = comp {
-                references.push(route_reference(node_id, comp, line, file_path, jsx_lang));
-            }
-        }
-
-        // React Router data-router (v6.4+) (react.ts:200-239).
-        if data_router_regex().is_match(content) {
-            for m in obj_path_regex().captures_iter(content) {
-                let whole = m.get(0).expect("group 0");
-                let win = route_object_own_properties(content, whole.start());
-                let comp = obj_element_attr()
-                    .captures(&win)
-                    .or_else(|| obj_component_attr().captures(&win))
-                    .map(|c| c.get(1).expect("comp group").as_str().to_string());
-                let Some(comp) = comp else { continue };
-                let route_path = {
-                    let p = m.get(1).expect("path group").as_str();
-                    if p.is_empty() {
-                        "/".to_string()
-                    } else {
-                        p.to_string()
-                    }
-                };
-                let line = line_of(content, whole.start());
-                let node = framework_node(
-                    format!("route:{file_path}:{line}:{route_path}"),
-                    NodeKind::Route,
-                    route_path.clone(),
-                    format!("{file_path}::route:{route_path}"),
-                    file_path.to_string(),
-                    line,
-                    line,
-                    0,
-                    0,
-                    jsx_lang,
-                    false,
-                );
-                let node_id = node.id.clone();
-                nodes.push(node);
-                references.push(route_reference(node_id, comp, line, file_path, jsx_lang));
-            }
-        }
-
-        // Next.js pages/app routes (react.ts:241-265).
-        if file_path.contains("pages/") || file_path.contains("app/") {
-            if content.contains("export default") {
-                if let Some(route_path) = file_path_to_route(file_path) {
-                    let byte = content.find("export default").expect("contains check");
-                    let line_num = line_of(content, byte);
-                    // Route node language is tsx/typescript/javascript (react.ts:260).
-                    let lang = if file_path.ends_with(".tsx") {
-                        Language::Tsx
-                    } else if file_path.ends_with(".ts") {
-                        Language::TypeScript
-                    } else {
-                        Language::JavaScript
-                    };
-                    nodes.push(framework_node(
-                        format!("route:{file_path}:{route_path}:{line_num}"),
-                        NodeKind::Route,
-                        route_path.clone(),
-                        format!("{file_path}::route:{route_path}"),
-                        file_path.to_string(),
-                        line_num,
-                        line_num,
-                        0,
-                        0,
-                        lang,
-                        false,
-                    ));
-                }
-            }
-        }
-
-        Some(FrameworkResolverExtractionResult { nodes, references })
+        // Components and custom hooks are NOT extracted here (upstream #841).
+        // The tree-sitter extractor emits them across .ts/.tsx/.js/.jsx:
+        // function and arrow components as `function` nodes, components a
+        // wrapper declares (`forwardRef`/`memo`/`styled`) as `component`
+        // nodes, and `useX` hooks as `function` nodes. The regex this pass
+        // carried duplicated those nodes (a `useAuth` became two `function`
+        // nodes); it contributes only what tree-sitter can't: React Router's
+        // routes. Next.js pages and route handlers are `super::nextjs`'s.
+        Some(react_router::extract_routes(file_path, content))
     }
-}
 
-/// `{ ...dependencies, ...devDependencies }` membership test (react.ts:20-21).
-fn dep_present(pkg: &serde_json::Value, keys: &[&str]) -> bool {
-    let in_section = |section: &str| -> bool {
-        pkg.get(section)
-            .and_then(|d| d.as_object())
-            .is_some_and(|deps| keys.iter().any(|k| deps.contains_key(*k)))
-    };
-    in_section("dependencies") || in_section("devDependencies")
-}
+    /// Name the routes whose path is built from a constant (React's
+    /// `postExtract`).
+    fn post_extract(&self, context: &dyn ResolutionContext) -> Option<Vec<Node>> {
+        Some(react_router::rename_constant_routes(context))
+    }
 
-/// Build a `references` ref linking a route node to its handler component
-/// (react.ts:188-196 / 229-237).
-fn route_reference(
-    from_node_id: String,
-    name: String,
-    line: i64,
-    file_path: &str,
-    language: Language,
-) -> RefView {
-    RefView {
-        row_id: None,
-        from_node_id,
-        reference_name: name,
-        reference_kind: EdgeKind::References,
-        line,
-        column: 0,
-        file_path: file_path.to_string(),
-        language,
-        is_function_ref: false,
-        reference_subkind: None,
+    /// The routes of tables another file hands the router (React's
+    /// `crossFileNodes`, [`react_tables::table_routes`]).
+    fn cross_file_nodes(&self, context: &dyn ResolutionContext) -> Option<CrossFileNodes> {
+        Some(CrossFileNodes {
+            extraction: react_tables::table_routes(context),
+            kind: NodeKind::Route,
+            owns: react_tables::is_table_route,
+        })
     }
 }
 
 fn framework_resolved(reference: &RefView, target_node_id: String, confidence: f64) -> ResolvedRef {
-    ResolvedRef {
-        original: reference.clone(),
+    ResolvedRef::new(
+        reference.clone(),
         target_node_id,
         confidence,
-        resolved_by: ResolvedBy::Framework,
-    }
+        ResolvedBy::Framework,
+    )
 }
 
 /// `isPascalCase` (react.ts:274-276).
@@ -402,34 +306,865 @@ fn resolve_component(
     }
 }
 
-/// `resolveHook` (react.ts:328-343).
-fn resolve_hook(name: &str, context: &dyn ResolutionContext) -> Option<String> {
+/// A value a file declares under a component's name, and what it renders
+/// (`declaredComponent`'s answer).
+struct DeclaredComponent {
+    declaration: Arc<Node>,
+    /// The id of the component of the module the value loads lazily, or of
+    /// the function it wraps; `None` when there is none to find and the
+    /// declaration is the binding, by name.
+    component: Option<String>,
+}
+
+/// A value `file_path` declares itself under a component's name, and what it
+/// renders (upstream `declaredComponent`, #2420). JavaScript scoping makes
+/// the name, used anywhere in that file — `<RegisterPage />`, a route's
+/// `element: <RegisterPage />`, a type — this declaration, never another
+/// file's same-named component: mantis's vite app bound its `RegisterPage`,
+/// a `Loadable(lazy(() => import('pages/auth/Register')))`, to the page of
+/// that name in the repository's Next.js app. Its `component` is the
+/// component of the module a lazy value loads ([`value_loader`]), or the
+/// function the value wraps (`observer(function Login() {…})`). A loader
+/// nested past the readers' bound has none. `None` when the file declares no
+/// such value (a function or class component is found the usual way).
+fn declared_component(
+    name: &str,
+    file_path: &str,
+    context: &dyn ResolutionContext,
+) -> Option<DeclaredComponent> {
+    let declaration = declared_value(name, file_path, context)?;
+    let component = match value_loader(&declaration, context) {
+        Ok(None) => wrapped_component(&declaration, context).map(|node| node.id.clone()),
+        Ok(Some(LoadedPage { spec, member })) => {
+            if member == "default" {
+                lazy_route_component(&spec, file_path, context)
+            } else {
+                picked_export(&spec, &member, file_path, context)
+            }
+        }
+        Err(lazy_loader::Exhausted) => None,
+    };
+    Some(DeclaredComponent {
+        declaration,
+        component,
+    })
+}
+
+/// The module a value `declaration` declares loads lazily, and the export
+/// its loader picks (upstream `valueLoader`): `Ok(None)` for a value that
+/// loads none.
+fn value_loader(
+    declaration: &Node,
+    context: &dyn ResolutionContext,
+) -> Result<Option<LoadedPage>, lazy_loader::Exhausted> {
+    let code = strip_comments_for_regex(
+        &declaration_text(declaration, context),
+        CommentLang::TypeScript,
+    );
+    match js_scan::initializer_at(&code, declaration.name.len()) {
+        Some(init) => lazy_loader::value_loader(&code[init..]),
+        None => Ok(None),
+    }
+}
+
+/// The module-level `const`, `let` or `var` `file_path` declares as `name`
+/// (upstream `declaredValue`): a module-level declarator's qualified name is
+/// its bare name.
+fn declared_value(
+    name: &str,
+    file_path: &str,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    context
+        .get_nodes_by_name_shared(name)
+        .into_iter()
+        .filter(|node| {
+            node.file_path == file_path
+                && matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+                && node.qualified_name == name
+        })
+        .min_by_key(|node| (node.start_line, node.start_column))
+}
+
+/// The component a value wraps, which is what it renders (upstream
+/// `wrappedComponent`): the function it holds (`const Application =
+/// observer(function Application() {…})`), or the component of its own file
+/// a wrapper call is handed ([`handed_component`]). An inner function counts
+/// when it has the value's name or ends where the value does — never a
+/// helper inside an arrow the graph has no node for (`withFallback('X', ()
+/// => { const load = () => …; … })`).
+fn wrapped_component(value: &Node, context: &dyn ResolutionContext) -> Option<Arc<Node>> {
+    let nodes = context.get_nodes_in_file_shared(&value.file_path);
+    let inner: Vec<&Arc<Node>> = nodes
+        .iter()
+        .filter(|node| {
+            is_component_kind(node.kind)
+                && node
+                    .qualified_name
+                    .strip_prefix(value.qualified_name.as_str())
+                    .and_then(|rest| rest.strip_prefix("::"))
+                    == Some(node.name.as_str())
+                && node.start_line >= value.start_line
+                && node.end_line <= value.end_line
+        })
+        .collect();
+    if !inner.is_empty() {
+        let held = inner
+            .iter()
+            .find(|node| node.name == value.name)
+            .or_else(|| {
+                (inner.len() == 1 && inner[0].end_line == value.end_line).then(|| &inner[0])
+            });
+        return held.map(|node| Arc::clone(node));
+    }
+    handed_component(value, &nodes, context)
+}
+
+/// The component of its own file a wrapper call around a declaration hands
+/// over (upstream `handedComponent`): `const TableView =
+/// observer(TableViewInner)`, `forwardRef(Inner) as {…}`, or mastodon's
+/// `const MemoizedBlurhash = memo(Blurhash)`, whose component node has no
+/// body of its own to render from. `nodes` are the file's.
+fn handed_component(
+    value: &Node,
+    nodes: &[Arc<Node>],
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    let code = strip_comments_for_regex(&declaration_text(value, context), CommentLang::TypeScript);
+    let init = js_scan::initializer_at(&code, value.name.len())?;
+    let handed = js_scan::wrapped_name(&code[init..js_scan::statement_end(&code, init, false)])?;
+    if !is_pascal_case(handed) || handed == value.name {
+        return None;
+    }
+    nodes
+        .iter()
+        .find(|node| {
+            node.name == handed && node.qualified_name == handed && is_component_kind(node.kind)
+        })
+        .cloned()
+}
+
+/// The binding a value holds and nothing more (upstream `heldBinding`):
+/// `AvatarWithHoverCard` of outline's `const Avatar = AvatarWithHoverCard`,
+/// past a type assertion (`= Page as FC`); `None` for any other initializer.
+fn held_binding(value: &Node, context: &dyn ResolutionContext) -> Option<String> {
+    let code = strip_comments_for_regex(&declaration_text(value, context), CommentLang::TypeScript);
+    let init = js_scan::initializer_at(&code, value.name.len())?;
+    held_at(&code, init, &value.name)
+}
+
+/// The binding the initializer at `init` of `code` holds and nothing more,
+/// when it is not `name`'s own ([`held_binding`]).
+fn held_at(code: &str, init: usize, name: &str) -> Option<String> {
+    static HELD: OnceLock<Regex> = OnceLock::new();
+    let held = HELD
+        .get_or_init(|| {
+            Regex::new(&format!(
+                "^{JS_SPACE}*({IDENT}){JS_SPACE}*(?:$|(?:as|satisfies){JS_SPACE})"
+            ))
+            .expect("held binding")
+        })
+        .captures(&code[init..js_scan::statement_end(code, init, false)])?;
+    let held = held.get(1)?.as_str();
+    (held != name).then(|| held.to_string())
+}
+
+/// The identifier pattern upstream writes `[A-Za-z_$][\w$]*`.
+const IDENT: &str = "[A-Za-z_$][A-Za-z0-9_$]*";
+
+/// What a module can export as a component: a declaration, or a value
+/// holding one (`EXPORTED_COMPONENT_KINDS`).
+fn is_exported_component_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Function
+            | NodeKind::Component
+            | NodeKind::Class
+            | NodeKind::Constant
+            | NodeKind::Variable
+    )
+}
+
+/// A barrel can forward another barrel; a few hops settle it
+/// (`MAX_REEXPORT_HOPS`).
+const MAX_REEXPORT_HOPS: usize = 4;
+
+/// The file a lazily loaded module is, from the file that loads it
+/// (`lazyModuleFile`): by the extensions that file's own imports resolve with
+/// (`./MainLayout` is `MainLayout/index.jsx` from a `.jsx` file), else by
+/// TypeScript's.
+fn lazy_module_file(
+    spec: &str,
+    from_file: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let language = js_language_for(from_file);
+    resolve_import_path(spec, from_file, language, context).or_else(|| {
+        (language != Language::TypeScript)
+            .then(|| resolve_import_path(spec, from_file, Language::TypeScript, context))
+            .flatten()
+    })
+}
+
+/// The component a lazy route module renders: its default export, else its
+/// `Component` export (`lazyRouteComponent`).
+fn lazy_route_component(
+    spec: &str,
+    from_file: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let file = lazy_module_file(spec, from_file, context)?;
+    exported_component(&file, "default", context, &[])
+        .or_else(|| exported_component(&file, "Component", context, &[]))
+}
+
+/// The component a lazy route's loader picks from the module `spec` loads:
+/// the export named `name`, through barrels (`pickedExport`).
+fn picked_export(
+    spec: &str,
+    name: &str,
+    from_file: &str,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let file = lazy_module_file(spec, from_file, context)?;
+    exported_component(&file, name, context, &[])
+}
+
+/// The component a tag imported from a module of the project renders
+/// (upstream #2563, the static half): what that module exports under the
+/// imported name ([`exported_component`]), through an `index` that forwards
+/// it, past a wrapper around it (`export default observer(AppSidebar)`,
+/// `memo(Blurhash)`), or in a value that holds another module's component.
+/// `None` for a package or namespace import, for a module that exports no
+/// component under the name, and where import resolution reaches the same
+/// node: it links the edge then, as it always did.
+fn imported_component(
+    reference: &RefView,
+    mapping: &ImportMapping,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    if mapping.is_namespace {
+        return None;
+    }
+    let module = resolve_import_path(
+        &mapping.source,
+        &reference.file_path,
+        reference.language,
+        context,
+    )?;
+    let exported = if mapping.is_default {
+        "default"
+    } else {
+        mapping.exported_name.as_str()
+    };
+    let target = exported_component(&module, exported, context, &[])?;
+    let imported = resolve_via_import(reference, context).map(|resolved| resolved.target_node_id);
+    (imported.as_deref() != Some(target.as_str())).then_some(target)
+}
+
+/// True for a reference a React route makes (`isReactRouteRef`): from a
+/// `route:<file>:…` node, in tsx or jsx, the language React gives its routes
+/// even in a `.ts` routes file. Vue Router's and Angular's routes are never
+/// in either.
+fn is_react_route_ref(reference: &RefView) -> bool {
+    matches!(reference.language, Language::Tsx | Language::Jsx)
+        && reference
+            .from_node_id
+            .strip_prefix("route:")
+            .and_then(|rest| rest.strip_prefix(reference.file_path.as_str()))
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// The component `file` exports as `name` (upstream `exportedComponent`):
+/// one it declares — `export default Page`, `export function Component`,
+/// `export { Page as Component }` — or one it forwards from the module that
+/// declares it, as a barrel `index.ts` does: `export { default } from
+/// './page'`, `export { Page as Component } from './page'`, `export * from
+/// './page'`, which forwards every name but the default, or an import it
+/// exports again, `import { Page } from './page'; export { Page }`, or in a
+/// value, outline's `const Avatar = AvatarWithHoverCard; export { Avatar }`.
+/// As in JavaScript, a name the file exports itself hides one an `export *`
+/// would forward, and a name two `export *` modules both forward is exported
+/// by neither. `visited` are the files the lookup came through.
+fn exported_component(
+    file: &str,
+    name: &str,
+    context: &dyn ResolutionContext,
+    visited: &[&str],
+) -> Option<String> {
+    if visited.contains(&file) || visited.len() > MAX_REEXPORT_HOPS {
+        return None;
+    }
+    let language = js_language_for(file);
+    let mut through = visited.to_vec();
+    through.push(file);
+    let forwarded = |source: &str, exported: &str| -> Option<String> {
+        let target = resolve_import_path(source, file, language, context)?;
+        exported_component(&target, exported, context, &through)
+    };
+    let content = context.read_file_shared(file);
+    let code = strip_comments_for_regex(content.as_deref().unwrap_or(""), CommentLang::TypeScript);
+    if let Some(local) = own_export(&code, name) {
+        let nodes = context.get_nodes_in_file_shared(file);
+        let declared_as = |binding: &str| -> Option<Arc<Node>> {
+            let named: Vec<&Arc<Node>> = nodes
+                .iter()
+                .filter(|node| node.name == binding && is_exported_component_kind(node.kind))
+                .collect();
+            named
+                .iter()
+                .find(|node| node.qualified_name == binding)
+                .or_else(|| named.first())
+                .map(|node| Arc::clone(node))
+        };
+        let exported = declared_as(&local);
+        // A constant that holds another binding is that binding: outline's
+        // `Avatar/index.ts` is `const Avatar = AvatarWithHoverCard; export {
+        // Avatar }`. (A `let` may be assigned another component before it is
+        // used.)
+        let mut binding = local.clone();
+        let mut declared = exported.clone();
+        for _ in 0..MAX_REEXPORT_HOPS {
+            let Some(held) = declared
+                .as_deref()
+                .filter(|node| node.kind == NodeKind::Constant)
+                .and_then(|node| held_binding(node, context))
+            else {
+                break;
+            };
+            declared = declared_as(&held);
+            binding = held;
+        }
+        // A value is what it wraps: `export default Page` of `const Page =
+        // observer(function Page_() {…})`. So is a component node minted for
+        // a wrapper around another component (`const MemoizedBlurhash =
+        // memo(Blurhash)`), which has no body to render from.
+        if let Some(declared) = declared {
+            let wrapped = match declared.kind {
+                NodeKind::Constant | NodeKind::Variable => wrapped_component(&declared, context),
+                NodeKind::Component => handed_component(&declared, &nodes, context),
+                _ => None,
+            };
+            return Some(wrapped.unwrap_or(declared).id.clone());
+        }
+        // A name the module imports and exports again — `import { Page }
+        // from './page'; export { Page }`, `import Page from './Page'; export
+        // default Page` — is the page that import names. `export default
+        // withAuth(Page)` hands over no binding of its own.
+        if binding == local
+            && name == "default"
+            && default_export_binding(&code).as_deref() != Some(local.as_str())
+        {
+            return None;
+        }
+        let imported = context
+            .get_import_mappings(file, language)
+            .into_iter()
+            .find(|mapping| mapping.local_name == binding);
+        let id = imported
+            .filter(|mapping| !mapping.is_namespace)
+            .and_then(|mapping| {
+                let exported = if mapping.is_default {
+                    "default"
+                } else {
+                    mapping.exported_name.as_str()
+                };
+                forwarded(&mapping.source, exported)
+            });
+        // A held binding that leads nowhere leaves the value itself the
+        // export.
+        return id.or_else(|| exported.map(|node| node.id.clone()));
+    }
+    let re_exports = context.get_re_exports(file, language);
+    for re_export in &re_exports {
+        if let ReExport::Named {
+            exported_name,
+            original_name,
+            source,
+        } = re_export
+            && exported_name == name
+        {
+            return forwarded(source, original_name);
+        }
+    }
+    if name == "default" {
+        return None;
+    }
+    let mut found: Option<String> = None;
+    for re_export in &re_exports {
+        let ReExport::Wildcard { source } = re_export else {
+            continue;
+        };
+        let id = forwarded(source, name);
+        if let (Some(id), Some(found)) = (&id, &found)
+            && id != found
+        {
+            return None;
+        }
+        if found.is_none() {
+            found = id;
+        }
+    }
+    found
+}
+
+/// The local name a module's own `export` gives `name` (upstream
+/// `ownExport`): its default export ([`default_exported_name`]), `export
+/// function Component`, `export const Component`, `export { Page as
+/// Component }`. `None` when it has none.
+fn own_export(source: &str, name: &str) -> Option<String> {
+    if name == "default" {
+        if let Some(declared) = default_exported_name(source) {
+            return Some(declared);
+        }
+    } else if let Ok(declaration) = Regex::new(&format!(
+        r"(?-u:\b)export{JS_SPACE}+(?:async{JS_SPACE}+)?(?:const|let|var|function|class){JS_SPACE}+{}",
+        regex::escape(name)
+    )) && declaration.find_iter(source).any(|m| {
+        // `(?![\w$])`
+        !source
+            .as_bytes()
+            .get(m.end())
+            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+    }) {
+        return Some(name.to_string());
+    }
+    extract_local_export_aliases(source)
+        .into_iter()
+        .find(|alias| alias.exported_name == name)
+        .map(|alias| alias.local_name)
+}
+
+/// The name a module's default export carries (upstream
+/// `defaultExportedName`): `export default Login`, `export default function
+/// Login`, `export default class Login`, `export default Login as FC`, or the
+/// component a wrapper call hands over — `observer(Login)`,
+/// `React.memo(Login)`, `connect(mapState)(Login)`,
+/// `withTranslation()(withRouter(Login))`.
+fn default_exported_name(source: &str) -> Option<String> {
+    static AT: OnceLock<Regex> = OnceLock::new();
+    static DECLARED: OnceLock<Regex> = OnceLock::new();
+    static BINDING: OnceLock<Regex> = OnceLock::new();
+    let at = AT
+        .get_or_init(|| {
+            Regex::new(&format!(r"(?-u:\b)export{JS_SPACE}+default{JS_SPACE}+"))
+                .expect("export default")
+        })
+        .find(source)?;
+    let rest = &source[at.end()..];
+    let declared = DECLARED.get_or_init(|| {
+        Regex::new(&format!(
+            r"^(?:async{JS_SPACE}+)?(?:function{JS_SPACE}*\*?{JS_SPACE}*|class{JS_SPACE}+)({IDENT})"
+        ))
+        .expect("default declaration")
+    });
+    let binding = BINDING.get_or_init(|| {
+        Regex::new(&format!(
+            r"^({IDENT})(?:[ \t]*(?:;|\r?\n|$)|{JS_SPACE}+(?:as|satisfies){JS_SPACE})"
+        ))
+        .expect("default binding")
+    });
+    if let Some(named) = declared
+        .captures(rest)
+        .or_else(|| binding.captures(rest))
+        .and_then(|captures| captures.get(1))
+    {
+        return Some(named.as_str().to_string());
+    }
+    js_scan::wrapped_name(&rest[..js_scan::statement_end(rest, 0, false)]).map(str::to_string)
+}
+
+/// What [`exported_component`] reads of a module's own exports besides its
+/// re-exports, as lines of the module's surface (W7-09e), and the import
+/// specifiers those exports forward. For each name the module exports itself
+/// — `default`, a declaration, an export list's alias — it follows the
+/// binding the export names ([`own_export`]: `export default Sidebar`) through
+/// what each `const` declared under that name holds ([`declarators`],
+/// outline's `const Avatar = AvatarWithHoverCard`), as far as
+/// `exported_component` does. Each import it reaches gets a line: the binding,
+/// the import's specifier and the name it imports, whether the export names
+/// the binding itself or holds it (for the default export, as the bare
+/// binding or wrapped), and whether the file also declares the name; and
+/// each binding on the way gets a line of what its declarations hold. A tag
+/// imported from the module renders through these, so a sync that sees one
+/// move refreshes the module's importers, and the barrels that forward the
+/// module are found through the specifiers. An export that reaches no import
+/// ends at a declaration of the file, or at nothing, and needs no line: an
+/// edge to the file's own node goes with its nodes whenever the file changes.
+/// A `const` inside a function counts as well as the module's own, so the
+/// scan never misses the one `exported_component` follows.
+pub(crate) fn export_forwards(text: &str) -> (Vec<String>, Vec<String>) {
+    static DECLARED_EXPORT: OnceLock<Regex> = OnceLock::new();
+    static DECLARATION: OnceLock<Regex> = OnceLock::new();
+    let code = strip_comments_for_regex(text, CommentLang::TypeScript);
+    let declared_exports: BTreeSet<String> = DECLARED_EXPORT
+        .get_or_init(|| {
+            Regex::new(&format!(
+                r"(?-u:\b)export{JS_SPACE}+(?:async{JS_SPACE}+)?(?:const|let|var|function|class){JS_SPACE}+({IDENT})"
+            ))
+            .expect("exported declaration")
+        })
+        .captures_iter(&code)
+        .filter_map(|captures| captures.get(1))
+        .map(|name| name.as_str().to_string())
+        .collect();
+    let aliases = extract_local_export_aliases(&code);
+    // What `own_export` gives each name: the default export's binding, a
+    // declaration exported where it stands, or an export list's local.
+    let mut exported: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(local) = default_exported_name(&code).or_else(|| {
+        aliases
+            .iter()
+            .find(|alias| alias.exported_name == "default")
+            .map(|alias| alias.local_name.clone())
+    }) {
+        exported.insert("default".to_string(), local);
+    }
+    for alias in &aliases {
+        if alias.exported_name != "default" && !declared_exports.contains(&alias.exported_name) {
+            exported
+                .entry(alias.exported_name.clone())
+                .or_insert_with(|| alias.local_name.clone());
+        }
+    }
+    for name in &declared_exports {
+        exported.insert(name.clone(), name.clone());
+    }
+    // What each `const` declared under a name holds, in the order they are
+    // written, and every name the file declares.
+    let declarations = declarators(&code);
+    let mut holds: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+    for declaration in declarations
+        .iter()
+        .filter(|declaration| declaration.constant)
+    {
+        holds
+            .entry(declaration.name)
+            .or_default()
+            .push(declaration.held.as_deref());
+    }
+    let mut declared: BTreeSet<&str> = DECLARATION
+        .get_or_init(|| {
+            Regex::new(&format!(
+                r"(?:^|[^A-Za-z0-9_$.])(?:(?:async{JS_SPACE}+)?function{JS_SPACE}*\*?{JS_SPACE}*|class{JS_SPACE}+)({IDENT})"
+            ))
+            .expect("declaration")
+        })
+        .captures_iter(&code)
+        .filter_map(|captures| captures.get(1))
+        .map(|name| name.as_str())
+        .collect();
+    declared.extend(declarations.iter().map(|declaration| declaration.name));
+    let imports = extract_import_mappings(text, Language::TypeScript);
+    let default_binding = default_export_binding(&code);
+    let mut lines: BTreeSet<String> = BTreeSet::new();
+    let mut sources: Vec<String> = Vec::new();
+    for (name, local) in &exported {
+        // The bindings the export can be: its own, then what each of those
+        // holds, a hop at a time.
+        let mut reached: Vec<&str> = vec![local.as_str()];
+        let mut level = 0..1;
+        for _ in 0..MAX_REEXPORT_HOPS {
+            let next = reached.len();
+            for index in level {
+                for &held in holds.get(reached[index]).into_iter().flatten().flatten() {
+                    if !reached.contains(&held) {
+                        reached.push(held);
+                    }
+                }
+            }
+            if reached.len() == next {
+                break;
+            }
+            level = next..reached.len();
+        }
+        let mut forwards = false;
+        for &binding in &reached {
+            let Some(mapping) = imports
+                .iter()
+                .find(|mapping| mapping.local_name == binding && !mapping.is_namespace)
+            else {
+                continue;
+            };
+            let imported = if mapping.is_default {
+                "default"
+            } else {
+                mapping.exported_name.as_str()
+            };
+            let how = if binding != local.as_str() {
+                "held"
+            } else if name != "default" {
+                "own"
+            } else if default_binding.as_deref() == Some(local.as_str()) {
+                "bare"
+            } else {
+                "wrapped"
+            };
+            let also = if declared.contains(binding) {
+                "\tdeclared"
+            } else {
+                ""
+            };
+            lines.insert(format!(
+                "forward\t{name}\t{binding}\t{}\t{imported}\t{how}{also}",
+                mapping.source
+            ));
+            if !sources.contains(&mapping.source) {
+                sources.push(mapping.source.clone());
+            }
+            forwards = true;
+        }
+        if forwards {
+            for binding in &reached {
+                if let Some(held) = holds.get(binding) {
+                    let held: Vec<&str> = held.iter().map(|held| held.unwrap_or("-")).collect();
+                    lines.insert(format!("holds\t{binding}\t{}", held.join("\t")));
+                }
+            }
+        }
+    }
+    (lines.into_iter().collect(), sources)
+}
+
+/// One declarator of a `const`, `let` or `var` statement, for
+/// [`export_forwards`]: its name, and for a `const` the binding its
+/// initializer holds and nothing more.
+struct Declarator<'a> {
+    name: &'a str,
+    constant: bool,
+    held: Option<String>,
+}
+
+/// Every declarator of every `const`, `let` and `var` statement in `code`, in
+/// the order they are written: each declarator of a statement on its own
+/// (`const unused = 1, Screen = Page`), and what a `const` one holds read as
+/// [`held_binding`] reads a declarator's own text, past any type annotation
+/// [`js_scan::initializer_at`] skips (`const Screen: (props: P) => Element =
+/// Page`). A pattern (`const { a } = b`) declares no name.
+fn declarators(code: &str) -> Vec<Declarator<'_>> {
+    static KEYWORD: OnceLock<Regex> = OnceLock::new();
+    static NAME: OnceLock<Regex> = OnceLock::new();
+    let keyword = KEYWORD.get_or_init(|| {
+        Regex::new(&format!(r"(?:^|[^A-Za-z0-9_$.])(const|let|var){JS_SPACE}+"))
+            .expect("declaration keyword")
+    });
+    let name = NAME.get_or_init(|| Regex::new(&format!("^{IDENT}")).expect("declarator name"));
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    for captures in keyword.captures_iter(code) {
+        let (Some(word), Some(whole)) = (captures.get(1), captures.get(0)) else {
+            continue;
+        };
+        let constant = word.as_str() == "const";
+        let mut at = whole.end();
+        loop {
+            at = code.len() - code[at..].trim_start_matches(js_scan::is_js_space).len();
+            let declared = if matches!(bytes.get(at), Some(b'{' | b'[')) {
+                let Some(close) = js_scan::match_bracket(code, at) else {
+                    break;
+                };
+                at = close + 1;
+                None
+            } else {
+                let Some(found) = name.find(&code[at..]) else {
+                    break;
+                };
+                at += found.end();
+                Some(found.as_str())
+            };
+            // The declarator ends where its statement does, or at the comma
+            // before the next one.
+            let end = js_scan::statement_end(code, at, true);
+            if let Some(declared) = declared {
+                let declarator = &code[..end];
+                let held = constant
+                    .then(|| js_scan::initializer_at(declarator, at))
+                    .flatten()
+                    .and_then(|init| held_at(declarator, init, declared));
+                out.push(Declarator {
+                    name: declared,
+                    constant,
+                    held,
+                });
+            }
+            if bytes.get(end) != Some(&b',') {
+                break;
+            }
+            at = end + 1;
+        }
+    }
+    out
+}
+
+/// The component a route's `layout:` reference names, found the way the
+/// route's own component is (upstream `layoutComponent`): through the route
+/// file's import of it, else declared in reach — or a lazily loaded layout
+/// module's component, or the export its loader picks.
+fn layout_component(
+    spec: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    if let Some(module) = spec.strip_prefix(LAZY_ROUTE_PREFIX) {
+        return lazy_route_component(module, &reference.file_path, context);
+    }
+    if is_react_route_ref(reference)
+        && let Some((module, export)) = lazy_loader::picked_export_name(spec)
+    {
+        return picked_export(module, export, &reference.file_path, context);
+    }
+    let Some(mapping) = context
+        .get_import_mappings(&reference.file_path, reference.language)
+        .into_iter()
+        .find(|mapping| mapping.local_name == spec)
+    else {
+        // A layout the route file declares itself: no name match follows a
+        // `layout:` reference, so the declaration binds here when there is
+        // no component to find.
+        if let Some(own) = declared_component(spec, &reference.file_path, context) {
+            return Some(own.component.unwrap_or_else(|| own.declaration.id.clone()));
+        }
+        return resolve_component(spec, &reference.file_path, context);
+    };
+    let via_import = resolve_via_import(
+        &RefView {
+            reference_name: spec.to_string(),
+            ..reference.clone()
+        },
+        context,
+    );
+    if let Some(resolved) = via_import {
+        return Some(resolved.target_node_id);
+    }
+    // `import { default as AppRoot } from './routes/app/root'`: read the
+    // module the import names — never a same-named component somewhere else.
+    if mapping.is_default || mapping.exported_name == "default" {
+        return lazy_route_component(&mapping.source, &reference.file_path, context);
+    }
+    let file = resolve_import_path(
+        &mapping.source,
+        &reference.file_path,
+        reference.language,
+        context,
+    )?;
+    context
+        .get_nodes_in_file_shared(&file)
+        .iter()
+        .find(|node| node.name == mapping.exported_name && is_component_kind(node.kind))
+        .map(|node| node.id.clone())
+}
+
+/// A declarator's own source text, `B = lazy(…)` in `const A = lazy(…), B =
+/// lazy(…)` (upstream `declarationText`): its lines, the last cut at its end
+/// column and the first from its start column. Columns are the byte columns
+/// the extractor stored; a file that no longer reads that way gives nothing.
+fn declaration_text(node: &Node, context: &dyn ResolutionContext) -> String {
+    let Some(facts) = context.source_facts(&node.file_path) else {
+        return String::new();
+    };
+    let (Ok(first), Ok(end)) = (
+        usize::try_from(node.start_line - 1),
+        usize::try_from(node.end_line),
+    ) else {
+        return String::new();
+    };
+    let end = end.min(facts.line_count());
+    if first >= end {
+        return String::new();
+    }
+    let mut lines: Vec<&str> = (first..end).map(|index| facts.line(index)).collect();
+    let last = lines.len() - 1;
+    if let Ok(cut @ 1..) = usize::try_from(node.end_column) {
+        let line = lines[last];
+        let Some(kept) = line.get(..cut.min(line.len())) else {
+            return String::new();
+        };
+        lines[last] = kept;
+    }
+    let from = usize::try_from(node.start_column).unwrap_or(0);
+    let Some(kept) = lines[0].get(from.min(lines[0].len())..) else {
+        return String::new();
+    };
+    lines[0] = kept;
+    lines.join("\n")
+}
+
+/// `isEsmLanguage` (react.ts:1312-1314): JS/TS and their JSX dialects,
+/// modules where a cross-file name needs an import.
+fn is_esm_script(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+    )
+}
+
+/// `resolveHook` (react.ts:1320-1346).
+fn resolve_hook(
+    name: &str,
+    from_file: &str,
+    context: &dyn ResolutionContext,
+    language: Language,
+) -> Option<String> {
     let candidates = context.get_nodes_by_name_shared(name);
-    if candidates.is_empty() {
+    let is_hook = |node: &Node| node.kind == NodeKind::Function && node.name.starts_with("use");
+    // A hook nested inside another function is only callable in there
+    // (upstream #2120).
+    let nested = |node: &Node| {
+        context
+            .get_nodes_in_file_shared(&node.file_path)
+            .iter()
+            .any(|outer| {
+                outer.id != node.id
+                    && matches!(outer.kind, NodeKind::Function | NodeKind::Method)
+                    && outer.start_line <= node.start_line
+                    && outer.end_line >= node.end_line
+                    && (outer.start_line < node.start_line || outer.end_line > node.end_line)
+            })
+    };
+    if let Some(own) = candidates
+        .iter()
+        .find(|node| node.file_path == from_file && is_hook(node) && !nested(node))
+    {
+        return Some(own.id.clone());
+    }
+    // A JS/TS module reaches another file's hook only by importing it — the
+    // import resolver's to follow (an imported name never gets here) —
+    // never by name alone (upstream #2240).
+    if is_esm_script(language) {
         return None;
     }
     let hooks: Vec<_> = candidates
-        .into_iter()
-        .filter(|n| n.kind == NodeKind::Function && n.name.starts_with("use"))
-        .collect();
-    if hooks.is_empty() {
-        return None;
-    }
-    const HOOK_DIRS: [&str; 4] = ["/hooks/", "/src/hooks/", "/lib/hooks/", "/utils/hooks/"];
-    if let Some(preferred) = hooks
         .iter()
-        .find(|n| HOOK_DIRS.iter().any(|d| n.file_path.contains(d)))
-    {
-        return Some(preferred.id.clone());
-    }
-    Some(hooks[0].id.clone())
+        .filter(|node| is_hook(node) && !nested(node))
+        .collect();
+    const HOOK_DIRS: [&str; 4] = ["/hooks/", "/src/hooks/", "/lib/hooks/", "/utils/hooks/"];
+    hooks
+        .iter()
+        .find(|node| HOOK_DIRS.iter().any(|dir| node.file_path.contains(dir)))
+        .or_else(|| hooks.first())
+        .map(|node| node.id.clone())
 }
 
-/// `resolveContext` (react.ts:348-368).
-fn resolve_context(name: &str, context: &dyn ResolutionContext) -> Option<String> {
+/// `resolveContext` (react.ts:1351-1377).
+fn resolve_context(
+    name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    // In a JS/TS module only the file's own context is in reach by name;
+    // another file's comes through an import (trpc's adapters'
+    // `createContext?.(…)` is an option, not an example app's
+    // `createContext`, upstream #2240).
+    if is_esm_script(reference.language) {
+        return context
+            .get_nodes_by_name_shared(name)
+            .iter()
+            .find(|node| node.file_path == reference.file_path)
+            .map(|node| node.id.clone());
+    }
     let candidates = context.get_nodes_by_name_shared(name);
     if candidates.is_empty() {
-        // Strip Context/Provider suffix fallback (react.ts:351-357).
+        // Without the Context/Provider suffix.
         let base_name = strip_context_suffix(name);
         if base_name != name {
             let base_candidates = context.get_nodes_by_name_shared(base_name);
@@ -467,376 +1202,11 @@ fn strip_context_suffix(name: &str) -> &str {
     }
 }
 
-/// `filePathToRoute` (react.ts:373-417).
-fn file_path_to_route(file_path: &str) -> Option<String> {
-    let base = file_path.rsplit('/').next().unwrap_or(file_path);
-    if !page_ext_regex().is_match(base) {
-        return None;
-    }
-    if base.starts_with('_') || config_file_regex().is_match(base) {
-        return None;
-    }
-
-    if pages_segment_regex().is_match(file_path) {
-        // replace(/^.*pages\//, '/')
-        let after = pages_prefix_regex().replace(file_path, "/");
-        // replace(/\/index\.(tsx?|jsx?)$/, '')
-        let after = index_ext_regex().replace(&after, "");
-        // replace(/\.(tsx?|jsx?)$/, '')
-        let after = trailing_ext_regex().replace(&after, "");
-        // replace(/\[([^\]]+)\]/g, ':$1')
-        let route = param_regex().replace_all(&after, ":$1").into_owned();
-        return Some(if route.is_empty() {
-            "/".to_string()
-        } else {
-            route
-        });
-    }
-
-    if app_segment_regex().is_match(file_path) {
-        if !file_path.contains("page.") {
-            return None;
-        }
-        // replace(/^.*app\//, '/')
-        let after = app_prefix_regex().replace(file_path, "/");
-        // replace(/\/page\.(tsx?|jsx?)$/, '')
-        let after = page_ext_strip_regex().replace(&after, "");
-        let route = param_regex().replace_all(&after, ":$1").into_owned();
-        return Some(if route.is_empty() {
-            "/".to_string()
-        } else {
-            route
-        });
-    }
-
-    None
-}
-
 fn dir_of(file: &str) -> String {
     match file.rfind('/') {
         Some(idx) => file[..idx].to_string(),
         None => String::new(),
     }
-}
-
-/// 1-based line number of `byte_index` (`slice(0, idx).split('\n').length`).
-fn line_of(content: &str, byte_index: usize) -> i64 {
-    content[..byte_index].matches('\n').count() as i64 + 1
-}
-
-fn byte_window(content: &str, start: usize, max_bytes: usize) -> &str {
-    let mut end = start.saturating_add(max_bytes).min(content.len());
-    while !content.is_char_boundary(end) {
-        end -= 1;
-    }
-    &content[start..end]
-}
-
-/// Hard byte bound on how far the `<Route …>` opening-tag scan may look forward
-/// from the `<` (upstream issue #1348).
-///
-/// The scan normally stops at the tag's own `>` (see [`opening_tag_end`]), but a
-/// malformed or unterminated tag has no `>` to find, so the search itself must be
-/// capped: without a cap one stray `<Route` would drag the scan to end-of-file,
-/// and a file carrying many such tags would turn this pass quadratic.
-///
-/// 2048 bytes is the cap, sized off the longest opening tags actually measured
-/// rather than a guess. Measured reference points, each the true tag length up to
-/// its brace-aware terminator: a lazy, error-bounded v6 data route spread over
-/// six attribute lines is 278 bytes; the same route with `hydrateFallbackElement`,
-/// `shouldRevalidate` and a `handle={{…}}` object is 525 bytes; a prettier-wrapped
-/// tag carrying twelve extra `data-*` attributes is 700 bytes. 2048 is ~3x that
-/// widest measured tag, so a legitimate tag is never truncated, while the work per
-/// tag stays constant. It is also strictly wider than the fixed 400-byte window it
-/// replaces (`react.ts:114-123`), so no attribute the old window could reach is
-/// lost.
-const ROUTE_OPENING_TAG_SCAN_LIMIT: usize = 2048;
-
-/// The `<Route …>` opening tag's own text, starting at `start` (its `<`).
-///
-/// Replaces the upstream fixed 400-byte window (`react.ts:114-123`), which never
-/// cut at the tag's end and therefore let a parent or pathless route match a
-/// *sibling's* `path`/`element` (upstream issue #1348). The window is bounded
-/// twice over: by the tag terminator when the tag is well formed, and by
-/// [`ROUTE_OPENING_TAG_SCAN_LIMIT`] always — so an unterminated tag can never
-/// scan unboundedly. A malformed tag additionally stops at the next `<Route`, so
-/// even then it cannot borrow a sibling's attributes.
-fn route_opening_tag_window(content: &str, start: usize) -> &str {
-    let bounded = byte_window(content, start, ROUTE_OPENING_TAG_SCAN_LIMIT);
-    if let Some(end) = opening_tag_end(bounded) {
-        return &bounded[..end];
-    }
-    match bounded.get(1..).and_then(|rest| rest.find("<Route")) {
-        Some(idx) => &bounded[..idx + 1],
-        None => bounded,
-    }
-}
-
-/// Hard byte bound on how far the data-router route-object scan may walk forward
-/// from a `path:` key (upstream issue #1348, data-router half).
-///
-/// The walk normally stops at the `}` closing that route object (see
-/// [`route_object_own_properties`]), but a malformed or unterminated object literal
-/// has no matching `}` to find, so the walk itself must be capped: without a cap one
-/// stray `path:` would drag it to end-of-file, and a file carrying many such keys
-/// would turn this pass quadratic. This is the object-form twin of
-/// [`ROUTE_OPENING_TAG_SCAN_LIMIT`], and both invariants are the same: terminate at
-/// the construct's own end, and cap the search regardless.
-///
-/// 4096 bytes is the cap, sized off route objects actually measured rather than a
-/// guess. Measured reference points, each the raw walk distance from the object's
-/// `path:` key to its own closing `}` (nested children included, because the walk
-/// traverses and elides them rather than stopping at them): a minimal inline
-/// `{ path, element }` is 38 bytes; a typical v6.4 route with `loader` and
-/// `errorElement` is 142; the same plus `action`, `handle={…}` and
-/// `shouldRevalidate`, with `element` last, is 407; a wide enterprise route adding
-/// `hydrateFallbackElement` and a nested `handle` object is 611; a parent route
-/// whose `children` array holds eight loader-bearing child routes, with the parent's
-/// own `element` declared last — the worst realistic walk, since every child byte
-/// must be traversed before the parent's own `element` is reached — is 1503. 4096 is
-/// ~2.7x that widest measured object, so a legitimate object is never truncated,
-/// while the work per `path:` key stays constant. It is also strictly wider than the
-/// fixed 300-byte window it replaces (`react.ts:206`), so no property the old window
-/// could reach is lost.
-const ROUTE_OBJECT_SCAN_LIMIT: usize = 4096;
-
-/// The route object's OWN properties, as text, starting at the `path:` key that
-/// begins at `path_key_start`.
-///
-/// Replaces the upstream fixed 300-byte window (`react.ts:206`), which scanned
-/// blindly forward and took the FIRST `element`/`Component` it found — so a parent
-/// route with no `element` of its own silently borrowed a CHILD route's component,
-/// the same borrowing defect [`route_opening_tag_window`] fixes for the `<Route>`
-/// JSX form (upstream issue #1348).
-///
-/// Nested `{…}` / `[…]` groups are ELIDED, not merely stopped at: a `children: […]`
-/// array cannot leak its own `element` into the parent's text, and neither can a
-/// `handle: {…}` object. Quoted values are copied verbatim, so a `}` or `>` inside
-/// `path: 'a>b'` neither ends the object nor unbalances the depth. The walk is
-/// bounded twice over, exactly as the JSX form is: by the object's own closing `}`
-/// when the literal is well formed, and by [`ROUTE_OBJECT_SCAN_LIMIT`] always. A
-/// malformed object additionally stops at the next `path:` key, so even then it
-/// cannot borrow a following sibling's properties.
-fn route_object_own_properties(content: &str, path_key_start: usize) -> String {
-    let bounded = byte_window(content, path_key_start, ROUTE_OBJECT_SCAN_LIMIT);
-    let bytes = bounded.as_bytes();
-    let mut own = String::with_capacity(bounded.len());
-    // Start of the run of depth-0 bytes not yet copied into `own`. Every byte the
-    // walk inspects structurally is ASCII, so every boundary is a char boundary.
-    let mut segment_start = 0usize;
-    let mut depth = 0usize;
-    let mut quote: Option<u8> = None;
-
-    for (index, byte) in bytes.iter().enumerate() {
-        match quote {
-            Some(open) => {
-                if *byte == open {
-                    quote = None;
-                }
-            }
-            None => match byte {
-                b'"' | b'\'' | b'`' => quote = Some(*byte),
-                b'{' | b'[' => {
-                    if depth == 0 {
-                        // Elide the nested group; a space keeps neighbouring tokens
-                        // from fusing across the hole.
-                        own.push_str(&bounded[segment_start..index]);
-                        own.push(' ');
-                    }
-                    depth += 1;
-                }
-                b'}' | b']' => {
-                    if depth == 0 {
-                        // This object's own end: nothing beyond it belongs to it.
-                        own.push_str(&bounded[segment_start..index]);
-                        return own;
-                    }
-                    depth -= 1;
-                    if depth == 0 {
-                        segment_start = index + 1;
-                    }
-                }
-                b'p' if depth == 0 && index > 0 && is_path_key_at(bounded, index) => {
-                    // Unterminated object: a second depth-0 `path:` can only be a
-                    // following sibling's, so stop rather than borrow from it.
-                    own.push_str(&bounded[segment_start..index]);
-                    return own;
-                }
-                _ => {}
-            },
-        }
-    }
-
-    if depth == 0 {
-        own.push_str(&bounded[segment_start..]);
-    }
-    own
-}
-
-/// Whether a `path` object key (`path` then optional whitespace then `:`) starts at
-/// `index` in `text`.
-fn is_path_key_at(text: &str, index: usize) -> bool {
-    let Some(rest) = text.get(index..).and_then(|r| r.strip_prefix("path")) else {
-        return false;
-    };
-    rest.trim_start().starts_with(':')
-}
-
-/// Byte index just past the `>` closing the opening tag that starts at byte 0 of
-/// `text`, or `None` when the tag does not terminate inside `text`.
-///
-/// `{…}` expression containers and quoted attribute values are skipped, so the
-/// `>` inside `element={<Comp/>}` or `path="a>b"` does not end the tag early.
-fn opening_tag_end(text: &str) -> Option<usize> {
-    let mut brace_depth = 0usize;
-    let mut quote: Option<u8> = None;
-    for (index, byte) in text.as_bytes().iter().enumerate() {
-        match quote {
-            Some(open) => {
-                if *byte == open {
-                    quote = None;
-                }
-            }
-            None => match byte {
-                b'"' | b'\'' | b'`' => quote = Some(*byte),
-                b'{' => brace_depth += 1,
-                b'}' => brace_depth = brace_depth.saturating_sub(1),
-                b'>' if brace_depth == 0 => return Some(index + 1),
-                _ => {}
-            },
-        }
-    }
-    None
-}
-
-fn component_patterns() -> &'static [Regex] {
-    static RE: OnceLock<Vec<Regex>> = OnceLock::new();
-    RE.get_or_init(|| {
-        vec![
-            // function components (react.ts:97).
-            Regex::new(r"(?:export\s+)?function\s+([A-Z][a-zA-Z0-9]*)\s*\(").expect("fn comp"),
-            // arrow function components (react.ts:99).
-            Regex::new(
-                r"(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:\([^)]*\)|[a-zA-Z_][a-zA-Z0-9_]*)\s*=>",
-            )
-            .expect("arrow comp"),
-            // forwardRef components (react.ts:101).
-            Regex::new(
-                r"(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:React\.)?forwardRef",
-            )
-            .expect("forwardRef comp"),
-            // memo components (react.ts:103).
-            Regex::new(r"(?:export\s+)?(?:const|let)\s+([A-Z][a-zA-Z0-9]*)\s*=\s*(?:React\.)?memo")
-                .expect("memo comp"),
-        ]
-    })
-}
-
-fn hook_pattern() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?:export\s+)?(?:function|const|let)\s+(use[A-Z][a-zA-Z0-9]*)\s*[=(]")
-            .expect("hook")
-    })
-}
-
-fn route_tag_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"<Route\b").expect("route tag"))
-}
-
-fn route_path_attr() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\bpath\s*=\s*["']([^"']+)["']"#).expect("route path"))
-}
-
-fn route_component_attr() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\bcomponent\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)").expect("route comp")
-    })
-}
-
-fn route_element_attr() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"\belement\s*=\s*\{\s*<\s*([A-Z][A-Za-z0-9_]*)").expect("route element")
-    })
-}
-
-fn data_router_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r"\b(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements)\b",
-        )
-        .expect("data router")
-    })
-}
-
-fn obj_path_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\bpath\s*:\s*['"]([^'"]*)['"]"#).expect("obj path"))
-}
-
-fn obj_element_attr() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\belement\s*:\s*<\s*([A-Z][A-Za-z0-9_]*)").expect("obj element"))
-}
-
-fn obj_component_attr() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\bComponent\s*:\s*([A-Z][A-Za-z0-9_]*)").expect("obj component"))
-}
-
-fn page_ext_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\.(tsx?|jsx?)$").expect("page ext"))
-}
-
-fn config_file_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\.config\.[a-z]+$").expect("config file"))
-}
-
-fn pages_segment_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:^|/)pages/").expect("pages segment"))
-}
-
-fn pages_prefix_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^.*pages/").expect("pages prefix"))
-}
-
-fn index_ext_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"/index\.(tsx?|jsx?)$").expect("index ext"))
-}
-
-fn trailing_ext_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\.(tsx?|jsx?)$").expect("trailing ext"))
-}
-
-fn param_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\[([^\]]+)\]").expect("param"))
-}
-
-fn app_segment_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?:^|/)app/").expect("app segment"))
-}
-
-fn app_prefix_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^.*app/").expect("app prefix"))
-}
-
-fn page_ext_strip_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"/page\.(tsx?|jsx?)$").expect("page strip"))
 }
 
 #[cfg(test)]
@@ -848,13 +1218,14 @@ mod tests {
 
     use super::*;
     use crate::types::ImportMapping;
-    use codegraph_core::types::Node;
+    use codegraph_core::types::{EdgeKind, Node};
     use std::collections::HashMap;
 
     #[derive(Default)]
     struct Ctx {
         files: HashMap<String, String>,
         nodes: Vec<Node>,
+        imports: HashMap<String, Vec<ImportMapping>>,
     }
 
     impl Ctx {
@@ -864,6 +1235,20 @@ mod tests {
         }
         fn node(mut self, n: Node) -> Self {
             self.nodes.push(n);
+            self
+        }
+        /// `file` imports `local` from `source`.
+        fn import(mut self, file: &str, local: &str, source: &str) -> Self {
+            self.imports
+                .entry(file.to_string())
+                .or_default()
+                .push(ImportMapping {
+                    local_name: local.to_string(),
+                    exported_name: local.to_string(),
+                    source: source.to_string(),
+                    is_default: false,
+                    is_namespace: false,
+                });
             self
         }
     }
@@ -919,8 +1304,34 @@ mod tests {
         fn get_node_by_id(&self, id: &str) -> Option<Node> {
             self.nodes.iter().find(|n| n.id == id).cloned()
         }
-        fn get_import_mappings(&self, _f: &str, _l: Language) -> Vec<ImportMapping> {
-            Vec::new()
+        fn get_import_mappings(&self, file: &str, _l: Language) -> Vec<ImportMapping> {
+            self.imports.get(file).cloned().unwrap_or_default()
+        }
+    }
+
+    /// A node of `file` at `lines` (1-based, inclusive) and byte `columns`,
+    /// with its own qualified name.
+    fn placed(
+        kind: NodeKind,
+        qualified_name: &str,
+        file: &str,
+        lines: (i64, i64),
+        columns: (i64, i64),
+    ) -> Node {
+        let name = qualified_name.rsplit("::").next().unwrap_or(qualified_name);
+        Node {
+            qualified_name: qualified_name.to_string(),
+            start_line: lines.0,
+            end_line: lines.1,
+            start_column: columns.0,
+            end_column: columns.1,
+            ..mk_node(
+                &format!("{}:{file}:{qualified_name}:{}", kind.as_str(), lines.0),
+                kind,
+                name,
+                file,
+                Language::Tsx,
+            )
         }
     }
 
@@ -965,6 +1376,83 @@ mod tests {
         }
     }
 
+    /// The export a lazy route's loader picks, `import:./x#Page`, is React's
+    /// only from a React route: Vue Router and Angular name a lazily loaded
+    /// component the same way (upstream `isReactRouteRef`).
+    #[test]
+    fn a_picked_export_resolves_only_from_a_react_route() {
+        let login = placed(
+            NodeKind::Function,
+            "Login",
+            "src/views/Login.tsx",
+            (1, 3),
+            (0, 1),
+        );
+        let ctx = Ctx::default()
+            .file("src/router.tsx", "")
+            .file("src/router.ts", "")
+            .file(
+                "src/views/Login.tsx",
+                "export function Login() {\n  return null;\n}\n",
+            )
+            .node(login.clone());
+        let from = |file: &str, language: Language, node: &str| RefView {
+            from_node_id: node.to_string(),
+            ..a_ref(
+                "import:./views/Login#Login",
+                EdgeKind::References,
+                file,
+                language,
+            )
+        };
+        let route = from(
+            "src/router.tsx",
+            Language::Tsx,
+            "route:src/router.tsx:3:/login",
+        );
+        assert!(ReactResolver.claims_reference(&route.reference_name));
+        assert_eq!(
+            ReactResolver
+                .resolve(&route, &ctx)
+                .map(|r| r.target_node_id),
+            Some(login.id.clone())
+        );
+        for reference in [
+            from(
+                "src/router.ts",
+                Language::TypeScript,
+                "route:src/router.ts:3:/login",
+            ),
+            from(
+                "src/router.tsx",
+                Language::Tsx,
+                "function:src/router.tsx:Routes:1",
+            ),
+            from(
+                "src/router.tsx",
+                Language::Tsx,
+                "route:src/other.tsx:3:/login",
+            ),
+        ] {
+            assert!(
+                ReactResolver.resolve(&reference, &ctx).is_none(),
+                "{}",
+                reference.from_node_id
+            );
+        }
+        // A layout the loader picks, the same way.
+        let layout = RefView {
+            reference_name: "layout:import:./views/Login#Login".to_string(),
+            ..route.clone()
+        };
+        assert_eq!(
+            ReactResolver
+                .resolve(&layout, &ctx)
+                .map(|r| r.target_node_id),
+            Some(login.id)
+        );
+    }
+
     // -- pure-helper units --------------------------------------------------
 
     #[test]
@@ -992,11 +1480,9 @@ mod tests {
     }
 
     #[test]
-    fn dir_of_and_line_of() {
+    fn dir_of_cases() {
         assert_eq!(dir_of("src/a/b.tsx"), "src/a");
         assert_eq!(dir_of("top.tsx"), "");
-        assert_eq!(line_of("a\nb\nc", 4), 3);
-        assert_eq!(line_of("abc", 0), 1);
     }
 
     #[test]
@@ -1038,8 +1524,9 @@ mod tests {
     // -- resolve: hook directory preference --------------------------------
 
     #[test]
-    fn resolve_hook_falls_back_to_first_when_no_hooks_dir() {
-        // No hooks/ directory, so the first candidate wins (react.ts:342).
+    fn resolve_hook_in_a_script_is_the_files_own() {
+        // In a JS/TS module another file's hook comes through an import (the
+        // import resolver's), never by name (upstream #2240).
         let hook = mk_node(
             "fn:src/util.ts:useThing:1",
             NodeKind::Function,
@@ -1048,21 +1535,86 @@ mod tests {
             Language::TypeScript,
         );
         let ctx = Ctx::default().node(hook.clone());
-        let reference = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
-        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        let elsewhere = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&elsewhere, &ctx).is_none());
+        let own = a_ref(
+            "useThing",
+            EdgeKind::Calls,
+            "src/util.ts",
+            Language::TypeScript,
+        );
+        let r = ReactResolver.resolve(&own, &ctx).expect("resolves");
         assert_eq!(r.target_node_id, hook.id);
         assert_eq!(r.confidence, 0.85);
+    }
+
+    #[test]
+    fn resolve_hook_never_targets_a_nested_hook() {
+        // A hook declared inside another function is only callable in there
+        // (upstream #2120): trpc's `useQuery` inside one of its factories.
+        let factory = placed(
+            NodeKind::Function,
+            "createHooks",
+            "src/hooks.ts",
+            (1, 10),
+            (0, 1),
+        );
+        let nested = placed(
+            NodeKind::Function,
+            "createHooks::useQuery",
+            "src/hooks.ts",
+            (2, 4),
+            (2, 3),
+        );
+        let ctx = Ctx::default().node(factory).node(nested);
+        let reference = a_ref(
+            "useQuery",
+            EdgeKind::Calls,
+            "src/hooks.ts",
+            Language::TypeScript,
+        );
+        assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+    }
+
+    #[test]
+    fn resolve_hook_outside_a_script_prefers_a_hooks_directory() {
+        // Only a non-script language reaches another file's hook by name: a
+        // hooks/ directory first, else the first candidate.
+        let far = mk_node(
+            "fn:src/util.ts:useThing:1",
+            NodeKind::Function,
+            "useThing",
+            "src/util.ts",
+            Language::TypeScript,
+        );
+        let near = mk_node(
+            "fn:src/hooks/useThing.ts:useThing:1",
+            NodeKind::Function,
+            "useThing",
+            "src/hooks/useThing.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default().node(far.clone()).node(near.clone());
+        assert_eq!(
+            resolve_hook("useThing", "src/a.py", &ctx, Language::Python),
+            Some(near.id)
+        );
+        let ctx = Ctx::default().node(far.clone());
+        assert_eq!(
+            resolve_hook("useThing", "src/a.py", &ctx, Language::Python),
+            Some(far.id)
+        );
     }
 
     #[test]
     fn resolve_hook_none_when_not_a_use_function() {
         // Candidate exists but is not a `use*` function -> no hook resolution.
         let notf = mk_node(
-            "class:src/useThing.ts:useThing:1",
+            "class:src/Page.tsx:useThing:1",
             NodeKind::Class,
             "useThing",
-            "src/useThing.ts",
-            Language::TypeScript,
+            "src/Page.tsx",
+            Language::Tsx,
         );
         let ctx = Ctx::default().node(notf);
         let reference = a_ref("useThing", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
@@ -1078,9 +1630,50 @@ mod tests {
     }
 
     #[test]
+    fn resolve_context_in_a_script_is_the_files_own() {
+        // trpc's adapters' `createContext?.(…)` is an option, not an example
+        // app's `createContext` (upstream #2240).
+        let other = mk_node(
+            "var:src/context/AuthContext.tsx:AuthContext:1",
+            NodeKind::Variable,
+            "AuthContext",
+            "src/context/AuthContext.tsx",
+            Language::Tsx,
+        );
+        let own = mk_node(
+            "var:src/App.tsx:AuthContext:1",
+            NodeKind::Variable,
+            "AuthContext",
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(other).node(own.clone());
+        let reference = a_ref(
+            "AuthContext",
+            EdgeKind::References,
+            "src/App.tsx",
+            Language::Tsx,
+        );
+        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
+        assert_eq!(r.target_node_id, own.id);
+        let elsewhere = a_ref(
+            "AuthContext",
+            EdgeKind::References,
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        assert!(ReactResolver.resolve(&elsewhere, &ctx).is_none());
+    }
+
+    /// A reference outside JS/TS, which only [`resolve_context`] itself sees.
+    fn script_less_ref(name: &str) -> RefView {
+        a_ref(name, EdgeKind::References, "src/app.py", Language::Python)
+    }
+
+    #[test]
     fn resolve_context_strips_suffix_when_no_direct_match() {
         // No `AuthProvider` node, but a base `Auth` node exists -> suffix strip
-        // fallback resolves to it (react.ts:351-357).
+        // fallback resolves to it.
         let base = mk_node(
             "var:src/Auth.tsx:Auth:1",
             NodeKind::Variable,
@@ -1089,14 +1682,10 @@ mod tests {
             Language::Tsx,
         );
         let ctx = Ctx::default().node(base.clone());
-        let reference = a_ref(
-            "AuthProvider",
-            EdgeKind::References,
-            "src/App.tsx",
-            Language::Tsx,
+        assert_eq!(
+            resolve_context("AuthProvider", &script_less_ref("AuthProvider"), &ctx),
+            Some(base.id)
         );
-        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
-        assert_eq!(r.target_node_id, base.id);
     }
 
     #[test]
@@ -1116,14 +1705,10 @@ mod tests {
             Language::Tsx,
         );
         let ctx = Ctx::default().node(far).node(near.clone());
-        let reference = a_ref(
-            "AuthContext",
-            EdgeKind::References,
-            "src/App.tsx",
-            Language::Tsx,
+        assert_eq!(
+            resolve_context("AuthContext", &script_less_ref("AuthContext"), &ctx),
+            Some(near.id)
         );
-        let r = ReactResolver.resolve(&reference, &ctx).expect("resolves");
-        assert_eq!(r.target_node_id, near.id);
     }
 
     #[test]
@@ -1136,6 +1721,180 @@ mod tests {
             Language::Tsx,
         );
         assert!(ReactResolver.resolve(&reference, &ctx).is_none());
+        assert_eq!(
+            resolve_context("MissingProvider", &script_less_ref("MissingProvider"), &ctx),
+            None
+        );
+    }
+
+    // -- resolve: the file's imports and its own values ---------------------
+
+    #[test]
+    fn an_imported_name_is_left_to_import_resolution() {
+        // antd's `<Button>` renders the package's, not the project's
+        // namesake (upstream #2120, #2475); the same for a hook or context.
+        let button = mk_node(
+            "component:src/components/Button.tsx:Button:1",
+            NodeKind::Component,
+            "Button",
+            "src/components/Button.tsx",
+            Language::Tsx,
+        );
+        let hook = mk_node(
+            "fn:src/Page.tsx:useQuery:1",
+            NodeKind::Function,
+            "useQuery",
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        let ctx = Ctx::default().node(button.clone()).node(hook.clone());
+        let tag = a_ref(
+            "Button",
+            EdgeKind::References,
+            "src/Page.tsx",
+            Language::Tsx,
+        );
+        let call = a_ref("useQuery", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
+        assert_eq!(
+            ReactResolver.resolve(&tag, &ctx).map(|r| r.target_node_id),
+            Some(button.id)
+        );
+        assert_eq!(
+            ReactResolver.resolve(&call, &ctx).map(|r| r.target_node_id),
+            Some(hook.id)
+        );
+        let ctx = ctx.import("src/Page.tsx", "Button", "antd").import(
+            "src/Page.tsx",
+            "useQuery",
+            "@tanstack/react-query",
+        );
+        assert!(ReactResolver.resolve(&tag, &ctx).is_none());
+        assert!(ReactResolver.resolve(&call, &ctx).is_none());
+    }
+
+    /// `src/App.tsx` for the declared-value cases, with each value's node.
+    fn app_with_values() -> Ctx {
+        let file = "src/App.tsx";
+        let source = "import { observer } from 'mobx-react';\n\
+                      const Panel = observer(function PanelInner() {\n\
+                      \x20 return <div />;\n\
+                      });\n\
+                      function Inner() { return <span />; }\n\
+                      const Item = forwardRef(Inner) as any; // a cast\n\
+                      const Home = lazy(() => import('./pages/Home'));\n";
+        let mut ctx = Ctx::default().file(file, source);
+        for (kind, name, lines, columns) in [
+            (NodeKind::Constant, "Panel", (2, 4), (6, 2)),
+            (NodeKind::Function, "Panel::PanelInner", (2, 4), (23, 1)),
+            (NodeKind::Function, "Inner", (5, 5), (0, 37)),
+            (NodeKind::Constant, "Item", (6, 6), (6, 37)),
+            (NodeKind::Constant, "Home", (7, 7), (6, 47)),
+        ] {
+            ctx = ctx.node(placed(kind, name, file, lines, columns));
+        }
+        // Another app's namesakes, in a component directory.
+        for name in ["Panel", "Item", "Home"] {
+            ctx = ctx.node(mk_node(
+                &format!("function:src/components/{name}.tsx:{name}:1"),
+                NodeKind::Function,
+                name,
+                &format!("src/components/{name}.tsx"),
+                Language::Tsx,
+            ));
+        }
+        ctx
+    }
+
+    #[test]
+    fn a_value_the_file_declares_renders_what_it_wraps() {
+        // Upstream #2420: the function a value holds, or the component of
+        // its own file a wrapper call is handed, past a type assertion.
+        let ctx = app_with_values();
+        for (name, target) in [
+            ("Panel", "function:src/App.tsx:Panel::PanelInner:2"),
+            ("Item", "function:src/App.tsx:Inner:5"),
+        ] {
+            let reference = a_ref(name, EdgeKind::References, "src/App.tsx", Language::Tsx);
+            let r = ReactResolver.resolve(&reference, &ctx).expect(name);
+            assert_eq!(r.target_node_id, target, "{name}");
+            assert_eq!(r.confidence, 0.9, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_value_wrapping_no_component_is_its_own_declaration() {
+        // Nothing to render is found, so the declaration binds by name, never
+        // another app's same-named component; elsewhere that one still wins.
+        let ctx = app_with_values();
+        let own = a_ref("Home", EdgeKind::References, "src/App.tsx", Language::Tsx);
+        assert!(ReactResolver.resolve(&own, &ctx).is_none());
+        let elsewhere = a_ref("Home", EdgeKind::References, "src/Page.tsx", Language::Tsx);
+        assert_eq!(
+            ReactResolver
+                .resolve(&elsewhere, &ctx)
+                .map(|r| r.target_node_id),
+            Some("function:src/components/Home.tsx:Home:1".to_string())
+        );
+    }
+
+    #[test]
+    fn an_inner_function_counts_by_its_name_or_its_end() {
+        let file = "src/Page.tsx";
+        let value = placed(NodeKind::Constant, "Page", file, (1, 6), (6, 2));
+        // A helper inside an arrow the graph has no node for renders nothing.
+        let ctx = Ctx::default().node(value.clone()).node(placed(
+            NodeKind::Function,
+            "Page::load",
+            file,
+            (2, 2),
+            (8, 20),
+        ));
+        assert_eq!(wrapped_component(&value, &ctx), None);
+        // The value's namesake is what it holds, wherever it ends.
+        let ctx = ctx.node(placed(
+            NodeKind::Function,
+            "Page::Page",
+            file,
+            (3, 5),
+            (2, 3),
+        ));
+        assert_eq!(
+            wrapped_component(&value, &ctx).map(|node| node.id.clone()),
+            Some("function:src/Page.tsx:Page::Page:3".to_string())
+        );
+        // A lone inner function ending where the value does.
+        let ctx = Ctx::default().node(value.clone()).node(placed(
+            NodeKind::Function,
+            "Page::Render",
+            file,
+            (2, 6),
+            (8, 1),
+        ));
+        assert_eq!(
+            wrapped_component(&value, &ctx).map(|node| node.id.clone()),
+            Some("function:src/Page.tsx:Page::Render:2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_declaration_reads_its_own_declarator() {
+        let ctx = app_with_values();
+        let item = placed(NodeKind::Constant, "Item", "src/App.tsx", (6, 6), (6, 37));
+        assert_eq!(
+            declaration_text(&item, &ctx),
+            "Item = forwardRef(Inner) as any"
+        );
+        let panel = placed(NodeKind::Constant, "Panel", "src/App.tsx", (2, 4), (6, 2));
+        assert_eq!(
+            declaration_text(&panel, &ctx),
+            "Panel = observer(function PanelInner() {\n  return <div />;\n})"
+        );
+        // A file that no longer reads that way gives nothing.
+        let stale = placed(NodeKind::Constant, "Item", "src/App.tsx", (60, 61), (6, 37));
+        assert_eq!(declaration_text(&stale, &ctx), "");
+        let ctx = Ctx::default().file("src/App.tsx", "const \u{e9}t\u{e9} = 1;\n");
+        let split = placed(NodeKind::Constant, "x", "src/App.tsx", (1, 1), (7, 20));
+        assert_eq!(declaration_text(&split, &ctx), "");
     }
 
     #[test]
@@ -1220,101 +1979,33 @@ mod tests {
         assert!(ReactResolver.resolve(&reference, &ctx).is_none());
     }
 
-    // -- extract: component variants + JSX gate -----------------------------
+    // -- extract: routes only -------------------------------------------------
 
     #[test]
-    fn extract_arrow_component_with_jsx() {
-        let content = "export const Card = () => { return <div/>; };";
-        let result = ReactResolver
-            .extract("src/Card.jsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(
-            result
-                .nodes
-                .iter()
-                .any(|n| n.kind == NodeKind::Component && n.name == "Card")
-        );
+    fn extract_emits_no_component_or_hook_nodes() {
+        // The tree-sitter extractor owns components and hooks (upstream
+        // #841); a regex node here duplicated them.
+        let content = "export const Card = () => { return <div/>; };\n\
+                       export function Panel() { return <div/>; }\n\
+                       const Fancy = React.forwardRef(() => <div/>);\n\
+                       export function useCounter() { return 0; }\n";
+        for file in [
+            "src/Card.tsx",
+            "src/Card.jsx",
+            "src/useCounter.ts",
+            "src/useX.js",
+        ] {
+            let result = ReactResolver
+                .extract(file, content, &test_extraction_context())
+                .expect("extract");
+            assert!(result.nodes.is_empty(), "{file}: {:?}", result.nodes);
+        }
     }
 
     #[test]
-    fn extract_component_handles_utf8_at_lookahead_boundary() {
-        let mut content = String::from("function Card(");
-        content.push_str("<div/>");
-        content.push_str(&"a".repeat(493));
-        content.push('é');
-
-        let result = ReactResolver
-            .extract("src/Card.tsx", &content, &test_extraction_context())
-            .expect("extract");
-
-        assert!(
-            result
-                .nodes
-                .iter()
-                .any(|n| n.kind == NodeKind::Component && n.name == "Card")
-        );
-    }
-
-    #[test]
-    fn extract_component_without_jsx_is_skipped() {
-        // A PascalCase function that returns no JSX must NOT be a component node.
-        let content = "export function Helper() { return 42; }";
-        let result = ReactResolver
-            .extract("src/Helper.tsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
-    }
-
-    #[test]
-    fn extract_forward_ref_and_memo_components() {
-        let content =
-            "const Fancy = React.forwardRef(() => <div/>);\nconst Wrapped = memo(() => <span/>);";
-        let result = ReactResolver
-            .extract("src/W.tsx", content, &test_extraction_context())
-            .expect("extract");
-        let names: Vec<&str> = result
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Component)
-            .map(|n| n.name.as_str())
-            .collect();
-        assert!(names.contains(&"Fancy"), "got {names:?}");
-        assert!(names.contains(&"Wrapped"), "got {names:?}");
-    }
-
-    #[test]
-    fn extract_custom_hook_node() {
-        let content = "export function useCounter() { return 0; }";
-        let result = ReactResolver
-            .extract("src/useCounter.ts", content, &test_extraction_context())
-            .expect("extract");
-        let hook = result
-            .nodes
-            .iter()
-            .find(|n| n.name == "useCounter")
-            .expect("hook node");
-        assert_eq!(hook.kind, NodeKind::Function);
-        assert_eq!(hook.language, Language::TypeScript);
-        assert!(hook.is_exported);
-    }
-
-    #[test]
-    fn extract_hook_js_language_for_plain_js() {
-        let content = "const useX = () => 1;";
-        let result = ReactResolver
-            .extract("src/useX.js", content, &test_extraction_context())
-            .expect("extract");
-        let hook = result
-            .nodes
-            .iter()
-            .find(|n| n.name == "useX")
-            .expect("hook");
-        assert_eq!(hook.language, Language::JavaScript);
-    }
-
-    #[test]
-    fn extract_route_element_attribute_variant() {
-        // <Route ... element={<Home/>}/> uses the element attr branch.
+    fn extract_reads_react_router_routes() {
+        // The routes are React Router's scanner's (`super::react_router`);
+        // React's extraction hands them over, each with what it renders.
         let content = "<Route path=\"/x\" element={<Home/>}/>";
         let result = ReactResolver
             .extract("src/App.tsx", content, &test_extraction_context())
@@ -1325,157 +2016,116 @@ mod tests {
             .find(|n| n.kind == NodeKind::Route)
             .expect("route");
         assert_eq!(route.name, "/x");
+        assert_eq!(route.language, Language::Tsx);
         assert!(result.references.iter().any(|r| r.reference_name == "Home"));
+        // A route with no address of its own, and a data route rendering
+        // nothing, are no routes.
+        for (file, content) in [
+            ("src/App.tsx", "<Route element={<Home/>}/>"),
+            (
+                "src/routes.tsx",
+                "createBrowserRouter([{ path: '/only' }]);",
+            ),
+        ] {
+            let result = ReactResolver
+                .extract(file, content, &test_extraction_context())
+                .expect("extract");
+            assert!(result.nodes.is_empty(), "{content}: {:?}", result.nodes);
+        }
     }
 
+    /// W7-09e: the lines a module's surface gets for its own exports that
+    /// lead to an import, and the specifiers they forward.
     #[test]
-    fn extract_route_handles_utf8_at_lookahead_boundary() {
-        let mut content = String::from("<Route path=\"/utf8\" element={<Home/>} ");
-        content.push_str(&"a".repeat(399 - content.len()));
-        content.push('é');
-
-        let result = ReactResolver
-            .extract("src/App.tsx", &content, &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-
-        assert_eq!(route.name, "/utf8");
-        assert!(result.references.iter().any(|r| r.reference_name == "Home"));
-    }
-
-    #[test]
-    fn extract_route_without_path_is_skipped() {
-        let content = "<Route element={<Home/>}/>";
-        let result = ReactResolver
-            .extract("src/App.tsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
-    }
-
-    #[test]
-    fn extract_data_router_object_routes() {
-        let content =
-            "const r = createBrowserRouter([\n  { path: '/dash', element: <Dashboard/> },\n]);";
-        let result = ReactResolver
-            .extract("src/routes.tsx", content, &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-        assert_eq!(route.name, "/dash");
-        assert!(
-            result
-                .references
-                .iter()
-                .any(|r| r.reference_name == "Dashboard")
-        );
-    }
-
-    #[test]
-    fn extract_data_router_handles_utf8_at_lookahead_boundary() {
-        let mut content =
-            String::from("const routes = createBrowserRouter([{ path: '/utf8', element: <Home/> ");
-        let path_start = content.find("path:").expect("path attribute");
-        let utf8_start = path_start + 299;
-        content.push_str(&"a".repeat(utf8_start - content.len()));
-        content.push('é');
-
-        let result = ReactResolver
-            .extract("src/routes.tsx", &content, &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-
-        assert_eq!(route.name, "/utf8");
-        assert!(result.references.iter().any(|r| r.reference_name == "Home"));
-    }
-
-    #[test]
-    fn extract_data_router_empty_path_becomes_root() {
-        let content = "createBrowserRouter([{ path: '', Component: Index }]);";
-        let result = ReactResolver
-            .extract("src/routes.tsx", content, &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-        assert_eq!(route.name, "/");
-    }
-
-    #[test]
-    fn extract_data_router_path_without_component_skipped() {
-        let content = "createBrowserRouter([{ path: '/only' }]);";
-        let result = ReactResolver
-            .extract("src/routes.tsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
-    }
-
-    #[test]
-    fn extract_nextjs_app_page_route() {
-        let content = "export default function Page() { return <div/>; }";
-        let result = ReactResolver
-            .extract("app/blog/page.tsx", content, &test_extraction_context())
-            .expect("extract");
-        let route = result
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Route)
-            .expect("route");
-        assert_eq!(route.name, "/blog");
-    }
-
-    #[test]
-    fn extract_nextjs_without_export_default_no_route() {
-        let content = "export function NotDefault() { return <div/>; }";
-        let result = ReactResolver
-            .extract("pages/x.tsx", content, &test_extraction_context())
-            .expect("extract");
-        assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Route));
-    }
-
-    // -- file_path_to_route pure branches -----------------------------------
-
-    #[test]
-    fn file_path_to_route_pages_index_and_param() {
-        assert_eq!(file_path_to_route("pages/index.tsx").as_deref(), Some("/"));
+    fn an_export_that_leads_to_an_import_is_a_forward() {
         assert_eq!(
-            file_path_to_route("pages/users/[id].tsx").as_deref(),
-            Some("/users/:id")
+            export_forwards("import Sidebar from './App';\n\nexport default Sidebar;\n"),
+            (
+                vec!["forward\tdefault\tSidebar\t./App\tdefault\tbare".to_string()],
+                vec!["./App".to_string()]
+            )
         );
-    }
-
-    #[test]
-    fn file_path_to_route_app_page_and_missing_page() {
         assert_eq!(
-            file_path_to_route("app/settings/page.tsx").as_deref(),
-            Some("/settings")
+            export_forwards(
+                "import AvatarWithHoverCard from './AvatarWithHoverCard';\n\nconst Avatar = AvatarWithHoverCard;\n\nexport { Avatar };\n"
+            )
+            .0,
+            [
+                "forward\tAvatar\tAvatarWithHoverCard\t./AvatarWithHoverCard\tdefault\theld",
+                "holds\tAvatar\tAvatarWithHoverCard",
+            ]
         );
-        // app/ path but not a page.* file -> None.
-        assert_eq!(file_path_to_route("app/settings/layout.tsx"), None);
-    }
-
-    #[test]
-    fn file_path_to_route_underscore_and_config_and_nonpage() {
-        assert_eq!(file_path_to_route("pages/_app.tsx"), None);
-        assert_eq!(file_path_to_route("pages/next.config.js"), None);
-        // Neither pages/ nor app/ segment.
-        assert_eq!(file_path_to_route("src/routes/home.tsx"), None);
-    }
-
-    #[test]
-    fn file_path_to_route_app_index_becomes_root() {
-        assert_eq!(file_path_to_route("app/page.tsx").as_deref(), Some("/"));
+        assert_eq!(
+            export_forwards(
+                "import { Inner as Base } from './inner';\nexport const Button = Base;\n"
+            )
+            .0,
+            [
+                "forward\tButton\tBase\t./inner\tInner\theld",
+                "holds\tButton\tBase"
+            ]
+        );
+        assert_eq!(
+            export_forwards("import Page from './Page';\nexport default withAuth(Page);\n").0,
+            ["forward\tdefault\tPage\t./Page\tdefault\twrapped"]
+        );
+        // Every declarator of a statement, past any type annotation the
+        // resolver reads past.
+        for text in [
+            "import App from './App';\nconst unused = 1, Sidebar = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst unused = 1,\n  Sidebar = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst Sidebar: (props: object) => JSX.Element = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst Sidebar: { (props: object): JSX.Element; displayName?: string } = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst Sidebar = App as FC;\nexport default Sidebar;\n",
+        ] {
+            assert_eq!(
+                export_forwards(text),
+                (
+                    vec![
+                        "forward\tdefault\tApp\t./App\tdefault\theld".to_string(),
+                        "holds\tSidebar\tApp".to_string(),
+                    ],
+                    vec!["./App".to_string()]
+                ),
+                "{text:?}"
+            );
+        }
+        // A `const` inside a function counts too, so the module's own is
+        // never missed; and a name the file declares as well is marked.
+        assert_eq!(
+            export_forwards(
+                "import App from './App';\nimport Other from './Other';\nexport function pick() {\n  const Sidebar = Other;\n  return Sidebar;\n}\nconst Sidebar = App;\nexport default Sidebar;\n"
+            ),
+            (
+                vec![
+                    "forward\tdefault\tApp\t./App\tdefault\theld".to_string(),
+                    "forward\tdefault\tOther\t./Other\tdefault\theld".to_string(),
+                    "holds\tSidebar\tOther\tApp".to_string(),
+                ],
+                vec!["./Other".to_string(), "./App".to_string()]
+            )
+        );
+        assert_eq!(
+            export_forwards(
+                "import Sidebar from './App';\nfunction Sidebar() {}\nexport default Sidebar;\n"
+            )
+            .0,
+            ["forward\tdefault\tSidebar\t./App\tdefault\tbare\tdeclared"]
+        );
+        // An export that ends at a declaration of the file, at a namespace
+        // or at nothing has no line; so does a value whose annotation the
+        // resolver does not read past (`Record<string, …>` stops it at its
+        // comma).
+        for text in [
+            "function AppSidebar() {}\nexport default observer(AppSidebar);\n",
+            "function Blurhash() {}\nconst MemoizedBlurhash = memo(Blurhash);\nexport { MemoizedBlurhash as Blurhash };\n",
+            "import * as ui from './ui';\nexport default ui;\n",
+            "import { Page } from './Page';\nfunction Main() {}\nexport default Main;\n",
+            "export default makeConfig();\n",
+            "import App from './App';\nconst Sidebar: Record<string, unknown> = App;\nexport default Sidebar;\n",
+            "import App from './App';\nconst { Sidebar } = App;\nexport default Sidebar;\n",
+        ] {
+            assert_eq!(export_forwards(text), (vec![], vec![]), "{text:?}");
+        }
     }
 }

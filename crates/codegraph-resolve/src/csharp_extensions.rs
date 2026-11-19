@@ -80,12 +80,12 @@ pub(crate) fn extension_method_target(
         }
         _ => return None,
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: chosen,
-        confidence: 0.9,
-        resolved_by: ResolvedBy::InstanceMethod,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        chosen,
+        0.9,
+        ResolvedBy::InstanceMethod,
+    ))
 }
 
 /// What a qualified name is declared in: all but its last `::` segment.

@@ -7,6 +7,7 @@ pub mod migrations;
 pub mod queries;
 pub mod rebuild;
 pub mod schema;
+mod schema_probe;
 #[cfg(feature = "test-hooks")]
 pub mod test_support;
 pub mod uninit;
@@ -14,8 +15,8 @@ pub mod viewer;
 pub mod wsl_shared_index;
 
 pub use connection::{
-    ExtractionStampIssue, Store, StoreError, StoreStatusOpen, StoreWriteAuthorization,
-    StoreWriteOpen, StoreWritePurpose,
+    ExtractionStampIssue, SchemaVersionReadError, Store, StoreError, StoreStatusOpen,
+    StoreWriteAuthorization, StoreWriteOpen, StoreWritePurpose,
 };
 pub use file_identity::{PathIdentity, path_still_names_file};
 pub use index_lease::{IndexLease, IndexLeaseError, IndexLeaseValidationError};

@@ -5,6 +5,7 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
+use crate::frameworks::fabric::is_view_manager_node;
 use crate::member_types::TYPE_ARGS;
 use crate::object_literal::{LiteralLookup, object_literal_property, property_contains};
 use crate::source_facts::{SourceFacts, TsFieldDeclaration};
@@ -39,6 +40,38 @@ fn ambiguous_name_ceiling() -> usize {
     })
 }
 
+/// The nodes named `name` that name matching reads: every one but those a
+/// native view manager's class mints, which no strategy offers or counts
+/// ([`is_view_manager_node`], KEEP-RUST, W7-21). Every lookup the matcher
+/// makes by name goes through this, [`nodes_with_qualified_name`] or
+/// [`nodes_with_lower_name`]; each lookup by file reads only kinds or
+/// languages such a node never has.
+fn nodes_named<C: ResolutionContext + ?Sized>(context: &C, name: &str) -> Vec<Arc<Node>> {
+    without_view_manager_nodes(context.get_nodes_by_name_shared(name))
+}
+
+/// [`nodes_named`] by qualified name.
+fn nodes_with_qualified_name<C: ResolutionContext + ?Sized>(
+    context: &C,
+    qualified_name: &str,
+) -> Vec<Arc<Node>> {
+    without_view_manager_nodes(context.get_nodes_by_qualified_name_shared(qualified_name))
+}
+
+/// [`nodes_named`] by lowercase name.
+fn nodes_with_lower_name<C: ResolutionContext + ?Sized>(
+    context: &C,
+    lower_name: &str,
+) -> Vec<Arc<Node>> {
+    without_view_manager_nodes(context.get_nodes_by_lower_name_shared(lower_name))
+}
+
+/// `nodes` without the ones a view manager's class mints.
+fn without_view_manager_nodes(mut nodes: Vec<Arc<Node>>) -> Vec<Arc<Node>> {
+    nodes.retain(|node| !is_view_manager_node(node));
+    nodes
+}
+
 /// Try to resolve a path-like reference by matching the filename against file
 /// nodes (`matchByFilePath`, `name-matcher.ts:14-77`).
 pub fn match_by_file_path(
@@ -57,7 +90,7 @@ pub fn match_by_file_path(
         return None;
     }
 
-    let candidates = context.get_nodes_by_name_shared(file_name);
+    let candidates = nodes_named(context, file_name);
     let file_nodes: Vec<Arc<Node>> = candidates
         .into_iter()
         .filter(|n| n.kind == NodeKind::File)
@@ -70,12 +103,12 @@ pub fn match_by_file_path(
     if let Some(exact) = file_nodes.iter().find(|n| {
         n.qualified_name == reference.reference_name || n.file_path == reference.reference_name
     }) {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: exact.id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            exact.id.clone(),
+            0.95,
+            ResolvedBy::FilePath,
+        ));
     }
 
     // Suffix match, picking the closest file node (name-matcher.ts:54-64).
@@ -89,22 +122,22 @@ pub fn match_by_file_path(
         .collect();
     if !suffix_matches.is_empty() {
         let chosen = pick_closest_file_node(&suffix_matches, reference);
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: chosen.id.clone(),
-            confidence: 0.85,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            chosen.id.clone(),
+            0.85,
+            ResolvedBy::FilePath,
+        ));
     }
 
     // Single same-named file node, lower confidence (name-matcher.ts:67-74).
     if file_nodes.len() == 1 {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: file_nodes[0].id.clone(),
-            confidence: 0.7,
-            resolved_by: ResolvedBy::FilePath,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_nodes[0].id.clone(),
+            0.7,
+            ResolvedBy::FilePath,
+        ));
     }
 
     None
@@ -574,8 +607,7 @@ pub(crate) fn enclosing_by_qualified_name<C: ResolutionContext + ?Sized>(
     start: i64,
     end: i64,
 ) -> Option<(i64, i64)> {
-    context
-        .get_nodes_by_qualified_name_shared(qualified)
+    nodes_with_qualified_name(context, qualified)
         .into_iter()
         .find(|p| {
             p.file_path == file_path
@@ -1292,8 +1324,8 @@ fn is_ascii_word_char(ch: char) -> bool {
 /// v1.6.1). The extractor emits `this.m()` and `pkg.F().M()` under the bare
 /// member name, so the receiver is read back from the call site's own line:
 /// the text at the ref's column must start with the name, be followed by a
-/// call opener, and be preceded by nothing, an operator/opener, or one of
-/// [`BARE_CALL_KEYWORDS`].
+/// call opener (`(`, `<`, or an optional call's `?.(`), and be preceded by
+/// nothing, an operator/opener, or one of [`BARE_CALL_KEYWORDS`].
 ///
 /// Unlike upstream, the opener may sit on a following line: JavaScript's
 /// automatic semicolon insertion never splits `finish\n()`, so that is a real
@@ -1322,6 +1354,10 @@ fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -
     };
     let after =
         facts.source()[line_start + column + name.len()..].trim_start_matches(char::is_whitespace);
+    // An optional call's `?.(` opens a call too (upstream #2240).
+    let after = after
+        .strip_prefix("?.")
+        .map_or(after, |rest| rest.trim_start_matches(char::is_whitespace));
     if !after.starts_with('(') && !after.starts_with('<') {
         return false;
     }
@@ -1582,8 +1618,7 @@ fn is_undeclared_type_name(
     context: &dyn ResolutionContext,
 ) -> bool {
     type_name.starts_with(|c: char| c.is_ascii_uppercase())
-        && !context
-            .get_nodes_by_name_shared(type_name)
+        && !nodes_named(context, type_name)
             .iter()
             .any(|n| is_method_owner(n) && same_language_family(n.language, reference.language))
 }
@@ -1654,8 +1689,7 @@ fn inherited_class_method(
     // Only a declaration some method of the name names as its owner can hold
     // it: the others' files are not read (W5-08).
     let owners = context.name_matcher_tables().method_owners(name, || {
-        context
-            .get_nodes_by_name_shared(name)
+        nodes_named(context, name)
             .iter()
             .filter(|node| node.kind == NodeKind::Method)
             .map(|node| member_owner_name(&node.qualified_name).to_string())
@@ -1748,8 +1782,7 @@ impl SupertypeWalk {
             // The name's declarations of the class's language that own
             // methods, in the name lookup's order, read once per pass.
             let owners = tables.owners_named(class.language, supertype, || {
-                context
-                    .get_nodes_by_name_shared(supertype)
+                nodes_named(context, supertype)
                     .into_iter()
                     .filter(|decl| decl.language == class.language && is_method_owner(decl))
                     .collect()
@@ -2888,7 +2921,7 @@ pub fn match_by_exact_name(
     let named = context
         .name_matcher_tables()
         .named_candidates(&reference.reference_name, || {
-            context.get_nodes_by_name_shared(&reference.reference_name)
+            nodes_named(context, &reference.reference_name)
         });
     let same_name = named.iter().map(|(node, _)| node);
     // `NAME(...)` where NAME is a function-like macro somewhere in the project
@@ -2914,6 +2947,12 @@ pub fn match_by_exact_name(
         // (upstream #965, `0a91d0f5`). Linking an import to what it names is
         // the import resolver's job.
         .filter(|(n, _)| n.kind != NodeKind::Import)
+        // A route is named by the URL it serves, which no reference spells as
+        // a name: a Django URL may read like one (`path('path', …)`,
+        // `path('not_found', not_found)`), and a call, an import or the
+        // route's own handler named alike means something else (KEEP-RUST,
+        // W7-19b).
+        .filter(|(n, _)| n.kind != NodeKind::Route)
         .filter(|(n, _)| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
         // Nested locals are only reachable from inside their container (#1230).
         .filter(|(n, reach)| is_reachable_within(n, reference, context, reach))
@@ -3250,12 +3289,12 @@ pub fn match_by_exact_name(
     // reference actually was, and only the CANDIDATES are narrowed.
     if reachable.len() == 1 {
         let is_cross_language = candidates[0].language != reference.language;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
-            confidence: if is_cross_language { 0.5 } else { 0.9 },
-            resolved_by: ResolvedBy::ExactMatch,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            candidates[0].id.clone(),
+            if is_cross_language { 0.5 } else { 0.9 },
+            ResolvedBy::ExactMatch,
+        ));
     }
 
     // Multiple matches — narrow down (name-matcher.ts:194-206). Decline past the
@@ -3266,12 +3305,12 @@ pub fn match_by_exact_name(
     if let Some(best) = find_best_match(reference, &candidates) {
         let proximity = compute_path_proximity(&reference.file_path, &best.file_path);
         let confidence = if proximity >= 30.0 { 0.7 } else { 0.4 };
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: best.id.clone(),
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            best.id.clone(),
             confidence,
-            resolved_by: ResolvedBy::ExactMatch,
-        });
+            ResolvedBy::ExactMatch,
+        ));
     }
 
     None
@@ -3296,7 +3335,8 @@ pub fn match_by_qualified_name(
         return crate::cpp_namespaces::match_cpp_global_name(reference, context);
     }
 
-    let mut candidates = context.get_nodes_by_qualified_name_shared(&reference.reference_name);
+    let mut candidates = nodes_with_qualified_name(context, &reference.reference_name);
+    candidates.retain(|node| !is_config_key_for_call(reference, node));
     // A C# `using X.Y;` names a namespace: one the project declares, else it
     // is the file's own (external) using, never another file's using of that
     // name (upstream #2220).
@@ -3319,12 +3359,12 @@ pub fn match_by_qualified_name(
         };
     }
     if candidates.len() == 1 {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::QualifiedName,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            candidates[0].id.clone(),
+            0.95,
+            ResolvedBy::QualifiedName,
+        ));
     }
 
     // Several symbols share this exact qualified name (an ODR clash / separate
@@ -3333,12 +3373,12 @@ pub fn match_by_qualified_name(
     if candidates.len() > 1 {
         let ordered = prefer_call_site_file(candidates, &reference.file_path);
         if ordered[0].file_path == reference.file_path {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: ordered[0].id.clone(),
-                confidence: 0.95,
-                resolved_by: ResolvedBy::QualifiedName,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                ordered[0].id.clone(),
+                0.95,
+                ResolvedBy::QualifiedName,
+            ));
         }
     }
 
@@ -3352,8 +3392,7 @@ pub fn match_by_qualified_name(
         }
         let base = reference.reference_name.rsplit("::").next()?;
         let prefix = format!("{}/", reference.reference_name);
-        let arity_candidates: Vec<Arc<Node>> = context
-            .get_nodes_by_name_shared(base)
+        let arity_candidates: Vec<Arc<Node>> = nodes_named(context, base)
             .into_iter()
             .filter(|candidate| {
                 candidate.language == Language::Erlang
@@ -3365,12 +3404,12 @@ pub fn match_by_qualified_name(
             })
             .collect();
         if arity_candidates.len() == 1 {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: arity_candidates[0].id.clone(),
-                confidence: 0.85,
-                resolved_by: ResolvedBy::QualifiedName,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                arity_candidates[0].id.clone(),
+                0.85,
+                ResolvedBy::QualifiedName,
+            ));
         }
         return None;
     }
@@ -3380,23 +3419,35 @@ pub fn match_by_qualified_name(
     // with the reference (#1079).
     let parts: Vec<&str> = reference.reference_name.split([':', '.']).collect();
     if let Some(last_name) = parts.last().filter(|s| !s.is_empty()) {
-        let partial: Vec<Arc<Node>> = context
-            .get_nodes_by_name_shared(last_name)
+        let partial: Vec<Arc<Node>> = nodes_named(context, last_name)
             .into_iter()
-            .filter(|c| c.qualified_name.ends_with(&reference.reference_name))
+            .filter(|c| {
+                !is_config_key_for_call(reference, c)
+                    && c.qualified_name.ends_with(&reference.reference_name)
+            })
             .collect();
         if !partial.is_empty() {
             let ordered = prefer_call_site_file(partial, &reference.file_path);
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: ordered[0].id.clone(),
-                confidence: 0.85,
-                resolved_by: ResolvedBy::QualifiedName,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                ordered[0].id.clone(),
+                0.85,
+                ResolvedBy::QualifiedName,
+            ));
         }
     }
 
     None
+}
+
+/// A config key is no callee (upstream `keepForRef`, #1180): a `calls`
+/// reference's qualified candidates leave out the YAML and Properties
+/// constants of a Spring config file, whose qualified name is the dotted key,
+/// so `service.process()` falls through to the method of that name.
+fn is_config_key_for_call(reference: &RefView, node: &Node) -> bool {
+    reference.reference_kind == EdgeKind::Calls
+        && node.kind == NodeKind::Constant
+        && matches!(node.language, Language::Yaml | Language::Properties)
 }
 
 /// Prefer the candidate(s) declared in the call site's own file, keeping the
@@ -3555,12 +3606,12 @@ pub(crate) fn resolve_object_literal_member(
         return None;
     }
 
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: first.id.clone(),
+    Some(ResolvedRef::new(
+        reference.clone(),
+        first.id.clone(),
         confidence,
         resolved_by,
-    })
+    ))
 }
 
 /// Resolve a method on a type, walking supertypes (`resolveMethodOnType`,
@@ -3576,7 +3627,7 @@ pub(crate) fn resolve_method_on_type(
     preferred_fqn: Option<&str>,
     depth: u32,
 ) -> Option<ResolvedRef> {
-    let method_candidates = context.get_nodes_by_name_shared(method_name);
+    let method_candidates = nodes_named(context, method_name);
     let want = format!("{type_name}::{method_name}");
     let matches: Vec<Arc<Node>> = method_candidates
         .into_iter()
@@ -3642,12 +3693,12 @@ pub(crate) fn resolve_method_on_type(
                 context,
             )
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: member.id.clone(),
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                member.id.clone(),
                 confidence,
                 resolved_by,
-            });
+            ));
         }
         return None;
     }
@@ -3664,12 +3715,12 @@ pub(crate) fn resolve_method_on_type(
                 let fp = m.file_path.replace('\\', "/");
                 fp.ends_with(&fqn_path) || fp.ends_with(&format!("/{fqn_path}"))
             }) {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: chosen.id.clone(),
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    chosen.id.clone(),
                     confidence,
                     resolved_by,
-                });
+                ));
             }
         }
     }
@@ -3679,12 +3730,12 @@ pub(crate) fn resolve_method_on_type(
     // Runs AFTER the preferred_fqn block, so Java/Kotlin import disambiguation
     // (#314), whose target is intentionally in another file, is unaffected.
     let ordered = prefer_call_site_file(matches, &reference.file_path);
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: ordered[0].id.clone(),
+    Some(ResolvedRef::new(
+        reference.clone(),
+        ordered[0].id.clone(),
         confidence,
         resolved_by,
-    })
+    ))
 }
 
 /// Last `::`-separated segment of a C++ name (`cppLastSegment`,
@@ -3700,7 +3751,7 @@ fn cpp_last_segment(name: &str) -> &str {
 /// (`cppClassExists`, `name-matcher.ts:621-626`).
 fn cpp_class_exists(name: &str, reference: &RefView, context: &dyn ResolutionContext) -> bool {
     let last = cpp_last_segment(name);
-    context.get_nodes_by_name_shared(last).iter().any(|n| {
+    nodes_named(context, last).iter().any(|n| {
         matches!(n.kind, NodeKind::Class | NodeKind::Struct | NodeKind::Union)
             && n.language == reference.language
     })
@@ -4144,8 +4195,7 @@ fn is_cpp_dot_call(receiver: &str, reference: &RefView, context: &dyn Resolution
 /// The C and C++ types the project declares under `name` (upstream #2413
 /// `cppTypesNamed`).
 fn cpp_types_named(name: &str, context: &dyn ResolutionContext) -> Vec<Arc<Node>> {
-    context
-        .get_nodes_by_name_shared(name)
+    nodes_named(context, name)
         .into_iter()
         .filter(|node| {
             matches!(node.language, Language::C | Language::Cpp)
@@ -5269,8 +5319,7 @@ fn match_ts_this_field_call(
     let caller = crate::object_owners::this_scope_caller(written, context);
     let (owner_qualified, _) = caller.qualified_name.rsplit_once("::")?;
     let owner_name = owner_qualified.rsplit("::").next()?;
-    let owners = context
-        .get_nodes_by_name_shared(owner_name)
+    let owners = nodes_named(context, owner_name)
         .into_iter()
         .filter(|node| {
             node.file_path == reference.file_path
@@ -5290,10 +5339,7 @@ fn match_ts_this_field_call(
 
     if declaration.value_type {
         let value_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
-        let holders = prefer_call_site_file(
-            context.get_nodes_by_name_shared(value_name),
-            &reference.file_path,
-        );
+        let holders = prefer_call_site_file(nodes_named(context, value_name), &reference.file_path);
         for holder in holders.into_iter().filter(|node| {
             matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
                 && same_language_family(node.language, reference.language)
@@ -5836,8 +5882,7 @@ pub fn match_method_call(
     // same-named global guess.
     if matches!(reference.language, Language::Lua | Language::Luau) {
         let want = format!("{object_or_class}::{method_name}");
-        let exact = context
-            .get_nodes_by_name_shared(&method_name)
+        let exact = nodes_named(context, &method_name)
             .into_iter()
             .filter(|candidate| {
                 candidate.language == reference.language
@@ -5857,11 +5902,13 @@ pub fn match_method_call(
             } else {
                 None
             };
-            return target.map(|target| ResolvedRef {
-                original: reference.clone(),
-                target_node_id: target.id.clone(),
-                confidence: 0.95,
-                resolved_by: ResolvedBy::InstanceMethod,
+            return target.map(|target| {
+                ResolvedRef::new(
+                    reference.clone(),
+                    target.id.clone(),
+                    0.95,
+                    ResolvedBy::InstanceMethod,
+                )
             });
         }
     }
@@ -5999,8 +6046,7 @@ pub fn match_method_call(
         // A type parameter is its bound; with none, only `Object`'s methods.
         if let Some(type_name) = inferred.clone()
             && crate::member_types::is_member_typed_language(reference.language)
-            && !context
-                .get_nodes_by_name_shared(&type_name)
+            && !nodes_named(context, &type_name)
                 .iter()
                 .any(|n| crate::kotlin_scope::is_method_owner_kind(n))
         {
@@ -6042,12 +6088,12 @@ pub fn match_method_call(
                     reference,
                     context,
                 ) {
-                    crate::cfml_scope::TypedReceiverCall::Method(method) => Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: method.id.clone(),
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::InstanceMethod,
-                    }),
+                    crate::cfml_scope::TypedReceiverCall::Method(method) => Some(ResolvedRef::new(
+                        reference.clone(),
+                        method.id.clone(),
+                        0.9,
+                        ResolvedBy::InstanceMethod,
+                    )),
                     // The receiver is one of the namesakes and nothing says
                     // which: a method picked by name below is a guess.
                     crate::cfml_scope::TypedReceiverCall::Ambiguous => return None,
@@ -6236,10 +6282,8 @@ pub fn match_method_call(
     // first (#1079), and a C# class the call's namespaces can see before one
     // they can't: serilog's `Some.InformationEvent()` in Serilog.Tests is its
     // own Support namespace's `Some` (upstream #2220).
-    let mut class_candidates = prefer_call_site_file(
-        context.get_nodes_by_name_shared(&object_or_class),
-        &reference.file_path,
-    );
+    let mut class_candidates =
+        prefer_call_site_file(nodes_named(context, &object_or_class), &reference.file_path);
     if reference.language == Language::CSharp && class_candidates.len() > 1 {
         let type_ref = RefView {
             reference_name: object_or_class.clone(),
@@ -6265,12 +6309,12 @@ pub fn match_method_call(
             if let Some(method_node) =
                 find_method_in_class(&class_node, &method_name, context, &|_| true)
             {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: method_node.id,
-                    confidence: 0.85,
-                    resolved_by: ResolvedBy::QualifiedName,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    method_node.id,
+                    0.85,
+                    ResolvedBy::QualifiedName,
+                ));
             }
         }
     }
@@ -6285,8 +6329,7 @@ pub fn match_method_call(
             // of the name in the project, nothing (W5-08).
             if tables
                 .method_owners(&method_name, || {
-                    context
-                        .get_nodes_by_name_shared(&method_name)
+                    nodes_named(context, &method_name)
                         .iter()
                         .filter(|node| node.kind == NodeKind::Method)
                         .map(|node| member_owner_name(&node.qualified_name).to_string())
@@ -6297,8 +6340,7 @@ pub fn match_method_call(
                 return None;
             }
             let walk = tables.supertype_walk(reference.language, &object_or_class, || {
-                context
-                    .get_nodes_by_name_shared(&object_or_class)
+                nodes_named(context, &object_or_class)
                     .into_iter()
                     .filter(|class_node| {
                         class_node.language == reference.language
@@ -6315,12 +6357,12 @@ pub fn match_method_call(
             inherited_class_method(&walk, &method_name, context)
         });
     if let Some(inherited) = inherited {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: inherited.id.clone(),
-            confidence: 0.8,
-            resolved_by: ResolvedBy::QualifiedName,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            inherited.id.clone(),
+            0.8,
+            ResolvedBy::QualifiedName,
+        ));
     }
 
     // Built-in method names need a validated receiver (#1987). Typed, imported,
@@ -6377,22 +6419,19 @@ pub fn match_method_call(
         Language::CSharp | Language::Java | Language::Rust
     );
     if names_external_type(&object_or_class, reference.language)
-        && !context
-            .get_nodes_by_name_shared(&object_or_class)
-            .iter()
-            .any(|n| {
-                same_language_family(n.language, reference.language)
-                    && (!types_only
-                        || crate::kotlin_scope::is_method_owner_kind(n)
-                        || matches!(
-                            n.kind,
-                            NodeKind::Enum
-                                | NodeKind::Namespace
-                                | NodeKind::Module
-                                | NodeKind::Trait
-                                | NodeKind::TypeAlias
-                        ))
-            })
+        && !nodes_named(context, &object_or_class).iter().any(|n| {
+            same_language_family(n.language, reference.language)
+                && (!types_only
+                    || crate::kotlin_scope::is_method_owner_kind(n)
+                    || matches!(
+                        n.kind,
+                        NodeKind::Enum
+                            | NodeKind::Namespace
+                            | NodeKind::Module
+                            | NodeKind::Trait
+                            | NodeKind::TypeAlias
+                    ))
+        })
     {
         return None;
     }
@@ -6433,10 +6472,9 @@ pub fn match_method_call(
     // (name-matcher.ts:852-880), call-site file first (#1079).
     let capitalized = capitalize(&object_or_class);
     if capitalized != object_or_class {
-        for class_node in prefer_call_site_file(
-            context.get_nodes_by_name_shared(&capitalized),
-            &reference.file_path,
-        ) {
+        for class_node in
+            prefer_call_site_file(nodes_named(context, &capitalized), &reference.file_path)
+        {
             if matches!(
                 class_node.kind,
                 NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
@@ -6450,12 +6488,12 @@ pub fn match_method_call(
                         callable_on_a_value(method, reference, context)
                     })
                 {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: method_node.id,
-                        confidence: 0.8,
-                        resolved_by: ResolvedBy::InstanceMethod,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        method_node.id,
+                        0.8,
+                        ResolvedBy::InstanceMethod,
+                    ));
                 }
             }
         }
@@ -6463,7 +6501,7 @@ pub fn match_method_call(
 
     // Strategy 3: methods-by-name, receiver-overlap scoring
     // (name-matcher.ts:882-933).
-    let method_candidates = context.get_nodes_by_name_shared(&method_name);
+    let method_candidates = nodes_named(context, &method_name);
     // Ubiquitous-method ceiling (#999): bail before the O(K) scoring work when a
     // method name is re-declared across a vendored theme/SDK.
     if method_candidates.len() > ambiguous_name_ceiling() {
@@ -6593,12 +6631,12 @@ pub fn match_method_call(
             && !crate::ruby_scope::is_self_receiver(&object_or_class)
             && !names_owner(&target_methods[0]))
     {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target_methods[0].id.clone(),
-            confidence: 0.7,
-            resolved_by: ResolvedBy::InstanceMethod,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target_methods[0].id.clone(),
+            0.7,
+            ResolvedBy::InstanceMethod,
+        ));
     }
 
     if target_methods.len() > 1 {
@@ -6654,12 +6692,12 @@ pub fn match_method_call(
         // (upstream #2221).
         if let Some(best) = best_match {
             if best_score >= 2 && best.id != reference.from_node_id {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: best.id.clone(),
-                    confidence: 0.65,
-                    resolved_by: ResolvedBy::InstanceMethod,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    best.id.clone(),
+                    0.65,
+                    ResolvedBy::InstanceMethod,
+                ));
             }
         }
     }
@@ -6781,8 +6819,7 @@ fn match_rust_self_call(
         return None;
     }
     let wanted = format!("{owner}::{method_name}");
-    let mut owned: Vec<Arc<Node>> = context
-        .get_nodes_by_name_shared(method_name)
+    let mut owned: Vec<Arc<Node>> = nodes_named(context, method_name)
         .into_iter()
         .filter(|candidate| {
             candidate.language == Language::Rust
@@ -6795,8 +6832,7 @@ fn match_rust_self_call(
     // than one owner declaration, require exactly one in the caller's file and
     // a method in that file (upstream #1882). A unique owner still permits
     // impl blocks split across files.
-    let owners = context
-        .get_nodes_by_qualified_name_shared(owner)
+    let owners = nodes_with_qualified_name(context, owner)
         .into_iter()
         .filter(|node| {
             node.language == Language::Rust
@@ -6824,12 +6860,12 @@ fn match_rust_self_call(
     let [target] = owned.as_slice() else {
         return None;
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.9,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Resolve `self.field.method()` through the field type declared on the
@@ -6850,8 +6886,7 @@ fn match_rust_self_field_call(
         return None;
     }
 
-    let owners = context
-        .get_nodes_by_name_shared(owner_name)
+    let owners = nodes_named(context, owner_name)
         .into_iter()
         .filter(|node| {
             node.language == Language::Rust
@@ -6892,8 +6927,7 @@ fn match_rust_self_field_call(
 
         // A same-named type in multiple project locations is not enough
         // evidence to choose one. External types have zero candidates.
-        let type_candidates = context
-            .get_nodes_by_name_shared(&field_type)
+        let type_candidates = nodes_named(context, &field_type)
             .into_iter()
             .filter(|node| {
                 node.language == Language::Rust
@@ -7159,8 +7193,7 @@ pub(crate) fn method_files_of<C: ResolutionContext + ?Sized>(
     context: &C,
 ) -> Arc<HashSet<String>> {
     context.name_matcher_tables().method_files(name, || {
-        context
-            .get_nodes_by_name_shared(name)
+        nodes_named(context, name)
             .iter()
             .filter(|node| node.kind == NodeKind::Method)
             .map(|node| node.file_path.clone())
@@ -7364,7 +7397,7 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         return None;
     }
     let lower_name = reference.reference_name.to_lowercase();
-    let candidates = context.get_nodes_by_lower_name_shared(&lower_name);
+    let candidates = nodes_with_lower_name(context, &lower_name);
     if candidates.len() > ambiguous_name_ceiling() {
         return None;
     }
@@ -7596,12 +7629,12 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         return None;
     }
     let is_cross_language = candidate.language != reference.language;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: candidate.id.clone(),
-        confidence: if is_cross_language { 0.3 } else { 0.5 },
-        resolved_by: ResolvedBy::Fuzzy,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        candidate.id.clone(),
+        if is_cross_language { 0.3 } else { 0.5 },
+        ResolvedBy::Fuzzy,
+    ))
 }
 
 /// Resolve a `::`-scoped factory chain (`matchScopedCallChain`,
@@ -7763,8 +7796,7 @@ fn lookup_callee_return_type(
         method = parts.last().copied().unwrap_or(callee).to_string();
         cls = Some(parts[..parts.len() - 1].join("::"));
     }
-    let candidates: Vec<Arc<Node>> = context
-        .get_nodes_by_name_shared(&method)
+    let candidates: Vec<Arc<Node>> = nodes_named(context, &method)
         .into_iter()
         .filter(|n| {
             matches!(n.kind, NodeKind::Method | NodeKind::Function)
@@ -8028,8 +8060,7 @@ fn other_supertype_named(
             .map(|c| c[1].trim_end_matches('.').to_string())
     })
     .unwrap_or_default();
-    let candidates: Vec<Arc<Node>> = context
-        .get_nodes_by_name_shared(name)
+    let candidates: Vec<Arc<Node>> = nodes_named(context, name)
         .into_iter()
         .filter(|node| {
             node.id != reference.from_node_id
@@ -8063,12 +8094,12 @@ fn other_supertype_named(
     let [candidate] = pool.as_slice() else {
         return None;
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: candidate.id.clone(),
-        confidence: 0.8,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        candidate.id.clone(),
+        0.8,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Reference kinds a bare JS/TS local can be: a call, a value (function refs
@@ -8549,8 +8580,7 @@ pub fn match_reference(
         && let Some((name, arity)) = split_erlang_arity(&reference.reference_name)
     {
         let arity_tail = format!("/{arity}");
-        let candidates: Vec<Arc<Node>> = context
-            .get_nodes_by_name_shared(name)
+        let candidates: Vec<Arc<Node>> = nodes_named(context, name)
             .into_iter()
             .filter(|candidate| {
                 candidate.language == Language::Erlang
@@ -8562,12 +8592,12 @@ pub fn match_reference(
             .iter()
             .find(|candidate| candidate.file_path == reference.file_path)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: same_file.id.clone(),
-                confidence: 0.95,
-                resolved_by: ResolvedBy::ExactMatch,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                same_file.id.clone(),
+                0.95,
+                ResolvedBy::ExactMatch,
+            ));
         }
         // Another module's function is called bare only through `-import(Mod,
         // [f/N])`, or from a `.hrl` a module includes (upstream #2178):
@@ -8582,11 +8612,13 @@ pub fn match_reference(
             return candidates
                 .iter()
                 .find(|candidate| candidate.qualified_name.starts_with(&prefix))
-                .map(|chosen| ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: chosen.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::ExactMatch,
+                .map(|chosen| {
+                    ResolvedRef::new(
+                        reference.clone(),
+                        chosen.id.clone(),
+                        0.9,
+                        ResolvedBy::ExactMatch,
+                    )
                 });
         }
         let candidates: Vec<Arc<Node>> =
@@ -8601,21 +8633,21 @@ pub fn match_reference(
                     .collect()
             };
         if candidates.len() == 1 {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: candidates[0].id.clone(),
-                confidence: 0.8,
-                resolved_by: ResolvedBy::ExactMatch,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                candidates[0].id.clone(),
+                0.8,
+                ResolvedBy::ExactMatch,
+            ));
         }
         if let Some(best) = find_best_match(reference, &candidates) {
             let proximity = compute_path_proximity(&reference.file_path, &best.file_path);
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: best.id.clone(),
-                confidence: if proximity >= 30.0 { 0.7 } else { 0.4 },
-                resolved_by: ResolvedBy::ExactMatch,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                best.id.clone(),
+                if proximity >= 30.0 { 0.7 } else { 0.4 },
+                ResolvedBy::ExactMatch,
+            ));
         }
         return None;
     }
@@ -8762,8 +8794,7 @@ pub fn match_function_ref(
     // that scope, unique-or-drop. Exempt from bare_fn_only.
     if let Some(sep) = reference.reference_name.rfind("::") {
         let member_name = &reference.reference_name[sep + 2..];
-        let scoped: Vec<Arc<Node>> = context
-            .get_nodes_by_name_shared(member_name)
+        let scoped: Vec<Arc<Node>> = nodes_named(context, member_name)
             .into_iter()
             .filter(|n| {
                 matches!(n.kind, NodeKind::Function | NodeKind::Method)
@@ -8794,16 +8825,15 @@ pub fn match_function_ref(
             .iter()
             .copied()
             .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::FunctionRef,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.9,
+            ResolvedBy::FunctionRef,
+        ));
     }
 
-    let named: Vec<Arc<Node>> = context
-        .get_nodes_by_name_shared(&reference.reference_name)
+    let named: Vec<Arc<Node>> = nodes_named(context, &reference.reference_name)
         .into_iter()
         .filter(|n| {
             (n.kind == NodeKind::Function
@@ -8916,12 +8946,12 @@ pub fn match_function_ref(
             .iter()
             .copied()
             .reduce(|a, b| if a.start_line <= b.start_line { a } else { b })?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: if same_file.len() == 1 { 0.95 } else { 0.9 },
-            resolved_by: ResolvedBy::FunctionRef,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            if same_file.len() == 1 { 0.95 } else { 0.9 },
+            ResolvedBy::FunctionRef,
+        ));
     }
 
     // Cross-file: only an unambiguous match resolves, or, in Python, the one
@@ -8936,12 +8966,12 @@ pub fn match_function_ref(
                     context,
                 )))
     {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: candidates[0].id.clone(),
-            confidence: 0.8,
-            resolved_by: ResolvedBy::FunctionRef,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            candidates[0].id.clone(),
+            0.8,
+            ResolvedBy::FunctionRef,
+        ));
     }
     None
 }
@@ -9191,12 +9221,12 @@ mod self_veto_tests {
             is_function_ref: false,
             reference_subkind: None,
         };
-        let result = ResolvedRef {
-            original: reference.clone(),
-            target_node_id: node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::ExactMatch,
-        };
+        let result = ResolvedRef::new(
+            reference.clone(),
+            node.id.clone(),
+            0.9,
+            ResolvedBy::ExactMatch,
+        );
         (reference, Some(result))
     }
 
@@ -9630,12 +9660,12 @@ mod tests {
         let rust_call = refv("map", EdgeKind::Calls, "src/lib.rs", Language::Rust, 1);
         let ctx = Ctx::default().node_by_id(ts_method.clone());
         let chosen = || {
-            Some(ResolvedRef {
-                original: rust_call.clone(),
-                target_node_id: ts_method.id.clone(),
-                confidence: 0.5,
-                resolved_by: ResolvedBy::ExactMatch,
-            })
+            Some(ResolvedRef::new(
+                rust_call.clone(),
+                ts_method.id.clone(),
+                0.5,
+                ResolvedBy::ExactMatch,
+            ))
         };
         assert!(
             gate_language_match(chosen(), &rust_call, &ctx).is_none(),
@@ -9659,12 +9689,12 @@ mod tests {
         let cgo = Ctx::default()
             .node_by_id(exported.clone())
             .file("go/lib.go", "package main\nimport \"C\"\n//export add\nfunc add(a, b C.int) C.int { return a + b }\n");
-        let via_cgo = Some(ResolvedRef {
-            original: c_call.clone(),
-            target_node_id: exported.id.clone(),
-            confidence: 0.5,
-            resolved_by: ResolvedBy::ExactMatch,
-        });
+        let via_cgo = Some(ResolvedRef::new(
+            c_call.clone(),
+            exported.id.clone(),
+            0.5,
+            ResolvedBy::ExactMatch,
+        ));
         assert!(
             gate_language_match(via_cgo, &c_call, &cgo).is_some(),
             "a cgo //export is a C ABI bridge"
@@ -10066,6 +10096,68 @@ mod tests {
         let r = refv("Foo::get", EdgeKind::Calls, "src/b.rs", Language::Rust, 1);
         let res = match_by_qualified_name(&r, &ctx).expect("partial qualified");
         assert!((res.confidence - 0.85).abs() < 1e-9);
+    }
+
+    /// Upstream `keepForRef` (#1180): a `calls` reference's exact and partial
+    /// qualified candidates leave out config-key constants; a `references`
+    /// one (an `@Value` binding's) keeps them.
+    #[test]
+    fn a_call_never_resolves_to_a_config_key() {
+        let key = |language: Language| {
+            mk(
+                "constant:key",
+                NodeKind::Constant,
+                "process",
+                "service.process",
+                "src/main/resources/application.yml",
+                language,
+            )
+        };
+        let method = mk(
+            "method:process",
+            NodeKind::Method,
+            "process",
+            "app.service.process",
+            "src/S.java",
+            Language::Java,
+        );
+        for language in [Language::Yaml, Language::Properties] {
+            let ctx = Ctx::default()
+                .qualified("service.process", vec![key(language)])
+                .name("process", vec![key(language), method.clone()]);
+            let call = refv(
+                "service.process",
+                EdgeKind::Calls,
+                "src/A.java",
+                Language::Java,
+                1,
+            );
+            let res = match_by_qualified_name(&call, &ctx).expect("the method by its tail");
+            assert_eq!(res.target_node_id, "method:process");
+            assert!((res.confidence - 0.85).abs() < 1e-9);
+            let binding = refv(
+                "service.process",
+                EdgeKind::References,
+                "src/A.java",
+                Language::Java,
+                1,
+            );
+            let res = match_by_qualified_name(&binding, &ctx).expect("the key");
+            assert_eq!(res.target_node_id, "constant:key");
+        }
+        // Another language's constant stays a candidate.
+        let ctx = Ctx::default().qualified("service.process", vec![key(Language::Java)]);
+        let call = refv(
+            "service.process",
+            EdgeKind::Calls,
+            "src/A.java",
+            Language::Java,
+            1,
+        );
+        assert_eq!(
+            match_by_qualified_name(&call, &ctx).map(|res| res.target_node_id),
+            Some("constant:key".to_string())
+        );
     }
 
     #[test]
@@ -16113,11 +16205,13 @@ mod tests {
             "src/util.rs",
             Language::Rust,
         );
-        let chosen = |reference: &RefView| ResolvedRef {
-            original: reference.clone(),
-            target_node_id: "function:helper".to_string(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::QualifiedName,
+        let chosen = |reference: &RefView| {
+            ResolvedRef::new(
+                reference.clone(),
+                "function:helper".to_string(),
+                0.9,
+                ResolvedBy::QualifiedName,
+            )
         };
         let gate = |source: &str, reference: &RefView| {
             let ctx = Ctx::default()
@@ -16909,5 +17003,339 @@ mod tests {
         let ctx = Ctx::default().lower("vue", vec![statement]);
         let reference = refv("vue", EdgeKind::Calls, "src/App.vue", Language::Vue, 6);
         assert_eq!(match_fuzzy(&reference, &ctx), None);
+    }
+
+    // ================= routes are never name-match targets ===================
+
+    /// A route is named by the URL it serves (KEEP-RUST, W7-19b): a Django
+    /// `path('path', …)` route named `path` answers no call of `path()`, no
+    /// import of it and no reference to it.
+    #[test]
+    fn exact_match_never_offers_a_route() {
+        let route = mk(
+            "route:urls-path",
+            NodeKind::Route,
+            "path",
+            "path",
+            "app/urls.py",
+            Language::Python,
+        );
+        let ctx = Ctx::default().name("path", vec![route]);
+        for kind in [EdgeKind::Calls, EdgeKind::Imports, EdgeKind::References] {
+            let reference = refv("path", kind, "app/views.py", Language::Python, 3);
+            assert_eq!(match_by_exact_name(&reference, &ctx), None, "{kind:?}");
+        }
+    }
+
+    /// A route named like its handler (`path('not_found', views.not_found)`)
+    /// is not the handler its own reference names, and does not make the
+    /// handler look ambiguous: the function in another file takes the
+    /// single-match confidence, where proximity would have picked the route.
+    #[test]
+    fn a_route_never_answers_or_shadows_its_own_handler() {
+        let route = mk(
+            "route:urls-not-found",
+            NodeKind::Route,
+            "not_found",
+            "not_found",
+            "app/urls.py",
+            Language::Python,
+        );
+        let handler = mk(
+            "function:not-found",
+            NodeKind::Function,
+            "not_found",
+            "not_found",
+            "app/views.py",
+            Language::Python,
+        );
+        let ctx = Ctx::default().name("not_found", vec![route, handler]);
+        let mut reference = refv(
+            "not_found",
+            EdgeKind::References,
+            "app/urls.py",
+            Language::Python,
+            1,
+        );
+        reference.from_node_id = "route:urls-not-found".to_string();
+        let resolved = match_by_exact_name(&reference, &ctx).expect("the handler resolves");
+        assert_eq!(resolved.target_node_id, "function:not-found");
+        assert_eq!(resolved.confidence, 0.9);
+    }
+
+    // ======= a native view manager's nodes are no name-match targets ========
+
+    /// The component and prop nodes a view manager's class mints, in the
+    /// manager's language (KEEP-RUST, W7-21): an Objective-C Paper manager's,
+    /// a Java or Kotlin Android one's.
+    fn view_manager_nodes(language: Language) -> (String, Node, Node) {
+        let file = match language {
+            Language::ObjC => "ios/BadgeManager.m",
+            Language::Java => "android/BadgeViewManager.java",
+            Language::Kotlin => "android/BadgeViewManager.kt",
+            other => panic!("no view manager is written in {other:?}"),
+        };
+        let mut component = mk(
+            &format!("fabric-component:{file}:Badge:3"),
+            NodeKind::Component,
+            "Badge",
+            &format!("{file}::Badge"),
+            file,
+            language,
+        );
+        component.is_exported = true;
+        let mut prop = mk(
+            &format!("fabric-prop:{file}:color:5"),
+            NodeKind::Property,
+            "color",
+            &format!("{file}::Badge.color"),
+            file,
+            language,
+        );
+        prop.is_exported = true;
+        (file.to_string(), component, prop)
+    }
+
+    /// KEEP-RUST (W7-21): no name-matching strategy offers the component or
+    /// prop a view manager's class mints. A supertype, a type reference or
+    /// a call naming one alone, its qualified name, or a dotted name ending
+    /// in a prop's, matches nothing.
+    #[test]
+    fn no_name_match_offers_a_view_managers_component_or_prop() {
+        for language in [Language::ObjC, Language::Java, Language::Kotlin] {
+            let (file, component, prop) = view_manager_nodes(language);
+            let ctx = Ctx::default()
+                .name("Badge", vec![component.clone()])
+                .name("color", vec![prop.clone()])
+                .qualified(&component.qualified_name, vec![component.clone()])
+                .qualified(&prop.qualified_name, vec![prop.clone()])
+                .lower("badge", vec![component.clone()])
+                .lower("color", vec![prop.clone()])
+                .node_by_id(component.clone())
+                .node_by_id(prop.clone());
+            for (name, kind) in [
+                ("Badge", EdgeKind::Extends),
+                ("Badge", EdgeKind::References),
+                ("Badge", EdgeKind::Calls),
+                ("color", EdgeKind::Calls),
+                ("color", EdgeKind::References),
+            ] {
+                let reference = refv(name, kind, "app/Use.src", language, 4);
+                assert_eq!(
+                    match_by_exact_name(&reference, &ctx),
+                    None,
+                    "{language:?} {kind:?} {name}"
+                );
+                assert_eq!(
+                    match_reference(&reference, &ctx),
+                    None,
+                    "{language:?} {kind:?} {name}"
+                );
+            }
+            for name in [
+                component.qualified_name.as_str(),
+                prop.qualified_name.as_str(),
+                "Badge.color",
+            ] {
+                let reference = refv(name, EdgeKind::Calls, "app/Use.src", language, 4);
+                assert_eq!(
+                    match_by_qualified_name(&reference, &ctx),
+                    None,
+                    "{language:?} {name} in {file}"
+                );
+            }
+        }
+    }
+
+    /// KEEP-RUST (W7-21): a view manager's nodes make no name ambiguous. The
+    /// class a Paper or Android manager's component is named for is the one
+    /// candidate of its name, at the single-match confidence, and so is the
+    /// property a manager's prop is named like.
+    #[test]
+    fn a_view_managers_nodes_leave_the_namesakes_unambiguous() {
+        for language in [Language::ObjC, Language::Java, Language::Kotlin] {
+            let (_, component, prop) = view_manager_nodes(language);
+            let class = mk(
+                "class:badge",
+                NodeKind::Class,
+                "Badge",
+                "Badge",
+                "native/Badge.src",
+                language,
+            );
+            let property = mk(
+                "property:badge-color",
+                NodeKind::Property,
+                "color",
+                "Badge::color",
+                "native/Badge.src",
+                language,
+            );
+            let ctx = Ctx::default()
+                .name("Badge", vec![class.clone(), component.clone()])
+                .name("color", vec![property.clone(), prop.clone()])
+                .node_by_id(class.clone())
+                .node_by_id(property.clone())
+                .node_by_id(component)
+                .node_by_id(prop);
+            for (name, kind, target) in [
+                ("Badge", EdgeKind::Extends, &class),
+                ("Badge", EdgeKind::References, &class),
+                ("color", EdgeKind::References, &property),
+            ] {
+                let reference = refv(name, kind, "app/Use.src", language, 4);
+                let resolved = match_by_exact_name(&reference, &ctx)
+                    .unwrap_or_else(|| panic!("{language:?} {kind:?} {name}: resolves"));
+                assert_eq!(
+                    (resolved.target_node_id.as_str(), resolved.confidence),
+                    (target.id.as_str(), 0.9),
+                    "{language:?} {kind:?} {name}"
+                );
+            }
+        }
+    }
+
+    /// KEEP-RUST (W7-21): a receiver named only by a view manager's
+    /// component is a type from outside the project, as with no such node:
+    /// `[Badge paint]` guesses no `paint` of another class by the words its
+    /// owner shares with the receiver.
+    #[test]
+    fn a_view_managers_component_declares_no_receiver_type() {
+        let (_, component, _) = view_manager_nodes(Language::ObjC);
+        let mut paint = mk(
+            "method:badge-helper-paint",
+            NodeKind::Method,
+            "paint",
+            "BadgeHelper::paint",
+            "ios/BadgeHelper.m",
+            Language::ObjC,
+        );
+        paint.start_line = 3;
+        let helper = mk(
+            "class:badge-helper",
+            NodeKind::Class,
+            "BadgeHelper",
+            "BadgeHelper",
+            "ios/BadgeHelper.m",
+            Language::ObjC,
+        );
+        let ctx = Ctx::default()
+            .name("Badge", vec![component.clone()])
+            .name("paint", vec![paint.clone()])
+            .name("BadgeHelper", vec![helper.clone()])
+            .node_by_id(component)
+            .node_by_id(paint)
+            .node_by_id(helper);
+        let reference = refv(
+            "Badge.paint",
+            EdgeKind::Calls,
+            "ios/Use.m",
+            Language::ObjC,
+            4,
+        );
+        assert_eq!(match_method_call(&reference, &ctx), None);
+        assert_eq!(match_reference(&reference, &ctx), None);
+    }
+
+    /// KEEP-RUST (W7-21): a view manager's component counts toward no
+    /// ceiling either: with as many nodes of a name as the fuzzy ceiling
+    /// admits, the one class among them is still the fuzzy answer beside it.
+    #[test]
+    fn a_view_managers_component_counts_toward_no_fuzzy_ceiling() {
+        let (_, component, _) = view_manager_nodes(Language::Java);
+        let mut named: Vec<Node> = (1..AMBIGUOUS_NAME_CEILING)
+            .map(|index| {
+                mk(
+                    &format!("property:badge-{index}"),
+                    NodeKind::Property,
+                    "Badge",
+                    &format!("Holder{index}::Badge"),
+                    &format!("android/holders/{index}/Holder.java"),
+                    Language::Java,
+                )
+            })
+            .collect();
+        named.push(mk(
+            "class:badge",
+            NodeKind::Class,
+            "Badge",
+            "Badge",
+            "android/Badge.java",
+            Language::Java,
+        ));
+        let reference = refv(
+            "Badge",
+            EdgeKind::Calls,
+            "android/Use.java",
+            Language::Java,
+            4,
+        );
+        let at_the_ceiling = Ctx::default().lower("badge", named.clone());
+        assert_eq!(
+            match_fuzzy(&reference, &at_the_ceiling).map(|resolved| resolved.target_node_id),
+            Some("class:badge".to_string())
+        );
+        named.push(component);
+        let beside = Ctx::default().lower("badge", named);
+        assert_eq!(
+            match_fuzzy(&reference, &beside).map(|resolved| resolved.target_node_id),
+            Some("class:badge".to_string())
+        );
+    }
+
+    /// W7-21: a view component a JavaScript-family spec declares
+    /// (`codegenNativeComponent`, `requireNativeComponent`) and its
+    /// `NativeProps` props stay name-match candidates, in each of the four
+    /// script languages a spec is written in.
+    #[test]
+    fn a_specs_component_and_props_stay_name_match_candidates() {
+        for (file, language) in [
+            ("src/BadgeNativeComponent.ts", Language::TypeScript),
+            ("src/BadgeNativeComponent.tsx", Language::Tsx),
+            ("src/BadgeNativeComponent.js", Language::JavaScript),
+            ("src/BadgeNativeComponent.jsx", Language::Jsx),
+        ] {
+            let mut component = mk(
+                &format!("fabric-component:{file}:Badge:8"),
+                NodeKind::Component,
+                "Badge",
+                &format!("{file}::Badge"),
+                file,
+                language,
+            );
+            component.is_exported = true;
+            let mut prop = mk(
+                &format!("fabric-prop:{file}:color:5"),
+                NodeKind::Property,
+                "color",
+                &format!("{file}::NativeProps.color"),
+                file,
+                language,
+            );
+            prop.is_exported = true;
+            let ctx = Ctx::default()
+                .name("Badge", vec![component.clone()])
+                .name("color", vec![prop.clone()])
+                .node_by_id(component.clone())
+                .node_by_id(prop.clone());
+            let reference = refv("Badge", EdgeKind::References, "src/App.src", language, 4);
+            assert_eq!(
+                match_by_exact_name(&reference, &ctx).map(|resolved| resolved.target_node_id),
+                Some(component.id.clone()),
+                "{file}"
+            );
+            let reference = refv(
+                "NativeProps.color",
+                EdgeKind::References,
+                "src/App.src",
+                language,
+                4,
+            );
+            assert_eq!(
+                match_by_qualified_name(&reference, &ctx).map(|resolved| resolved.target_node_id),
+                Some(prop.id.clone()),
+                "{file}"
+            );
+        }
     }
 }

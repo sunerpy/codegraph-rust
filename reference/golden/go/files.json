@@ -9,6 +9,15 @@
     "size": 203
   },
   {
+    "content_hash": "34b7d2b4ff4089c2ebbc39e1447776623a0f0e6a5b118f2e36c8baad7f5c8eaf",
+    "errors": null,
+    "generated": 0,
+    "language": "go",
+    "node_count": 13,
+    "path": "config.go",
+    "size": 716
+  },
+  {
     "content_hash": "176b35b02d0f4e9aff372868b7b318d5e83a3a98702146b226647b203bba7a0b",
     "errors": null,
     "generated": 0,

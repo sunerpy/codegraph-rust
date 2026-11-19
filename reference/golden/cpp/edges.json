@@ -433,6 +433,32 @@
   },
   {
     "col": null,
+    "kind": "calls",
+    "line": 3,
+    "metadata": {
+      "registeredAt": "pure_virtual.cpp:14",
+      "synthesizedBy": "cpp-override",
+      "via": "read"
+    },
+    "provenance": "heuristic",
+    "source": "method:6111b5c9721038715cb2fe6785508441",
+    "target": "method:f7e502d803cea6773599d065461241c3"
+  },
+  {
+    "col": null,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "registeredAt": "pure_virtual.cpp:15",
+      "synthesizedBy": "cpp-override",
+      "via": "clone"
+    },
+    "provenance": "heuristic",
+    "source": "method:87836f369d78cf28d87186e7ab99fb7b",
+    "target": "method:c73cebcf51bf89a351f9f723998c0e0f"
+  },
+  {
+    "col": null,
     "kind": "contains",
     "line": null,
     "metadata": null,

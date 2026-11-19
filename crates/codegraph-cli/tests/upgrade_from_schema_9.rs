@@ -1,15 +1,21 @@
 //! Migrating a current index one schema behind (W5-09e).
 //!
+//! The first two tests index the mini corpus with this binary and take the
+//! database back to schema 9, so its rows are this binary's graph and only the
+//! schema is behind. Each plants it as a `Current` index, edits a file other
+//! files depend on, and syncs it through one of the two incremental paths:
+//! `codegraph sync` from the shell, and the watcher's sync of the changed
+//! paths. Both must migrate the schema to the current one in place, without a
+//! rebuild, leave the stored-references marker unwritten (the migration creates
+//! `resolved_refs` empty, so the dependents are extracted), and leave a
+//! canonical graph equal to a fresh `init` of the edited tree. A full `index`
+//! afterwards writes the marker.
+//!
 //! `tests/fixtures/upgrade_schema_9/codegraph.db` is the schema-9 database a
-//! release build of 3878d52 (extraction version 22, the current one) wrote for
-//! the mini corpus. Each test plants it in a fresh project namespace as a
-//! `Current` index, edits a file other files depend on, and syncs it through
-//! one of the two incremental paths: `codegraph sync` from the shell, and the
-//! watcher's sync of the changed paths. Both must migrate the schema to the
-//! current one in place, without a rebuild, leave the stored-references marker
-//! unwritten (the migration creates `resolved_refs` empty, so the dependents
-//! are extracted), and leave a canonical graph equal to a fresh `init` of the
-//! edited tree. A full `index` afterwards writes the marker.
+//! release build of 3878d52 (extraction version 22) wrote for the mini corpus.
+//! The third test migrates that database's own DDL in place. Its rows are that
+//! build's graph, which a later extraction version may change, so it compares
+//! the schema only.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,7 +25,8 @@ use codegraph_bench::oracle::{canonicalize_db, diff_canonical};
 use codegraph_core::IndexPaths;
 use codegraph_store::migrations::CURRENT_SCHEMA_VERSION;
 use codegraph_store::{
-    CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, ExtractionStatus, Store, checksum_hex,
+    CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, EXTRACTION_VERSION_KEY, ExtractionStatus,
+    Store, checksum_hex,
 };
 
 /// The edit: one line above everything `src/app.ts` imports from it.
@@ -63,10 +70,79 @@ fn watcher_sync_migrates_a_schema_9_index_in_place() {
     assert_full_index_writes_the_marker(&project);
 }
 
-/// Copy the mini corpus into `dir`, create a namespace with the current binary,
-/// then replace its database with the schema-9 one and publish it as a current
-/// index of this extraction version.
+/// The release's schema-9 database migrates in place too. Only the schema and
+/// the marker are compared: the rows are the 3878d52 build's graph.
+#[test]
+fn the_release_schema_9_database_migrates_in_place() {
+    let dir = TestDir::new("release");
+    let project = plant_release_schema_9_index(&dir);
+    fs::write(project.join("src/math.ts"), MATH_EDITED).unwrap();
+
+    let paths = index_paths(&project);
+    let db = paths.current_db();
+    let outcome = codegraph_watch::sync_changed_paths(&project, &db, ["src/math.ts"])
+        .expect("watcher sync over the release's schema-9 index");
+    assert_eq!(outcome.files_reindexed, 1, "an incremental sync");
+
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Current,
+        "the migrated namespace must stay current"
+    );
+    let conn = open_immutable(&db);
+    assert_eq!(
+        schema_version(&conn),
+        CURRENT_SCHEMA_VERSION,
+        "schema must be current"
+    );
+    assert!(has_table(&conn, "resolved_refs"), "migration 10 ran");
+    assert_eq!(
+        marker(&conn),
+        None,
+        "a migrated index is not trusted for stored references"
+    );
+}
+
+/// Copy the mini corpus into `dir`, index it with the current binary, then take
+/// the database back to schema 9 as a schema-9 build left it: no
+/// `resolved_refs`, no stored-references marker, version 9 recorded. Its rows
+/// stay this binary's graph, so a comparison with a fresh `init` checks the
+/// migration alone.
 fn plant_schema_9_index(dir: &TestDir) -> PathBuf {
+    let project = dir.path().join("project");
+    copy_tree(&mini_fixture(), &project);
+    let init = cli(&["init", path_str(&project)]);
+    assert!(init.ok, "init failed: {}", init.stderr);
+
+    let paths = index_paths(&project);
+    let db = paths.current_db();
+    rewrite_database(
+        &db,
+        &format!(
+            "DROP TABLE resolved_refs;
+             DELETE FROM project_metadata WHERE key = '{marker}';
+             DELETE FROM schema_versions WHERE version = {current};
+             INSERT INTO schema_versions (version, applied_at, description) VALUES (9, 0, 'v9');",
+            marker = codegraph_watch::resolved_refs::VERSION_KEY,
+            current = CURRENT_SCHEMA_VERSION,
+        ),
+    );
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Current,
+        "the planted namespace must classify as current"
+    );
+    let conn = open_immutable(&db);
+    assert_eq!(schema_version(&conn), 9, "the planted index is at schema 9");
+    assert!(!has_table(&conn, "resolved_refs"));
+    project
+}
+
+/// Copy the mini corpus into `dir`, create a namespace with the current binary,
+/// then replace its database with the release's schema-9 one and publish it as
+/// a current index of this extraction version. That build stamped extraction
+/// version 22, so the planted copy's stamp is rewritten to this one.
+fn plant_release_schema_9_index(dir: &TestDir) -> PathBuf {
     let project = dir.path().join("project");
     copy_tree(&mini_fixture(), &project);
     let init = cli(&["init", path_str(&project)]);
@@ -78,6 +154,12 @@ fn plant_schema_9_index(dir: &TestDir) -> PathBuf {
         let _ = fs::remove_file(PathBuf::from(format!("{}{sidecar}", db.display())));
     }
     fs::copy(schema_9_database(), &db).expect("plant the schema-9 database");
+    rewrite_database(
+        &db,
+        &format!(
+            "UPDATE project_metadata SET value = '{CURRENT_EXTRACTION_VERSION}' WHERE key = '{EXTRACTION_VERSION_KEY}';"
+        ),
+    );
     stage_state_slot(
         &paths,
         2,
@@ -153,6 +235,23 @@ fn assert_full_index_writes_the_marker(project: &Path) {
         marker(&conn).is_some_and(|marker| marker.starts_with("1:")),
         "a full index writes the marker"
     );
+}
+
+/// Run `sql` on `db` and leave it without `-wal`/`-shm`, as a closed index is.
+fn rewrite_database(db: &Path, sql: &str) {
+    let conn = rusqlite::Connection::open(db).expect("open the planted index");
+    conn.execute_batch(sql).expect("rewrite the planted index");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint the planted index");
+    drop(conn);
+    for sidecar in ["-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{sidecar}", db.display()));
+        assert!(
+            !path.exists(),
+            "closing the planted index left {}",
+            path.display()
+        );
+    }
 }
 
 /// The stored-references marker (`codegraph_watch::resolved_refs::VERSION_KEY`).

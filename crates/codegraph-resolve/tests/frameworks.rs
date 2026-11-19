@@ -1,4 +1,4 @@
-//! Regression tests for the React / Vue / NestJS [`FrameworkResolver`]s.
+//! Regression tests for the React / Next.js / Vue / Nuxt / NestJS [`FrameworkResolver`]s.
 //!
 //! Each test drives a resolver through an in-memory [`ResolutionContext`] and
 //! asserts the produced [`ResolvedRef`] / extraction shape against the upstream
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_resolve::framework::FrameworkResolver;
-use codegraph_resolve::frameworks::{detect_frameworks, godot, nestjs, react, vue};
+use codegraph_resolve::frameworks::{detect_frameworks, godot, nestjs, nextjs, react, vue};
 use codegraph_resolve::types::{ImportMapping, RefView, ResolutionContext, ResolvedBy};
 
 /// Extraction context for a resolver call that needs no project configuration.
@@ -159,6 +159,39 @@ fn react_detects_via_tsx_file() {
     assert!(react::ReactResolver.detect(&ctx));
 }
 
+/// React in an app's manifest rather than the root's: proshop keeps `react`
+/// in `frontend/`, an ASP.NET solution its app in `src/Web/ClientApp/`
+/// (upstream #2395). Neither app has a `.jsx` or `.tsx` file.
+#[test]
+fn react_detects_via_an_app_package_json() {
+    for app in ["frontend/", "apps/web/", "src/Web/ClientApp/"] {
+        let ctx = MockContext::default()
+            .with_file("package.json", r#"{"name":"shop","private":true}"#)
+            .with_file(
+                &format!("{app}package.json"),
+                r#"{"peerDependencies":{"react":"18"}}"#,
+            )
+            .with_file(&format!("{app}src/index.js"), "export const x = 1;");
+        assert!(react::ReactResolver.detect(&ctx), "{app}");
+    }
+}
+
+/// A dependency's own manifest inside `node_modules` is not the project's.
+#[test]
+fn react_does_not_detect_a_manifest_inside_node_modules() {
+    let ctx = MockContext::default()
+        .with_file(
+            "tools/node_modules/react-ui/package.json",
+            r#"{"dependencies":{"react":"18"}}"#,
+        )
+        .with_file(
+            "tools/node_modules/react-ui/index.js",
+            "module.exports = 1;",
+        )
+        .with_file("tools/src/index.js", "export const x = 1;");
+    assert!(!react::ReactResolver.detect(&ctx));
+}
+
 #[test]
 fn react_does_not_detect_plain_ts_project() {
     let ctx = MockContext::default()
@@ -212,26 +245,35 @@ fn react_does_not_resolve_component_from_plain_ts_file() {
 }
 
 #[test]
-fn react_resolves_hook_preferring_hooks_dir() {
+fn react_resolves_only_the_files_own_hook() {
     let hook = node(
-        "hook:src/hooks/useAuth.ts:useAuth:1",
+        "function:src/hooks/useAuth.ts:useAuth:1",
         NodeKind::Function,
         "useAuth",
         "src/hooks/useAuth.ts",
         Language::TypeScript,
     );
     let ctx = MockContext::default().with_node(hook.clone());
+    // In a JS/TS module another file's hook comes through an import (the
+    // import resolver's), never by name: Page.tsx imports nothing here
+    // (upstream #2240).
     let reference = ref_view("useAuth", EdgeKind::Calls, "src/Page.tsx", Language::Tsx);
-    let resolved = react::ReactResolver
-        .resolve(&reference, &ctx)
-        .expect("resolves");
+    assert!(react::ReactResolver.resolve(&reference, &ctx).is_none());
+    // The file's own hook resolves.
+    let own = ref_view(
+        "useAuth",
+        EdgeKind::Calls,
+        "src/hooks/useAuth.ts",
+        Language::TypeScript,
+    );
+    let resolved = react::ReactResolver.resolve(&own, &ctx).expect("resolves");
     assert_eq!(resolved.target_node_id, hook.id);
     assert_eq!(resolved.confidence, 0.85);
     assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
 }
 
 #[test]
-fn react_resolves_context() {
+fn react_resolves_only_the_files_own_context() {
     let ctx_node = node(
         "variable:src/context/AuthContext.tsx:AuthContext:1",
         NodeKind::Variable,
@@ -246,17 +288,22 @@ fn react_resolves_context() {
         "src/App.tsx",
         Language::Tsx,
     );
-    let resolved = react::ReactResolver
-        .resolve(&reference, &ctx)
-        .expect("resolves");
+    assert!(react::ReactResolver.resolve(&reference, &ctx).is_none());
+    let own = ref_view(
+        "AuthContext",
+        EdgeKind::References,
+        "src/context/AuthContext.tsx",
+        Language::Tsx,
+    );
+    let resolved = react::ReactResolver.resolve(&own, &ctx).expect("resolves");
     assert_eq!(resolved.target_node_id, ctx_node.id);
     assert_eq!(resolved.confidence, 0.8);
     assert_eq!(resolved.resolved_by, ResolvedBy::Framework);
 }
 
 #[test]
-fn react_extract_emits_nextjs_page_route() {
-    let result = react::ReactResolver
+fn nextjs_extract_emits_a_page_route_calling_its_default_export() {
+    let result = nextjs::NextjsResolver
         .extract(
             "pages/about.tsx",
             "export default function About() { return <div/>; }",
@@ -269,21 +316,32 @@ fn react_extract_emits_nextjs_page_route() {
         .find(|n| n.kind == NodeKind::Route)
         .expect("route node");
     assert_eq!(route.name, "/about");
+    assert!(
+        result
+            .references
+            .iter()
+            .any(|r| r.reference_name == "About" && r.reference_kind == EdgeKind::Calls)
+    );
+    // React no longer reads Next.js file routes.
+    let react = react::ReactResolver
+        .extract(
+            "pages/about.tsx",
+            "export default function About() { return <div/>; }",
+            &no_project_config(),
+        )
+        .expect("extract result");
+    assert!(!react.nodes.iter().any(|n| n.kind == NodeKind::Route));
 }
 
 #[test]
-fn react_extract_component_and_route_reference() {
+fn react_extract_route_reference_and_no_component() {
     let content =
         "export function Home() { return <Layout/>; }\n<Route path=\"/home\" component={Home}/>";
     let result = react::ReactResolver
         .extract("src/Home.tsx", content, &no_project_config())
         .expect("extract result");
-    assert!(
-        result
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Component && n.name == "Home")
-    );
+    // The component is the tree-sitter extractor's `function` node (#841).
+    assert!(!result.nodes.iter().any(|n| n.kind == NodeKind::Component));
     let route = result
         .nodes
         .iter()
@@ -298,13 +356,13 @@ fn react_extract_component_and_route_reference() {
     );
 }
 
-/// Nested v6 shape from upstream #1348: the parent route has a `path` but renders
-/// `<Outlet/>`, and the pathless `index` child must stay skipped. The unbounded
-/// 400-byte window let the parent borrow the child's `element` and let the `index`
-/// route borrow its sibling's `path`, producing `/dashboard -> DashboardHome`,
-/// a duplicate `settings` node, and `settings -> DashboardHome`.
+/// Nested v6 shape from upstream #1348: the parent `<Route path="/dashboard">`
+/// renders nothing of its own (an `<Outlet/>`), its `index` child is the page at
+/// that address and claims it, and `settings` is nested under it. Each route
+/// reads only its own opening tag: the fixed 400-byte window this replaced let the
+/// parent borrow the child's `element` and the `index` route its sibling's `path`.
 #[test]
-fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
+fn react_route_index_child_claims_its_parents_address() {
     let content = concat!(
         "function DashboardHome() { return null; }\n",
         "function Settings() { return null; }\n",
@@ -331,8 +389,11 @@ fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
         .collect();
     assert_eq!(
         routes,
-        vec![("/dashboard".to_string(), 6), ("settings".to_string(), 8)],
-        "the pathless index route must not borrow its sibling's path"
+        vec![
+            ("/dashboard".to_string(), 7),
+            ("/dashboard/settings".to_string(), 8)
+        ],
+        "the index route is the page at its parent's address; settings nests under it"
     );
 
     let refs: Vec<(String, i64)> = result
@@ -342,15 +403,20 @@ fn react_route_window_stops_at_tag_end_not_at_sibling_routes() {
         .collect();
     assert_eq!(
         refs,
-        vec![("Settings".to_string(), 8)],
-        "only the settings route owns an element; the parent renders <Outlet/>"
+        vec![
+            ("DashboardHome".to_string(), 7),
+            ("Settings".to_string(), 8)
+        ],
+        "each route renders its own element; the parent renders <Outlet/>"
     );
 }
 
-/// An unterminated `<Route path=…` followed by a long run of `<` must not let the
-/// scan run to end-of-file, and must not reach the well-formed route far below it.
+/// An unterminated `<Route path=…` followed by a long run of `<`: the scanner reads
+/// the run as the tag's attributes, one character at a time, and the well-formed
+/// route below it as an element among them. The `/a` tag never closes, so it is no
+/// route (upstream's scanner), and `/b` keeps its own element.
 #[test]
-fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
+fn react_route_unterminated_tag_is_no_route() {
     let mut content = String::from("function Comp() { return null; }\n<Route path=\"/a\"\n");
     content.push_str(&"<".repeat(200_000));
     content.push_str("\n<Route path=\"/b\" element={<Comp/>} />\n");
@@ -365,7 +431,7 @@ fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
         .filter(|n| n.kind == NodeKind::Route)
         .map(|n| n.name.clone())
         .collect();
-    assert_eq!(routes, vec!["/a".to_string(), "/b".to_string()]);
+    assert_eq!(routes, vec!["/b".to_string()]);
 
     let refs: Vec<(String, i64)> = result
         .references
@@ -375,14 +441,13 @@ fn react_route_window_is_bounded_for_unterminated_tag_and_bare_angle_run() {
     assert_eq!(
         refs,
         vec![("Comp".to_string(), 4)],
-        "the unterminated /a tag must not reach the /b element 200KB later"
+        "the unterminated /a tag is no route, and /b renders its own element"
     );
 }
 
-/// Pins `ROUTE_OPENING_TAG_SCAN_LIMIT` from the outside: a 700-byte prettier-wrapped
-/// opening tag — wider than both the old 400-byte window and any tag measured while
-/// sizing the bound — still yields its `path` and its `element`, so the bound cannot
-/// be tightened to a value that truncates legitimate input.
+/// A 700-byte prettier-wrapped opening tag, wider than the fixed 400-byte window the
+/// scanner replaced, still yields its `path` and its `element`: a tag's attributes
+/// are read to its own `>`, however long.
 #[test]
 fn react_route_window_keeps_long_multiline_opening_tag_intact() {
     let filler: String = (0..12)
@@ -433,8 +498,9 @@ fn react_route_window_keeps_long_multiline_opening_tag_intact() {
 
 /// The data-router half of upstream #1348: a PARENT route object carries a `path`
 /// but no `element` of its own, and the first `element` the fixed 300-byte window
-/// met belonged to a CHILD inside `children: [...]`. The parent must produce NO
-/// borrowed edge, and each child exactly its own.
+/// this replaced met belonged to a CHILD inside `children: [...]`. The parent
+/// renders nothing; its `index` child is the page at its address, and `settings`
+/// nests under it, each with exactly its own element.
 #[test]
 fn react_data_router_parent_without_element_does_not_borrow_from_children() {
     let content = concat!(
@@ -460,8 +526,11 @@ fn react_data_router_parent_without_element_does_not_borrow_from_children() {
         .collect();
     assert_eq!(
         routes,
-        vec![("settings".to_string(), 6)],
-        "a parent route with no element of its own must emit no route->component pair"
+        vec![
+            ("/dashboard".to_string(), 5),
+            ("/dashboard/settings".to_string(), 6)
+        ],
+        "the index child is the page at /dashboard; the parent emits no route of its own"
     );
 
     let refs: Vec<(String, i64)> = result
@@ -471,8 +540,11 @@ fn react_data_router_parent_without_element_does_not_borrow_from_children() {
         .collect();
     assert_eq!(
         refs,
-        vec![("Settings".to_string(), 6)],
-        "/dashboard must not borrow DashboardHome from its pathless index child"
+        vec![
+            ("DashboardHome".to_string(), 5),
+            ("Settings".to_string(), 6)
+        ],
+        "each child renders its own element, and the parent borrows none"
     );
 }
 
@@ -521,9 +593,8 @@ fn react_data_router_child_without_element_does_not_borrow_from_parent() {
     );
 }
 
-/// A malformed object carrying two depth-0 `path:` keys — no `{` and no `}` separates
-/// them, so only the next-`path:` stop can keep the first from borrowing the second's
-/// element.
+/// A malformed object carrying two `path:` keys: as in a JavaScript object literal,
+/// the last one is the object's path, and the route is declared there.
 #[test]
 fn react_data_router_object_stops_at_next_path_key_when_unbraced() {
     let content = "createBrowserRouter([{ path: '/a', path: '/b', element: <B/> }]);\n";
@@ -592,11 +663,10 @@ fn react_data_router_object_survives_angle_brackets_and_stops_at_sibling() {
     );
 }
 
-/// A route object that legitimately runs well past the old 300-byte window — `loader`,
-/// `action`, `errorElement`, `hydrateFallbackElement`, a nested `handle={{…}}` and a
-/// `shouldRevalidate`, with its own `element` declared LAST — must still be seen whole.
-/// This pins the new bound from the outside: tightening it below the object length
-/// reddens this test.
+/// A route object that runs well past the fixed 300-byte window the scanner replaced
+/// — `loader`, `action`, `errorElement`, `hydrateFallbackElement`, a nested
+/// `handle={{…}}` and a `shouldRevalidate`, with its own `element` declared LAST —
+/// is read whole.
 #[test]
 fn react_data_router_keeps_long_route_object_intact() {
     let content = concat!(
@@ -653,8 +723,9 @@ fn react_data_router_keeps_long_route_object_intact() {
     );
 }
 
-/// An unterminated route object followed by a well-formed one 200KB later: the walk
-/// must neither run to end-of-file nor reach that far-away element.
+/// An unterminated route object with a well-formed one 200KB later inside it: the
+/// object never closes, so it is no route, and the well-formed one renders its own
+/// element.
 #[test]
 fn react_data_router_object_walk_is_bounded_for_unterminated_literal() {
     let mut content = String::from("createBrowserRouter([\n  { path: '/a',\n");
@@ -747,18 +818,26 @@ fn vue_resolves_pascalcase_component_call() {
 }
 
 #[test]
-fn vue_extract_emits_nuxt_page_route() {
-    // the upstream extract keys on `/pages/` (with leading slash), so the route file
-    // must sit under a parent dir (vue.ts:198).
-    let result = vue::VueResolver
-        .extract("app/pages/users/[id].vue", "", &no_project_config())
-        .expect("extract result");
-    let route = result
-        .nodes
-        .iter()
-        .find(|n| n.kind == NodeKind::Route)
-        .expect("route node");
-    assert_eq!(route.name, "/users/:id");
+fn nuxt_extract_emits_page_route() {
+    // Nuxt's page routes are the Nuxt resolver's, nested or at the
+    // repository root (upstream #2130); the Vue resolver extracts none.
+    for path in ["app/pages/users/[id].vue", "pages/users/[id].vue"] {
+        let result = vue::NuxtResolver
+            .extract(path, "", &no_project_config())
+            .expect("extract result");
+        let route = result
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Route)
+            .expect("route node");
+        assert_eq!(route.name, "/users/:id", "{path}");
+        assert!(
+            vue::VueResolver
+                .extract(path, "", &no_project_config())
+                .is_none(),
+            "{path}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +848,23 @@ fn vue_extract_emits_nuxt_page_route() {
 fn nestjs_detects_via_package_json() {
     let ctx = MockContext::default()
         .with_file("package.json", r#"{"dependencies":{"@nestjs/core":"10"}}"#);
+    assert!(nestjs::NestjsResolver.detect(&ctx));
+}
+
+/// `@nestjs/*` in a workspace app's manifest, with no conventionally named
+/// controller or module file to fall back on.
+#[test]
+fn nestjs_detects_via_an_app_package_json() {
+    let ctx = MockContext::default()
+        .with_file(
+            "package.json",
+            r#"{"private":true,"workspaces":["apps/*"]}"#,
+        )
+        .with_file(
+            "apps/api/package.json",
+            r#"{"dependencies":{"@nestjs/core":"10"}}"#,
+        )
+        .with_file("apps/api/src/main.ts", "bootstrap();");
     assert!(nestjs::NestjsResolver.detect(&ctx));
 }
 

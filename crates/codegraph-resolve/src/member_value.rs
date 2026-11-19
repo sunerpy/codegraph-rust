@@ -210,11 +210,13 @@ fn unique_callable(
     (matches!(target.kind, NodeKind::Function | NodeKind::Method)
         && target.id != reference.from_node_id
         && !is_python_property(target, context))
-    .then(|| ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence,
-        resolved_by: ResolvedBy::FunctionRef,
+    .then(|| {
+        ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            confidence,
+            ResolvedBy::FunctionRef,
+        )
     })
 }
 

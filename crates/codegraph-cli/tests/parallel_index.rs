@@ -424,6 +424,7 @@ fn index_force_writes_the_generated_flag_per_file() {
         rows,
         vec![
             ("api.pb.go".to_string(), 1),
+            ("config.go".to_string(), 0),
             ("generator.go".to_string(), 0),
             ("nightly.go".to_string(), 0),
             ("payroll.go".to_string(), 1),

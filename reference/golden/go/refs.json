@@ -1,1 +1,32 @@
-[]
+[
+  {
+    "candidates": null,
+    "col": 14,
+    "file_path": "config.go",
+    "from_node_id": "variable:24d5d8e9c6f80483836e436a6eab1f1f",
+    "language": "go",
+    "line": 8,
+    "reference_kind": "calls",
+    "reference_name": "errors.New"
+  },
+  {
+    "candidates": null,
+    "col": 44,
+    "file_path": "config.go",
+    "from_node_id": "function:54962f702d233db77d35d0ca4c91c74e",
+    "language": "go",
+    "line": 23,
+    "reference_kind": "calls",
+    "reference_name": "errors.New"
+  },
+  {
+    "candidates": null,
+    "col": 7,
+    "file_path": "config.go",
+    "from_node_id": "file:config.go",
+    "language": "go",
+    "line": 3,
+    "reference_kind": "imports",
+    "reference_name": "errors"
+  }
+]

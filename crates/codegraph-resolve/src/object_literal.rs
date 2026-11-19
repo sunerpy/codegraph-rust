@@ -101,12 +101,12 @@ pub(crate) fn resolve_object_literal_binding(
     let target = facts.literal_binding_target(&container.id, &key, |facts| {
         binding_target(facts, container, &binding, calls, reference, context)
     })?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target,
-        confidence: 0.85,
-        resolved_by: ResolvedBy::InstanceMethod,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target,
+        0.85,
+        ResolvedBy::InstanceMethod,
+    ))
 }
 
 fn accepts(node: &Node, calls: bool) -> bool {

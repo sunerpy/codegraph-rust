@@ -311,9 +311,10 @@ pub fn is_generated_file(path: &str) -> bool {
 }
 
 /// Mockgen's default output, `mock_<src>.go`, anchored to the final path
-/// segment. Upstream's `/^mock_[^/]+\.go$/` is basename-scoped, so a nested
-/// `src/mock_helpers.go` matches while a `mock_store/` DIRECTORY does not, and
-/// `[^/]+` requires a non-empty stem between the prefix and the extension.
+/// segment: a nested `src/mock_helpers.go` matches while a `mock_store/`
+/// DIRECTORY does not, and the stem between the prefix and the extension is
+/// not empty. Upstream's `/^mock_[^/]+\.go$/` tests the whole path, so only a
+/// root `mock_x.go` matches there (KEEP-RUST, `KNOWN_DIFFS.md`).
 fn is_mockgen_default_output(path: &str) -> bool {
     basename(path)
         .strip_prefix("mock_")

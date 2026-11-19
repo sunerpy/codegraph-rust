@@ -9,9 +9,10 @@
 //!
 //! The heuristic `FrameworkResolver` layer is a small additive layer on top of
 //! the deterministic import + name-matching core. [`framework::FrameworkResolver`]
-//! is the documented EXTENSION POINT; v1 ships THREE concrete implementations —
-//! React/Next.js, Vue/Nuxt, and NestJS ([`frameworks`]) — detected per-project
-//! by [`frameworks::detect_frameworks`]. The other ~19 upstream resolvers remain
+//! is the documented EXTENSION POINT; the concrete implementations (NestJS,
+//! React, Vue, Godot, Tauri, Nuxt, React Router, Next.js, Expo Router:
+//! [`frameworks`]) are detected per-project by
+//! [`frameworks::detect_frameworks`]. The other upstream resolvers remain
 //! deferred (see `KNOWN_DIFFS.md`).
 
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
@@ -43,6 +44,7 @@ pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 mod go_calls;
 pub mod go_packages;
 mod go_scope;
+pub mod go_std_methods;
 pub mod import_resolver;
 pub mod java_scope;
 mod js_store;
@@ -78,6 +80,7 @@ pub mod source_facts;
 pub mod strip_comments;
 mod swift_scope;
 pub mod swift_type_visibility;
+pub mod synthesis;
 mod type_parameters;
 pub mod types;
 pub mod workspace_packages;
@@ -85,9 +88,9 @@ pub mod workspace_packages;
 pub use context::StoreResolutionContext;
 pub use framework::FrameworkResolver;
 pub use name_matcher::CASE_INSENSITIVE_LANGUAGES;
-pub use resolver::{ReferenceResolver, ResolutionObservation};
+pub use resolver::{CrossFileApplied, CrossFilePlan, ReferenceResolver, ResolutionObservation};
 pub use snapshot_context::{EdgeAdjacency, SnapshotResolutionContext, build_edge_adjacency};
 pub use types::{
-    FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView, ResolutionContext,
-    ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
+    AlsoTarget, EdgeShape, FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView,
+    ResolutionContext, ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
 };

@@ -148,6 +148,19 @@ pub fn uninit_index_with_drain(
     uninit_index_with(paths, deadline, cancelled, drain, &mut NoFault)
 }
 
+/// The states `uninit` removes. An index an older version built is removed as
+/// it is: uninit reads no row of it, so it need not be rebuilt first. A
+/// refusal elsewhere offers `uninit --force` only for these.
+pub(crate) fn uninit_accepts(status: &ExtractionStatus) -> bool {
+    matches!(
+        status,
+        ExtractionStatus::Current
+            | ExtractionStatus::Building { .. }
+            | ExtractionStatus::Uninitialized
+            | ExtractionStatus::Outdated { .. }
+    )
+}
+
 fn uninit_index_with(
     paths: &IndexPaths,
     deadline: Instant,
@@ -155,16 +168,8 @@ fn uninit_index_with(
     drain: impl FnOnce() -> Result<(), String>,
     fault: &mut impl UninitFault,
 ) -> Result<UninitOutcome, UninitError> {
-    // An index an older version built is removed as it is: uninit reads no
-    // row of it, so it need not be rebuilt first.
     let visible = Store::extraction_status(paths);
-    if !matches!(
-        visible,
-        ExtractionStatus::Current
-            | ExtractionStatus::Building { .. }
-            | ExtractionStatus::Uninitialized
-            | ExtractionStatus::Outdated { .. }
-    ) {
+    if !uninit_accepts(&visible) {
         return Err(UninitError::StateRejected { status: visible });
     }
 
@@ -176,13 +181,7 @@ fn uninit_index_with(
             other => unreachable!("uninit purpose returned unexpected Store open: {other:?}"),
         };
     if authorization.purpose() != StoreWritePurpose::UninitContinuation
-        || !matches!(
-            authorization.status(),
-            ExtractionStatus::Current
-                | ExtractionStatus::Building { .. }
-                | ExtractionStatus::Uninitialized
-                | ExtractionStatus::Outdated { .. }
-        )
+        || !uninit_accepts(authorization.status())
     {
         return Err(UninitError::StateRejected {
             status: authorization.status().clone(),

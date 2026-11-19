@@ -58,8 +58,8 @@ pub enum Change {
     AddCompetitor,
     /// A project control file changes: one resolution reads (`package.json`,
     /// `tsconfig.json`, `jsconfig.json` or a config it extends, a workspace
-    /// member's manifest, a `.csproj` or `.props`, a `Cargo.toml`, a Tauri
-    /// config), the root `.gitignore`, `.git/info/exclude`, the index root's
+    /// member's manifest, a `.csproj` or `.props`, a `Cargo.toml`, a `go.mod`,
+    /// a Tauri config), the root `.gitignore`, `.git/info/exclude`, the index root's
     /// `config.toml` or `codegraph.json`, or a Shopify theme marker
     /// (`layout/theme.liquid`, `config/settings_schema.json`).
     ControlFile,
@@ -111,6 +111,9 @@ impl Op {
 
 type EdgeSpec = (&'static str, &'static str, &'static str);
 
+/// An edge and one string its metadata holds under a key.
+type MetadataSpec = (EdgeSpec, &'static str, &'static str);
+
 /// A `before` tree, one edit, and the edges that prove the case is live.
 pub struct Case {
     change: Change,
@@ -120,7 +123,14 @@ pub struct Case {
     edges_before: Vec<EdgeSpec>,
     edges_after: Vec<EdgeSpec>,
     absent_after: Vec<EdgeSpec>,
+    metadata_before: Vec<MetadataSpec>,
+    metadata_after: Vec<MetadataSpec>,
+    absent_metadata_after: Vec<MetadataSpec>,
     languages_after: Vec<(&'static str, &'static str)>,
+    names_before: Vec<(&'static str, &'static str)>,
+    names_after: Vec<(&'static str, &'static str)>,
+    detected_before: Vec<(&'static str, bool)>,
+    detected_after: Vec<(&'static str, bool)>,
 }
 
 impl Case {
@@ -135,7 +145,14 @@ impl Case {
             edges_before: Vec::new(),
             edges_after: Vec::new(),
             absent_after: Vec::new(),
+            metadata_before: Vec::new(),
+            metadata_after: Vec::new(),
+            absent_metadata_after: Vec::new(),
             languages_after: Vec::new(),
+            names_before: Vec::new(),
+            names_after: Vec::new(),
+            detected_before: Vec::new(),
+            detected_after: Vec::new(),
         }
     }
 
@@ -203,9 +220,75 @@ impl Case {
         self
     }
 
+    /// An edge the `before` index must hold with `value` under `key` in its
+    /// metadata: a synthesized edge, beside a base edge between the same
+    /// nodes.
+    pub fn edge_metadata_before(
+        mut self,
+        edge: EdgeSpec,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.metadata_before.push((edge, key, value));
+        self
+    }
+
+    /// No edge between nodes a fresh index of the final tree holds may have
+    /// `value` under `key` in its metadata: a synthesized edge gone, though a
+    /// base edge between the same nodes stays.
+    pub fn no_edge_metadata_after(
+        mut self,
+        edge: EdgeSpec,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.absent_metadata_after.push((edge, key, value));
+        self
+    }
+
+    /// An edge a fresh index of the final tree must hold with `value` under
+    /// `key` in its metadata (a framework edge's `framework`): the
+    /// comparison with each sync reads the metadata too.
+    pub fn edge_metadata_after(
+        mut self,
+        edge: EdgeSpec,
+        key: &'static str,
+        value: &'static str,
+    ) -> Self {
+        self.metadata_after.push((edge, key, value));
+        self
+    }
+
     /// The language a fresh index of the final tree records for file `path`.
     pub fn file_language_after(mut self, path: &'static str, language: &'static str) -> Self {
         self.languages_after.push((path, language));
+        self
+    }
+
+    /// A node of `kind` named `name` the `before` index must hold: a change
+    /// that renames a node in place (a route's name) shows in no edge.
+    pub fn named_before(mut self, kind: &'static str, name: &'static str) -> Self {
+        self.names_before.push((kind, name));
+        self
+    }
+
+    /// A node of `kind` named `name` a fresh index of the final tree must
+    /// hold.
+    pub fn named_after(mut self, kind: &'static str, name: &'static str) -> Self {
+        self.names_after.push((kind, name));
+        self
+    }
+
+    /// Whether the `before` index detected `framework`: a change of the
+    /// frameworks a project shows need not show in any edge.
+    pub fn detected_before(mut self, framework: &'static str, detected: bool) -> Self {
+        self.detected_before.push((framework, detected));
+        self
+    }
+
+    /// Whether a fresh index of the final tree detects `framework`.
+    pub fn detected_after(mut self, framework: &'static str, detected: bool) -> Self {
+        self.detected_after.push((framework, detected));
         self
     }
 
@@ -304,6 +387,9 @@ fn run_case(name: &str, case: &Case) {
 
     let mut cli = case.index_before("cli");
     expect_edges(name, "before", cli.graph(), &case.edges_before);
+    expect_edge_metadata(name, "before", cli.graph(), &case.metadata_before);
+    expect_names(name, "before", cli.graph(), &case.names_before);
+    expect_detected(name, "before", &cli.db(), &case.detected_before);
     let mut languages = indexed_languages(cli.graph());
     case.apply(&mut cli);
     cli.sync();
@@ -321,6 +407,10 @@ fn run_case(name: &str, case: &Case) {
         .index();
     expect_edges(name, "fresh", fresh.graph(), &case.edges_after);
     expect_no_edges(name, "fresh", fresh.graph(), &case.absent_after);
+    expect_edge_metadata(name, "fresh", fresh.graph(), &case.metadata_after);
+    expect_no_edge_metadata(name, "fresh", fresh.graph(), &case.absent_metadata_after);
+    expect_names(name, "fresh", fresh.graph(), &case.names_after);
+    expect_detected(name, "fresh", &fresh.db(), &case.detected_after);
     for &(path, language) in &case.languages_after {
         let recorded = fresh
             .graph()
@@ -399,7 +489,8 @@ fn run_case(name: &str, case: &Case) {
     // And the Shopify theme row and its marker (W4-LIQ-01).
     let shopify_rows = support::project_metadata_with_prefix(&fresh.db(), "shopify_themes");
     // And the class-head rows (W5-07), the control-input rows, the
-    // detected frameworks and the Dart pubspec rows (W5-06). An input
+    // detected frameworks and the Dart pubspec rows (W5-06), and what the
+    // synthesis stage read beside the index (W7-17b). An input
     // outside the project is keyed by
     // the absolute path its reader used, which differs between the trees, so
     // only project paths are compared.
@@ -408,6 +499,18 @@ fn run_case(name: &str, case: &Case) {
         "control_inputs",
         "frameworks_",
         "dart_pubspec",
+        "synthesis_unindexed_inputs",
+        // The Play routes marker (W7-19c).
+        "play_routes",
+        // The Laravel and Drupal lane markers (W7-19d).
+        "laravel_routes",
+        "drupal_refs",
+        // The Vapor lane marker (W7-19g).
+        "vapor_routes",
+        // The Rust crate roots marker (W7-19h).
+        "rust_crate_roots",
+        // The bridge-facts rows and the bridge lane marker (W7-21).
+        "rn_bridge",
     ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -639,6 +742,79 @@ fn expect_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
 }
 
 #[track_caller]
+fn expect_detected(name: &str, label: &str, db: &Path, specs: &[(&str, bool)]) {
+    let rows = support::project_metadata_with_prefix(db, "frameworks_detected");
+    let detected: Vec<String> = rows
+        .first()
+        .and_then(|(_, value)| serde_json::from_str(value).ok())
+        .unwrap_or_default();
+    for &(framework, want) in specs {
+        assert_eq!(
+            detected.iter().any(|known| known == framework),
+            want,
+            "[{name}] the {label} index detects {detected:?}, which this case exists to \
+             exercise with {framework} {}",
+            if want { "detected" } else { "not detected" }
+        );
+    }
+}
+
+fn expect_names(name: &str, label: &str, graph: &Graph, names: &[(&str, &str)]) {
+    for &(kind, node_name) in names {
+        assert!(
+            !graph.nodes_named(kind, node_name).is_empty(),
+            "[{name}] the {label} index has no {kind} named `{node_name}`, which this case \
+             exists to exercise\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
+fn expect_edge_metadata(name: &str, label: &str, graph: &Graph, specs: &[MetadataSpec]) {
+    for &((source, kind, target), key, value) in specs {
+        assert!(
+            graph
+                .edges_matching(source, kind, target)
+                .iter()
+                .any(
+                    |edge| edge.metadata.get(key).and_then(serde_json::Value::as_str)
+                        == Some(value)
+                ),
+            "[{name}] the {label} index has no {source} -[{kind}]-> {target} with `{key}: \
+             {value:?}` in its metadata, which this case exists to exercise\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
+fn expect_no_edge_metadata(name: &str, label: &str, graph: &Graph, specs: &[MetadataSpec]) {
+    for &((source, kind, target), key, value) in specs {
+        for selector in [source, target] {
+            assert!(
+                !graph.nodes_matching(selector).is_empty(),
+                "[{name}] the {label} index has no `{selector}`, so the absence of \
+                 {source} -[{kind}]-> {target} with `{key}: {value:?}` would hold vacuously\n{}",
+                graph.report()
+            );
+        }
+        assert!(
+            !graph
+                .edges_matching(source, kind, target)
+                .iter()
+                .any(
+                    |edge| edge.metadata.get(key).and_then(serde_json::Value::as_str)
+                        == Some(value)
+                ),
+            "[{name}] the {label} index holds {source} -[{kind}]-> {target} with `{key}: \
+             {value:?}` in its metadata, which this case exists to rule out\n{}",
+            graph.report()
+        );
+    }
+}
+
+#[track_caller]
 fn expect_no_edges(name: &str, label: &str, graph: &Graph, edges: &[EdgeSpec]) {
     for &(source, kind, target) in edges {
         for selector in [source, target] {
@@ -846,6 +1022,9 @@ matrix! {
     javascript_global_namespace_member_renamed,
     javascript_object_literal_this_call_body_edit,
     tsx_tag_becomes_a_parameter_body_edit,
+    tsx_route_element_body_edit,
+    tsx_wrapper_value_body_edit,
+    tsx_framework_edge_keeps_its_resolvers_name,
     typescript_interface_moves_into_a_declare_module_body,
     vue_options_api_this_call_body_edit,
     vue_template_call_reaches_an_added_composable,
@@ -917,6 +1096,7 @@ matrix! {
     cpp_lowercase_macro_class_body_edit,
     c_auto_local_initializer_call_body_edit,
     java_subclass_gains_a_base_its_caller_reaches,
+    java_class_gains_a_second_interface,
     typescript_dollar_import_reaches_an_added_module,
     typescript_dollar_default_export_names_another_declaration,
     java_super_call_in_an_override_body_edit,
@@ -1343,13 +1523,542 @@ matrix! {
     typescript_tsconfig_paths_alias_disappears,
     typescript_tsconfig_extends_target_appears,
     typescript_paths_retarget_moves_a_barrel_source,
+    typescript_app_tsconfig_paths_appear,
+    typescript_app_tsconfig_paths_retarget_to_the_root,
+    typescript_app_tsconfig_is_deleted,
+    javascript_app_jsconfig_paths_appear,
     typescript_react_dependency_leaves_package_json,
+    typescript_react_dependency_appears_in_an_app_package_json,
+    typescript_react_dependency_appears_above_no_script,
+    typescript_react_dependency_beside_an_added_script,
+    typescript_nestjs_bootstrap_sets_a_global_prefix,
+    typescript_nestjs_bootstrap_drops_its_global_prefix,
+    typescript_nestjs_e2e_spec_sets_a_global_prefix,
+    typescript_nestjs_router_module_registration_is_removed,
+    typescript_nestjs_provider_beside_its_controller_appears,
+    javascript_express_mount_appears,
+    javascript_express_mount_is_removed,
+    javascript_express_mount_prefix_changes,
+    javascript_express_second_mount_of_a_router_appears,
+    javascript_express_mounted_handler_body_edit,
+    javascript_express_dependency_appears_in_package_json,
+    javascript_express_routes_file_appears_without_a_dependency,
+    javascript_express_second_middleware_appears_in_the_file,
+    javascript_express_second_middleware_is_removed_from_the_file,
+    javascript_express_controller_method_gains_a_candidate,
+    javascript_express_controller_method_loses_a_candidate,
+    javascript_express_service_method_gains_a_candidate,
+    javascript_express_service_method_loses_a_candidate,
+    javascript_express_x_middleware_declaration_appears,
+    javascript_express_x_middleware_declaration_is_removed,
+    javascript_express_controller_object_appears,
+    javascript_express_controller_object_is_deleted,
+    astro_page_appears,
+    typescript_astro_endpoint_verb_changes,
+    typescript_astro_dependency_leaves_package_json,
+    astro_second_component_appears_in_the_directory,
+    astro_second_component_leaves_the_directory,
+    astro_global_member_namesakes_appear,
+    astro_global_member_namesakes_leave,
+    python_django_requirement_appears,
+    python_django_requirement_leaves,
+    python_django_manage_py_appears,
+    python_django_manage_py_is_deleted,
+    python_django_urlconf_gains_a_path,
+    python_django_urlconf_loses_a_path,
+    python_django_included_urlconf_is_deleted,
+    python_django_included_urlconf_reappears,
+    python_flask_dependency_appears_in_pipfile,
+    python_flask_dependency_leaves_pipfile,
+    python_flask_url_rule_appears,
+    python_flask_url_rule_is_removed,
+    python_flask_register_view_gains_a_path,
+    python_fastapi_dependency_appears_in_pyproject,
+    python_fastapi_dependency_leaves_pyproject,
+    python_fastapi_mount_gains_a_prefix,
+    python_fastapi_mount_loses_its_prefix,
+    python_fastapi_mount_prefix_changes,
+    python_fastapi_mount_prefix_becomes_computed,
+    python_fastapi_second_mount_of_a_router_appears,
+    python_fastapi_second_mount_of_a_router_is_deleted,
+    python_fastapi_router_prefix_changes,
+    python_fastapi_alias_import_mount_appears,
+    python_fastapi_alias_import_mount_is_removed,
+    python_fastapi_mounted_handler_body_edit,
+    python_django_model_gains_a_namesake_in_the_directory,
+    python_django_model_loses_its_namesake_in_the_directory,
+    python_django_model_gains_a_second_candidate_in_its_tier,
+    python_django_model_loses_its_second_candidate,
+    python_django_model_moves_into_a_function_body,
+    python_django_model_moves_under_tests,
+    java_spring_build_gradle_gains_spring_boot,
+    java_spring_build_gradle_drops_spring_boot,
+    java_spring_pom_gains_springframework,
+    java_spring_pom_drops_springframework,
+    java_spring_service_annotation_appears,
+    java_spring_service_annotation_is_removed,
+    java_spring_mapping_path_changes,
+    java_spring_class_prefix_changes,
+    java_spring_prefix_constant_changes,
+    java_spring_config_key_appears,
+    java_spring_config_key_is_removed,
+    java_spring_config_key_changes_its_relaxed_spelling,
+    java_spring_config_key_appears_in_the_base_file_beside_a_profile,
+    java_spring_config_key_appears_in_a_profile_file,
+    java_spring_config_base_file_is_deleted,
+    java_spring_module_gains_its_own_config_key,
+    java_spring_module_loses_its_own_config_key,
+    java_spring_configuration_properties_gains_a_shorter_key,
+    java_spring_configuration_properties_loses_its_shorter_key,
+    java_spring_properties_key_is_renamed_to_a_binding,
+    java_spring_properties_key_is_renamed_away_from_a_binding,
+    java_spring_service_convention_gains_a_second_candidate,
+    java_spring_service_convention_loses_its_second_candidate,
+    scala_play_build_sbt_gains_play_scala,
+    scala_play_build_sbt_drops_play_scala,
+    scala_play_application_conf_appears,
+    scala_play_application_conf_is_deleted,
+    scala_play_routes_file_appears_in_a_subproject,
+    scala_play_routes_file_in_a_subproject_is_deleted,
+    scala_play_routes_gains_a_line,
+    scala_play_routes_loses_a_line,
+    scala_play_nearer_controller_appears,
+    scala_play_nearer_controller_is_deleted,
+    scala_play_action_is_renamed,
+    scala_play_action_is_removed,
+    scala_play_controller_is_renamed,
+    scala_play_controller_is_renamed_back,
+    scala_play_routes_file_moves_into_another_project,
+    kotlin_play_class_joins_an_existing_action,
+    kotlin_play_class_joins_an_action_at_the_same_depth,
+    scala_play_parked_routes_reach_an_added_controller_past_the_tail_ceiling,
+    java_play_extension_override_brings_a_controller_into_the_jvm,
+    java_play_extension_override_takes_a_controller_out_of_the_jvm,
+    php_laravel_artisan_appears,
+    php_laravel_artisan_is_deleted,
+    php_laravel_kernel_appears,
+    php_laravel_kernel_is_deleted,
+    php_laravel_controller_gains_the_action,
+    php_laravel_controller_loses_the_action,
+    php_laravel_controller_file_appears,
+    php_laravel_controller_file_is_deleted,
+    php_laravel_same_named_controller_appears_in_another_controllers_directory,
+    php_laravel_same_named_controller_leaves_the_other_controllers_directory,
+    php_laravel_resource_gains_a_second_path_match,
+    php_laravel_resource_loses_its_second_path_match,
+    php_laravel_route_service_provider_gains_a_prefix,
+    php_laravel_route_service_provider_loses_its_prefix,
+    php_laravel_with_routing_gains_using,
+    php_laravel_with_routing_loses_using,
+    php_laravel_with_routing_gains_an_api_prefix,
+    php_laravel_with_routing_loses_its_api_prefix,
+    php_laravel_required_routes_file_appears,
+    php_laravel_required_routes_file_is_deleted,
+    php_drupal_composer_json_gains_a_drupal_dependency,
+    php_drupal_composer_json_drops_its_drupal_dependency,
+    php_drupal_info_yml_appears,
+    php_drupal_info_yml_is_deleted,
+    php_drupal_controller_gains_the_method,
+    php_drupal_controller_loses_the_method,
+    php_drupal_another_class_gains_the_method,
+    php_drupal_another_class_loses_the_method,
+    php_drupal_same_named_class_without_the_method_appears,
+    php_drupal_same_named_class_with_the_method_appears,
+    php_drupal_same_named_class_with_the_method_goes,
+    php_drupal_routing_file_gains_a_form_route,
+    php_drupal_routing_file_loses_its_form_route,
+    php_drupal_route_handler_names_another_method,
+    php_drupal_hook_gains_a_second_implementation,
+    php_drupal_hook_loses_its_second_implementation,
+    php_drupal_hook_definition_appears,
+    php_drupal_hook_definition_is_deleted,
+    php_drupal_use_import_stays_unresolved_when_its_last_segment_appears,
+    ruby_rails_gemfile_gains_rails,
+    ruby_rails_gemfile_drops_rails,
+    ruby_rails_engine_routes_file_appears,
+    ruby_rails_engine_routes_file_is_deleted,
+    ruby_rails_controller_file_appears,
+    ruby_rails_controller_file_is_deleted,
+    ruby_rails_controller_gains_the_action,
+    ruby_rails_controller_loses_the_action,
+    ruby_rails_controller_class_is_renamed_to_the_routes_controller,
+    ruby_rails_controller_class_is_renamed_away_from_the_routes_controller,
+    ruby_rails_second_controller_class_appears,
+    ruby_rails_second_controller_class_goes,
+    ruby_rails_second_class_is_renamed_to_the_routes_controller,
+    ruby_rails_second_class_is_renamed_away_from_the_routes_controller,
+    ruby_rails_conventional_controller_file_appears_with_only_a_function,
+    ruby_rails_conventional_controller_file_with_only_a_function_goes,
+    ruby_rails_conventional_controller_file_appears_beside_the_class,
+    ruby_rails_conventional_controller_file_goes_beside_the_class,
+    ruby_rails_namespaced_controller_file_moves_out_of_its_namespace,
+    ruby_rails_namespaced_controller_file_moves_into_its_namespace,
+    ruby_rails_own_module_controller_without_the_action_appears,
+    ruby_rails_own_module_controller_without_the_action_goes,
+    ruby_rails_routes_file_gains_a_route,
+    ruby_rails_routes_file_loses_a_route,
+    ruby_rails_model_moves_out_of_app_models,
+    ruby_rails_model_moves_into_app_models,
+    csharp_aspnet_root_startup_appears,
+    csharp_aspnet_root_startup_is_deleted,
+    csharp_aspnet_excluded_program_gains_a_web_host,
+    csharp_aspnet_excluded_program_loses_its_web_host,
+    csharp_aspnet_controller_gains_an_action,
+    csharp_aspnet_controller_loses_an_action,
+    csharp_aspnet_endpoint_constant_changes_its_value,
+    csharp_aspnet_endpoint_constant_changes_its_value_back,
+    csharp_aspnet_endpoint_constant_is_deleted,
+    csharp_aspnet_endpoint_constant_comes_back,
+    csharp_aspnet_group_head_file_appears,
+    csharp_aspnet_group_head_file_is_deleted,
+    csharp_aspnet_group_gains_a_route_prefix,
+    csharp_aspnet_group_loses_its_route_prefix,
+    csharp_aspnet_service_moves_out_of_services,
+    csharp_aspnet_service_moves_into_services,
+    razor_aspnet_page_model_beside_the_page_appears,
+    razor_aspnet_page_model_beside_the_page_is_deleted,
+    swift_vapor_handler_type_appears,
+    swift_vapor_handler_type_is_deleted,
+    swift_vapor_handler_overload_gains_the_request,
+    swift_vapor_handler_overload_loses_the_request,
+    swift_vapor_handler_rival_overload_gains_the_request,
+    swift_vapor_handler_rival_overload_loses_the_request,
+    swift_vapor_handler_type_gains_the_handler,
+    swift_vapor_handler_type_loses_the_handler,
+    swift_vapor_extension_gains_its_api_path,
+    swift_vapor_extension_loses_its_api_path,
+    swift_vapor_handler_moves_into_its_type,
+    swift_vapor_handler_moves_into_an_extension,
+    swift_vapor_self_handler_extension_appears,
+    swift_vapor_self_handler_extension_is_deleted,
+    swift_vapor_bare_handler_gains_a_namesake,
+    swift_vapor_bare_handler_loses_its_namesake,
+    swift_vapor_package_gains_vapor,
+    swift_vapor_package_drops_vapor,
+    swift_vapor_excluded_package_gains_vapor,
+    swift_vapor_excluded_package_drops_vapor,
+    swift_vapor_import_appears_in_a_file_that_routes_nothing,
+    swift_vapor_import_goes_from_a_file_that_routes_nothing,
+    swiftui_import_appears,
+    swiftui_import_goes,
+    uikit_view_mention_appears,
+    uikit_view_mention_goes,
+    swift_vapor_closure_call_target_appears,
+    swift_vapor_closure_call_target_is_deleted,
+    swift_vapor_controller_moves_out_of_controllers,
+    swift_vapor_controller_moves_into_controllers,
+    swiftui_model_gains_an_extension_beside_it,
+    swiftui_model_loses_its_extension,
+    swift_vapor_group_prefix_changes,
+    rust_workspace_member_gains_a_lib_beside_its_main,
+    rust_workspace_member_loses_its_lib_beside_its_main,
+    rust_workspace_member_gains_its_crate_root,
+    rust_workspace_member_loses_its_crate_root,
+    rust_root_module_appears_over_a_workspace_crate,
+    rust_root_module_over_a_workspace_crate_is_deleted,
+    rust_root_module_shrinks_under_the_size_limit,
+    rust_root_module_grows_over_the_size_limit,
+    react_native_alias_becomes_ambiguous,
+    react_native_alias_stops_being_ambiguous,
+    react_native_alias_is_retargeted,
+    react_native_alias_is_retargeted_back,
+    react_native_extern_shim_drops_its_method,
+    react_native_extern_shim_gains_its_method,
+    react_native_extern_shim_becomes_a_remap_module,
+    react_native_extern_shim_stops_being_a_remap_module,
+    react_native_extern_method_moves_out_of_its_class,
+    react_native_extern_method_moves_into_its_class,
+    react_native_remap_target_appears,
+    react_native_remap_target_is_deleted,
+    react_native_jvm_method_loses_its_annotation,
+    react_native_jvm_method_gains_its_annotation,
+    react_native_turbo_spec_drops_a_method,
+    react_native_turbo_spec_gains_a_method,
+    swift_objc_bridge_target_appears,
+    swift_objc_bridge_target_goes,
+    swift_objc_bridge_target_gains_a_namesake,
+    swift_objc_bridge_target_loses_its_namesake,
+    swift_objc_method_is_exposed_on_its_line,
+    swift_objc_method_is_hidden_on_its_line,
+    swift_objc_method_is_exposed_on_the_line_above,
+    swift_objc_method_is_hidden_on_the_line_above,
+    expo_binding_names_another_module,
+    expo_binding_names_its_module_again,
+    expo_binding_type_argument_changes,
+    expo_binding_type_argument_changes_back,
+    expo_module_gains_its_kotlin_implementation,
+    expo_module_loses_its_kotlin_implementation,
+    fabric_workspace_manifest_appears,
+    fabric_workspace_manifest_is_deleted,
+    fabric_workspace_manifest_comes_to_name_react_native,
+    react_native_call_appears_beside_an_unchanged_export,
+    react_native_call_appears_beside_an_unchanged_objcpp_export,
+    react_native_call_appears_beside_an_unchanged_java_module,
+    react_native_call_appears_beside_an_unchanged_kotlin_module,
+    react_native_call_appears_beside_an_unchanged_spec,
+    react_native_call_appears_beside_an_unchanged_shim,
+    react_native_call_appears_through_an_unchanged_alias,
+    expo_call_appears_beside_an_unchanged_binding,
+    react_native_turbo_implementation_appears,
+    react_native_turbo_implementation_is_deleted,
+    react_native_extern_method_moves_into_its_class_past_the_tail_ceiling,
+    swift_objc_function_is_exposed_on_its_line,
+    swift_objc_function_is_hidden_on_its_line,
+    react_native_turbo_kotlin_implementation_gains_its_method_past_the_tail_ceiling,
+    react_native_turbo_java_implementation_gains_its_method_past_the_tail_ceiling,
+    expo_one_binding_name_in_two_files_reaches_each_files_module,
+    swift_objc_bridge_gives_way_to_a_namesake_in_the_messages_language,
+    swift_objc_bridge_answers_again_when_its_namesake_goes,
+    react_native_bridge_gives_way_to_a_namesake_in_the_calls_language,
+    react_native_bridge_answers_again_when_its_namesake_goes,
+    paper_view_manager_appears_beside_its_view_class,
+    paper_view_manager_is_deleted,
+    react_native_remapped_bridge_gives_way_to_a_namesake_of_the_call,
+    react_native_remapped_bridge_answers_again_when_its_namesake_goes,
+    swift_objc_bridge_gives_way_to_a_swift_namesake_of_the_call,
+    swift_objc_bridge_answers_again_when_the_swift_namesake_goes,
+    swift_objc_bridge_gives_way_to_a_cpp_namesake_of_the_call,
+    swift_objc_bridge_answers_again_when_the_cpp_namesake_goes,
+    swift_objc_bridge_gives_way_when_a_cpp_namesakes_class_is_renamed,
+    swift_objc_bridge_answers_again_when_the_cpp_class_is_renamed_back,
+    react_native_bridge_gives_way_to_an_arkts_namesake_of_the_call,
+    react_native_bridge_answers_again_when_the_arkts_namesake_goes,
+    rust_workspace_crate_root_shrinks_under_the_size_limit,
+    rust_workspace_crate_root_grows_over_the_size_limit,
+    rust_workspace_members_gain_a_crate,
+    rust_workspace_members_lose_a_crate,
+    rust_workspace_member_renames_its_package,
+    rust_workspace_member_takes_its_package_name_back,
+    rust_workspace_glob_gains_a_member,
+    rust_workspace_glob_loses_a_member,
+    rust_root_manifest_appears_beside_axum_routes,
+    rust_root_manifest_beside_axum_routes_is_deleted,
+    rust_route_handler_module_appears,
+    rust_route_handler_module_is_deleted,
+    rust_handler_moves_into_handlers,
+    rust_handler_moves_out_of_handlers,
+    go_router_gains_a_route_line,
+    go_router_loses_a_route_line,
+    go_route_path_loses_its_leading_slash,
+    go_route_path_regains_its_leading_slash,
+    go_mux_pattern_loses_its_method,
+    go_mux_pattern_gains_a_method,
+    go_route_handler_appears_in_another_file_of_its_package,
+    go_route_handler_leaves_another_file_of_its_package,
+    go_bare_type_gains_a_namesake_in_its_own_package,
+    go_bare_type_loses_its_own_package_namesake,
+    go_picked_type_gains_a_build_tag_twin,
+    go_picked_type_loses_its_build_tag_twin,
+    go_picked_type_gains_a_namesake_in_another_package,
+    go_picked_type_loses_a_namesake_in_another_package,
+    go_bare_type_is_written_through_a_package,
+    go_qualified_type_is_written_bare,
+    go_embedded_type_gains_a_namesake_in_its_own_package,
+    go_embedded_type_loses_its_own_package_namesake,
+    go_first_go_file_appears_in_a_javascript_project,
+    go_last_go_file_leaves_a_javascript_project,
+    go_root_go_mod_appears_in_a_project_without_go_files,
+    go_root_go_mod_leaves_a_project_without_go_files,
+    vue_nuxt_config_appears,
+    vue_nuxt_app_manifest_gains_nuxt,
+    vue_nuxt_page_body_edit,
     typescript_declared_dependency_makes_a_bare_import_external,
     typescript_workspace_member_manifest_renames_its_package,
     typescript_workspace_member_manifest_is_deleted,
     typescript_workspace_glob_gains_a_member,
     tauri_config_marker_appears,
     tauri_command_attribute_makes_an_invoke_call_its_edge,
+    tauri_command_body_edit_keeps_the_invoke_edges_resolver_name,
+    typescript_next_navigation_call_names_another_page,
+    tsx_next_page_body_edit_keeps_its_navigations,
+    tsx_next_static_page_delete_falls_back_to_the_dynamic_route,
+    typescript_next_dependency_appears_in_package_json,
+    typescript_next_config_appears,
+    typescript_next_app_manifest_gains_next,
+    typescript_next_route_handler_body_edit,
+    typescript_expo_navigation_call_names_another_screen,
+    tsx_expo_screen_body_edit_keeps_its_navigations,
+    tsx_expo_static_screen_delete_falls_back_to_the_dynamic_route,
+    typescript_expo_router_dependency_appears_in_package_json,
+    typescript_expo_config_appears_beside_a_layout,
+    typescript_expo_api_route_body_edit,
+    typescript_tanstack_navigation_call_names_another_route,
+    tsx_tanstack_route_body_edit_keeps_its_navigations,
+    tsx_tanstack_static_route_delete_falls_back_to_the_dynamic_route,
+    typescript_tanstack_router_dependency_appears_in_package_json,
+    tsx_tanstack_code_route_moves_under_another_parent,
+    javascript_vue_router_navigation_call_names_another_route,
+    javascript_vue_router_route_rename_drops_its_named_navigation,
+    javascript_vue_router_static_route_delete_falls_back_to_the_dynamic_route,
+    javascript_vue_router_dependency_appears_in_package_json,
+    javascript_vue_router_layout_body_edit_keeps_the_layout,
+    typescript_nuxt_router_push_names_another_page,
+    javascript_vue_router_lazy_view_appears,
+    javascript_vue_router_lazy_module_default_export_moves,
+    javascript_vue_router_lazy_module_default_statement_names_another,
+    typescript_vue_router_imported_layout_appears,
+    typescript_vue_router_barrel_reexports_another_layout,
+    typescript_vue_router_second_declarator_gains_its_export,
+    typescript_vue_router_second_declarator_loses_its_export,
+    javascript_sveltekit_goto_names_another_page,
+    javascript_sveltekit_server_redirect_names_another_page,
+    javascript_sveltekit_static_page_delete_falls_back_to_the_dynamic_page,
+    javascript_sveltekit_group_folder_rename_keeps_the_address,
+    javascript_sveltekit_dependency_appears_in_package_json,
+    javascript_sveltekit_page_appears_where_a_goto_points,
+    javascript_sveltekit_static_page_appears_beside_the_dynamic_page,
+    javascript_sveltekit_second_optional_page_makes_the_short_path_ambiguous,
+    typescript_sveltekit_lib_module_appears,
+    typescript_angular_mount_path_edit_moves_the_loaded_routes,
+    typescript_angular_constant_path_edit_renames_the_route,
+    typescript_angular_constant_barrel_reexports_another_file,
+    typescript_angular_ng_module_imports_its_routing_module,
+    typescript_angular_nx_barrel_forwards_another_module,
+    typescript_angular_nx_alias_retargets_the_mount,
+    typescript_angular_lazy_component_default_export_moves,
+    typescript_angular_lazy_component_appears,
+    typescript_angular_mounted_routes_file_appears,
+    typescript_angular_earlier_file_mounts_the_routes_too,
+    typescript_angular_dependency_appears_in_package_json,
+    typescript_angular_navigation_call_names_another_route,
+    typescript_angular_redirect_chain_link_moves,
+    tsx_react_router_route_renders_another_page,
+    tsx_react_router_page_body_edit_keeps_its_route,
+    tsx_react_router_page_delete_leaves_its_route,
+    typescript_react_router_navigation_call_names_another_route,
+    typescript_react_router_dependency_appears_in_package_json,
+    typescript_react_router_route_constant_renames_the_route,
+    tsx_react_router_routes_file_edit_names_its_route_before_resolving,
+    typescript_synthesis_registration_moves,
+    typescript_synthesis_channel_file_deleted,
+    typescript_synthesis_survives_an_unrelated_edit,
+    typescript_synthesis_target_gains_a_namesake,
+    javascript_emitter_handler_gains_a_competitor,
+    javascript_emitter_handler_loses_a_competitor,
+    swift_closure_collection_keeps_its_field_after_an_edit,
+    typescript_react_state_update_goes,
+    kotlin_actual_file_deleted,
+    cpp_override_renamed,
+    pascal_form_appears,
+    java_mybatis_mapper_gains_a_namesake,
+    typescript_class_drops_its_interface,
+    swift_protocol_extension_appears,
+    java_interface_file_deleted,
+    typescript_registry_gains_a_handler,
+    typescript_registry_handler_file_deleted,
+    typescript_registry_dispatch_removed,
+    tsx_rendered_component_appears,
+    tsx_rendered_component_file_deleted,
+    tsx_tag_removed,
+    go_method_in_an_added_file_gains_its_owner,
+    go_interface_method_renamed_off_its_implementer,
+    go_embedding_removed_drops_the_interface,
+    go_embedded_type_renames_its_method,
+    go_interface_embeds_another_std_type,
+    go_grpc_server_gains_its_missing_rpc,
+    go_gin_registration_moves_to_another_file,
+    go_gin_dispatch_call_removed,
+    ts_thunk_starts_dispatching_another_thunk,
+    ts_thunk_dispatch_target_gains_a_namesake_thunk,
+    python_celery_task_loses_its_decorator,
+    java_spring_listener_hears_another_event,
+    csharp_mediatr_handler_takes_another_request,
+    ruby_sidekiq_worker_drops_its_mixin,
+    ruby_sidekiq_qualified_worker_is_reopened_with_a_perform,
+    php_laravel_listen_map_gains_a_listener,
+    ts_pinia_options_store_gains_an_action,
+    ts_rtk_api_gains_a_hook_binding,
+    js_vuex_module_becomes_a_store_file,
+    ts_rtk_endpoint_key_is_renamed,
+    ts_rtk_api_gains_a_namesake_of_an_endpoint,
+    ts_pinia_factory_gains_a_namesake_in_another_file,
+    ts_pinia_store_gains_the_action_its_consumer_calls,
+    js_vuex_namespace_gains_a_second_store_file_of_the_action,
+    js_vuex_module_gains_the_mutation_its_action_commits,
+    go_goframe_go_mod_comes_to_require_goframe,
+    go_goframe_handler_takes_another_request_type,
+    go_goframe_route_path_is_changed,
+    go_goframe_another_controller_takes_the_request_type,
+    go_goframe_controller_file_is_deleted,
+    tsx_next_link_target_page_appears,
+    tsx_next_link_target_page_deleted,
+    tsx_react_router_route_file_edit_serves_a_links_path,
+    vue_router_route_is_renamed_to_a_links_name,
+    svelte_sveltekit_link_target_page_appears,
+    svelte_sveltekit_page_server_appears,
+    svelte_sveltekit_page_server_deleted,
+    svelte_sveltekit_page_appears_beside_its_loader,
+    vue_composable_member_is_renamed,
+    vue_kebab_component_appears_elsewhere,
+    vue_package_json_declares_an_imported_tags_package,
+    tsx_tanstack_link_route_file_appears,
+    tsx_header_link_default_export_stops_wrapping_a_link,
+    tsx_route_config_get_href_returns_another_path,
+    tsx_tsconfig_alias_of_a_links_route_config_points_elsewhere,
+    tsx_workspace_package_wrapper_wraps_another_component,
+    typescript_expo_helper_returns_another_screen,
+    typescript_expo_push_comes_to_consume_a_helper,
+    typescript_angular_template_file_runs_another_handler,
+    typescript_angular_template_file_appears,
+    typescript_angular_template_file_deleted,
+    typescript_angular_template_url_names_another_template,
+    typescript_angular_indexed_template_runs_another_handler,
+    c_fnptr_table_gains_an_entry,
+    c_fnptr_header_typedef_becomes_data,
+    c_fnptr_header_table_macro_changes_its_expansion,
+    c_fnptr_dispatch_reads_another_field,
+    cpp_local_fn_ptr_binds_another_function,
+    c_fnptr_struct_definitions_change_their_order,
+    c_fnptr_entry_gains_a_namesake,
+    c_fnptr_identical_struct_table_gains_an_entry,
+    c_fnptr_shared_definition_splits,
+    c_fnptr_header_struct_gains_a_conditional_field,
+    c_fnptr_header_struct_drops_its_conditional_field,
+    c_fnptr_non_indexed_include_gains_an_entry,
+    c_fnptr_non_indexed_include_appears,
+    c_fnptr_non_indexed_include_deleted,
+    c_fnptr_non_indexed_include_becomes_gitignored,
+    c_fnptr_non_indexed_include_becomes_excluded,
+    go_var_group_gains_a_member_whose_initializer_calls_another_file,
+    go_package_closure_call_reaches_a_function_that_appears,
+    go_package_literal_struct_file_deleted,
+    go_const_group_member_read_by_a_function,
+    go_module_path_renamed_unlinks_a_cross_package_call,
+    go_nested_module_file_appears_and_links_its_importer,
+    go_nested_module_file_deleted_unlinks_its_importer,
+    go_root_module_file_deleted_unlinks_a_cross_package_call,
+    go_func_field_wiring_appears_in_a_file_that_only_wires,
+    go_func_field_wiring_removed,
+    go_func_field_type_stops_being_a_func,
+    go_func_field_copied_value_changes_in_another_file,
+    go_func_field_package_level_wiring_appears,
+    go_func_field_module_renamed_unlinks_a_qualified_literal,
+    tsx_react_router_lazy_barrel_page_appears,
+    tsx_react_router_lazy_page_default_export_moves,
+    tsx_react_router_lazy_page_body_edit_keeps_its_route,
+    tsx_react_router_loader_picks_another_export,
+    tsx_react_router_picked_default_export_moves,
+    tsx_react_router_picked_export_module_appears,
+    jsx_react_router_table_edit_moves_its_routes,
+    jsx_react_router_consumer_stops_handing_its_table,
+    jsx_react_router_consumer_starts_handing_a_table,
+    jsx_react_router_table_consumer_deleted,
+    jsx_react_router_table_page_moves,
+    jsx_react_router_consumer_moves_another_files_table,
+    jsx_react_router_layout_around_a_same_file_table_changes,
+    jsx_react_router_earlier_consumer_stops_handing_a_table,
+    jsx_react_router_earlier_consumer_starts_handing_a_table,
+    tsx_jsx_tag_forwarding_index_re_points,
+    tsx_jsx_tag_index_value_holds_another_component,
+    tsx_jsx_tag_module_behind_the_index_wraps_another,
+    tsx_jsx_tag_middle_module_re_points,
+    tsx_jsx_tag_index_declares_its_export,
+    tsx_jsx_tag_forwarded_module_deleted,
+    tsx_jsx_tag_memo_wrapped_component_renamed,
+    tsx_jsx_tag_index_later_declarator_re_points,
+    tsx_jsx_tag_index_listed_later_declarator_re_points,
+    tsx_jsx_tag_index_annotated_value_re_points,
+    tsx_jsx_tag_index_shadowed_value_re_points,
     typescript_package_version_bump_keeps_every_edge,
     liquid_json_template_joins_a_theme_once_its_settings_schema_appears,
     liquid_json_templates_leave_once_the_theme_layout_goes,
@@ -1364,6 +2073,27 @@ matrix! {
     pascal_include_flips_from_php_and_its_routine_is_called,
     pascal_include_flips_to_php_and_its_routine_leaves,
     javascript_file_gains_the_flow_pragma,
+    typescript_tier_client_path_changes,
+    typescript_tier_route_path_changes,
+    typescript_tier_mount_prefix_changes,
+    typescript_tier_nestjs_global_prefix_appears,
+    typescript_tier_nestjs_global_prefix_goes,
+    typescript_tier_second_route_ties_the_call,
+    typescript_tier_second_route_goes,
+    typescript_tier_imported_base_url_changes,
+    typescript_tier_imported_instance_module_is_deleted,
+    typescript_tier_import_alias_points_elsewhere,
+    php_tier_laravel_api_prefix_moves_the_route,
+    php_tier_request_helper_stops_requesting,
+    javascript_tier_client_moves_under_tests,
+    typescript_tier_queue_binding_names_another_queue,
+    tsx_tier_chat_becomes_a_socket_server,
+    typescript_tier_on_event_goes_and_the_emitter_pass_keeps_the_pair,
+    java_tier_spring_test_imports_its_request_builders,
+    #[ignore = "unscheduled: base import resolution probes the disk for an import candidate the index lacks (pre-existing, not the tier pass)"]
+    typescript_tier_excluded_import_candidate_appears,
+    #[ignore = "unscheduled: base import resolution probes the disk for an import candidate the index lacks (pre-existing, not the tier pass)"]
+    typescript_tier_excluded_import_candidate_goes,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -1478,6 +2208,178 @@ fn surface_bootstrap_reconciles_an_index_built_before_the_rows() {
             surface_rows,
             "[{driver}] module-surface rows"
         );
+    }
+}
+
+/// W7-20: an index whose synthesis marker is the last version's (17, before
+/// the tier passes) recomputes the stage on its next sync, with nothing
+/// changed: the test fakes that index (its tier edges deleted, the marker
+/// set back), and both drivers must draw the tier edge, match a fresh
+/// index and write this version's marker.
+#[test]
+fn tier_passes_recompute_an_index_of_the_last_synthesis_version() {
+    const APP: &str = "import express from 'express';\nconst app = express();\napp.post('/api/users', createUser);\nfunction createUser(req, res) {}\n";
+    const FORM: &str =
+        "export function submit() {\n  return fetch('/api/users', { method: 'POST' });\n}\n";
+    let tree = [
+        (
+            "package.json",
+            "{\"name\":\"app\",\"private\":true,\"dependencies\":{\"express\":\"^4.0.0\"}}\n",
+        ),
+        ("apps/api/app.ts", APP),
+        ("apps/web/form.ts", FORM),
+    ];
+    let edge = |graph: &Graph| {
+        graph
+            .edges_matching(
+                "function submit",
+                "calls",
+                "route apps/api/app.ts::POST:/api/users",
+            )
+            .into_iter()
+            .any(|edge| edge.metadata["synthesizedBy"] == "http-client")
+    };
+    let index_old = |label: &str| {
+        let mut project = tree
+            .iter()
+            .fold(
+                support::Project::named(label),
+                |project, (path, contents)| project.file(path, contents),
+            )
+            .index();
+        let conn = rusqlite::Connection::open(project.db()).unwrap();
+        let deleted = conn
+            .execute(
+                "DELETE FROM edges WHERE metadata LIKE '%\"synthesizedBy\":\"http-client\"%'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(deleted, 1, "the fresh index draws the tier edge");
+        let updated = conn
+            .execute(
+                "UPDATE project_metadata SET value = '17' WHERE key = 'synthesis_version'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+        conn.close().unwrap();
+        project.reload();
+        assert!(!edge(project.graph()), "{}", project.graph().report());
+        project
+    };
+
+    let mut cli = index_old("cli");
+    cli.sync();
+    let mut watch = index_old("watch");
+    watcher_sync(&watch, &[]);
+    watch.reload();
+
+    let fresh = tree
+        .iter()
+        .fold(
+            support::Project::named("fresh"),
+            |project, (path, contents)| project.file(path, contents),
+        )
+        .index();
+    assert!(edge(fresh.graph()), "{}", fresh.graph().report());
+    let expected = canonicalize_db(&fresh.db()).expect("canonicalize the fresh index");
+    for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+        assert!(
+            edge(project.graph()),
+            "[{driver}]\n{}",
+            project.graph().report()
+        );
+        let actual = canonicalize_db(&project.db()).expect("canonicalize the synced index");
+        if let Err(diff) = diff_canonical(&expected, &actual, None) {
+            panic!(
+                "[{driver}] the recomputed index differs from a fresh one\n{}{diff}",
+                readable_difference(fresh.graph(), project.graph()),
+            );
+        }
+        assert_eq!(
+            support::project_metadata_with_prefix(&project.db(), "synthesis_version"),
+            [("synthesis_version".to_string(), "19".to_string())],
+            "[{driver}]"
+        );
+    }
+}
+
+/// The edges the tier passes synthesize (`http-client`, `queue-job`,
+/// `event-bus`, `test-request`), each by its ends' natural keys, with its
+/// line, column and metadata.
+fn tier_edges(graph: &Graph) -> BTreeSet<String> {
+    graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.metadata
+                    .get("synthesizedBy")
+                    .and_then(serde_json::Value::as_str),
+                Some("http-client" | "queue-job" | "event-bus" | "test-request")
+            )
+        })
+        .map(|edge| {
+            format!(
+                "{} -[{}]-> {} at {:?}:{:?} {}",
+                graph.describe(&edge.source),
+                edge.kind,
+                graph.describe(&edge.target),
+                edge.line,
+                edge.col,
+                edge.metadata
+            )
+        })
+        .collect()
+}
+
+/// W7-20 (KEEP-RUST): the tier pass resolves a client's import among the
+/// indexed files, so an excluded import candidate appearing beside the
+/// indexed one, or going, leaves the tier passes' edges as a fresh index
+/// draws them, through both drivers and in both directions. The whole index
+/// is a known gap there (`typescript_tier_excluded_import_candidate_appears`
+/// and `…_goes`): base import resolution probes the disk for the excluded
+/// candidate.
+#[test]
+fn tier_edges_converge_beside_an_excluded_import_candidate() {
+    for (name, case) in [
+        (
+            "appears",
+            cases::typescript_tier_excluded_import_candidate_appears(),
+        ),
+        (
+            "goes",
+            cases::typescript_tier_excluded_import_candidate_goes(),
+        ),
+    ] {
+        let final_tree = case.final_tree();
+        let mut cli = case.index_before("cli");
+        case.apply(&mut cli);
+        cli.sync();
+        let mut watch = case.index_before("watch");
+        let changed = case.apply(&mut watch);
+        watcher_sync(&watch, &changed);
+        watch.reload();
+        let fresh = final_tree
+            .iter()
+            .fold(Project::named("fresh"), |project, (path, contents)| {
+                project.file(path, contents)
+            })
+            .index();
+        let expected = tier_edges(fresh.graph());
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.contains("route server/app.ts::GET:/api/users/:id")),
+            "[{name}] the fresh index draws the client's edge: {expected:#?}"
+        );
+        for (driver, project) in [("cli", &cli), ("watch", &watch)] {
+            assert_eq!(
+                tier_edges(project.graph()),
+                expected,
+                "[{name}] [{driver}] the tier edges differ from a fresh index's"
+            );
+        }
     }
 }
 

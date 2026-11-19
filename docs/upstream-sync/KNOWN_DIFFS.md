@@ -35,31 +35,84 @@ Tier-3 rules:
 The v1 Rust port of `reference/colby/src/resolution/` ships the two CORE
 deterministic strategies — import resolution (`import-resolver.ts`) and name
 matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
-(`index.ts`), plus THREE concrete `FrameworkResolver` implementations behind the
+(`index.ts`), plus concrete `FrameworkResolver` implementations behind the
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
-React/Next.js, Vue/Nuxt, and NestJS (`crates/codegraph-resolve/src/frameworks/`),
-detected per-project by `detect_frameworks`. The remaining ~19 colby resolvers
-stay deferred. The following colby behaviors are intentionally NOT ported in v1:
+Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
+Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
+FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules (their JavaScript side and their Swift and Kotlin declarations), Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge and Fabric's view components (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+`detect_frameworks`. The other colby resolvers stay deferred. The following
+colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
-  in `reference/colby/src/resolution/frameworks/**` EXCEPT react/vue/nestjs:
-  Spring/Java, Drupal `routing.yml`, Express, Svelte, React Native / Expo / Fabric
-  bridges, Swift↔ObjC bridging, the Go-module / Python / Ruby / C# / Play route
-  extractors, and the Astro resolver
-  (`frameworks/astro.ts`: `astro:*` module imports + the `Astro` global resolved
-  as framework-provided, and `src/pages` file-based route-node mapping). These
-  are an additive heuristic layer; on a project where none of react/vue/nestjs is
-  detected the orchestrator holds an empty resolver list, so behavior matches
-  colby with zero frameworks detected. The Astro
-  EXTRACTION half (frontmatter + `<script>` delegation, template `{call(...)}`
-  and `<Component>` refs) IS ported (`crates/codegraph-extract/src/embedded/astro.rs`,
-  #768); only its framework-resolution half is deferred. Re-enable any of the
-  deferred resolvers by adding it to `frameworks/` and the `detect_frameworks`
-  registry — no orchestrator change required.
-- **Callback / observer edge synthesis** — `synthesizeCallbackEdges`
-  (`reference/colby/src/resolution/callback-synthesizer.ts`, invoked at
-  `index.ts:959-963`). Heuristic dynamic-dispatch edge synthesis; deferred behind
-  the same extension point.
+  in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
+  Terraform's (W7-24c) and CICS's, which is left out with COBOL (OD-2). These
+  are an additive heuristic layer; on a project where none
+  of them is detected the orchestrator holds an empty resolver list, so
+  behavior matches colby with zero frameworks detected. Astro's extraction
+  (frontmatter + `<script>` delegation, template `{call(...)}` and
+  `<Component>` refs) is the embedded extractor's
+  (`crates/codegraph-extract/src/embedded/astro.rs`, #768), and its framework
+  resolution (`astro:*` module imports, the `Astro` global, `src/pages` routes,
+  components named in markup) the Astro resolver's (`frameworks/astro.rs`).
+  Re-enable any of the deferred resolvers by adding it to `frameworks/` and the
+  `detect_frameworks` registry — no orchestrator change required.
+- **Django's ORM dispatch (W7-19b)** — colby's Django resolver links
+  `_iterable_class` to `ModelIterable.__iter__` (0.7), written for Django's own
+  source. Its answer reads the class named `ModelIterable` while its edge's
+  target is `__iter__`, so a second `ModelIterable`, or that class gaining an
+  `__iter__`, changes the answer where a sync finds the edge by neither the
+  target's name nor the reference's. It waits for a sync lane that reads it;
+  Django claims no `_iterable_class` (`frameworks/python.rs`).
+- **FastAPI mounts through an absolute import (W7-19b)** — a router mounted
+  through an absolute import (`from app.api.routes import items`, then
+  `api_router.include_router(items.router)`) keeps its routes' file names:
+  the port finds the mounted module as colby's `b635dd46` does, by an import
+  path that reads no Python package root, and `app.api.routes.items` names no
+  file that way. A relative import's module is followed. colby resolves the
+  absolute import from the project's package roots since #1921 (`6fe9dc12`),
+  which would name fastapi-realworld's routes `POST /users/login` and the
+  like; that is row 70 of the 2026-10-22 audit, a PORT row left to the next
+  round (`frameworks/python.rs`).
+- **`candidates` on framework references** — colby's Astro endpoint and
+  Next.js route-handler references carry `candidates: [method]`, which no
+  resolution step reads. A framework reference here carries none (`RefView`
+  has no such field), so an unresolved one's `unresolved_refs.candidates` is
+  `NULL` where colby's holds the list.
+- **Dynamic-dispatch synthesis passes** — of `SYNTH_PASSES`
+  (`callback-synthesizer.ts`), the field, closure-collection, emitter,
+  render, JSX, Pascal form, Flutter, C++ override, interface override, Kotlin
+  expect/actual, gRPC stub, MyBatis, gin middleware-chain, redux-thunk,
+  object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
+  Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
+  passes, the cross-tier and test-request passes (`tier-synthesizer.ts`), the
+  React Native event-channel, Fabric native-view, Expo cross-platform and
+  React Native cross-platform passes, the Vue and Angular template passes,
+  the SvelteKit loader and page
+  passes, the Expo Router return pass and the Next.js, React Router, TanStack
+  Router, Vue Router and SvelteKit link passes, and the Go prerequisites
+  (`go-method-contains`, `go-implements`) are ported
+  (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
+  yet. colby reads no Expo Router `<Link href>`, `<Redirect href>` or
+  `Stack.Screen` name either (`frameworks/expo-router.ts`, "Not covered
+  yet"). The link passes keep `b635dd46`'s view of their inputs:
+  #2769's escaping of a wrapper's name in the React Router prefilter, and
+  #2484's `unittests/` and `*_unittest(s)/` test directories, are PORT rows
+  of the 2026-10-22 audit, left to the next round. Two colby readings are
+  ported as they behave: a Next.js `href={{ pathname }}` names nothing, as
+  colby's sticky key, started at an offset of the whole source in a slice
+  that starts there, never matches; and an Expo helper is the one function
+  of its name in the navigation's file, else the project's, colby's step
+  between them reading an import mapping's `resolvedPath`, which nothing
+  sets. The ported passes and the merge keep `b635dd46`'s view of Jest/Vitest
+  manual mocks: #2790's skip of a `__mocks__/` handler for production code
+  is a PORT row of the 2026-10-22 audit, left with the rest of that row to
+  the next round. The C++ override pass is `b635dd46`'s too: #2609's skip of
+  a member template's explicit specialization, which shares the template's
+  name, is a PORT row of the same audit, left with its extraction half. A
+  TypeScript abstract method and an ArkTS interface's method
+  signature are no nodes here (#2653, a PORT row of the same audit, and the
+  ArkTS spec's missing `method_signature`), so a call through either reaches
+  no implementation.
 - **Razor `@using` cascade resolution** — `resolveRazorUsing` / `getRazorUsings`
   (`index.ts:1116-1158`), tied to the Razor framework layer.
 
@@ -121,14 +174,24 @@ text-formatting / relevance-ordering differences. Six of the eight shared tools 
 `codegraph_files` tree/flat/grouped) are byte-identical; the diffs below are
 confined to `codegraph_explore` and `codegraph_status`.
 
-- **`codegraph_explore` relevance ranking (RWR/flow/skeletonization) is not
-  ported; the size-adaptive output BUDGET is.** colby's `findRelevantContext`
-  (`reference/colby/src/context/index.ts`) ranks the subgraph with
-  Random-Walk-with-Restart / personalized PageRank, computes a FLOW spine among
-  named symbols (`buildFlowFromNamedSymbols`), and adaptively SKELETONIZES
-  off-spine polymorphic-sibling files to signatures (`adaptiveExplore`,
-  `tools.ts:2422-2623`). The Rust port reproduces the DETERMINISTIC structure —
-  header, blast radius, relationship map, dynamic boundaries, and per-file source
+- **`codegraph_explore` relevance ranking (RWR/skeletonization) is not
+  ported; the size-adaptive output BUDGET and the Flow section are.** colby's
+  `findRelevantContext` (`reference/colby/src/context/index.ts`) ranks the
+  subgraph with Random-Walk-with-Restart / personalized PageRank, computes a
+  FLOW spine among named symbols (`buildFlowFromNamedSymbols`), and adaptively
+  SKELETONIZES off-spine polymorphic-sibling files to signatures
+  (`adaptiveExplore`, `tools.ts:2422-2623`). The port opens the response with
+  the same Flow section (the chain, `dynamic:` hop tags, `(when …)` branch
+  conditions), followed by the "Dynamic-dispatch links among your symbols"
+  section as `e8ddc4e2` prints it (#2748, #2751). The spine does not yet weight
+  file ranking or body windows, and a flow that does not connect gets no
+  boundary or polymorphic-dispatch announcement of its own; the port's boundary
+  scan over the explore seeds still runs. The low-value files the links put
+  last and `excludeLowValueFiles` drops are `b635dd46`'s `isLowValue` patterns;
+  upstream has since moved both onto its engine-wide test predicate (#2557,
+  PARTIAL in the 2026-10-22 audit). The Rust port reproduces the DETERMINISTIC
+  structure — header,
+  blast radius, relationship map, dynamic boundaries, and per-file source
   grouped by file — by seeding roots from the FTS search results
   (`searchLimit: 8`) and pulling their callers/callees + `contains` children into
   the subgraph. It DOES now apply colby's `getExploreOutputBudget`
@@ -182,11 +245,11 @@ of [`equivalence.md`](../equivalence.md) and the module docs. Each one leaves
 a guess unresolved, gives the same graph whatever order the files were indexed
 in, reads the source as it is written where colby misreads it, follows a
 grammar or extractor shape that is not colby's, or, by the owner's decision,
-records what colby does not. None is a Tier-3 rule: the goldens pin this
-port's own output, these differences included. A difference of mechanism
-alone, which gives colby's result (one scan in place of a regex compiled per
-name, a per-pass memo, a pattern rewritten for Rust's regex engine), is not
-listed.
+records what colby does not or skips what colby reads. None is a Tier-3
+rule: the goldens pin this port's own output, these differences included. A
+difference of mechanism alone, which gives colby's result (one scan in place
+of a regex compiled per name, a per-pass memo, a pattern rewritten for Rust's
+regex engine), is not listed.
 
 ### Resolution
 
@@ -210,6 +273,511 @@ listed.
 - **C# extension methods (W3-05c, owner 2026-10-11, OD-8).** A call on an
   outside type reaches the one project extension method in scope that takes it
   as `this`; colby resolves no extension method (`csharp_extensions.rs`).
+- **A test's NestJS bootstrap (W7-02b).** A `NestFactory.create` in a test
+  file (an e2e spec) with no `src/` segment above it belongs to the directory
+  above its test folder, else the one holding it, and within one app the
+  entry point's bootstrap decides over a test's: an e2e spec's
+  `setGlobalPrefix('api')` names neither another integration app's routes
+  nor the routes its app's own entry point serves. colby puts every such
+  spec at the repository root and prefers a bootstrap that configures the
+  app, so all of nestjs/nest's integration apps took one spec's `/api`
+  (`nestjs.rs`).
+- **A path two Next.js apps serve (W7-07).** When several Next pages serve
+  one path (two apps of a monorepo each with `/login`), a navigation call
+  goes to its own app's page: the app whose root is the longest one above
+  the calling file. Several such pages, or none, leave the call unresolved,
+  and no dynamic route stands in. colby keeps one page per path, the last in
+  node order; the store returns nodes in insertion order, which a sync
+  changes. A path one page serves binds as in colby, wherever the call is
+  (`nextjs.rs`).
+- **Expo Router screens by app (W7-08).** A navigation call matches only the
+  screens of its own Expo app, the longest directory above an `app/` that
+  holds the calling file, exact and dynamic alike; a file under no Expo app
+  is not read, and a path two screens of that app serve (`app/index.tsx`
+  beside `app/(tabs)/index.tsx`) stays unresolved. colby keeps one table for
+  the project, reads every file and keeps the last screen of a path in node
+  order, so in a monorepo a React Router app's `navigate('/')` reached the
+  Expo app's `/` screen (`expo_router.rs`).
+- **A path two React Router routes of one app serve (W7-09b).** A
+  navigation call matches only the routes of its own app, as in colby, and a
+  path two routes of that app serve (written twice, or the bare path two
+  optional-parameter routes such as `/cart/:id?` and `/cart/:item?` shorten
+  to) stays unresolved, with no dynamic route standing in. colby's
+  `addRouteTo` keeps the first route of a path in node order, which a sync
+  changes (`react_router.rs`).
+- **A React Router route file nested past 256 levels (W7-09b).** The route
+  scanner's two recursive steps, a unit (a bracket group, a string or
+  template, a template hole, one character) and a JSX element, share a bound
+  of 256 levels. A file that goes deeper yields no routes, those read before
+  that point included, and names and hands over no route table (W7-09d): a
+  parent route that was never closed would leave its children's paths wrong. No file runs the call stack out; colby's scanner
+  recurses without a bound. The bracket, string and wrapped-call scanners in
+  `js_scan.rs` keep their stackless walks and have no bound
+  (`react_router.rs`).
+- **A route table whose routes' references changed (W7-09d).** The pass
+  that reconciles the routes of React Router tables after `post_extract`
+  replaces a route the tables still give when its name, qualified name or
+  references changed: it deletes the stored route, re-resolves the edges
+  that reached it and inserts the new one with its references. colby's
+  `reconcileCrossFileNodes` renames such a route in place and keeps its
+  references, so when a table's first reader changes, say an earlier file
+  stops handing over a table its own file maps inside `<Route
+  element={<Layout/>}>`, the route keeps rendering outside the layout until a
+  full index (`resolver.rs`, `react_tables.rs`).
+- **A React lazy loader nested past 256 levels (W7-09c).** The loader
+  readers follow a loader's arrays, destructuring patterns, wrapper calls
+  and default objects 256 levels deep; a loader nested deeper links nothing
+  (its route renders nothing of it, and a value it is the loader of renders
+  none of its module), so no loader runs the call stack out; colby's readers
+  recurse without a bound (`lazy_loader.rs`).
+- **A path two TanStack Router routes of one app serve (W7-10).** A
+  navigation call matches only the routes of its own app, as in colby, and
+  a path two routes of that app serve stays unresolved. colby's
+  `addRouteTo` keeps the first route of a path in node order, which a sync
+  changes (`tanstack_router.rs`).
+- **A framework resolution into a module that exports nothing (W7-10).**
+  Whichever strategy chose a result, a framework resolver's included, it is
+  dropped when its target sits in another file's ES module that has imports
+  but exports nothing (`gate_js_visibility`); colby holds only name matching to
+  such a module (`isVisibleAcrossFiles`). Letting framework results through
+  was measured on LibreChat and typescript-large: every edge it added ended
+  in a test file or a compiler-test baseline, React tags such as `<Wrapper>`
+  and `<Icon>` bound to another spec file's function and navigations bound
+  to a test fixture's route. The cost: a route of a router declared in such
+  a module, a `main.tsx` that builds `createBrowserRouter([...])` or a
+  TanStack code route tree and renders it, is reached by no navigation from
+  another file (`resolver.rs`).
+- **A name or a path two Vue Router routes of one app carry (W7-11).** A
+  navigation call matches only the routes of its own app, as in colby. Each
+  table entry is a route of its own, listed once where it is written, its
+  node named by its file, line and path, and a name or a path more than one
+  entry of the app carries stays unresolved, two entries that repeat each
+  other or share a line included. colby skips an entry whose path and name
+  an earlier entry of its file gave, keeps the first route of a name or a
+  path in node order, which a sync changes, and finds an entry's route by
+  its path, so where one file declares a path twice, each name of that path
+  goes to the file's last route of it. A `children` field is read only as
+  an array written in place: after `children: kids`, colby's
+  `indexOf('[')` reads the next array, a later entry's children, as that
+  entry's too (`vue_router.rs`).
+- **A Vue Router destination that is no whole literal (W7-11).** A
+  navigation's destination is read only when it is whole: a string, a
+  template whose holes fill whole segments, a conditional of them, or a
+  local initialized to one, and of an object destination only the object's
+  own `name` and `path`; a comment does not end the value (`'/' /* x */ +
+  next` goes on). colby reads the literal heading an expression, so
+  vue-element-admin's `replace({ path: '/redirect' + fullPath })` navigates
+  to the `/redirect` frame, a hole sharing a segment (`` `/p-${id}` ``) as
+  the segment, and the first `name:` or `path:` written anywhere in the
+  object, inside its `query` or `params` too. The other routers read
+  destinations as colby does (`route_href.rs`, `vue_router.rs`).
+- **The component a Vue Router route names (W7-11).** A route renders what
+  the router file's import of its identifier takes: a named import the
+  module's node exported under that name, at its declaration or through an
+  export list or the modules that re-export it (never a private declaration
+  of the name, nor one nested in another declaration, which the module's
+  text tells: the extractor marks a declaration inside an exported function
+  exported; nor what `export default` declares, nor a `.vue` file's own
+  export, whose template is no script), a default import the module's
+  default export; a lazy `() => import(…)` renders the module's default
+  export, a `.vue` file's own component. The
+  route's reference to an identifier is named `component:<name>`, which
+  only Vue Router answers: where the import names a module that is not
+  found, or one holding no such component, the route renders nothing, and
+  only a name no import reaches is looked up by name: a declaration of the
+  routes file (vue-vben-admin's `const AuthPageLayout = () => import(…)`
+  layout, which colby leaves unresolved), else a component. A relative
+  specifier is the file it names. colby writes the bare identifier and takes the module's first
+  component, else its first function whose name starts with a capital,
+  whatever the import names, and otherwise any component of the
+  identifier's name, which the Vue resolver and name matching bind too:
+  vue-vben-admin's `component: IFrameView`, imported from a layouts module
+  of three lazy constants, renders `BasicLayout` (`vue_router.rs`).
+- **Angular `children` and nested constants written elsewhere (W7-13).**
+  A route's `children` are read only from an array written in place, and a
+  path constant's nested object only from an object written in place; colby
+  takes the first `[` or `{` after the key, so `children: CHILDREN` read the
+  array of a later entry, and `path: paths.account.path` whose `account`
+  names another constant read the next field's object (`angular_router.rs`).
+- **A cycle of Angular mounts (W7-13).** A routes file in a cycle of
+  `loadChildren` mounts sits under the prefixes of its own chain up to the
+  first file that repeats; colby memoizes each file's prefix in the order it
+  renames the routes, so in a cycle a file's name depended on which route
+  was renamed first (`angular_router.rs`).
+- **An Angular path constant that aliases itself (W7-13).** A chain of local
+  aliases (`const { create } = internalRoutes.accounts;`) is followed at most
+  eight hops, and an alias that leads back to a chain being read reads
+  nothing; colby follows aliases without a bound, so `const a = a.b;`
+  recursed until the stack ran out (`angular_router.rs`).
+- **A path two Angular routes of one app serve, and Angular redirects
+  (W7-13).** A navigation call matches only the routes of its own app, as in
+  colby, and a path two routes of that app serve stays unresolved. A
+  redirect is followed through the routes and the other redirects at most
+  four hops, whatever order its files are read in: a path a route serves
+  keeps the route, a path whose redirects lead to two routes reaches neither,
+  and so does `/` when two root `**` redirects disagree. colby keeps the
+  first route of a path in node order (`addRouteTo`) and applies redirects
+  in node and file order for four passes, the first to claim a path keeping
+  it, so which redirect wins and how long a chain resolves depend on an
+  order a sync changes (`angular_router.rs`).
+- **An Angular destination (W7-13).** `'/editor/' + slug` is the literal
+  and one segment only when the literal ends with `/` and one operand
+  follows; a conditional or a template is read whole, as Vue Router reads
+  its destinations; a relative arm of a conditional, and an arm that leaves
+  the site (`//auth.example.com/login`), drop out before the arms are
+  matched; `.concat` adds a segment per argument, its arguments split at
+  the top level; and a route or a redirect whose path holds a constant the
+  cross-file pass could not read is in no table. colby adds
+  `/` and a hole to any literal head, so `'/redirect' + path` reached
+  `/redirect/:x` and `'/a/' + b + '/c'` reached `/a/:x`, reads the literal
+  heading a conditional or a template (a hole sharing a segment counts as
+  the segment), checks only the first arm of a conditional, matches an
+  absolute URL's path (`//auth.example.com/login` reached `/login`), splits
+  `.concat`'s arguments at every comma, and matches an unread constant's
+  placeholder as a literal segment, which any hole of a destination fits
+  and a destination written the same way names (`angular_router.rs`).
+- **A path two SvelteKit pages of one app serve (W7-12).** A navigation
+  call matches only the pages of its own app, as in colby, and a path two
+  pages of that app serve (`(a)/x/+page.svelte` beside `(b)/x/+page.svelte`,
+  or the path two `[[optional]]` pages shorten to) stays unresolved, with no
+  dynamic page standing in. colby's `addRouteTo` keeps the first page of a
+  path in node order, which a sync changes (`sveltekit_router.rs`).
+- **A SvelteKit destination that is no whole literal, or leaves the site
+  (W7-12).** `goto` and `redirect` read their destination whole, as Vue
+  Router does: a string, a template whose holes fill whole segments, a
+  conditional of them, or, for `goto`, a local initialized to one; and an
+  absolute or protocol-relative URL reaches nothing (an arm of a conditional
+  that is one drops out before the other arms are matched, so
+  `sso ? 'https://auth.example.com/login' : '/login'` still reaches
+  `/login`). colby reads the literal heading the expression and keeps an
+  absolute URL's path:
+  `redirect(303, '/article/' + slug)` is read as `/article/` and reaches an
+  `/article` page, a hole sharing a segment counts as the whole segment
+  (`` `/profile/@${name}` `` reaches `/profile/@:user`, as
+  `` `/create/preview-02${url.search}` `` reaches `/create/:item`), and
+  `redirect(303, 'https://auth.example.com/login')` reaches the app's own
+  `/login` (`sveltekit_router.rs`).
+- **SvelteKit's `$lib` in a monorepo (W7-12).** An import of `$lib/x` is
+  the file `src/lib/x` of the importing file's app, the directory above its
+  first `src`, `pages`, `app` or `routes` folder, and reaches that file's own
+  node, as every import edge does; colby reads `src/lib/` at the repository
+  root, which in a monorepo is no app's, and takes the first node
+  `getNodesInFile` returns for the file (`svelte.rs`).
+- **A Svelte store subscription (W7-12).** `$store` in a component binds the
+  one variable or constant named `store` its own file declares, and nothing
+  else; colby takes the first variable or constant of the name anywhere in
+  node order, so `$page` from `$app/stores` reached any project `page`
+  (`svelte.rs`).
+- **A capitalized call in a Svelte app (W7-12).** A component call binds the
+  one component of its name in the calling file's directory or below, else
+  the one of the project; several in the directory, or several in the
+  project and none there, is none. colby takes the first component under the
+  directory's path prefix, so `src/ui/List.svelte` reached a `Card` in
+  `src/ui-kit/` (`svelte.rs`).
+- **A tag imported from a module that exports no component under its name
+  (W7-09e).** A JSX tag imported from a module of the project renders what
+  the module exports under the name, as colby's (#2563); when the module
+  exports no component there, the tag keeps the edge import resolution
+  gives it, where colby's `jsx-render` pass draws nothing for the tag. The
+  resolver chain has no way for one resolver to veto the next, and the
+  static `references` edge is import resolution's (`react.rs`).
+- **A framework name pattern with two candidates (W7-19a).** Express's
+  middleware, controller and service patterns and Astro's component names
+  resolve only through their one candidate: two declarations of a middleware
+  name in the reference's file, two methods whose paths name the controller or
+  the service, or two components of the name whose paths start with the
+  file's directory answer nothing, and the reference goes on to import and
+  name resolution as if the framework were not detected. colby takes the first
+  in its store's order, so its edge follows the order the files were indexed
+  in (`express.rs`, `astro.rs`).
+- **Express middleware without its suffix (W7-19a).** colby's middleware
+  resolution falls back to the name without a `Middleware` suffix when no
+  declaration carries the whole name. The port does not: a whole name passes
+  the prefilter only when a node that declares nothing carries it (an import,
+  a parameter), and with the same-file rule the fallback then links that
+  import's call, `corsMiddleware()` from `cors-kit`, to the file's own `cors`,
+  which it is not. The outcome also reads whether another file declares the
+  whole name, which a sync cannot re-read from an edge to `cors`
+  (`express.rs`).
+- **An Express controller's object (W7-19a).** colby's controller resolution
+  also takes a method of the name from the files of nodes named
+  `XController`. The port does not: with the same-file rule that finds only
+  the method of an `XController` object the reference's own file declares,
+  which the instance-method strategy links already, and its outcome reads
+  which files declare `XController`, which a sync cannot re-read from the
+  edge to the method (`express.rs`).
+- **The `Astro` global (W7-19a).** Astro claims `Astro` and every name that
+  starts with `Astro.`, so `Astro.redirect(…)` and `Astro.cookies.has(…)`
+  resolve to their own source (1.0) whether or not any file declares
+  `redirect` or `has`. colby's prefilter lets such a call through only when
+  one of its names is declared somewhere, so there it resolves or stays
+  unresolved by what unrelated files declare (`astro.rs`).
+- **A name heuristic's tier with two candidates (W7-19b).** The pick the
+  Django, Flask, FastAPI, Spring, ASP.NET, SwiftUI, UIKit, Vapor, Rust and Go name heuristics share (#2225) resolves a tier only
+  through its one candidate: two declarations of the name in the reference's
+  file, its directory, a preferred folder or the project answer nothing and
+  stop the search, and the reference goes on to import and name resolution
+  as if the framework were not detected. colby takes the first in its store's
+  order (`frameworks/name_heuristic.rs`). Go's conventions search only the
+  reference's file and package, and stop at a pick that answers nothing, as
+  Spring's and ASP.NET's do; colby tries the next convention only when there
+  is no candidate either. In a package of valid Go the stop changes no
+  result: the package declares no type and function of one name, and its
+  build-tag twins share their kind, so a later convention could only answer
+  nothing again or find no candidate (`frameworks/go.rs`).
+- **A name heuristic's pick in another code family (W7-19b).** A pick written
+  in another code family than the reference answers nothing, for a `calls`
+  reference too: a Python `get_db()` in a FastAPI project whose one candidate
+  is a TypeScript `get_db` is left to the other strategies. colby passes a
+  framework's `calls` result across families, as a React Native or Expo
+  bridge call needs, so there the guess links it; for every other kind its
+  gate drops the pick and both answer nothing. A candidate of another family
+  still holds its tier (`frameworks/name_heuristic.rs`).
+- **A name a Python file imports (W7-19b).** The Django, Flask and FastAPI
+  name heuristics guess no name the reference's file imports: the import
+  names the module or the package that declares it, and import resolution
+  answers there, as for a React component (#2120). netbox draws with
+  `svgwrite`'s `Group`, which colby's Django resolver links to netbox's own
+  `Group` model by its capitalized name; here the call resolves as it would
+  without Django (`frameworks/python.rs`).
+- **No name match reaches a route (W7-19b).** A route is named by the URL it
+  serves, which no reference spells as a name, so the name matcher offers no
+  route. A Django URL can read like one: in DRF's tests a route served at
+  `path` took the imports and calls of Django's own `path`, and
+  `path('not_found', not_found)` resolved its handler to the route itself,
+  which now reaches the function. colby's exact-name match passes a route, an
+  importable kind there, and draws those edges (`name_matcher.rs`).
+- **A Spring binding's key is Spring's alone (W7-19c).** The reference an
+  `@Value` or `@ConfigurationProperties` binding makes resolves only through
+  the Spring resolver: one key spelt alike binds at `0.9` and of several the
+  base file's (else the shortest file name's) at `0.75`; a key no config file
+  holds stays unresolved, and so does one without a dot, which Spring's #1180
+  gate passes over. colby lets import and name resolution outrank Spring's
+  `0.75`, against its own comment that the base `application.yml` wins over
+  the profile variants: a key two files hold binds, when spelt exactly, to the
+  qualified-name match's first (`application-dev.yml` before
+  `application.yml`), and when spelt loosely, like a key no file holds, to the
+  binding node itself, which is named as its key (`frameworks/spring.rs`,
+  `resolver.rs`).
+- **Spring config keys of equal rank (W7-19c).** Of the keys a binding names
+  that rank alike (base files, profile files with names of one length, or
+  keys of the shortest length under an `@ConfigurationProperties` prefix),
+  the one whose file shares the most directories with the binding's wins,
+  then the first by file, line, column and id: the modules of a multi-module
+  project each hold an `application.yml` and read their own (in mall, five
+  `mall-portal` bindings link to `mall-portal`'s keys, not `mall-admin`'s).
+  colby takes the first in its store's order, which its comment calls the
+  path's (`frameworks/spring.rs`).
+- **Spring's conventions stop at a pick that answers nothing (W7-19c).**
+  Spring's convention rules (`…Service`, `…Repository`, `…Controller`, one
+  capitalized word, `…Component` or `…Config`) go on to the next rule only
+  when a rule finds no candidate. A rule whose shared pick answers nothing (a
+  tier of two, a pick in another code family) ends them, so a later rule does
+  not guess again with other kinds and folders. colby tries the next rule only
+  when there is no candidate either, and takes the first otherwise
+  (`frameworks/spring.rs`).
+- **Play's nearest controller (W7-19c).** Of the classes named as a routes
+  line's controller, Play takes the one whose file shares the most directories
+  with the routes file, and answers nothing when two share as many, or when
+  the action it picks is in another code family than the reference. colby
+  takes the first class in its store's order whose file has the action: in
+  play-samples, whose projects each hold a `HomeController`, that links most
+  projects' routes to one project's controller (`frameworks/play.rs`).
+- **Play reads only routes lines (W7-19c).** Play resolves a reference only
+  when a routes file makes it, and such a reference takes no other strategy's
+  answer: a line Play answers nothing for stays unresolved. colby also guesses
+  a `Controller.action` that Scala or Java code writes, and lets name matching
+  guess a line it leaves: in play-samples that links two Scala calls of
+  `play-scala-websocket-example` to Java methods of
+  `play-java-websocket-example`, and `play-scala-tls-example`'s `GET /`, whose
+  three nearest `HomeController`s tie, to `play-scala-anorm-example`'s
+  (`frameworks/play.rs`, `resolver.rs`).
+- **Laravel and Drupal take one candidate (W7-19d).** Where colby takes the
+  first of several candidates in its store's order, Laravel and Drupal take
+  the only one and answer nothing for several: a `Controller@action`'s
+  method among the files of the controller classes so named (those whose
+  file ends with a written namespace path first), a resource route's
+  controller among the classes whose file ends with its path (akaunting's
+  `Common\Companies` is both `Common/Companies.php` and
+  `Api/Common/Companies.php`, and its two routes files mean one each), a
+  Drupal routing file's bare namespaced class, and a `hook_X`'s
+  implementation. Of several Drupal controller classes of a handler's name,
+  Drupal takes the only one whose file holds the method, where colby takes
+  its first class and, when that file lacks the method, the class itself
+  (`frameworks/laravel.rs`, `frameworks/drupal.rs`).
+- **Laravel and Drupal candidates are PHP's (W7-19d).** Laravel's
+  controller classes, Drupal's handler classes and its hook
+  implementations are PHP classes and functions; colby takes them in any
+  language, a Pascal `.inc` file's functions among the hook
+  implementations (`frameworks/laravel.rs`, `frameworks/drupal.rs`).
+- **Laravel's and Drupal's claims read the reference (W7-19d).** colby's
+  claims take `Controller@action`, namespaced class names, `Class::method`
+  and `hook_X` past the name prefilter wherever they are written, so every
+  PHP `use Foo\Bar;` reaches its resolvers, and Drupal's namespaced-class
+  rule links it at `0.85` to any project class `Bar`, in any namespace,
+  which no sync then revisits when such a class comes or goes. Laravel
+  claims only a Laravel route's references, Drupal only a routing file's
+  and the `hook_X` names, and Drupal's handler rules answer only a routing
+  file's references; a `use` import stays import resolution's
+  (`frameworks/laravel.rs`, `frameworks/drupal.rs`, `resolver.rs`).
+- **A Drupal routing handler is Drupal's alone (W7-19d).** A routing file's
+  reference takes no other strategy's answer, so a handler Drupal answers
+  nothing for stays unresolved. colby lets the other strategies answer it:
+  without this rule instance-method matching linked four of drupal/drupal's
+  `_entity_form: <entity type>.<operation>` routes to an entity class's
+  method named for the operation (`menu.delete` to `Menu::delete()`, and
+  `filter_format.disable`, `image_style.flush`, `entity_form_mode.delete`
+  alike), where the route serves the entity type's form handler
+  (`frameworks/drupal.rs`, `resolver.rs`).
+- **Rails takes one candidate (W7-19e).** Where colby takes the first of
+  several candidates in its store's order, Rails takes the only one and
+  answers nothing for several: a route's action among the files of the
+  controller classes so named (after the filter by the controller's module
+  path), a model among the classes of its name in a path holding
+  `app/models/`, and a controller among those in a path holding
+  `controllers/` (`frameworks/rails.rs`).
+- **Rails candidates are Ruby's (W7-19e).** A route's action and Rails'
+  controller, model, helper, service and job candidates are Ruby methods,
+  functions, classes and modules; colby takes them in any language, a
+  monorepo front end's TypeScript `UsersController` among a route's
+  controllers (`frameworks/rails.rs`).
+- **ASP.NET's conventions stop at a pick that answers nothing (W7-19f).**
+  ASP.NET's convention rules (`…Controller`, `…Service` or `I…`,
+  `…Repository`, a letters-only model, `…ViewModel` or `…Dto`) go on to the
+  next rule only when a rule finds no candidate. A rule whose shared pick
+  answers nothing (a tier of two, a pick in another code family) ends them,
+  as Spring's do. colby tries the next rule only when there is no candidate
+  either, and takes the first otherwise (`frameworks/aspnet.rs`).
+- **An ASP.NET constant route takes one value (W7-19f).** A FastEndpoints
+  route whose path is a constant (`Post(CreateContributorRequest.Route)`) is
+  renamed by its value only when every C# class or struct of the constant's
+  class name that declares the field gives the same value; several values
+  leave it the name its file gives it. colby takes the first such class in
+  its store's order (`frameworks/aspnet.rs`).
+- **SwiftUI's, UIKit's and Vapor's conventions stop at a pick that answers
+  nothing (W7-19g).** Their convention rules (SwiftUI's `…View`, `…ViewModel`,
+  `…Store` or `…Manager` and model; UIKit's `…ViewController`, `…View`,
+  `…Cell` and `…Delegate` or `…DataSource`; Vapor's `…Controller`, Fluent
+  model and `…Middleware`) go on to the next rule only when a rule finds no
+  candidate. A rule whose shared pick answers nothing (a tier of two, such as
+  a type and its `extension` in one folder, or a pick in another code family)
+  ends them, as Spring's and ASP.NET's do. colby tries the next rule only when
+  there is no candidate either, and takes the first otherwise; where that is
+  an `extension`, its Swift type gate moves the edge to the declaration the
+  extension extends, as Rust's name matching does after the framework
+  answers nothing, so the target is mostly the same and only the resolver and
+  the confidence differ (`frameworks/swift.rs`).
+- **A Vapor handler's overloads (W7-19g).** Of one type's methods named as a
+  route's handler (`use: index`), the one a route takes when there are
+  several is the sole one whose first lines (at most three, not past its end)
+  declare a `Request` parameter (`(req: Request`, `(_ req: Request`); none or
+  two such leave the handler unresolved. colby takes the earliest of those
+  that declare one, else the earliest of all, which guesses when both or
+  neither take the request Vapor passes (`frameworks/swift.rs`).
+- **Rust's conventions stop at a pick that answers nothing (W7-19h).** Rust's
+  convention rules (`…_handler` or `handle_…`, `…Service` or `…Repository`, a
+  letters-only capitalized model) go on to the next rule only when a rule
+  finds no candidate the reference can name under the Rust scope rule. A rule
+  whose shared pick answers nothing (a tier of two, a pick in another code
+  family) ends them, the module rule's too, as Spring's do. colby tries the
+  next rule only when there is no candidate either, and takes the first
+  otherwise (`frameworks/rust.rs`).
+- **A Rust module is its file node (W7-19h).** The module rule links a
+  lowercase name to the file node of the root's `src/<name>.rs` or
+  `src/<name>/mod.rs`, or of a workspace crate's `src/lib.rs` or
+  `src/main.rs`. colby takes that file's module node, which no Rust
+  extraction writes, else the file's first node by line and id, which is a
+  declaration rather than the file when one written on the file's first line
+  (a `const`, an `enum`, a field) has an id sorting before `file:`
+  (`frameworks/rust.rs`).
+- **A Cargo workspace's crates (W7-19h).** The crates the Rust module rule
+  reads come from members inside the project: a member that is an absolute
+  path or leaves the root once normalized, and a glob whose static prefix
+  does, is neither read nor listed, where colby reads its manifest and then
+  finds no indexed crate root there. A glob member's walk lists each
+  directory's subdirectories sorted by name, where colby's come in the
+  filesystem's order. A name two members give (both their names, or one's
+  name and the other's `_` alias) names neither, where colby's later member
+  takes it; Cargo itself refuses two packages of one name. A glob reads `*`,
+  `?`, `[…]` (`[!…]` and `[^…]` negated), `{a,b}` and `**`, the part of
+  picomatch a Cargo workspace writes; any other form (a leading `!`, an
+  extglob, a group, an escape, a POSIX class, a brace without a comma)
+  expands to nothing (`frameworks/cargo_workspace.rs`).
+- **The bridge a name means (W7-21).** Where colby takes the first of the
+  sorted candidates, the bridges answer only through the sole one and nothing
+  when there are several, without trying the next: the Swift–Objective-C
+  bridge's Objective-C method a Swift call's name bridges to, and the exposed
+  Swift declarations of the first base name of an Objective-C selector that
+  names any; the React Native bridge's export target outside the export's
+  own file, an `RCT_EXTERN` class's Swift method, a JVM export's target
+  outside its own file, and the native method of the preferred platform;
+  Expo modules' type fallback; and the event channel's named handler. "The
+  sole one" counts distinct nodes, so two entries that reach one method are
+  one candidate, and a `0.6` answer names the module of that node's first
+  entry. The platform preference (Objective-C, then Swift, then any) is no
+  ambiguity and is colby's. colby's `localeCompare` order of the candidates
+  plays no part (`frameworks/swift_objc.rs`, `frameworks/react_native.rs`,
+  `frameworks/expo_modules.rs`, `synthesis/react_native.rs`). Two answers
+  colby gives are withheld besides (OD-B28). The Swift–Objective-C and React
+  Native bridges' answers below `0.9` only fill in: one gives way to any
+  other candidate whose target is in the reference's own language, however
+  confident, TypeScript, TSX, JavaScript and JSX counting as one language and
+  Swift and Objective-C as two. colby's Strategy 1 keeps such an answer
+  beside the import and name matches and takes the most confident, so its
+  `0.6` guess by name beat a `0.4` or `0.5` match of the selector a message's
+  own class declares, or of the function a call's own file declares; an
+  answer of `0.9` or more still returns first, as colby's does
+  (`resolver.rs`). And no name-matching strategy offers or counts the
+  component and prop nodes an Objective-C Paper view manager, or a Java or
+  Kotlin view manager, mints: colby exports them, so they took the classes
+  and properties they are named for, by the exported bonus or the same-file
+  one, and made those names ambiguous. A JavaScript-family spec's component
+  and props stay name-match targets, and the synthesis passes read every
+  component (`name_matcher.rs`, `frameworks/fabric.rs`).
+- **Framework candidates on a member chain (W7-21).** colby's Strategy 1
+  keeps a framework result below `0.9` as a candidate, but two early returns
+  after it read none of the candidates: an untyped JavaScript member chain of
+  three or more segments not starting `this.` or `window.` returns only the
+  object-path or namespace-import match, and a JavaScript, TypeScript or
+  Python call on a call's result (`make().run()`) only name matching. Rust's
+  resolver keeps a framework candidate in both branches (`resolver.rs`), so a
+  framework's low-confidence answer for such a reference can link where
+  colby's never does. The React Native bridge's `0.6` answer, the first wide
+  one this meets, is not given for either shape, as colby gives none; its
+  `0.95` answer for `NativeModules.Mod.m()`, which colby returns before the
+  gate, is (`frameworks/react_native.rs`). The other frameworks' low
+  answers in the two branches stay a difference.
+- **The single-candidate shortcut counts before the scope filters (#211).**
+  An exact-name match whose candidates the scope filters narrow to one (an
+  Objective-C message to `self` kept to its sender's hierarchy, a Swift
+  call's shape, a bare JavaScript call kept to what its file binds) scores
+  `0.4` or `0.7` when the name had several candidates before them, where
+  colby's `name-matcher.ts` at `e8ddc4e2` counts after them (11874-11884)
+  and gives the one left `0.9`, or `0.5` across languages. The count before
+  the filters keeps a filtered-out rival from turning a match the ranking
+  would decline into a `0.9` one (a GDScript `extends Node` reaching a Rust
+  `struct Node`). Counting after them moves confidences in every language
+  and the goldens, so it is left to the next round with the other audit rows
+  of OD-A1 (OD-B29, `name_matcher.rs`).
+- **No Expo export is bridge evidence (#2032).** colby's language gate takes
+  an exported Swift or Kotlin `expo-module:` node as bridge evidence for a
+  web `calls` reference (`hasBridgeEvidence`, `name-matcher.ts` at
+  `e8ddc4e2`, 194-200), so a JavaScript name match may cross to it:
+  `ExpoHaptics.fn()` with no `requireNativeModule` binding reaches
+  `…::ExpoHaptics.fn` by its qualified name at `0.85`. `has_bridge_evidence`
+  has no such clause, so that match is gated out and the call stays
+  unresolved unless `expo-modules-js` answers it. No corpus of the W7-21
+  review holds such a call; left to the next round (OD-B29,
+  `name_matcher.rs`).
+- **A partial qualified-name match takes any ending (W7-21 review).** A
+  dotted or `::` name that ends another node's qualified name matches it by
+  that ending alone, the call site's own file first, where colby's partial
+  match (`name-matcher.ts` at `e8ddc4e2`, 12024-12063) requires the ending to
+  start at a scope separator (`endsAtScopeBoundary`) and prefers a candidate
+  of the reference's own language family. W7-21's dotted qualified names
+  (`<file>::<Module>.<member>`) are new endings of that kind; no reference in
+  the W7-21 review corpora reaches the matcher with one. Left to the next
+  round (OD-B29, `name_matcher.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -217,6 +785,220 @@ listed.
   scores by its words (`fooValue`), calls an instance or extension member of
   that name, or nothing, where colby's member lookup and receiver guesses take
   the constructor (`dart_members.rs`, `name_matcher.rs`).
+
+### Synthesis
+
+- **When a sync recomputes synthesis (W7-14).** A sync recomputes every
+  synthesized edge whenever it changes the index, bootstraps a lane or runs
+  the orphan sweep, and when the `synthesis_version` marker is missing or at
+  another version.
+  colby decides by what changed (`src/index.ts:985-1082,1378-1409`): a
+  changed file that was a synthesis input, held a synthesized edge or
+  matches `hasSynthesisPattern`, a new renderable definition, a moved route,
+  workspace-package map or Python root set, or references an interrupted
+  resolution left pending. A handler a name picks depends on every candidate
+  of that name, and an unchanged file's base edges move when a sync
+  re-resolves them, which that gate does not see; its pattern holds for
+  nearly every code file anyway. The
+  `synthesis_inputs` table is never written, so #2565's and #2688's filter
+  of its rows has nothing to filter (`synthesis/mod.rs`,
+  `codegraph-watch/src/sync.rs`).
+- **The handler a name means (W7-14).** An emitter handler named `h` is the
+  one function or method `h` of the registering file, else the one of the
+  project, and nothing when either has several: an ambiguous name stays
+  unresolved. A gin handler (W7-15c) follows the same rule among the Go
+  functions and methods, the registering file being that of the name's first
+  registration, and a React Native event handler written by name (W7-21)
+  among the functions and methods; one registered under a constant event
+  name is the one function or method of that name in the registering file,
+  nothing when it has several and the enclosing function when it has none. colby takes the first of `getNodesByName`, the one of the file
+  first by path. The passes otherwise walk colby's orders (`synthesis/stage.rs`,
+  `synthesis/callback.rs`, `synthesis/go_dispatch.rs`).
+- **The handler a registry maps (W7-14d).** An object-registry handler named
+  `h` follows the same rule within the first kind that has a node `h`
+  (function, else class or struct, else method): the one of the registry's
+  file, else the one of the project, else nothing, without falling to the
+  next kind. colby takes that kind's first node of `getNodesByName`
+  (`synthesis/registry.rs`).
+- **The thunk a dispatch names (W7-16d, OD-B14).** A redux-thunk constant's
+  `dispatch(name(…))` reaches the one candidate of the first kind that has
+  one: a thunk declaration, else a constant, else a function or method of the
+  dispatching file, else one of the project. Several of that kind reach
+  nothing, without falling to the next kind or choosing the dispatching
+  file's. colby takes that kind's first node of `getNodesByName`
+  (`synthesis/framework.rs`).
+- **The worker a qualified name means (W7-16d, OD-B14).** A Sidekiq enqueue
+  through `A::Worker` reaches the `perform` of the one class of that qualified
+  name that is a worker, and nothing when several are, even when their
+  `perform` is one method (two declarations of the class on one line); it then
+  does not fall back to the last segment. colby takes the first such class
+  (`synthesis/framework.rs`).
+- **The store a dispatch names (W7-16b, hard invariant 6).** A generated RTK
+  Query hook reaches the one function of its endpoint's name in its own file.
+  A Pinia factory name more than one file defines is no store, a variable a
+  file binds to more than one store binds none, a call reaches the one
+  function of the method's name in the store's file, and a call outside every
+  function comes from the file's one component. A Vuex key reaches the one
+  candidate of its first tier (the store files whose path has the key's
+  namespace as a segment, or for a root key the dispatching file), else the
+  project's one candidate. Several of any of them reach nothing. colby takes
+  the first, and the last factory and binding (`synthesis/framework.rs`).
+- **The handler a GoFrame route's bare type reaches (W7-16c, OD-B16).** A
+  route whose package-qualified request type no method takes falls back to
+  the methods taking the bare type, leaving out one whose qualified parameter
+  is another route's request type: with `cash` and `order` both declaring a
+  `ListReq` route and only `order` handling one, `GET /cash/list` reaches
+  nothing. A same-package (`*ListReq`) or aliased (`*sys.DeptSearchReq`)
+  parameter still links. colby keeps every method of the bare type
+  (`synthesis/goframe.rs`).
+- **Navigation links (W7-18a, OD-B10).** A Next.js `<Link href>` names a
+  page only by a destination starting with `/`, as an internal `<a href>`
+  and every other router's link do; colby skips an external `<a href>`
+  only, and its table reads an absolute URL's path, so a `<Link
+  href="https://…/">` (mantis's MUI links) reaches the site's own `/`. An
+  Expo helper's literals name the screens of the navigation's own Expo app,
+  a navigation under no Expo app reads none, and the eight-screen cap and
+  the memo are per helper and app, as a navigation call matches (W7-08);
+  colby reads the helper against one table for the project. The files are
+  read in path order, so the navigation that first reaches a helper's
+  screen, whose `registeredAt` and `navMethod` the edge carries, is the same
+  on every index; colby walks `getAllFiles()` in index order. A path or a
+  name two routes of a link's app carry names nothing, as for the routers'
+  navigation calls (`synthesis/links.rs`).
+- **How the stage writes its edges (W7-18c0).** The stage keeps the row
+  of each synthesized edge it makes again unchanged, deletes the stored
+  ones it no longer makes or makes differently, and inserts the new ones,
+  in one transaction; the rows it leaves are the ones deleting every
+  synthesized edge and inserting the new list would leave. colby's
+  `publish` deletes every synthesized edge and inserts every new one
+  (`src/db/synthesis-stage.ts:52-89`). Where a query lists a node's edges
+  of one kind by row id, a kept synthesized edge can come before a base
+  edge the same sync rewrote, as base edges a sync rewrote already come
+  after the ones it kept; a fresh index writes the stage's edges after
+  every base edge, as colby does (`replace_synthesized_edges` in
+  `codegraph-store`).
+- **A Vue template's names (W7-18c).** A tag or a handler is the one node
+  of its name and kinds in the template's file, else the one of the project,
+  and nothing when either has several; a tag no node is named renders the
+  component Nuxt auto-imports under it only when one component has that
+  Nuxt name, and a handler destructured from a composable is the one member
+  of its key in the composable's file. colby takes the first in node order
+  at each step. A file joins nothing unless it holds exactly one component
+  (`synthesis/vue.rs`).
+- **Angular templates (W7-18d, OD-B18).** A `templateUrl` template the
+  index holds is read as the index holds it, so one changed since it was
+  indexed reads as absent until its own sync; any other is read only where
+  the scan's rules admit it whatever its extension, through no symbolic
+  link, no larger than `indexing.max_file_size` and never outside the
+  project root, and is recorded, so that a sync that finds it reading
+  differently recomputes the stage. colby reads any file at the path. An
+  inline `template:` is read only when its value is a string or template
+  literal; colby takes the value's first character for the quote and reads
+  from there to that character's next occurrence, so `template: tag + '…' +
+  tag` reads `ag + '…' + `. A link's destination is read as a navigation
+  call's is (W7-13): a relative arm, or one that leaves the site, drops out
+  before the arms are matched, where colby checks only the first arm
+  (`synthesis/angular.rs`).
+- **A SvelteKit route's page (W7-18b).** Every page the SvelteKit table
+  holds calls its own file's component, a page whose path another page of
+  its app serves too (route groups `(a)/x` and `(b)/x`, which SvelteKit
+  rejects as a conflict). colby walks each app's paths, each holding the
+  first page in node order, so only that page is joined. A page or layout
+  file joins nothing, its route or its loader, unless it holds exactly one
+  component; colby takes the first (`synthesis/sveltekit.rs`).
+- **JSX render (W7-14e, OD-A4).** A tag renders what its static
+  `references` edge reaches, a component, function, class or value, never
+  a method. colby scans a file's text for `<Name` and finds the child by
+  name (`jsxChild`, `declaredComponent` and its local-binding and export
+  lookups). The tags are the ones the syntax tree gives in tsx and jsx
+  files, so JSX in a `.js` file renders nothing here, and a type argument
+  (`Array<Box>`, `useState<Box>()`) is no tag, where colby's pattern reads
+  one. A tag outside every function renders from the value or the file
+  the syntax tree gives it to; colby decides by line, and a line a value
+  shares with another statement renders from no one (#2587). A wrapper
+  (`styled(Button)`, `memo(Button)`) does not render what it wraps, colby's
+  `wrapped` edges: the base graph has no edge from the wrapper to it
+  (`synthesis/jsx.rs`). colby's default-import fallback (#2137) takes the
+  imported file's component only when that file declares exactly one; a
+  default import here binds the first component the file exports
+  (`import_resolver.rs`).
+- **A file that drifted since it was indexed (W7-14).** The stage reads a
+  file only while its size and modification time, or its content hash, are
+  the ones its file row records, the MCP engine's freshness probe; a drifted
+  file reads as absent until its sync recomputes the stage, never sliced by
+  its old nodes' lines. colby reads the file as it is on disk
+  (`synthesis/stage.rs`). The Go steps read from that text the package an
+  embedding of a type outside the index is written through, so an
+  embedding in a drifted file brings no method and matches no other
+  type's; colby reads it through its resolution context
+  (`synthesis/go.rs`, W7-15b).
+- **Mockgen's default output name (W7-15c).** A `mock_<name>.go` is a
+  generated file in any directory, its file name tested alone
+  (`is_mockgen_default_output`): the gRPC stub pass takes no struct of
+  `svc/mock_greeter.go` for a server, and the MCP tools rank the file as
+  generated without mockgen's banner. colby's `/^mock_[^/]+\.go$/` tests the
+  whole path (`generated-detection.ts`), so only a root `mock_x.go` matches
+  there; a nested one is generated by its banner alone, and its structs are
+  candidate servers (`codegraph-core/src/file_class.rs`,
+  `synthesis/go_dispatch.rs`).
+- **C function pointers: a struct is one definition (W7-17a).** The
+  function-pointer pass keys a registration and a dispatch by a struct
+  definition and its field: each `struct` or `union` node is one, and two
+  definitions with the same name and fields are two. A name means the one
+  definition of that name in the project, else the one of the file's
+  translation unit (the file and the files its `#include`s reach), else
+  nothing; the type of a file-scope table, the one owner a field name
+  falls back to, and a table entry follow the same rule, the entry's function
+  being the one of its name in the table's file, else in the includer's, else
+  in the project. colby keys by the name: `structLayout` keeps the last
+  layout of a name, a chain walks the first with the field, and `resolveFn`
+  takes the table file's first candidate, else the first
+  (`synthesis/c_fnptr.rs`).
+- **C function pointers: a body with conditionals (W7-17a).** A struct's
+  fields are read as its definition writes them, conditionals unevaluated, an
+  inline struct no node holds included (vim's `cmdname`: the whole
+  `ex_cmds.h` parses to no symbol here) as the file writes it, not as the
+  first includer's evaluation leaves it. From the declaration that holds a
+  body's first `#if`, `#ifdef`, `#ifndef`, `#elif`, `#else`, `#endif` or
+  `#include` on, a field's position may differ between translation units,
+  so a positional table entry for it is not registered; a designated
+  `.field = fn` still is, and a chain never walks a field the body declares
+  twice. colby reads the positions as written and walks the first field of
+  the name (`synthesis/c_fnptr.rs`).
+- **C function pointers: what is read (W7-17a, W7-17b).** An `#include`
+  resolves to an indexed file, else, as colby's does, to a file on disk under
+  the project root, but only to one the scan's rules admit whatever its
+  extension (the default ignores, the root `.gitignore`, `.git/info/exclude`
+  and the configured include and exclude), reached through no symbolic link
+  and no larger than `indexing.max_file_size`; colby reads any file there,
+  excluded, ignored or linked. So a first candidate the configuration keeps
+  out is no file here, and the include resolves to the second. The macro
+  patterns read `\r`, `\n` and `\r\n` as line ends, not U+2028 or U+2029,
+  which JavaScript's `m` flag reads too. Every file runs through every stage,
+  without colby's survival filters, which skip a file only where the stage
+  would find nothing, except in two cases: an initializer whose type only a
+  non-indexed include aliases, which this pass registers and colby's filter
+  skips (its `aliasNames` are the indexed files' object macros), and a match
+  that starts before a function and runs across a line end into its
+  signature line, which shifts the matches inside its body
+  (`synthesis/c_fnptr.rs`, `synthesis/inputs.rs`).
+- **A Go type followed through aliases (W7-15d).** The func-field pass
+  follows a type through aliases and defined types at most three deep, from
+  whichever name it starts. colby keeps one answer per type name and file
+  whatever the depth it reached it at (`resolveMemo`): a chain four or more
+  deep resolves there when the type past the third step was resolved first,
+  and that type, written in the same file, resolves to nothing once the
+  chain was followed first (`synthesis/go_func_field.rs`).
+- **Cross-tier channels and test requests: what is read (W7-20).** A
+  receiver's imported client and queue bindings, and a Laravel request
+  helper's body, are read through the view: the indexed files whose text is
+  the one their file rows record, as the other passes read them (W7-14).
+  colby reads them from disk, a file outside the index or drifted since it
+  was indexed included. The import of a receiver's head resolves among the
+  indexed files only: when its candidates include a JavaScript file the
+  configuration excludes or the size limit keeps out, colby takes that file
+  and reads its bindings from disk, and this pass skips it for the next
+  indexed candidate (`synthesis/tier.rs`, `synthesis/context.rs`).
 
 ### Extraction
 
@@ -247,6 +1029,42 @@ listed.
   `make`); local-scope offsets are bytes, colby's UTF-16 code units
   (`dart_chains.rs`, `dart_prefixes.rs`, `dart_local_scope.rs`,
   `dart_scope.rs`).
+- **A Rust route's handler column (W7-19h).** An axum or actix builder
+  route's reference to its handler sits where the handler's name is written
+  (#2359), at its byte column: the Rust scope rule cuts the reference's line
+  at its column as a byte offset, as tree-sitter's Rust references store
+  theirs. colby stores the UTF-16 column, which its scope rule reads the
+  same way; the two differ only on a line holding a non-ASCII character
+  before the handler (`.route("/café", get(handlers::list))`). Route nodes'
+  columns are UTF-16 code units in both (`frameworks/rust.rs`).
+- **Store and RTK initializers (W7-16b).** A Vue store's or an RTK Query
+  api's initializer is walked as its declaration's, skipping only what became
+  a node: the store call, its wrappers, `state` and an endpoint's other
+  options keep their calls, as a Zustand store's do (#693, #1862). A Vuex
+  module's `export default {…}` is walked as before around its collections'
+  members. colby walks none of the initializer once it finds a collection or
+  an endpoint, and none of the statement once the file reads like a store
+  (`walker.rs`).
+- **Store and RTK member names (W7-16b).** A collection member or an
+  endpoint is named only by a static key (an identifier, or a string of
+  `[A-Za-z0-9_$]` without its quotes) and qualified under its declaration
+  (`useAuthStore::login`, `api::getPosts`); a `function*` value is a member
+  too. colby names any key by its text without quotes, so a computed
+  `[types.SET]` member is a node named `[types.SET]`, qualifies by the file
+  and skips a `function*` value (`walker.rs`).
+
+### Scan scope
+
+- **`addons` skipped by default (Godot; W7-16c, OD-B17).** The default
+  `indexing.ignore_dirs` adds `addons`, a Godot project's vendored editor
+  plugins, to colby's default directories (with `.godot`, the engine's
+  regenerated cache). Like every entry it is a directory name skipped at any
+  depth in any project, so first-party code under a directory of that name is
+  not indexed either: a GoFrame app's addon modules (`addons/<name>/`, which
+  the GoFrame pass's addon tier tells apart) and a core directory such as
+  hotgo's `api/admin/addons/`. colby indexes them. A project re-includes them
+  with a custom `ignore_dirs` list in `.codegraph/config.toml`
+  ([`godot.md`](../godot.md); `codegraph-core/src/config.rs`).
 
 ### Path order, not index order
 
@@ -285,7 +1103,12 @@ depth for the same reason (`lua_scope.rs`).
   only (`import_resolver.rs`).
 - **PHP.** A class name reference is recorded by its last segment and its
   written name read back from the source; a rooted `\strlen()` keeps its `\`
-  and resolves as `strlen` (`php_scope.rs`, `import_resolver.rs`).
+  and resolves as `strlen` (`php_scope.rs`, `import_resolver.rs`). A Laravel
+  route's handler class sits at the route's column 0 under the name colby's
+  extraction gives it: a simple name is read as written, through the routes
+  file's `use` imports and namespace as colby reads it, and a namespaced one
+  (a string handler without `@`, relative to the controllers root) reaches
+  no class (`php_scope.rs`).
 - **Dart libraries.** Only an indexed file's directives are read, a URI whose
   path leaves the project names nothing, an export chain is followed at most 64
   libraries deep (colby recurses without a bound), and a field's initializer is
@@ -306,4 +1129,87 @@ for them that colby's sync has no counterpart for, each with a version marker
 withdrawn before the sync's first write and restored once it has resolved
 ([Daemon and watch lifecycle](../architecture.md#daemon-and-watch-lifecycle)).
 The Shopify theme lane also covers a scoped sync: a theme marker added or
-removed converges there, where colby's needs a full sync.
+removed converges there, where colby's needs a full sync. NestJS route naming
+needs no lane: every sync renames the routes again, and one that nothing
+renames any more (its app's global prefix or version, or its module's
+`RouterModule` entry, went away) gets the name its file gives it back
+(`frameworks/nestjs.rs`), where colby's sync keeps the old name. Express's
+mount prefixes need none either: every sync composes them again and renames
+only Express's own routes, so another framework's route in a mounted file
+keeps its name, which colby renames, and a route that no mount renames any
+more gets its file's name back (`frameworks/express.rs`), where colby's sync
+keeps the old prefix. FastAPI's router prefixes (`bc45e907`) need none either:
+every sync composes them again and renames only FastAPI's own routes, so a
+Flask route on a FastAPI decorator's line keeps its name, which colby
+renames, and a route that nothing renames any more (its mount gone, its prefix
+computed, its router mounted at a second path) gets its file's name back
+(`frameworks/python.rs`), where colby's sync keeps the old prefix. Spring's
+config keys and Play's actions have lanes of their own (W7-19c): a config file
+a sync rebuilds or removes re-resolves every reference a key can bind, since a
+relaxed spelling or a second profile file moves a binding without touching
+its name, and a class or action a sync adds, removes or moves into another
+language re-resolves the routes lines naming it (`play_routes_version`).
+So do Laravel's controllers and Drupal's handlers and hooks (W7-19d): a
+class or method name a sync adds to or removes from a controller file (a
+path holding `Controllers`) re-resolves the Laravel route references naming
+its class or file (`laravel_routes_version`), and one a sync adds to or
+removes from any PHP file re-resolves the routing files' handlers naming
+the file's classes, a hook function that comes or goes every `hook_X` it
+answers, and a node named `hook_X` that comes or goes the resolved
+references of that name (`drupal_refs_version`). So do Rails' controllers
+(W7-19e): a Ruby class, method or function name a sync adds to or removes
+from any file re-resolves the Rails route references naming one of the
+file's classes, or naming the file as their
+`app/controllers/<controller>_controller.rb` (`rails_routes_version`).
+So do Vapor's handlers (W7-19g): each Swift method or function name a file
+that a sync changes declares before the change or after it re-resolves the
+Vapor route handlers naming that method (`vapor_routes_version`), whether or
+not the name moved, since a handler's choice also reads its candidates'
+types and first lines (a `Request` parameter, an `extension A.B` line).
+So do Rust's crate roots (W7-19h): a root `src/<name>.rs` or
+`src/<name>/mod.rs`, or a workspace member's `src/lib.rs` or `src/main.rs`,
+that a sync adds or removes, or whose file node comes or goes as it crosses
+`max_file_size`, re-resolves the references named for the module or for the
+member's crate, since the module rule's target is a file node that no such
+name reaches (`rust_crate_roots_version`).
+So do the React Native, Expo modules and Swift–Objective-C bridges (W7-21),
+whose answers read what no node records: a JavaScript file's `NativeModules`
+aliases and `requireNativeModule` bindings, an Objective-C file's
+`RCT_EXPORT_*`, `RCT_REMAP_*` and `RCT_EXTERN_*` entries, a JVM module's name
+and `@ReactMethod`s, a TurboModule spec, and whether a Swift method is
+exposed to Objective-C. Each file holding any of them keeps a row of them,
+which a sync's resolution reads for the files it did not change instead of
+their text. A sync compares a changed file's old row with its new facts, and
+its Objective-C, Java and Kotlin method names before and after: an alias or
+binding that came, went or names another module re-resolves the references
+written through its name; an export, `RCT_EXTERN`, JVM or spec entry that
+came, went or changed, the JavaScript references whose last segment is its
+JavaScript name; an Objective-C method, the Swift references whose last
+segment is a base name of its selector and the JavaScript ones whose last
+segment is its first keyword or the JavaScript name of an export of it; a
+JVM method, the JavaScript references of its name; a Swift method that came,
+went, or changed its qualified name or its exposure, the Objective-C
+selectors that bridge from its name and the JavaScript names of the
+`RCT_EXTERN` entries of it; and a file whose exported binding changed, its
+importers, whole (`rn_bridges_version`). Since a bridge's answer below `0.9`
+gives way to a candidate in its reference's own language (OD-B28, above) and
+to any more confident one, a node of a changed file, of any language and
+kind, that came, went, moved or changed anything else name matching reads of
+it, compared once the framework nodes are back, also re-resolves the
+JavaScript-family, Swift and Objective-C references whose last segment is its
+name, case aside, and that such an answer resolved: an Objective-C reference
+only through a selector, a JavaScript one only through an entry's JavaScript
+name. A second C++ class `Cache` with a method of a Swift call's name on
+`cache`, or a class renamed `Cache` in place, takes the call from the bridge
+at `0.65`, as an ArkTS class `Player` takes `player.rewind()` in TypeScript.
+Fabric's detection reads the
+`package.json` of each directory below `packages/`, `apps/`, `modules/` and
+`libraries/`, which no index holds: those listings and manifests are
+JavaScript control inputs, so a manifest that comes, goes or changes there
+detects again.
+Laravel's route names need no lane: every sync recomputes them from their
+qualified names, as colby's does, so a mount that goes away is undone in
+both. ASP.NET's route names (W7-19f) need none either: every sync recomputes
+a constant route's and an endpoint group's names from their qualified
+names, and a route whose constant or group head went away gets its file's
+name back (`frameworks/aspnet.rs`), where colby's sync keeps the old name.

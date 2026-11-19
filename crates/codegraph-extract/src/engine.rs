@@ -181,6 +181,13 @@ pub fn detect_language_with(
 ) -> Language {
     let path = file_path.as_ref();
     let normalized = normalize_path(path);
+    // A Play routes file has no extension (`conf/routes`) or a made-up one
+    // (`conf/api.routes`): it is indexed as a YAML file, which makes no
+    // symbols, so the Play framework resolver extracts its routes (upstream
+    // `isPlayRoutesFile`, first in `detectLanguage`).
+    if is_play_routes_file(&normalized) {
+        return Language::Yaml;
+    }
     // A Shopify theme's JSON template or section group is Liquid, and only
     // inside a theme under the project root (upstream #2393).
     if crate::embedded::shopify::is_shopify_liquid_json(&normalized, overrides.project_root()) {
@@ -205,6 +212,15 @@ pub fn detect_language_with(
         return language;
     }
     Language::Unknown
+}
+
+/// Whether `path` (project-relative, `/`-separated) is a Play routes file:
+/// `conf/routes`, one under a project's `conf/` (`app/conf/routes`), or any
+/// `*.routes` include (upstream `isPlayRoutesFile` in `grammars.ts`, the same
+/// from `025ebc88` to `e8ddc4e2`; the suffix is matched case-sensitively, as
+/// upstream's `endsWith`).
+pub fn is_play_routes_file(path: &str) -> bool {
+    path == "conf/routes" || path.ends_with("/conf/routes") || path.ends_with(".routes")
 }
 
 /// The language `file_path` is indexed as, given its `source`: the language
@@ -679,6 +695,78 @@ pub fn scan_membership(
     relative: &str,
     dir: bool,
 ) -> Membership {
+    ScanScope::new(root, options).membership(relative, dir, false)
+}
+
+/// The scan's rules for one root and its options, read once (the root
+/// `.gitignore` and `.git/info/exclude` with them), judging single paths as
+/// [`scan_membership`] does. The synthesis stage asks it about the files an
+/// `#include` names that the index does not hold (W7-17b).
+pub struct ScanScope {
+    root: PathBuf,
+    ignore_dirs: Vec<String>,
+    reserved_roots: std::collections::BTreeSet<PathBuf>,
+    ignore_paths: Vec<String>,
+    exclude: Vec<String>,
+    include: Vec<String>,
+    gitignore: RootGitignore,
+    overrides: Arc<ExtensionOverrides>,
+}
+
+impl ScanScope {
+    pub fn new(root: &Path, options: &ExtractOptions) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            ignore_dirs: options.ignore_dirs.clone(),
+            reserved_roots: codegraph_core::IndexPaths::reserved_index_roots(
+                root,
+                std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+            ),
+            ignore_paths: options.ignore_paths.clone(),
+            exclude: options.exclude.clone(),
+            include: options.include.clone(),
+            gitignore: RootGitignore::load(root),
+            overrides: Arc::clone(&options.extensions),
+        }
+    }
+
+    /// Whether the scan's ignore model admits `relative` as a file, whatever
+    /// its extension: [`scan_membership`]'s verdict on a file, without its
+    /// question whether the file is extractable source.
+    pub fn admits_file(&self, relative: &str) -> Membership {
+        self.membership(relative, false, true)
+    }
+
+    fn membership(&self, relative: &str, dir: bool, any_extension: bool) -> Membership {
+        let ignored_dirs = self
+            .ignore_dirs
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let pattern_sets: Vec<&[String]> = vec![&self.ignore_paths, &self.exclude];
+        let include = IncludeSet::new(&self.include, &self.exclude);
+        let rules = ScanRules {
+            root: &self.root,
+            ignored_dirs: &ignored_dirs,
+            reserved_roots: &self.reserved_roots,
+            pattern_sets: &pattern_sets,
+            gitignore: &self.gitignore,
+            include: &include,
+            overrides: &self.overrides,
+        };
+        membership_by(&rules, relative, dir, any_extension)
+    }
+}
+
+/// [`scan_membership`]'s walk under `rules`; with `any_extension` a file the
+/// ignore model admits is admitted whether or not it is extractable source.
+fn membership_by(
+    rules: &ScanRules<'_>,
+    relative: &str,
+    dir: bool,
+    any_extension: bool,
+) -> Membership {
+    let root = rules.root;
     let components = relative
         .split('/')
         .filter(|component| !component.is_empty())
@@ -686,27 +774,6 @@ pub fn scan_membership(
     if components.is_empty() || components.iter().any(|c| *c == "." || *c == "..") {
         return Membership::Rejected;
     }
-    let ignored_dirs = options
-        .ignore_dirs
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let gitignore = RootGitignore::load(root);
-    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude];
-    let include = IncludeSet::new(&options.include, &options.exclude);
-    let reserved_roots = codegraph_core::IndexPaths::reserved_index_roots(
-        root,
-        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    );
-    let rules = ScanRules {
-        root,
-        ignored_dirs: &ignored_dirs,
-        reserved_roots: &reserved_roots,
-        pattern_sets: &pattern_sets,
-        gitignore: &gitignore,
-        include: &include,
-        overrides: &options.extensions,
-    };
     let mut parent = root.to_path_buf();
     let mut above = GitignoreAncestry::default();
     for (index, name) in components.iter().enumerate() {
@@ -732,7 +799,9 @@ pub fn scan_membership(
                 return Membership::Rejected;
             }
             return match rules.decide(&partial, false, above) {
-                EntryDecision::File { extractable: true } => Membership::Admitted,
+                EntryDecision::File { extractable } if extractable || any_extension => {
+                    Membership::Admitted
+                }
                 _ => Membership::Rejected,
             };
         }
@@ -1859,6 +1928,38 @@ mod tests {
         assert_eq!(detect_language("data.bin"), Language::Unknown);
         assert_eq!(detect_language("project.godot"), Language::GodotProject);
         assert_eq!(detect_language("src/lib.rs"), Language::Rust);
+    }
+
+    /// A Play routes file is a YAML file (upstream `isPlayRoutesFile`): the
+    /// root's `conf/routes`, a project's under it, any `*.routes` include,
+    /// the suffix case-sensitive; the scan indexes it as a file only.
+    #[test]
+    fn play_routes_files_are_yaml_files() {
+        for path in [
+            "conf/routes",
+            "play-java-hello/conf/routes",
+            "conf/api.routes",
+            "modules/admin.routes",
+        ] {
+            assert!(is_play_routes_file(path), "{path}");
+            assert_eq!(detect_language(path), Language::Yaml, "{path}");
+            assert!(
+                is_extractable_source_path(path, &ExtensionOverrides::default()),
+                "{path}"
+            );
+        }
+        for path in [
+            "routes",
+            "xconf/routes",
+            "conf/routes.txt",
+            "conf/ROUTES",
+            "conf/api.ROUTES",
+            "config/routes",
+        ] {
+            assert!(!is_play_routes_file(path), "{path}");
+        }
+        assert_eq!(detect_language("conf/routes.txt"), Language::Unknown);
+        assert_eq!(detect_language("xconf/routes"), Language::Unknown);
     }
 
     #[test]

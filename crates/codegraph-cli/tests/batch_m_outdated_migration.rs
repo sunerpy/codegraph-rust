@@ -14,6 +14,8 @@
 //! the index namespace, and an `uninitialized` namespace stays reserved for an
 //! explicit `init`.
 
+mod upgrade_support;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -545,6 +547,51 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         lua_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
         "a forced migration must write the Lua module marker of `index --force`"
     );
+    // The Play routes marker (W7-19c), likewise.
+    let play_marker = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("play_routes")
+            .expect("Play routes marker")
+    };
+    assert_eq!(
+        play_marker(&paths),
+        vec![("play_routes_version".to_string(), "1".to_string())],
+        "a migration writes the Play routes marker"
+    );
+    assert_eq!(
+        play_marker(&paths),
+        play_marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the Play routes marker of `index --force`"
+    );
+    // The Laravel and Drupal lane markers (W7-19d), the Rails one
+    // (W7-19e), the Vapor one (W7-19g), the Rust crate roots one (W7-19h)
+    // and the bridge one (W7-21), likewise.
+    for (prefix, key) in [
+        ("laravel_routes", "laravel_routes_version"),
+        ("drupal_refs", "drupal_refs_version"),
+        ("rails_routes", "rails_routes_version"),
+        ("vapor_routes", "vapor_routes_version"),
+        ("rn_bridges", "rn_bridges_version"),
+        ("rust_crate_roots", "rust_crate_roots_version"),
+    ] {
+        let marker = |paths: &IndexPaths| {
+            Store::open_for_read(paths, deadline(), || false)
+                .expect("readable namespace")
+                .project_metadata_with_prefix(prefix)
+                .expect("lane marker")
+        };
+        assert_eq!(
+            marker(&paths),
+            vec![(key.to_string(), "1".to_string())],
+            "a migration writes the {key} marker"
+        );
+        assert_eq!(
+            marker(&paths),
+            marker(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+            "a forced migration must write the {key} marker of `index --force`"
+        );
+    }
     // And the C/C++ namespace rows (W4-CPP-07).
     let namespace_rows = |paths: &IndexPaths| {
         Store::open_for_read(paths, deadline(), || false)
@@ -1715,6 +1762,92 @@ fn outdated_migration_writes_the_lua_module_rows_of_index_force() {
     );
 }
 
+/// W7-21: a migration writes the bridge rows (a shim's `RCT_EXTERN`
+/// entries, a JS file's `NativeModules` aliases, a Swift file's methods and
+/// their exposure) and their marker as `index --force` does.
+#[test]
+fn outdated_migration_writes_the_bridge_rows_of_index_force() {
+    let dir = TestDir::new("outdated-rn-bridges");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+        ),
+        (
+            "ios/CaptureView.swift",
+            "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n",
+        ),
+        (
+            "ios/CaptureView.m",
+            "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n",
+        ),
+        (
+            "src/a.ts",
+            "import { NativeModules } from 'react-native';\n\nexport const captureView = NativeModules.CaptureView;\n",
+        ),
+        (
+            "src/plain.ts",
+            "export function plain() {\n  return 1;\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-rn-bridges", &project);
+    let bridge_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("rn_bridge")
+            .expect("bridge rows")
+    };
+    let migrated = bridge_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "rn_bridge_surface:ios/CaptureView.m",
+            "rn_bridge_surface:ios/CaptureView.swift",
+            "rn_bridge_surface:src/a.ts",
+            "rn_bridges_version",
+        ],
+        "a migration writes the bridge rows of the files holding a bridge fact, and their \
+         marker: {migrated:?}"
+    );
+    assert!(
+        migrated[0].1.contains("syncSettings") && migrated[2].1.contains("CaptureView"),
+        "a row holds its file's entries and aliases: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        bridge_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the bridge rows of `index --force`"
+    );
+}
+
 /// W4-PHP-01: a migration writes the PHP head rows (a type's kind and the
 /// supertypes its `extends` and trait `use`s name, through its file's
 /// imports) and their marker as `index --force` does.
@@ -1867,9 +2000,11 @@ fn outdated_migration_writes_the_class_head_rows_of_index_force() {
 }
 
 /// W5-06: a migration writes the control-input rows (what resolution read
-/// of the JS/TS configs and manifests, the C# project files and the Cargo
-/// manifests), the detected frameworks and both markers as `index --force`
-/// does.
+/// of the JS/TS configs and manifests, the C# project files, the Cargo
+/// manifests, W7-15d1, the Go module files and, W7-19b to W7-19d, the
+/// root files the Python, Spring, Play, Laravel and Drupal frameworks are
+/// detected by), the detected frameworks and both markers as
+/// `index --force` does.
 #[test]
 fn outdated_migration_writes_the_control_rows_of_index_force() {
     let dir = TestDir::new("outdated-control-inputs");
@@ -1901,6 +2036,18 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
         ),
         ("src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n"),
+        ("svc/go.mod", "module example.com/svc\n\ngo 1.22\n"),
+        ("svc/main.go", "package main\n\nfunc main() {}\n"),
+        // Names no Python framework, so the detected frameworks stay React
+        // and Go (`svc/main.go`).
+        ("requirements.txt", "requests>=2\n"),
+        // Nor Spring.
+        (
+            "pom.xml",
+            "<project><artifactId>app</artifactId></project>\n",
+        ),
+        // Nor Drupal.
+        ("composer.json", "{\"require\":{\"php\":\">=8.1\"}}\n"),
     ] {
         let full = project.join(path);
         fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
@@ -1947,8 +2094,15 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
             .collect::<Vec<_>>(),
         [
             "control_inputs:csharp",
+            "control_inputs:dotnet",
+            "control_inputs:go",
             "control_inputs:js",
+            "control_inputs:jvm",
+            "control_inputs:php",
+            "control_inputs:python",
+            "control_inputs:ruby",
             "control_inputs:rust",
+            "control_inputs:swift",
             "control_inputs_version",
             "frameworks_detected",
             "frameworks_version",
@@ -1957,10 +2111,29 @@ fn outdated_migration_writes_the_control_rows_of_index_force() {
     );
     for (row, input) in [
         (0, "\"App/App.csproj\""),
-        (1, "\"tsconfig.json\""),
-        (1, "\"package.json\""),
-        (2, "\"Cargo.toml\""),
-        (4, "\"react\""),
+        // ASP.NET's two root files, both absent: `App/Program.cs` is no
+        // root one.
+        (1, "\"Program.cs\":null"),
+        (1, "\"Startup.cs\":null"),
+        (2, "\"svc/go.mod\""),
+        (3, "\"tsconfig.json\""),
+        (3, "\"package.json\""),
+        // A digest, where the five absent root files record null.
+        (4, "\"pom.xml\":\""),
+        (4, "\"build.sbt\":null"),
+        // A digest, where the two absent Laravel root files record null.
+        (5, "\"composer.json\":\""),
+        (5, "\"artisan\":null"),
+        (5, "\"app/Http/Kernel.php\":null"),
+        // A digest, where the seven absent root files record null.
+        (6, "\"requirements.txt\":\""),
+        // Rails' four root files, all absent.
+        (7, "\"Gemfile\":null"),
+        (7, "\"config/routes.rb\":null"),
+        (8, "\"Cargo.toml\""),
+        // Vapor's root `Package.swift`, absent.
+        (9, "\"Package.swift\":null"),
+        (11, "\"react\""),
     ] {
         assert!(
             migrated[row].1.contains(input),
@@ -2472,4 +2645,149 @@ fn status_reports_a_current_index_under_the_tombstone() {
     let status = cli(&["status", project_arg, "--json"]);
     let json: serde_json::Value = serde_json::from_str(&status.stdout).expect("status JSON");
     assert_eq!(json["initialized"], true, "{}", status.stdout);
+}
+
+/// W7-09b: a migration names a route a constant spells before it resolves
+/// the navigation calls, as `index --force` does (upstream `postExtract`
+/// before resolution), so a call to the route's path navigates to it after
+/// the upgrade.
+#[test]
+fn outdated_migration_names_constant_routes_before_resolving_navigation() {
+    let dir = TestDir::new("outdated-react-router-constant-route");
+    let project = dir.path().join("web");
+    for (path, contents) in [
+        (
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        ),
+        (
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' } },\n} as const\n",
+        ),
+        (
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  return redirect('/app')\n}\n",
+        ),
+        (
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let migrated = canonicalize_db(&paths.current_db()).expect("canonicalize migrated db");
+    assert!(
+        migrated
+            .edges
+            .iter()
+            .any(|edge| edge.get("kind").and_then(|kind| kind.as_str()) == Some("navigates")),
+        "the migrated index must hold the call's navigates edge: {:?}",
+        migrated.edges
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-react-router-constant-route", &project);
+    let rebuilt = canonicalize_db(
+        &IndexPaths::resolve(&peer, None)
+            .expect("resolve peer v2 paths")
+            .current_db(),
+    )
+    .expect("canonicalize peer db");
+    diff_canonical(&rebuilt, &migrated, None)
+        .expect("a forced migration must equal a fresh v2 `index --force`");
+}
+
+/// W7-14: a migration synthesizes the dispatch edges no reference names, as
+/// `index --force` does, and leaves the synthesis marker a sync reads.
+#[test]
+fn outdated_migration_synthesizes_dispatch_edges() {
+    let dir = TestDir::new("outdated-synthesis");
+    let project = dir.path().join("app");
+    for (path, contents) in [
+        (
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+        ),
+        (
+            "src/app.ts",
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let migrated = canonicalize_db(&paths.current_db()).expect("canonicalize migrated db");
+    assert!(
+        migrated.edges.iter().any(|edge| {
+            let edge = serde_json::to_string(edge).expect("serialize a canonical edge");
+            edge.contains("synthesizedBy") && edge.contains("callback")
+        }),
+        "the migrated index must hold the synthesized dispatch edge: {:?}",
+        migrated.edges
+    );
+    let marker = rusqlite::Connection::open_with_flags(
+        format!(
+            "{}?immutable=1",
+            upgrade_support::sqlite_file_uri(&paths.current_db())
+        ),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .expect("open the migrated db")
+    .query_row(
+        "SELECT value FROM project_metadata WHERE key = 'synthesis_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .expect("the migration writes the synthesis marker");
+    assert_eq!(marker, "19");
+    let (_scratch, peer) = fresh_force_peer("outdated-synthesis", &project);
+    let rebuilt = canonicalize_db(
+        &IndexPaths::resolve(&peer, None)
+            .expect("resolve peer v2 paths")
+            .current_db(),
+    )
+    .expect("canonicalize peer db");
+    diff_canonical(&rebuilt, &migrated, None)
+        .expect("a forced migration must equal a fresh v2 `index --force`");
 }

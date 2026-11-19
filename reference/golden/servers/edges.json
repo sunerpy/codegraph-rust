@@ -13,6 +13,30 @@
   },
   {
     "col": 0,
+    "kind": "calls",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:vapor/Sources/App/routes.swift:4:GET:/hello",
+    "target": "function:94b39098bab610cdaf0bdebd6ef1b20f"
+  },
+  {
+    "col": 0,
+    "kind": "calls",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:express/routes/users.js:9:GET:/users/:id",
+    "target": "function:203842290365d50993a2f45495b18a72"
+  },
+  {
+    "col": 0,
     "kind": "imports",
     "line": 2,
     "metadata": {
@@ -62,6 +86,182 @@
   {
     "col": 0,
     "kind": "references",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "drupal",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:drupal/modules/custom/greeting/greeting.routing.yml:1:/hello",
+    "target": "method:dbc237abab96f8f768a79e8d91dc5d8f"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 1,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "play",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:play/conf/routes:1:GET:/",
+    "target": "method:0952d7c19228f96d12bb769ece592391"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 11,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "import"
+    },
+    "provenance": null,
+    "source": "route:express/app.js:11:USE:/api",
+    "target": "constant:d1b69054221431f51b587e24cd94be13"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.7,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:spring/src/main/java/com/example/users/UserController.java:15:GET:/users/{id}",
+    "target": "method:203dfa9524733a2e4ceac374305fad0b"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 15,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:gin/main.go:15:GET:/ping",
+    "target": "function:822994b41b49c7ca4069da738515f400"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 19,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:flask/app.py:19:GET:/ping",
+    "target": "function:359d25aadac7c78f4c23663b4a877017"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.85,
+      "framework": "rails",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:rails/config/routes.rb:2:GET:/users/:id:users#show",
+    "target": "method:519356e5fcc6de599e3961ad1a49bead"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.85,
+      "framework": "rails",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:rails/config/routes.rb:2:GET:/users:users#index",
+    "target": "method:ec5576bfff4fde71d094b1c11bbf0808"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 2,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "play",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:play/conf/routes:2:GET:/items/:id",
+    "target": "method:dffa1d90061d3bb5d52e05bf5da1951d"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 4,
+    "metadata": {
+      "confidence": 0.85,
+      "framework": "rails",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:rails/config/routes.rb:4:GET:/admin/reports:admin/reports#index",
+    "target": "method:fd9132c439cfae25243586341304dc2d"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "laravel",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:laravel/routes/web.php:6:GET:/users",
+    "target": "method:89630d061e1ba36c3a3eee13e796d89a"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "vapor",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:vapor/Sources/App/Controllers/TodoController.swift:6:GET:/todos",
+    "target": "method:e26506678f57fd0e05462e7399ce0be8"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 6,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:flask/app.py:6:GET:/hello",
+    "target": "function:c49b36ba9866aa9075c5e726b4f3fd4b"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 7,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:fastapi/main.py:7:GET:/{item_id}",
+    "target": "function:91f55ff4968a290758de7bbd2a2aabfd"
+  },
+  {
+    "col": 0,
+    "kind": "references",
     "line": 8,
     "metadata": {
       "confidence": 0.7,
@@ -70,6 +270,31 @@
     "provenance": null,
     "source": "route:nest/src/users/users.controller.ts:8:GET:/users/:id",
     "target": "method:49949645145820e984b029acad16139c"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 8,
+    "metadata": {
+      "confidence": 0.9,
+      "framework": "laravel",
+      "resolvedBy": "framework"
+    },
+    "provenance": null,
+    "source": "route:laravel/routes/web.php:8:GET:/stats",
+    "target": "method:9c266f666867e6f29cf57cec22ddddc0"
+  },
+  {
+    "col": 0,
+    "kind": "references",
+    "line": 9,
+    "metadata": {
+      "confidence": 0.9,
+      "resolvedBy": "exact-match"
+    },
+    "provenance": null,
+    "source": "route:aspnet/Controllers/UsersController.cs:9:GET:/api/[controller]/{id}",
+    "target": "method:5305c5e90802aeb697042a8f5a945c5c"
   },
   {
     "col": 11,

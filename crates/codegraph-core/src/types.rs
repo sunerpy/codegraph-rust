@@ -37,7 +37,7 @@ pub const NODE_KIND_STRINGS: [&str; 23] = [
     "union",
 ];
 
-pub const EDGE_KIND_STRINGS: [&str; 12] = [
+pub const EDGE_KIND_STRINGS: [&str; 13] = [
     "contains",
     "calls",
     "imports",
@@ -50,6 +50,7 @@ pub const EDGE_KIND_STRINGS: [&str; 12] = [
     "instantiates",
     "overrides",
     "decorates",
+    "navigates",
 ];
 
 pub const LANGUAGE_STRINGS: [&str; 42] = [
@@ -236,10 +237,15 @@ pub enum EdgeKind {
     Overrides,
     #[serde(rename = "decorates")]
     Decorates,
+    /// A screen transition a router resolves: `router.push('/login')`,
+    /// `<Link href="/login">`, to the route it names. A framework resolver
+    /// gives it to a `calls` or `references` reference.
+    #[serde(rename = "navigates")]
+    Navigates,
 }
 
 impl EdgeKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Contains,
         Self::Calls,
         Self::Imports,
@@ -252,6 +258,7 @@ impl EdgeKind {
         Self::Instantiates,
         Self::Overrides,
         Self::Decorates,
+        Self::Navigates,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -268,6 +275,7 @@ impl EdgeKind {
             Self::Instantiates => "instantiates",
             Self::Overrides => "overrides",
             Self::Decorates => "decorates",
+            Self::Navigates => "navigates",
         }
     }
 }

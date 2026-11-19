@@ -2152,6 +2152,69 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             }
             return Ok(());
         }
+        // A database a newer codegraph wrote (OD-19) is unreadable here, and
+        // nothing may write it; report which versions disagree instead of
+        // failing like a read.
+        Err(
+            error @ codegraph_store::StoreError::FutureSchema {
+                found,
+                supported,
+                discard_with_uninit,
+                ..
+            },
+        ) => {
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "recoveryCommand": null,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!(
+                    "State:   current (schema {found} is newer than this binary's {supported})"
+                );
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                if discard_with_uninit {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph, or run `codegraph uninit --force {}` and then `codegraph init {}` to discard and rebuild it.",
+                        project.display(),
+                        project.display()
+                    );
+                } else {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph to use it."
+                    );
+                }
+            }
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     if status_open.rebuilding {
@@ -6099,6 +6162,7 @@ fn index_project_inner(
         Option<codegraph_resolve::lua_scope::LuaModuleRow>,
         Option<codegraph_resolve::dart_scope::HeadRow>,
         Option<codegraph_resolve::dart_libraries::LibraryRow>,
+        Option<codegraph_watch::rn_bridges::BridgeFacts>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
@@ -6117,6 +6181,7 @@ fn index_project_inner(
     let mut go_rows: Vec<(String, codegraph_resolve::go_packages::HeadRow)> = Vec::new();
     let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
     let mut class_head_rows: Vec<(String, codegraph_watch::class_heads::HeadsRow)> = Vec::new();
+    let mut bridge_rows: Vec<(String, codegraph_watch::rn_bridges::BridgeFacts)> = Vec::new();
     let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
     let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
@@ -6204,6 +6269,7 @@ fn index_project_inner(
             let lua_row = codegraph_watch::lua_modules::row_of(language, &source, &result.nodes);
             let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
             let dart_library_row = codegraph_watch::dart_libraries::row_of(language, &source);
+            let bridge_row = codegraph_watch::rn_bridges::row_of(relative, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
@@ -6226,6 +6292,7 @@ fn index_project_inner(
                 lua_row,
                 dart_row,
                 dart_library_row,
+                bridge_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
@@ -6252,6 +6319,7 @@ fn index_project_inner(
                 lua_row,
                 dart_row,
                 dart_library_row,
+                bridge_row,
             )) = payload
             else {
                 files_not_source += 1;
@@ -6343,6 +6411,9 @@ fn index_project_inner(
             if let Some(row) = dart_library_row {
                 dart_library_rows.push((relative.clone(), row));
             }
+            if let Some(row) = bridge_row {
+                bridge_rows.push((relative.clone(), row));
+            }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
             }
@@ -6414,6 +6485,8 @@ fn index_project_inner(
     drop(php_rows);
     codegraph_watch::class_heads::write_index_rows(&store, &mut class_head_rows)?;
     drop(class_head_rows);
+    codegraph_watch::rn_bridges::write_index_rows(&store, &mut bridge_rows)?;
+    drop(bridge_rows);
     codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
     drop(lua_rows);
     codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
@@ -6426,8 +6499,9 @@ fn index_project_inner(
     // Ruby (W4-RB-01), CFML (W4-CF-01), Swift (W4-SW-01), Objective-C
     // (W4-SW-04), Go (W4-GO-01), Rust receiver (W4-RS-03), PHP
     // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01), R base-binding
-    // (W4-R-01), Dart head (W4-DART-01) or Dart library (W4-DART-02)
-    // dependent unrefreshed.
+    // (W4-R-01), Dart head (W4-DART-01), Dart library (W4-DART-02), Play
+    // (W7-19c), Laravel or Drupal (W7-19d), Rails (W7-19e), Rust crate root
+    // (W7-19h) or bridge (W7-21) dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     codegraph_watch::java_heads::write_marker(&store)?;
     codegraph_watch::kotlin_surfaces::write_marker(&store)?;
@@ -6447,6 +6521,13 @@ fn index_project_inner(
     codegraph_watch::case_folded::write_marker(&store)?;
     codegraph_watch::lua_modules::write_marker(&store)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
+    codegraph_watch::play_routes::write_marker(&store)?;
+    codegraph_watch::laravel_routes::write_marker(&store)?;
+    codegraph_watch::drupal_refs::write_marker(&store)?;
+    codegraph_watch::rails_routes::write_marker(&store)?;
+    codegraph_watch::vapor_routes::write_marker(&store)?;
+    codegraph_watch::rn_bridges::write_marker(&store)?;
+    codegraph_watch::rust_crate_roots::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
@@ -6506,7 +6587,7 @@ fn index_project_inner(
     codegraph_watch::control_inputs::write_index_rows(
         &store,
         project,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store
@@ -6526,6 +6607,22 @@ fn index_project_inner(
         "framework_extract",
         framework_started.elapsed(),
         json!({ "enabled": resolver.has_framework_resolvers() }),
+    );
+    diagnostic_run.phase_start("framework_finalize");
+    let framework_finalize_started = std::time::Instant::now();
+    let pb = phase_spinner("Finalizing frameworks", quiet);
+    // Cross-file framework finalization (NestJS RouterModule prefixes, React
+    // Router routes named after a constant, then the routes of tables
+    // another file hands React Router) BEFORE resolution, as upstream's
+    // index runs runPostExtract: a navigation call resolves against the
+    // route's final name.
+    resolver.run_post_extract(&mut store)?;
+    resolver.run_cross_file_nodes(&mut store)?;
+    finish_phase(&pb, "Finalized frameworks");
+    diagnostic_run.phase_end(
+        "framework_finalize",
+        framework_finalize_started.elapsed(),
+        json!({}),
     );
     // Finished from INSIDE the callback on the final chunk so the retained line
     // lands before the resolver's deferred passes (which resolve refs this bar
@@ -6597,17 +6694,16 @@ fn index_project_inner(
         resolution_started.elapsed(),
         json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
     );
-    diagnostic_run.phase_start("framework_finalize");
-    let framework_finalize_started = std::time::Instant::now();
-    let pb = phase_spinner("Finalizing frameworks", quiet);
-    // Cross-file framework finalization (NestJS RouterModule prefixing) after
-    // resolution, mirroring the upstream index.ts:358 runPostExtract.
-    resolver.run_post_extract(&mut store)?;
-    finish_phase(&pb, "Finalized frameworks");
+    // The dispatch edges no reference names, over the finished base graph
+    // (W7-14).
+    diagnostic_run.phase_start("synthesis");
+    let synthesis_started = std::time::Instant::now();
+    let synthesis = codegraph_resolve::synthesis::run_stage(&mut store, project, &options)?;
+    codegraph_resolve::synthesis::write_marker(&store)?;
     diagnostic_run.phase_end(
-        "framework_finalize",
-        framework_finalize_started.elapsed(),
-        json!({}),
+        "synthesis",
+        synthesis_started.elapsed(),
+        json!({ "edges": synthesis.inserted }),
     );
     // Every reference is now in `unresolved_refs` or `resolved_refs`
     // (W5-09e).

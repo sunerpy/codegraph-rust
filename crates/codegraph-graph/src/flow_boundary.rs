@@ -28,9 +28,12 @@ pub struct BoundaryContinuations {
     pub uncertain: Vec<BoundaryContinuation>,
 }
 
-/// The kinds that continue a flow (`navigates` has no Rust edge kind yet).
+/// The kinds that continue a flow (`CONTINUATION_KINDS`).
 fn is_continuation_kind(kind: EdgeKind) -> bool {
-    matches!(kind, EdgeKind::Calls | EdgeKind::Instantiates)
+    matches!(
+        kind,
+        EdgeKind::Calls | EdgeKind::Instantiates | EdgeKind::Navigates
+    )
 }
 
 /// One row per target and bucket, in line order; `exclude` drops the symbols

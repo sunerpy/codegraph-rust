@@ -88,25 +88,39 @@ pub fn resolve(base: &str, relative: &str) -> String {
 /// whose target is outside the root, so this guard covers lexical traversal
 /// only (#1631).
 pub(crate) fn lexical_path_within_root(project_root: &str, file_path: &str) -> Option<PathBuf> {
+    lexical_relative(file_path).map(|relative| Path::new(project_root).join(relative))
+}
+
+/// `file_path` normalized as a project-relative path, `\` read as `/`, or
+/// `None` when it could leave the project root lexically: the rule
+/// [`lexical_path_within_root`] applies before it joins the root.
+pub(crate) fn lexical_relative(file_path: &str) -> Option<String> {
     let normalized_separators = file_path.replace('\\', "/");
-    let bytes = normalized_separators.as_bytes();
-    let has_windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    // After separators are normalized, a leading `/` covers POSIX absolute
-    // paths plus Windows root-relative, UNC, and device forms. Check it directly
-    // rather than using `Path::is_absolute`: on Windows `/outside` is rooted but
-    // not "absolute" (it has no drive prefix), yet joining it to `C:\repo`
-    // still escapes to `C:\outside`. The prefix check covers both `C:/outside`
-    // and drive-relative `C:outside` forms on every host.
-    if normalized_separators.starts_with('/') || has_windows_prefix {
+    if escapes_at_start(&normalized_separators) {
         return None;
     }
 
+    // Normalizing can bring a drive to the front (`./C:/outside`,
+    // `a/../C:/outside`), so its result is checked again.
     let relative = normalize(&normalized_separators);
-    if relative == ".." || relative.starts_with("../") {
+    if escapes_at_start(&relative) || relative == ".." || relative.starts_with("../") {
         return None;
     }
 
-    Some(Path::new(project_root).join(relative))
+    Some(relative)
+}
+
+/// Whether `path`, its separators normalized to `/`, joined to a root would
+/// not stay below it. A leading `/` covers POSIX absolute paths plus Windows
+/// root-relative, UNC, and device forms. Check it directly rather than using
+/// `Path::is_absolute`: on Windows `/outside` is rooted but not "absolute" (it
+/// has no drive prefix), yet joining it to `C:\repo` still escapes to
+/// `C:\outside`. The prefix check covers both `C:/outside` and drive-relative
+/// `C:outside` forms on every host.
+fn escapes_at_start(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let has_windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    path.starts_with('/') || has_windows_prefix
 }
 
 /// Compute a relative path from `from` to `to`, both treated as POSIX
@@ -220,6 +234,11 @@ mod tests {
         assert!(lexical_path_within_root(root, r"\outside\a.ts").is_none());
         assert!(lexical_path_within_root(root, r"C:\outside\a.ts").is_none());
         assert!(lexical_path_within_root(root, r"C:outside\a.ts").is_none());
+        // A drive that only normalizing brings to the front (W7-15d1).
+        assert!(lexical_path_within_root(root, "./C:/outside/a.ts").is_none());
+        assert!(lexical_path_within_root(root, "a/../C:/outside/a.ts").is_none());
+        assert!(lexical_path_within_root(root, r".\C:\outside\a.ts").is_none());
+        assert!(lexical_path_within_root(root, r"a\..\C:outside\a.ts").is_none());
     }
 
     #[cfg(any(unix, windows))]

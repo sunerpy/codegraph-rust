@@ -992,7 +992,8 @@ A `Current` index beside the uninit tombstone, which an `init` that published
 `Current` but could not remove the tombstone leaves, is reported the same way,
 with `recoveryCommand` set to `codegraph init <project>`; human output shows
 `current (blocked by the uninit tombstone)` and that recovery. Reads refuse such
-an index until `init` rebuilds it.
+an index until `init` rebuilds it; `uninit --force` discards it instead and keeps
+the tombstone.
 
 When the WAL is larger than both the database and the configured WAL limit,
 `status` warns that live CodeGraph processes must be stopped before running:
@@ -1407,6 +1408,18 @@ the index, even one an interrupted `init` left `building`, because only `init`
 removes the tombstone; `status` and the read errors name `codegraph init` as the
 recovery then.
 
+### An index a newer CodeGraph wrote
+
+A database recording a schema newer than this binary's is left alone: `search`
+and the other reads, `sync`, `init`, `index --force`, MCP tools and the daemon
+refuse it, change nothing, and name both schema versions. `status` reports it as
+`current` with `initialized: false` and the versions in `extractionStatusDetail`.
+Upgrade CodeGraph to use it again. To discard it instead, run `codegraph uninit
+--force` and then `codegraph init`; the refusal offers that only where `uninit`
+would succeed: a state it accepts and, for a current index, a readable database
+with this binary's extraction stamp. The newer schema is reported before a leftover uninit
+tombstone, whose `init` recovery would refuse such an index.
+
 ### Index diagnostics
 
 `init`, `index`, and `sync` share `--debug` and `--debug-log <FILE>`.
@@ -1459,6 +1472,6 @@ golden byte-stable output.
   constraint, guardrail-enforced; LLM combination happens in the orchestration
   layer).
 - No semantic search; search is FTS5 + deterministic scoring only.
-- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Godot, and Tauri;
+- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Nuxt, Godot, and Tauri;
   other framework resolution remains explicitly deferred.
 - No languages beyond the fixed `LANGUAGES` set.

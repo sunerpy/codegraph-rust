@@ -552,23 +552,30 @@ async fn splits_a_symbols_outgoing_calls_into_the_sure_and_the_unfollowed() {
 /* ------------------------------------------------------- a synthesized hop -- */
 
 #[tokio::test]
-async fn an_interface_dispatch_the_graph_does_not_bridge_ends_where_the_static_graph_does() {
-    // KEEP-RUST: upstream's synthesis stage adds an interface-impl `calls` edge
-    // for Go's implicit satisfaction and the strip draws it as a dashed `via …`
-    // hop (its case "draws the interface bridge as a dashed hop"). The Rust
-    // port has no edge synthesis stage, so the same question stops at the
-    // interface method — and says so, rather than inventing the hop. The
-    // dashed-hop labels are covered by `flow_edge_label`'s own cases.
+async fn draws_the_interface_bridge_as_a_dashed_hop_that_names_its_mechanism() {
+    // Upstream's case of the same name: Go's implicit satisfaction gives the
+    // synthesis stage an `implements` edge (W7-15b), its interface pass the
+    // `interface-impl` call the strip draws as a dashed `via …` hop.
     let project = fixture();
     let payload = flow(&project.viewer(), "?from=Tick&to=stamp", StatusCode::OK).await;
-    assert_eq!(payload["flows"], serde_json::json!([]), "{payload}");
-    assert!(
-        payload["reason"]
-            .as_str()
-            .unwrap()
-            .contains("dynamic dispatch")
-    );
-    assert_eq!(payload["unresolved"], serde_json::json!([]));
+    let flows = payload["flows"].as_array().expect("flows");
+    assert!(!flows.is_empty(), "{payload}");
+    let path = names(&flows[0]);
+    assert_eq!(path.first().map(String::as_str), Some("Tick"), "{payload}");
+    assert_eq!(path.last().map(String::as_str), Some("stamp"), "{payload}");
+    let synthesized: Vec<&Value> = flows[0]["hops"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|hop| hop["edge"]["synthesized"] == true)
+        .collect();
+    assert!(!synthesized.is_empty(), "{payload}");
+    for hop in synthesized {
+        assert_eq!(hop["edge"]["provenance"], "heuristic", "{hop}");
+        let label = hop["edge"]["label"].as_str().unwrap();
+        assert!(label.starts_with("via "), "{label}");
+        assert_ne!(label, "calls");
+    }
 }
 
 /* ---------------------------------------------------------- explore parity -- */

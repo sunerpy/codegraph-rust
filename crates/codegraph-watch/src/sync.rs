@@ -697,6 +697,45 @@ fn sync_paths_with_store(
     // failed sync may have changed: every R file is re-resolved once
     // (W4-R-01).
     let r_bootstrap = crate::r_bindings::needs_bootstrap(store)?;
+    // And for the Play routes references whose actions a failed sync's
+    // changes moved: every routes file is re-resolved once (W7-19c). The
+    // lane compares the changed files' surfaces only when the index recorded
+    // Play: otherwise a Play this sync detects is a framework change, which
+    // re-extracts every file.
+    let play_bootstrap = crate::play_routes::needs_bootstrap(store)?;
+    let recorded_frameworks =
+        crate::control_inputs::recorded_frameworks(store)?.unwrap_or_default();
+    let recorded = |framework: &str| recorded_frameworks.iter().any(|name| name == framework);
+    changed_names.play.track = recorded("play");
+    // And for the Laravel route references whose controllers a failed
+    // sync's changes moved, and the Drupal handlers and hooks (W7-19d):
+    // every file holding one is re-resolved once. Each lane compares only
+    // when the index recorded its framework, as Play's does.
+    let laravel_bootstrap = crate::laravel_routes::needs_bootstrap(store)?;
+    changed_names.laravel.track = recorded("laravel");
+    let drupal_bootstrap = crate::drupal_refs::needs_bootstrap(store)?;
+    changed_names.drupal.track = recorded("drupal");
+    // And for the Rails route references whose controllers a failed sync's
+    // changes moved (W7-19e), the same way.
+    let rails_bootstrap = crate::rails_routes::needs_bootstrap(store)?;
+    changed_names.rails.track = recorded("rails");
+    // And for the Vapor route handlers whose candidates a failed sync's
+    // changes moved (W7-19g), the same way.
+    let vapor_bootstrap = crate::vapor_routes::needs_bootstrap(store)?;
+    changed_names.vapor.track = recorded("vapor");
+    // And for the bridge references a failed sync's changes moved (W7-21):
+    // the bridge-facts rows are rebuilt and, in a project a bridge is
+    // detected in, every JavaScript-family, Swift and Objective-C file is
+    // re-resolved once. The lane compares only when the index recorded a
+    // bridge reading the rows, as Play's does.
+    let rn_bootstrap = crate::rn_bridges::needs_bootstrap(store)?;
+    changed_names.rn_bridges.track = crate::rn_bridges::READERS.iter().any(|name| recorded(name));
+    // And for the Rust references the module rule links to a crate root a
+    // failed sync's changes added or removed (W7-19h): every Rust file is
+    // re-resolved once. The lane retries only when the index recorded Rust,
+    // as Play's does.
+    let rust_crate_roots_bootstrap = crate::rust_crate_roots::needs_bootstrap(store)?;
+    let mut rust_crate_roots_track = recorded("rust");
     // And for the Dart files whose bare calls read other files' class heads:
     // every Dart file is re-resolved once (W4-DART-01). A rebuild for an
     // unreadable row starts with the marker current: withdraw it before
@@ -844,8 +883,21 @@ fn sync_paths_with_store(
         || r_bootstrap
         || dart_bootstrap
         || dart_library_bootstrap
+        || play_bootstrap
+        || laravel_bootstrap
+        || drupal_bootstrap
+        || rails_bootstrap
+        || vapor_bootstrap
+        || rn_bootstrap
+        || rust_crate_roots_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
+    // A bootstrap re-resolves dependents without `begin_mutation`: the
+    // synthesized edges go stale with them, so their marker goes first
+    // (W7-14).
+    if any_bootstrap {
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
+    }
     // A sync with nothing to do detects no framework: the frameworks read
     // their control files (`package.json`, the Tauri markers), which are the
     // JS kind's inputs, and the sources a changed file brings.
@@ -863,12 +915,20 @@ fn sync_paths_with_store(
             let context = resolver.store_context(store);
             resolver.initialize(&context);
         }
-        frameworks = resolver.framework_names();
+        frameworks = resolver.framework_signature();
         frameworks_changed = crate::control_inputs::frameworks_changed(store, &frameworks)?;
     }
     if frameworks_changed {
         changed_names.begin_mutation(store)?;
         crate::control_inputs::withdraw_frameworks_marker(store)?;
+        // Every file is re-extracted and re-resolved: no lane compares.
+        changed_names.play.track = false;
+        changed_names.laravel.track = false;
+        changed_names.drupal.track = false;
+        changed_names.rails.track = false;
+        changed_names.vapor.track = false;
+        changed_names.rn_bridges.track = false;
+        rust_crate_roots_track = false;
         for file in store.all_files()? {
             if reindexed.contains(&file.path) || changed_names.removed_files.contains(&file.path) {
                 continue;
@@ -909,6 +969,25 @@ fn sync_paths_with_store(
             &mut dependent_sites,
             &mut dependent_fallbacks,
         )?;
+        // A Spring config key binds by its relaxed spelling, and a second
+        // profile file's key moves an existing binding's confidence or
+        // target, which no name lookup reaches (W7-19c): a changed config
+        // file retries every reference a key can bind, the unresolved ones by
+        // their whole names, the resolved ones by site.
+        if !frameworks_changed
+            && frameworks.iter().any(|name| name == "spring")
+            && reindexed
+                .iter()
+                .chain(&changed_names.removed_files)
+                .any(|file| codegraph_resolve::frameworks::spring::is_spring_config_file(file))
+        {
+            changed_names.note_any(store.unresolved_config_key_names()?);
+            for found in store.resolved_config_key_sites()? {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+        }
         // What other files read from a changed JavaScript-family module's
         // text no node records (W4a-F3): the files resolving through it, up
         // the barrels that forward it, re-resolve whole.
@@ -1365,6 +1444,56 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if play_bootstrap {
+            for file in crate::play_routes::every_routes_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
+        if laravel_bootstrap {
+            for file in crate::laravel_routes::every_route_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
+        if drupal_bootstrap {
+            for file in crate::drupal_refs::every_reference_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
+        if rails_bootstrap {
+            for file in crate::rails_routes::every_route_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
+        if vapor_bootstrap {
+            for file in crate::vapor_routes::every_route_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         if case_bootstrap {
             for file in crate::case_folded::every_case_insensitive_file(
                 store,
@@ -1385,6 +1514,16 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(file);
             }
         }
+        if rust_crate_roots_bootstrap {
+            for file in crate::rust_receivers::every_rust_file(
+                store,
+                &reindexed,
+                &changed_names.removed_files,
+            )? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         // What a changed Python import statement re-exports moves for its
         // module's importers without any node of those names changing.
         if !changed_names.python_imports.is_empty() {
@@ -1393,13 +1532,13 @@ fn sync_paths_with_store(
                 project_root.to_string_lossy(),
             )
             .with_max_file_size(scope.options.max_file_size);
+            let mut reexported = Vec::new();
             for (file, statement) in &changed_names.python_imports {
-                changed_names.any.extend(
-                    codegraph_resolve::import_resolver::python_reexported_names(
-                        file, statement, &context,
-                    ),
-                );
+                reexported.extend(codegraph_resolve::import_resolver::python_reexported_names(
+                    file, statement, &context,
+                ));
             }
+            changed_names.note_any(reexported);
         }
         let name_list: Vec<String> = changed_names.any.iter().cloned().collect();
         for affected in store.reference_sites_of_edges_to_named_targets(&name_list)? {
@@ -1462,14 +1601,174 @@ fn sync_paths_with_store(
         // nodes/refs were dropped on re-extraction (upstream tree-sitter.ts:4796-4819).
         if resolver.has_framework_resolvers() {
             let reindexed_files: Vec<String> = reindexed.iter().cloned().collect();
-            resolver.extract_and_persist_frameworks_with(
+            let framework_files = resolver.extract_and_persist_frameworks_with(
                 store,
                 &reindexed_files,
                 &scope.framework,
                 &scope.options.extensions,
             )?;
+            changed_names.note_framework_node_files(&framework_files);
         }
-        let (scope_sites, fallback_files) = refresh_dependent_refs(
+        // Cross-file framework finalization on every sync, before anything is
+        // resolved, as a full index runs it (upstream's sync runs
+        // runPostExtract before its resolution too): a route a constant names
+        // is renamed before a navigation call resolves against it. The
+        // updates are compared with the stored nodes before they are written,
+        // for the restore check.
+        let post_extract = resolver.post_extract_updates(store);
+        changed_names.note_post_extract_updates(store, &post_extract)?;
+        if !post_extract.is_empty() {
+            store.upsert_nodes(&post_extract)?;
+        }
+        // Then the nodes no single file's extraction makes, the routes of
+        // the tables another file hands React Router (W7-09d): what the
+        // passes want now, compared with the store, the first change
+        // withdrawing the markers. The edges into a node that goes are
+        // re-read as an unchanged dependent's sites, and a node that comes
+        // has its references resolved below.
+        let cross_file = resolver.plan_cross_file_nodes(store)?;
+        if cross_file.changes_store() {
+            changed_names.begin_mutation(store)?;
+            changed_names.abandon_restore_check();
+        }
+        let cross_file_applied = resolver.apply_cross_file_plan(store, &cross_file, false)?;
+        for affected in cross_file_applied.incoming {
+            if !reindexed.contains(&affected.file_path) {
+                merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
+            }
+        }
+        // The Play actions whose candidates the changes moved (W7-19c), read
+        // once the framework nodes are back: the unresolved ones retry by
+        // their whole names, which no tail ceiling bounds, and the resolved
+        // ones by site, an edge's target being only the action's method.
+        if changed_names.play.track && frameworks.iter().any(|name| name == "play") {
+            let moved: Vec<String> = changed_names.play.moved_names(store)?.into_iter().collect();
+            if !moved.is_empty() {
+                for found in store.resolved_reference_sites_named(&moved)? {
+                    if !reindexed.contains(&found.file_path) {
+                        merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                    }
+                }
+                changed_names.note_any(moved);
+            }
+        }
+        // The Laravel controllers and the Drupal handlers and hooks whose
+        // candidates the changes moved (W7-19d), read the same way: the
+        // unresolved ones by their whole names, the resolved ones by site.
+        if changed_names.laravel.track && frameworks.iter().any(|name| name == "laravel") {
+            let moved = changed_names.laravel.moved(store)?;
+            let retries = crate::laravel_routes::retries(store, &moved)?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
+        if changed_names.drupal.track && frameworks.iter().any(|name| name == "drupal") {
+            let moved = changed_names.drupal.moved(store)?;
+            let retries =
+                crate::drupal_refs::retries(store, &moved, changed_names.candidates.iter())?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
+        // The Rails route targets whose controllers the changes moved
+        // (W7-19e), read the same way.
+        if changed_names.rails.track && frameworks.iter().any(|name| name == "rails") {
+            let moved = changed_names.rails.moved(store)?;
+            let retries = crate::rails_routes::retries(store, &moved)?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
+        // The Vapor route handlers whose method a changed file declares on
+        // either side (W7-19g), read the same way.
+        if changed_names.vapor.track && frameworks.iter().any(|name| name == "vapor") {
+            let touched = changed_names.vapor.touched(store)?;
+            let retries = crate::vapor_routes::retries(store, &touched)?;
+            for found in retries.sites {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            changed_names.note_any(retries.names);
+        }
+        // The bridge references the changes moved (W7-21), read once the
+        // framework nodes are back: the importers of a changed exported
+        // `requireNativeModule` binding re-resolve whole, the unresolved
+        // references retry by their whole names and the resolved ones by
+        // site, a bridge's weak answer among them when a node of its
+        // reference's name, of any language, came, went or changed. A
+        // bootstrap rebuilds the rows and re-resolves every
+        // JavaScript-family, Swift and Objective-C file of a bridged project.
+        let detected =
+            |names: &[&str]| frameworks.iter().any(|name| names.contains(&name.as_str()));
+        let rn_bridges = crate::rn_bridges::bridge_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.rn_bridges,
+            &reindexed,
+            &changed_names.removed_files,
+            rn_bootstrap,
+            detected(&crate::rn_bridges::BRIDGES),
+            changed_names.rn_bridges.track && detected(&crate::rn_bridges::READERS),
+        )?;
+        for file in &rn_bridges.files {
+            dependent_sites.remove(file);
+            dependent_fallbacks.insert(file.clone());
+        }
+        for found in &rn_bridges.sites {
+            if !dependent_fallbacks.contains(&found.file_path) {
+                merge_dependent_site(
+                    &mut dependent_sites,
+                    &mut dependent_fallbacks,
+                    found.clone(),
+                );
+            }
+        }
+        changed_names.note_any(rn_bridges.names.iter().cloned());
+        // The Rust module rule's targets, the crate roots the changes added
+        // or removed or whose file node came or went (W7-19h): a target is a
+        // file node named for its file, so no name the changes touched
+        // reaches the references naming its module or crate. They are read
+        // the same way.
+        if rust_crate_roots_track && frameworks.iter().any(|name| name == "rust") {
+            let names: Vec<String> = {
+                let context = codegraph_resolve::StoreResolutionContext::new(
+                    store,
+                    project_root.to_string_lossy(),
+                )
+                .with_max_file_size(scope.options.max_file_size);
+                let crates = codegraph_resolve::ResolutionContext::cargo_workspace_crates(&context);
+                crate::rust_crate_roots::names_reaching(
+                    changed_names
+                        .added_files
+                        .iter()
+                        .chain(&changed_names.removed_files)
+                        .chain(&changed_names.file_nodes_changed),
+                    &crates,
+                )
+                .into_iter()
+                .collect()
+            };
+            if !names.is_empty() {
+                for found in store.resolved_reference_sites_named(&names)? {
+                    if !reindexed.contains(&found.file_path) {
+                        merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                    }
+                }
+                changed_names.note_any(names);
+            }
+        }
+        let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
             scope,
@@ -1479,7 +1778,9 @@ fn sync_paths_with_store(
             &receiver_dependents,
             &reindexed,
             stored_refs_marker.is_some(),
+            &cross_file,
         )?;
+        scope_sites.extend(cross_file_applied.inserted_sites);
         let mut scope_files = reindexed.clone();
         scope_files.extend(fallback_files);
         #[cfg(test)]
@@ -1498,18 +1799,38 @@ fn sync_paths_with_store(
                     .collect(),
             );
         }
+        // So were the bridge-facts rows: a file the sync did not change is
+        // read from its row (W7-21).
+        if !rn_bootstrap {
+            resolver.trust_recorded_bridge_rows(
+                reindexed
+                    .iter()
+                    .chain(&changed_names.removed_files)
+                    .cloned()
+                    .collect(),
+            );
+        }
         // A qualified reference (`util::double/1`) is retried by its whole
         // name too, however many share its tail (W5-05).
         let mut retry_names = changed_names.any.clone();
         retry_names.extend(changed_names.qualified.iter().cloned());
+        // A sync whose touched names are all names of framework nodes a
+        // re-extraction left out and the passes put back as they were has
+        // nothing to wake: the store's nodes are what they were, so every
+        // reference parked under one of those names sees the candidates it
+        // saw. It skips the one pass over the parked references a retry by
+        // name reads (W7-19a0).
+        if changed_names.only_restored_nodes_touched(store)? {
+            retry_names.clear();
+        }
+        #[cfg(test)]
+        tests::note_retry_names(&retry_names);
         resolver.resolve_incremental_and_persist(
             store,
             &scope_files,
             &scope_sites,
             &retry_names,
         )?;
-        // Cross-file framework finalization on every sync (upstream index.ts:464).
-        resolver.run_post_extract(store)?;
         // Last: the surface and namespace rows, then the markers the first
         // mutation withdrew.
         surfaces.write_rows(store)?;
@@ -1528,6 +1849,7 @@ fn sync_paths_with_store(
         go.write_rows(store)?;
         php.write_rows(store)?;
         class_heads.write_rows(store)?;
+        rn_bridges.write_rows(store)?;
         control.write_rows(store)?;
         crate::control_inputs::write_frameworks(store, &frameworks)?;
         dart.write_rows(store)?;
@@ -1554,6 +1876,13 @@ fn sync_paths_with_store(
         crate::case_folded::write_marker(store)?;
         crate::lua_modules::write_marker(store)?;
         crate::r_bindings::write_marker(store)?;
+        crate::play_routes::write_marker(store)?;
+        crate::laravel_routes::write_marker(store)?;
+        crate::drupal_refs::write_marker(store)?;
+        crate::rails_routes::write_marker(store)?;
+        crate::vapor_routes::write_marker(store)?;
+        crate::rn_bridges::write_marker(store)?;
+        crate::rust_crate_roots::write_marker(store)?;
         crate::dart_heads::write_marker(store)?;
         crate::dart_libraries::write_marker(store)?;
         crate::resolved_refs::restore_marker(
@@ -1574,10 +1903,42 @@ fn sync_paths_with_store(
     // healthy index (marker absent) skips this entirely, so an ordinary sync is
     // byte-for-byte unchanged.
     if store.is_resolution_incomplete()? {
+        // The sweep writes base edges: the synthesized ones go stale first.
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
         let stats = sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
         outcome.pending_refs_processed = stats.total;
         outcome.pending_refs_resolved = stats.resolved;
         outcome.pending_refs_unresolved = stats.unresolved;
+    }
+
+    // A file the last stage run read beside the index (W7-17b) that reads
+    // differently now, its text, its presence or its scan scope changed,
+    // makes the stage's edges stale as a base-graph write does. Every sync
+    // compares, a sync that changed nothing included.
+    if codegraph_resolve::synthesis::marker_is_current(store)?
+        && codegraph_resolve::synthesis::inputs_changed(store, project_root, &scope.options)?
+    {
+        codegraph_resolve::synthesis::withdraw_marker(store)?;
+    }
+
+    // The dispatch edges no reference names (W7-14), recomputed whole once
+    // the base graph is final. Every write to the base graph above comes
+    // after a withdrawal of the marker (`begin_mutation`, a lane bootstrap,
+    // the sweep, a changed input read beside the index), so a sync
+    // recomputes whenever it finds the marker away: after its own changes,
+    // or a sync that stopped before writing it back, which is this sync's
+    // last write.
+    if !codegraph_resolve::synthesis::marker_is_current(store)? {
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_SYNTHESIS.with(std::cell::Cell::get) {
+            bail!("injected sync failure before synthesis");
+        }
+        codegraph_resolve::synthesis::run_stage(store, project_root, &scope.options)?;
+        #[cfg(test)]
+        if tests::FAIL_BEFORE_SYNTHESIS_MARKER.with(std::cell::Cell::get) {
+            bail!("injected sync failure before the synthesis marker");
+        }
+        codegraph_resolve::synthesis::write_marker(store)?;
     }
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -1631,6 +1992,7 @@ fn refresh_dependent_refs(
     receiver_names: &BTreeMap<String, BTreeSet<String>>,
     already_reindexed: &HashSet<String>,
     stored_refs: bool,
+    cross_file: &codegraph_resolve::CrossFilePlan,
 ) -> Result<(BTreeSet<ReferenceSite>, HashSet<String>)> {
     let dependents = dependent_sites
         .keys()
@@ -1662,7 +2024,14 @@ fn refresh_dependent_refs(
             .collect::<Vec<_>>()
             .into_par_iter()
             .map(|relative| {
-                let refs = extract_dependent_refs(project_root, relative, scope, resolver);
+                let refs = extract_dependent_refs(project_root, relative, scope, resolver).map(
+                    |mut refs| {
+                        // The nodes no single file's extraction makes keep
+                        // their references (W7-09d).
+                        refs.extend(cross_file.refs_of_file(relative).iter().cloned());
+                        refs
+                    },
+                );
                 (relative.clone(), refs)
             })
             .collect();
@@ -1822,8 +2191,12 @@ fn sweep_orphaned_refs(
     // duplicate rows (`unresolved_refs` has no UNIQUE constraint), which
     // accumulate across interrupt→heal cycles and diverge from `index --force`.
     // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
-    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
+    // Cross-file framework finalization before resolution, as a full index
+    // runs it; a cross-file node that goes puts the references whose edges
+    // reached it back among the pending ones the batch resolves.
     resolver.run_post_extract(store)?;
+    resolver.run_cross_file_nodes(store)?;
+    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
     Ok(result.stats)
 }
 
@@ -1960,6 +2333,15 @@ fn sync_one(
             .namespaces
             .before_change(store, relative)?;
     }
+    // Whether a tracked file the Rust module rule may target has its file
+    // node, before and after: crossing `max_file_size` changes that
+    // without adding or removing the file (W7-19h).
+    let file_node = (!added && crate::rust_crate_roots::may_be_module_target(relative))
+        .then(|| codegraph_core::node_id::file_node_id(relative));
+    let had_file_node = match &file_node {
+        Some(id) => store.node_by_id(id)?.is_some(),
+        None => false,
+    };
     reextract_into_store(
         store,
         relative,
@@ -1967,6 +2349,13 @@ fn sync_one(
         changed_names,
         (&metadata, &source, content_hash),
     )?;
+    if let Some(id) = &file_node
+        && store.node_by_id(id)?.is_some() != had_file_node
+    {
+        changed_names
+            .file_nodes_changed
+            .insert(relative.to_string());
+    }
     changed_names
         .cpp
         .after_change(store, relative, c_family, c_family_after)?;
@@ -1980,6 +2369,9 @@ fn sync_one(
         change.importers.extend(importers.iter().cloned());
         change.added = added;
     }
+    changed_names
+        .rn_bridges
+        .note_importers(relative, &importers);
     if let Some(change) = changed_names.python_files.get_mut(relative) {
         change.importers.extend(importers);
     }
@@ -2025,6 +2417,17 @@ fn remove_tracked_file(
     changed_names.note_removed(node_names_in_file(store, relative)?);
     let old_nodes = store.nodes_by_file_path(relative)?;
     changed_names.note_qualified(&old_nodes);
+    changed_names.play.note(relative, &old_nodes);
+    changed_names.laravel.note(relative, &old_nodes);
+    changed_names.drupal.note(relative, &old_nodes);
+    changed_names.rails.note(relative, &old_nodes);
+    changed_names.vapor.note(relative, &old_nodes);
+    changed_names
+        .rn_bridges
+        .note(store, relative, &old_nodes, None)?;
+    changed_names
+        .rn_bridges
+        .note_importers(relative, &importers);
     changed_names.rust_receiver_types.extend(
         old_nodes
             .iter()
@@ -2375,7 +2778,7 @@ fn note_python_global_readers(
             }
         }
     }
-    changed_names.any.extend(names);
+    changed_names.note_any(names);
     for found in sites {
         if !reindexed.contains(&found.file_path) {
             merge_dependent_site(dependent_sites, dependent_fallbacks, found);
@@ -2448,32 +2851,25 @@ fn reextract_into_store(
     // Other languages read declaration text no node records (a C function's
     // `static`), so their moved nodes still touch.
     let old_nodes = store.nodes_by_file_path(relative)?;
-    let old_ids: HashSet<(&str, &str)> = old_nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.name.as_str()))
-        .collect();
-    let new_ids: HashSet<(&str, &str)> = result
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node.name.as_str()))
-        .collect();
-    let order_before = positioned_candidate_keys(&old_nodes);
-    let order_after = positioned_candidate_keys(&result.nodes);
-    let touched_when_moved: HashSet<&str> = old_nodes
-        .iter()
-        .chain(&result.nodes)
-        .filter(|node| {
-            node.language != Language::Php
-                && !(node.language == Language::Dart && node.kind == NodeKind::Import)
-        })
-        .map(|node| node.name.as_str())
-        .collect();
-    for (_, name) in old_ids.symmetric_difference(&new_ids) {
-        if touched_when_moved.contains(*name) || order_before.get(*name) != order_after.get(*name) {
-            changed_names.any.insert((*name).to_string());
-        }
-    }
-    changed_names.note_candidates(&old_nodes, &result.nodes);
+    let mut touched = ChangedNames::default();
+    touched.note_node_diff(&old_nodes, &result.nodes);
+    // The stored nodes stay for the restore check when the comparison
+    // touched a name: a framework's nodes are among them, and no
+    // re-extraction makes those (W7-19a0).
+    changed_names.note_restorable(relative, &old_nodes, &touched);
+    changed_names.absorb_node_diff(touched);
+    // What a Play action's choice read of this file (W7-19c), a Laravel
+    // controller's and a Drupal handler's or hook's (W7-19d), a Rails route
+    // target's (W7-19e) and a Vapor route handler's (W7-19g).
+    changed_names.play.note(relative, &old_nodes);
+    changed_names.laravel.note(relative, &old_nodes);
+    changed_names.drupal.note(relative, &old_nodes);
+    changed_names.rails.note(relative, &old_nodes);
+    changed_names.vapor.note(relative, &old_nodes);
+    // What the bridges read of this file's text and methods (W7-21).
+    changed_names
+        .rn_bridges
+        .note(store, relative, &old_nodes, Some((source, &result.nodes)))?;
     // What other files' Java resolution reads of this one's text and
     // packages, before and after (W4-JVM-01).
     changed_names.java.note(
@@ -2697,6 +3093,11 @@ struct ChangedNames {
     js_surfaces: BTreeMap<String, crate::module_surfaces::SurfaceChange>,
     /// The files this sync removed.
     removed_files: BTreeSet<String>,
+    /// The tracked files the Rust module rule may target whose file node
+    /// came or went as the sync re-extracted them: a file over
+    /// `max_file_size` is recorded without nodes, so crossing the limit
+    /// adds or removes its file node while the file stays tracked (W7-19h).
+    file_nodes_changed: BTreeSet<String>,
     /// Whether this sync already withdrew the surface version marker, as it
     /// does before its first mutation and restores once everything persisted.
     surface_dirty: bool,
@@ -2734,6 +3135,25 @@ struct ChangedNames {
     /// What the changed files held that a Go call in other files reads:
     /// type declarations' embeddings and field types (W4-GO-01).
     go: crate::go_heads::GoChanges,
+    /// What the changed files held that a Play action's choice reads: class
+    /// names and the names and languages of methods and functions (W7-19c).
+    play: crate::play_routes::PlayChanges,
+    /// What the changed files held that a Laravel controller's choice reads:
+    /// class names and method names (W7-19d).
+    laravel: crate::laravel_routes::LaravelChanges,
+    /// What the changed files held that a Drupal handler's or hook's choice
+    /// reads: class and method names, and hook functions (W7-19d).
+    drupal: crate::drupal_refs::DrupalChanges,
+    /// What the changed files held that a Rails route target's choice reads:
+    /// Ruby class names and the names of methods and functions (W7-19e).
+    rails: crate::rails_routes::RailsChanges,
+    /// What the changed files held that a Vapor route handler's choice
+    /// reads: the names of Swift methods and functions (W7-19g).
+    vapor: crate::vapor_routes::VaporChanges,
+    /// What the changed files held that the React Native, Expo and
+    /// Swift-Objective-C bridges read: their bridge facts, and their
+    /// Objective-C and JVM methods (W7-21).
+    rn_bridges: crate::rn_bridges::BridgeChanges,
     /// The Rust type, trait and alias names that came, went or changed: a
     /// CamelCase path receiver of such a name is the project's or an outside
     /// type by it (W4-RS-03).
@@ -2753,6 +3173,48 @@ struct ChangedNames {
     /// What the changed files held that a Dart name or import in other files
     /// reads: their directives (W4-DART-02).
     dart_libraries: crate::dart_libraries::DartLibraryChanges,
+    /// Whether every name this sync touched may be a name of stored nodes its
+    /// framework passes put back as they were (W7-19a0): a name is touched
+    /// either by a changed file's node comparison or through
+    /// [`Self::note_all`] and [`Self::note_any`], which stop the check.
+    restored: RestoreCheck,
+}
+
+/// What a sync keeps to tell, once its framework passes have run, whether the
+/// names it touched were touched only by framework nodes a re-extraction left
+/// out and the passes put back as they were
+/// ([`ChangedNames::only_restored_nodes_touched`]).
+#[derive(Debug, Default)]
+struct RestoreCheck {
+    /// The stored nodes of each changed file whose node comparison touched a
+    /// name, from before the change, by file.
+    files: BTreeMap<String, Vec<Node>>,
+    /// How many nodes `files` holds, at most [`RESTORE_CHECK_NODE_LIMIT`].
+    nodes: usize,
+    /// Set once the sync touched a name some other way, would keep more nodes
+    /// than the limit, or had a framework pass change a node outside `files`:
+    /// its retry by name then runs as it always does.
+    abandoned: bool,
+}
+
+impl RestoreCheck {
+    fn abandon(&mut self) {
+        self.abandoned = true;
+        self.files.clear();
+        self.nodes = 0;
+    }
+}
+
+/// How many stored nodes a sync keeps for its restore check. The check saves
+/// one pass over the parked references, which a sync of a few files notices; a
+/// larger sync retries by name rather than hold its files' old nodes.
+const RESTORE_CHECK_NODE_LIMIT: usize = 10_000;
+
+/// Whether `a` and `b` are the same node but for when each was written.
+fn same_but_timestamp(a: &Node, b: &Node) -> bool {
+    let mut a = a.clone();
+    a.updated_at = b.updated_at;
+    a == *b
 }
 
 /// What a changed Python file held before the change. A module global's
@@ -2806,9 +3268,17 @@ impl ChangedNames {
             crate::case_folded::withdraw_marker(store)?;
             crate::lua_modules::withdraw_marker(store)?;
             crate::r_bindings::withdraw_marker(store)?;
+            crate::play_routes::withdraw_marker(store)?;
+            crate::laravel_routes::withdraw_marker(store)?;
+            crate::drupal_refs::withdraw_marker(store)?;
+            crate::rails_routes::withdraw_marker(store)?;
+            crate::vapor_routes::withdraw_marker(store)?;
+            crate::rn_bridges::withdraw_marker(store)?;
+            crate::rust_crate_roots::withdraw_marker(store)?;
             crate::dart_heads::withdraw_marker(store)?;
             crate::dart_libraries::withdraw_marker(store)?;
             crate::resolved_refs::withdraw_marker(store)?;
+            codegraph_resolve::synthesis::withdraw_marker(store)?;
             self.surface_dirty = true;
         }
         Ok(())
@@ -2846,9 +3316,153 @@ impl ChangedNames {
     /// them differently.
     fn note_all(&mut self, names: impl IntoIterator<Item = String>) {
         for name in names {
+            self.restored.abandon();
             self.candidates.insert(name.clone());
             self.any.insert(name);
         }
+    }
+
+    /// Stop the restore check: this sync retries by name as it always does.
+    fn abandon_restore_check(&mut self) {
+        self.restored.abandon();
+    }
+
+    /// Touch `names` for the name lane alone: what a name reaches moved
+    /// though no node of it changed (a Python re-export, a module global's
+    /// readers).
+    fn note_any(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.restored.abandon();
+            self.any.insert(name);
+        }
+    }
+
+    /// Touch the names whose nodes differ between a file's stored nodes
+    /// (`before`) and the ones its re-extraction made (`after`), the
+    /// comparison `reextract_into_store` describes: an id that came or went
+    /// touches its name, unless only a PHP node or a Dart import moved and
+    /// the order of that name's nodes held, and [`Self::note_candidates`]
+    /// adds the names whose candidates changed.
+    fn note_node_diff(&mut self, before: &[Node], after: &[Node]) {
+        let old_ids: HashSet<(&str, &str)> = before
+            .iter()
+            .map(|node| (node.id.as_str(), node.name.as_str()))
+            .collect();
+        let new_ids: HashSet<(&str, &str)> = after
+            .iter()
+            .map(|node| (node.id.as_str(), node.name.as_str()))
+            .collect();
+        let order_before = positioned_candidate_keys(before);
+        let order_after = positioned_candidate_keys(after);
+        let touched_when_moved: HashSet<&str> = before
+            .iter()
+            .chain(after)
+            .filter(|node| {
+                node.language != Language::Php
+                    && !(node.language == Language::Dart && node.kind == NodeKind::Import)
+            })
+            .map(|node| node.name.as_str())
+            .collect();
+        for (_, name) in old_ids.symmetric_difference(&new_ids) {
+            if touched_when_moved.contains(*name)
+                || order_before.get(*name) != order_after.get(*name)
+            {
+                self.any.insert((*name).to_string());
+            }
+        }
+        self.note_candidates(before, after);
+    }
+
+    /// Whether [`Self::note_node_diff`] touched nothing.
+    fn touches_nothing(&self) -> bool {
+        self.any.is_empty()
+            && self.candidates.is_empty()
+            && self.qualified.is_empty()
+            && self.rust_receiver_types.is_empty()
+    }
+
+    /// What one file's [`Self::note_node_diff`] touched, added to this sync's.
+    fn absorb_node_diff(&mut self, touched: ChangedNames) {
+        self.any.extend(touched.any);
+        self.candidates.extend(touched.candidates);
+        self.qualified.extend(touched.qualified);
+        self.rust_receiver_types.extend(touched.rust_receiver_types);
+    }
+
+    /// Keep `file`'s stored nodes (`before`) for the restore check when its
+    /// node comparison (`touched`) touched a name.
+    fn note_restorable(&mut self, file: &str, before: &[Node], touched: &ChangedNames) {
+        if self.restored.abandoned || touched.touches_nothing() {
+            return;
+        }
+        if self.restored.files.contains_key(file)
+            || self.restored.nodes + before.len() > RESTORE_CHECK_NODE_LIMIT
+        {
+            self.restored.abandon();
+            return;
+        }
+        self.restored.nodes += before.len();
+        self.restored
+            .files
+            .insert(file.to_string(), before.to_vec());
+    }
+
+    /// The framework extraction of the changed files made nodes in `files`:
+    /// one in a file the check does not keep is a node no comparison saw.
+    fn note_framework_node_files(&mut self, files: &BTreeSet<String>) {
+        if files
+            .iter()
+            .any(|file| !self.restored.files.contains_key(file))
+        {
+            self.restored.abandon();
+        }
+    }
+
+    /// `updates` are what the post-extract passes are about to write: one
+    /// that changes a stored node outside the files the check keeps changes a
+    /// node no comparison saw.
+    fn note_post_extract_updates(&mut self, store: &Store, updates: &[Node]) -> Result<()> {
+        if self.restored.abandoned {
+            return Ok(());
+        }
+        let outside: Vec<&Node> = updates
+            .iter()
+            .filter(|node| !self.restored.files.contains_key(&node.file_path))
+            .collect();
+        if outside.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = outside.iter().map(|node| node.id.clone()).collect();
+        let stored = store.nodes_by_ids(&ids)?;
+        if outside.iter().any(|update| {
+            stored
+                .get(&update.id)
+                .is_none_or(|node| !same_but_timestamp(node, update))
+        }) {
+            self.restored.abandon();
+        }
+        Ok(())
+    }
+
+    /// Whether every name this sync touched is one its framework passes made
+    /// moot (W7-19a0): only node comparisons touched names, no pass changed a
+    /// node outside the files they compared, and each of those files' nodes,
+    /// read back now, touch nothing against its stored ones. The store's
+    /// nodes are then what they were before the sync, so a retry by those
+    /// names would wake references whose candidates are what they were.
+    fn only_restored_nodes_touched(&self, store: &Store) -> Result<bool> {
+        if self.restored.abandoned {
+            return Ok(false);
+        }
+        for (file, before) in &self.restored.files {
+            let after = store.nodes_by_file_path(file)?;
+            let mut touched = ChangedNames::default();
+            touched.note_node_diff(before, &after);
+            if !touched.touches_nothing() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Record each name whose nodes differ between `before` and `after` as a ref
@@ -2980,7 +3594,7 @@ fn positioned_candidate_keys(nodes: &[Node]) -> BTreeMap<&str, Vec<String>> {
 /// file, since name matching reads a candidate's line only when the candidate
 /// shares the ref's file. A node that cannot be serialized keys by its id, so a
 /// move still counts as a change.
-fn candidate_key(node: &Node) -> String {
+pub(crate) fn candidate_key(node: &Node) -> String {
     let mut key = node.clone();
     key.id.clear();
     key.start_line = 0;
@@ -3038,6 +3652,14 @@ pub(crate) mod tests {
         /// Fail the next sync after its mutations, before resolution.
         pub(crate) static FAIL_BEFORE_RESOLUTION: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Fail the next sync that recomputes synthesis once every other
+        /// write is done, before the stage.
+        pub(crate) static FAIL_BEFORE_SYNTHESIS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next sync that recomputes synthesis once the stage has
+        /// replaced the edges, before the marker goes back.
+        pub(crate) static FAIL_BEFORE_SYNTHESIS_MARKER: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         /// Fail the next Lua row rebuild once the old rows are purged and
         /// one is written back.
         pub(crate) static FAIL_AFTER_LUA_ROW_PURGE: std::cell::Cell<bool> =
@@ -3061,6 +3683,21 @@ pub(crate) mod tests {
         /// How the syncs on this thread refreshed each dependent file.
         static DEPENDENT_REFRESHES: std::cell::RefCell<Vec<DependentRefresh>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// The names each sync on this thread retried parked references by,
+        /// sorted.
+        static RETRY_NAMES: std::cell::RefCell<Vec<Vec<String>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note_retry_names(names: &HashSet<String>) {
+        let mut names: Vec<String> = names.iter().cloned().collect();
+        names.sort();
+        RETRY_NAMES.with(|retries| retries.borrow_mut().push(names));
+    }
+
+    /// The names each sync since the last call retried by, in sync order.
+    fn take_retry_names() -> Vec<Vec<String>> {
+        RETRY_NAMES.with(|retries| std::mem::take(&mut *retries.borrow_mut()))
     }
 
     /// One dependent file a sync refreshed: whether its references came
@@ -3181,6 +3818,294 @@ pub(crate) mod tests {
         let db = default_db_path(dir.path()).unwrap();
         sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
         edge_projection(&db)
+    }
+
+    const SYNTH_SCENE: (&str, &str) = (
+        "src/scene.ts",
+        "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+    );
+    const SYNTH_RENDER: (&str, &str) = (
+        "src/app.ts",
+        "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+    );
+    const SYNTH_PAINT: (&str, &str) = (
+        "src/app.ts",
+        "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerPaint);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n",
+    );
+
+    fn synthesis_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(codegraph_resolve::synthesis::VERSION_KEY)
+            .unwrap()
+    }
+
+    fn synthesized_edges(db: &Path) -> Vec<String> {
+        edge_projection(db)
+            .into_iter()
+            .filter(|edge| edge.contains("synthesizedBy"))
+            .collect()
+    }
+
+    /// Insert a synthesized edge no pass would make, between two nodes named
+    /// `source` and `target`: the stage's replacement must remove it.
+    fn plant_stale_synthesized_edge(db: &Path, source: &str, target: &str) {
+        let mut store = Store::open(db).unwrap();
+        let id = |name: &str| store.nodes_by_name(name).unwrap().pop().unwrap().id;
+        let edge = codegraph_core::types::Edge {
+            id: None,
+            source: id(source),
+            target: id(target),
+            kind: codegraph_core::types::EdgeKind::Calls,
+            metadata: Some(
+                serde_json::json!({"synthesizedBy": "callback", "registeredAt": "stale"}),
+            ),
+            line: None,
+            col: None,
+            provenance: Some("heuristic".to_string()),
+        };
+        store.insert_edges(&[edge]).unwrap();
+        assert!(
+            synthesized_edges(db)
+                .iter()
+                .any(|edge| edge.contains("stale"))
+        );
+    }
+
+    /// The stage follows an edit (W7-14): the registration moves to another
+    /// method, and the sync's synthesized edges are a fresh index's.
+    #[test]
+    fn a_sync_recomputes_the_synthesized_edges() {
+        let dir = TestDir::new("synthesis-edit");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        let before = synthesized_edges(&db);
+        assert!(
+            before.len() == 1 && before[0].contains("App::triggerRender"),
+            "{before:?}"
+        );
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+
+        write_files(dir.path(), &[SYNTH_PAINT]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]).unwrap();
+        let after = synthesized_edges(&db);
+        assert!(
+            after.len() == 1 && after[0].contains("App::triggerPaint"),
+            "{after:?}"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-edit-fresh", &[SYNTH_SCENE, SYNTH_PAINT])
+        );
+    }
+
+    /// A sync that stops before the stage, or after the replacement and
+    /// before the marker, leaves the marker away (W7-14): the next sync, with
+    /// nothing changed, recomputes and writes it back.
+    #[test]
+    fn a_sync_stopped_before_its_synthesis_marker_leaves_the_next_to_recompute() {
+        for (label, hook) in [
+            ("stage", &FAIL_BEFORE_SYNTHESIS),
+            ("marker", &FAIL_BEFORE_SYNTHESIS_MARKER),
+        ] {
+            let dir = TestDir::new(&format!("synthesis-stop-{label}"));
+            let db = default_db_path(dir.path()).unwrap();
+            write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+            sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+
+            write_files(dir.path(), &[SYNTH_PAINT]);
+            hook.with(|fail| fail.set(true));
+            let failed = sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]);
+            hook.with(|fail| fail.set(false));
+            assert!(
+                failed.is_err(),
+                "{label}: the injected failure must stop the sync"
+            );
+            assert_eq!(
+                synthesis_marker(&db),
+                None,
+                "{label}: the marker stays away"
+            );
+
+            sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+            assert_eq!(
+                synthesis_marker(&db).as_deref(),
+                Some(codegraph_resolve::synthesis::VERSION),
+                "{label}"
+            );
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(
+                    &format!("synthesis-stop-{label}-fresh"),
+                    &[SYNTH_SCENE, SYNTH_PAINT]
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    /// A marker another version of the passes wrote is not current (W7-14c
+    /// moved it to "2"): a sync with nothing changed replaces that
+    /// version's synthesized edges and writes this version's marker.
+    #[test]
+    fn a_synthesis_marker_of_another_version_recomputes() {
+        let dir = TestDir::new("synthesis-version");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(codegraph_resolve::synthesis::VERSION_KEY, "1")
+            .unwrap();
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-version-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// A lane bootstrap re-resolves without `begin_mutation`, so it withdraws
+    /// the synthesis marker before its first write (W7-14): a sync that
+    /// stops after the lane markers went back leaves it away, and the next
+    /// sync replaces a stale synthesized edge.
+    #[test]
+    fn a_lane_bootstrap_withdraws_the_synthesis_marker() {
+        let dir = TestDir::new("synthesis-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)
+            .unwrap();
+
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert!(
+            surface_marker(&db).is_some(),
+            "the bootstrap's lane marker went back"
+        );
+        assert_eq!(synthesis_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-bootstrap-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// The orphan sweep resolves new base edges on a sync with nothing
+    /// changed, so the stage recomputes after it (W7-14).
+    #[test]
+    fn the_orphan_sweep_recomputes_the_synthesized_edges() {
+        let dir = TestDir::new("synthesis-sweep");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+        assert_eq!(
+            synthesis_marker(&db).as_deref(),
+            Some(codegraph_resolve::synthesis::VERSION)
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-sweep-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// The orphan sweep withdraws the synthesis marker before its first
+    /// write (W7-14): a sync that stops after sweeping leaves it away, and
+    /// the next sync, with nothing to sweep, replaces a stale synthesized
+    /// edge.
+    #[test]
+    fn an_orphan_sweep_withdraws_the_synthesis_marker() {
+        let dir = TestDir::new("synthesis-sweep-stop");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0]).unwrap();
+        plant_stale_synthesized_edge(&db, "triggerPaint", "onUpdate");
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_SYNTHESIS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(synthesis_marker(&db), None);
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("synthesis-sweep-stop-fresh", &[SYNTH_SCENE, SYNTH_RENDER])
+        );
+    }
+
+    /// A file that changed on disk since it was indexed feeds no pass until
+    /// its own sync (W7-14): its old nodes' lines would slice its new text.
+    /// Its lines need not have moved for that: the stage cannot tell, so a
+    /// drift that keeps every line where it was still hides the channel.
+    #[test]
+    fn a_drifted_file_feeds_no_synthesis_until_its_sync() {
+        const SCENE_DRIFTED: (&str, &str) = (
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const callback of this.callbacks) callback();\n  }\n}\n",
+        );
+        const OTHER: (&str, &str) = ("src/other.ts", "export const other = 1;\n");
+        const OTHER_EDITED: (&str, &str) = ("src/other.ts", "export const other = 2;\n");
+        let dir = TestDir::new("synthesis-drift");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &[SYNTH_SCENE, SYNTH_RENDER, OTHER]);
+        sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0, OTHER.0]).unwrap();
+        assert_eq!(synthesized_edges(&db).len(), 1);
+
+        // The scene drifts; a sync of another file recomputes without it.
+        write_files(dir.path(), &[SCENE_DRIFTED, OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert_eq!(synthesized_edges(&db), Vec::<String>::new());
+
+        // Its own sync brings the channel back, as a fresh index has it.
+        sync_changed_paths(dir.path(), &db, [SCENE_DRIFTED.0]).unwrap();
+        assert_eq!(synthesized_edges(&db).len(), 1);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "synthesis-drift-fresh",
+                &[SCENE_DRIFTED, SYNTH_RENDER, OTHER_EDITED]
+            )
+        );
     }
 
     /// A sync with no transaction around it can fail after its mutations
@@ -5346,6 +6271,345 @@ pub(crate) mod tests {
         assert_eq!(metadata(&db, &row_key), Some(row));
     }
 
+    /// W7-19b: an index from before the `python` control kind has no row for
+    /// it. The first sync counts the kind as moved, so it detects the
+    /// frameworks (here as before: nothing is extracted again), writes the
+    /// row and leaves the graph as it was; the next sync does not count it.
+    #[test]
+    fn a_missing_python_control_row_detects_the_frameworks_once() {
+        let dir = TestDir::new("control-inputs-python-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            ("manage.py", "import sys\n"),
+            (
+                "shop/urls.py",
+                "from django.urls import path\nfrom . import views\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n]\n",
+            ),
+            (
+                "shop/views.py",
+                "def product_list(request):\n    return None\n",
+            ),
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with("shop/urls.py:shop/urls.py::route:products/ -[references]-> shop/views.py:product_list")),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Python.row_key();
+        let row = metadata(&db, &row_key).expect("the Python row");
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Python)
+        };
+        assert!(!moved(&db));
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(&row_key)
+            .unwrap();
+        assert!(moved(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Django was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            Some("[\"django\"]".to_string())
+        );
+        assert!(!moved(&db));
+    }
+
+    /// W7-19c: likewise for the `jvm` kind. The first sync after the row is
+    /// gone detects the frameworks once (Spring, as before), writes the row
+    /// back and leaves the graph as it was; the next does not count it.
+    #[test]
+    fn a_missing_jvm_control_row_detects_the_frameworks_once() {
+        let dir = TestDir::new("control-inputs-jvm-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            (
+                "pom.xml",
+                "<project><dependency>spring-boot-starter-web</dependency></project>\n",
+            ),
+            (
+                "src/main/java/demo/HelloController.java",
+                "package demo;\n\n@RestController\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n",
+            ),
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected.iter().any(|edge| edge.starts_with("src/main/java/demo/HelloController.java:")
+                && edge.contains("-[references]-> src/main/java/demo/HelloController.java:demo::HelloController::hello")),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Jvm.row_key();
+        let row = metadata(&db, &row_key).expect("the JVM row");
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Jvm)
+        };
+        assert!(!moved(&db));
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(&row_key)
+            .unwrap();
+        assert!(moved(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Spring was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            Some("[\"spring\"]".to_string())
+        );
+        assert!(!moved(&db));
+    }
+
+    /// W7-19d: likewise for the `php` kind, in an index built before it
+    /// and the Laravel and Drupal lanes. The first sync detects the
+    /// frameworks once (Laravel and Drupal, as before), re-resolves every
+    /// route file's references once, bringing back the edges an older sync
+    /// lost, and writes the row and both markers back; the next counts
+    /// neither.
+    #[test]
+    fn a_missing_php_control_row_and_lane_markers_detect_and_re_resolve_once() {
+        let dir = TestDir::new("control-inputs-php-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            LARAVEL_ARTISAN,
+            LARAVEL_ROUTES,
+            LARAVEL_INDEX,
+            DRUPAL_COMPOSER,
+            DRUPAL_ROUTING,
+            DRUPAL_METHOD,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with("routes/web.php:")
+                    && edge.contains(&format!("-[references]-> {}:", LARAVEL_INDEX.0))),
+            "{expected:#?}"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with(&format!("{}:", DRUPAL_ROUTING.0))
+                    && edge.contains("GreetingController::hello ")),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Php.row_key();
+        let row = metadata(&db, &row_key).expect("the PHP row");
+        let frameworks = metadata(&db, crate::control_inputs::FRAMEWORKS_KEY);
+        assert!(
+            frameworks
+                .as_deref()
+                .is_some_and(|found| found.contains("\"laravel\"") && found.contains("\"drupal\"")),
+            "{frameworks:?}"
+        );
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Php)
+        };
+        let lanes_pending = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            (
+                crate::laravel_routes::needs_bootstrap(&store).unwrap(),
+                crate::drupal_refs::needs_bootstrap(&store).unwrap(),
+            )
+        };
+        assert!(!moved(&db));
+        assert_eq!(lanes_pending(&db), (false, false));
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 2, "the route edges an older sync lost");
+            store.delete_project_metadata(&row_key).unwrap();
+            store
+                .delete_project_metadata(crate::laravel_routes::VERSION_KEY)
+                .unwrap();
+            store
+                .delete_project_metadata(crate::drupal_refs::VERSION_KEY)
+                .unwrap();
+        }
+        assert!(moved(&db));
+        assert_eq!(lanes_pending(&db), (true, true));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            outcome.files_reindexed, 0,
+            "Laravel and Drupal were detected before"
+        );
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            frameworks
+        );
+        assert!(!moved(&db));
+        assert_eq!(lanes_pending(&db), (false, false));
+    }
+
+    /// W7-19e: likewise for the `ruby` kind, in an index built before it
+    /// and the Rails lane. The first sync detects the frameworks once (Rails,
+    /// as before), re-resolves every route file's references once, bringing
+    /// back the edge an older sync lost, and writes the row and the marker
+    /// back; the next counts neither.
+    #[test]
+    fn a_missing_ruby_control_row_and_lane_marker_detect_and_re_resolve_once() {
+        let dir = TestDir::new("control-inputs-ruby-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_INDEX];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with(&format!("{}:", RAILS_ROUTES.0))
+                    && edge.contains(&format!("-[references]-> {}:", RAILS_INDEX.0))),
+            "{expected:#?}"
+        );
+        let row_key = crate::control_inputs::ControlKind::Ruby.row_key();
+        let row = metadata(&db, &row_key).expect("the Ruby row");
+        let frameworks = metadata(&db, crate::control_inputs::FRAMEWORKS_KEY);
+        assert!(
+            frameworks
+                .as_deref()
+                .is_some_and(|found| found.contains("\"rails\"")),
+            "{frameworks:?}"
+        );
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Ruby)
+        };
+        let lane_pending = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::rails_routes::needs_bootstrap(&store).unwrap()
+        };
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the route edge an older sync lost");
+            store.delete_project_metadata(&row_key).unwrap();
+            store
+                .delete_project_metadata(crate::rails_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert!(moved(&db));
+        assert!(lane_pending(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Rails was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            frameworks
+        );
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+    }
+
+    /// W7-19g: likewise for the `swift` kind, in an index built before it
+    /// and the Vapor lane. The first sync detects the frameworks once (Vapor,
+    /// as before), re-resolves every route file's references once, bringing
+    /// back the edge an older sync lost, and writes the row and the marker
+    /// back; the next counts neither.
+    #[test]
+    fn a_missing_swift_control_row_and_lane_marker_detect_and_re_resolve_once() {
+        let dir = TestDir::new("control-inputs-swift-row");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_REQUEST];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(vapor_routed(&db), "{expected:#?}");
+        let row_key = crate::control_inputs::ControlKind::Swift.row_key();
+        let row = metadata(&db, &row_key).expect("the Swift row");
+        let frameworks = metadata(&db, crate::control_inputs::FRAMEWORKS_KEY);
+        assert!(
+            frameworks
+                .as_deref()
+                .is_some_and(|found| found.contains("\"vapor\"")),
+            "{frameworks:?}"
+        );
+        let moved = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::control_inputs::check(&store, dir.path(), false, false, &[], &[])
+                .unwrap()
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Swift)
+        };
+        let lane_pending = |db: &Path| {
+            let store = Store::open(db).unwrap();
+            crate::vapor_routes::needs_bootstrap(&store).unwrap()
+        };
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the route edge an older sync lost");
+            store.delete_project_metadata(&row_key).unwrap();
+            store
+                .delete_project_metadata(crate::vapor_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert!(moved(&db));
+        assert!(lane_pending(&db));
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(outcome.files_reindexed, 0, "Vapor was detected before");
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(metadata(&db, &row_key), Some(row));
+        assert_eq!(
+            metadata(&db, crate::control_inputs::FRAMEWORKS_KEY),
+            frameworks
+        );
+        assert!(!moved(&db));
+        assert!(!lane_pending(&db));
+    }
+
     /// W5-06: a control file a watcher event names is read whole, so one
     /// replaced with its size and modification time kept still counts as
     /// changed.
@@ -6008,6 +7272,940 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
         assert_eq!(r_marker(&db), version);
         assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn play_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::play_routes::VERSION_KEY)
+            .unwrap()
+    }
+
+    const PLAY_ROUTES: (&str, &str) = ("conf/routes", "GET / controllers.HomeController.index\n");
+    const PLAY_FAR: (&str, &str) = (
+        "app/controllers/HomeController.scala",
+        "package controllers\n\nclass HomeController {\n  def index(): Int = 1\n}\n",
+    );
+    const PLAY_NEAR: (&str, &str) = (
+        "conf/HomeController.scala",
+        "package conf\n\nclass HomeController {\n  def index(): Int = 2\n}\n",
+    );
+
+    /// W7-19c: a sync failing after it indexed a nearer `HomeController`,
+    /// before resolving, leaves the next sync, with nothing changed, to move
+    /// the routes file's action to it, as a fresh index has it: the routes
+    /// file is a YAML file no other lane's bootstrap re-resolves, and the
+    /// Play marker the failure left away brings it back.
+    #[test]
+    fn a_play_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to = |db: &Path, file: &str| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with("conf/routes:")
+                    && edge.contains(&format!("-[references]-> {file}:"))
+            })
+        };
+        let dir = TestDir::new("play-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [PLAY_ROUTES, PLAY_FAR];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+        assert!(to(&db, PLAY_FAR.0), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[PLAY_NEAR]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [PLAY_NEAR.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            play_marker(&db),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        // The lane refreshed the routes file's site before the failure: its
+        // reference waits unresolved.
+        assert!(!to(&db, PLAY_NEAR.0), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [PLAY_ROUTES, PLAY_FAR, PLAY_NEAR];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("play-routes-fresh", &fresh)
+        );
+        assert!(to(&db, PLAY_NEAR.0), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+    }
+
+    const SPRING_APP: (&str, &str) = (
+        "src/main/java/demo/App.java",
+        "package demo;\n\n@RestController\nclass App {\n  @Value(\"${app.name}\")\n  private String name;\n}\n",
+    );
+    const SPRING_CONFIG: (&str, &str) =
+        ("src/main/resources/application.yml", "app:\n  other: x\n");
+    const SPRING_CONFIG_NAMED: (&str, &str) = (
+        "src/main/resources/application.yml",
+        "app:\n  other: x\n  name: demo\n",
+    );
+
+    /// W7-19c: a sync failing after it wrote a config key, before resolving,
+    /// leaves the next sync, with nothing changed, to bind the `@Value` to
+    /// it, as a fresh index has it: the bindings are Java references, which
+    /// the Java bootstrap the failure left behind re-resolves; the Play
+    /// marker goes and comes back with the others.
+    #[test]
+    fn a_spring_config_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let bound = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with("src/main/java/demo/App.java:")
+                    && edge.contains("-[references]-> src/main/resources/application.yml:app.name ")
+            })
+        };
+        let dir = TestDir::new("spring-config-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [SPRING_APP, SPRING_CONFIG];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+        assert!(!bound(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[SPRING_CONFIG_NAMED]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [SPRING_CONFIG.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            play_marker(&db),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!bound(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [SPRING_APP, SPRING_CONFIG_NAMED];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("spring-config-fresh", &fresh)
+        );
+        assert!(bound(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            play_marker(&db),
+            Some(crate::play_routes::VERSION.to_string())
+        );
+    }
+
+    fn lane_marker(db: &Path, key: &str) -> Option<String> {
+        Store::open(db).unwrap().get_project_metadata(key).unwrap()
+    }
+
+    const LARAVEL_ARTISAN: (&str, &str) = ("artisan", "#!/usr/bin/env php\n<?php\n");
+    const LARAVEL_ROUTES: (&str, &str) = (
+        "routes/web.php",
+        "<?php\n\nRoute::get('/users', 'Admin\\UserController@index');\n",
+    );
+    const LARAVEL_EMPTY: (&str, &str) = (
+        "app/Http/Controllers/Admin/UserController.php",
+        "<?php\n\nclass UserController\n{\n}\n",
+    );
+    const LARAVEL_INDEX: (&str, &str) = (
+        "app/Http/Controllers/Admin/UserController.php",
+        "<?php\n\nclass UserController\n{\n    public function index()\n    {\n    }\n}\n",
+    );
+
+    /// W7-19d: a sync failing after it gave the controller its `index`,
+    /// before resolving, leaves the next sync, with nothing changed, to link
+    /// the route's `Admin\UserController@index` to it, as a fresh index has
+    /// it: the reference waits under its whole name, which no lane but
+    /// Laravel's wakes, and the Laravel marker the failure left away brings
+    /// it back.
+    #[test]
+    fn a_laravel_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let routed = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with("routes/web.php:")
+                    && edge.contains(&format!("-[references]-> {}:", LARAVEL_INDEX.0))
+            })
+        };
+        let dir = TestDir::new("laravel-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LARAVEL_ARTISAN, LARAVEL_ROUTES, LARAVEL_EMPTY];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            Some(crate::laravel_routes::VERSION.to_string())
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[LARAVEL_INDEX]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [LARAVEL_INDEX.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [LARAVEL_ARTISAN, LARAVEL_ROUTES, LARAVEL_INDEX];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("laravel-routes-fresh", &fresh)
+        );
+        assert!(routed(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            Some(crate::laravel_routes::VERSION.to_string())
+        );
+    }
+
+    /// W7-19d: an index without the Laravel marker (built before it, or a
+    /// sync that stopped) has every file holding a Laravel route's reference
+    /// re-resolved by its next sync, with nothing changed: the controller
+    /// edge an older sync lost comes back.
+    #[test]
+    fn an_index_without_the_laravel_marker_re_resolves_the_route_files() {
+        let version = Some(crate::laravel_routes::VERSION.to_string());
+        let dir = TestDir::new("laravel-routes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LARAVEL_ARTISAN, LARAVEL_ROUTES, LARAVEL_INDEX];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            version
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route' AND file_path = 'routes/web.php')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the controller edge an older sync lost");
+            store
+                .delete_project_metadata(crate::laravel_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::laravel_routes::VERSION_KEY),
+            version
+        );
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const DRUPAL_COMPOSER: (&str, &str) = (
+        "composer.json",
+        "{\"require\": {\"drupal/core\": \"^10\"}}\n",
+    );
+    const DRUPAL_ROUTING: (&str, &str) = (
+        "modules/greeting/greeting.routing.yml",
+        "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::hello'\n",
+    );
+    const DRUPAL_CLASS: (&str, &str) = (
+        "modules/greeting/src/Controller/GreetingController.php",
+        "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n}\n",
+    );
+    const DRUPAL_METHOD: (&str, &str) = (
+        "modules/greeting/src/Controller/GreetingController.php",
+        "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n    public function hello()\n    {\n    }\n}\n",
+    );
+
+    /// W7-19d: a sync failing after it gave the controller class its
+    /// `hello`, before resolving, leaves the next sync, with nothing changed,
+    /// to move the routing file's handler from the class to the method, as a
+    /// fresh index has it: the routing file is a YAML file no other lane's
+    /// bootstrap re-resolves, and the Drupal marker the failure left away
+    /// brings it back.
+    #[test]
+    fn a_drupal_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let to_method = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with(&format!("{}:", DRUPAL_ROUTING.0))
+                    && edge.contains("GreetingController::hello ")
+            })
+        };
+        let dir = TestDir::new("drupal-refs-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [DRUPAL_COMPOSER, DRUPAL_ROUTING, DRUPAL_CLASS];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::drupal_refs::VERSION_KEY),
+            Some(crate::drupal_refs::VERSION.to_string())
+        );
+        assert!(!to_method(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[DRUPAL_METHOD]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [DRUPAL_METHOD.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::drupal_refs::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [DRUPAL_COMPOSER, DRUPAL_ROUTING, DRUPAL_METHOD];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("drupal-refs-fresh", &fresh)
+        );
+        assert!(to_method(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::drupal_refs::VERSION_KEY),
+            Some(crate::drupal_refs::VERSION.to_string())
+        );
+    }
+
+    const RAILS_GEMFILE: (&str, &str) = ("Gemfile", "gem \"rails\"\n");
+    const RAILS_ROUTES: (&str, &str) = (
+        "config/routes.rb",
+        "Rails.application.routes.draw do\n  get 'users', to: 'users#index'\nend\n",
+    );
+    const RAILS_EMPTY: (&str, &str) = (
+        "app/controllers/users_controller.rb",
+        "class UsersController\nend\n",
+    );
+    const RAILS_INDEX: (&str, &str) = (
+        "app/controllers/users_controller.rb",
+        "class UsersController\n  def index\n  end\nend\n",
+    );
+
+    /// W7-19e: a sync failing after it gave the controller its `index`,
+    /// before resolving, leaves the next sync, with nothing changed, to link
+    /// the route's `users#index` to it, as a fresh index has it: the
+    /// reference waits under its whole name, which no lane but Rails' wakes,
+    /// and the Rails marker the failure left away brings it back.
+    #[test]
+    fn a_rails_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let routed = |db: &Path| {
+            edge_projection(db).iter().any(|edge| {
+                edge.starts_with(&format!("{}:", RAILS_ROUTES.0))
+                    && edge.contains(&format!("-[references]-> {}:", RAILS_INDEX.0))
+            })
+        };
+        let dir = TestDir::new("rails-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_EMPTY];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rails_routes::VERSION_KEY),
+            Some(crate::rails_routes::VERSION.to_string())
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[RAILS_INDEX]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [RAILS_INDEX.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::rails_routes::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!routed(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_INDEX];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("rails-routes-fresh", &fresh)
+        );
+        assert!(routed(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::rails_routes::VERSION_KEY),
+            Some(crate::rails_routes::VERSION.to_string())
+        );
+    }
+
+    /// W7-19e: an index without the Rails marker (built before it, or a sync
+    /// that stopped) has every file holding a Rails route's reference
+    /// re-resolved by its next sync, with nothing changed: the controller
+    /// edge an older sync lost comes back.
+    #[test]
+    fn an_index_without_the_rails_marker_re_resolves_the_route_files() {
+        let version = Some(crate::rails_routes::VERSION.to_string());
+        let dir = TestDir::new("rails-routes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RAILS_GEMFILE, RAILS_ROUTES, RAILS_INDEX];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::rails_routes::VERSION_KEY), version);
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route' AND file_path = 'config/routes.rb')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the controller edge an older sync lost");
+            store
+                .delete_project_metadata(crate::rails_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lane_marker(&db, crate::rails_routes::VERSION_KEY), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const VAPOR_PACKAGE: (&str, &str) = (
+        "Package.swift",
+        "// swift-tools-version:5.9\nlet package = Package(name: \"App\", dependencies: [.package(url: \"https://github.com/vapor/vapor.git\", from: \"4.0.0\")])\n",
+    );
+    const VAPOR_ROUTES: (&str, &str) = (
+        "Sources/App/routes.swift",
+        "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"sitemap\", use: SiteMapController.index)\n}\n",
+    );
+    const VAPOR_NO_REQUEST: (&str, &str) = (
+        "Sources/App/Controllers/SiteMapController.swift",
+        "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(names: [String]) async throws -> String { \"\" }\n}\n",
+    );
+    const VAPOR_REQUEST: (&str, &str) = (
+        "Sources/App/Controllers/SiteMapController.swift",
+        "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(req: Request) async throws -> String { \"\" }\n}\n",
+    );
+
+    /// Whether the Vapor route links to the handler overload that takes the
+    /// `Request`.
+    fn vapor_routed(db: &Path) -> bool {
+        edge_projection(db).iter().any(|edge| {
+            edge.starts_with(
+                "Sources/App/routes.swift:Sources/App/routes.swift::route:/sitemap -[references]-> \
+                 Sources/App/Controllers/SiteMapController.swift:SiteMapController::index ",
+            )
+        })
+    }
+
+    /// W7-19g: a sync failing after it gave the second overload its
+    /// `Request`, before resolving, leaves the next sync, with nothing
+    /// changed, to link the route's `SiteMapController@index` to it, as a
+    /// fresh index has it: the reference waits under its whole name, which
+    /// no lane but Vapor's wakes, and the Vapor marker the failure left away
+    /// brings it back.
+    #[test]
+    fn a_vapor_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let dir = TestDir::new("vapor-routes-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_NO_REQUEST];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::vapor_routes::VERSION_KEY),
+            Some(crate::vapor_routes::VERSION.to_string())
+        );
+        assert!(!vapor_routed(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[VAPOR_REQUEST]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [VAPOR_REQUEST.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::vapor_routes::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert!(!vapor_routed(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_REQUEST];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("vapor-routes-fresh", &fresh)
+        );
+        assert!(vapor_routed(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            lane_marker(&db, crate::vapor_routes::VERSION_KEY),
+            Some(crate::vapor_routes::VERSION.to_string())
+        );
+    }
+
+    /// W7-19g: an index without the Vapor marker (built before it, or a sync
+    /// that stopped) has every file holding a Swift route's reference
+    /// re-resolved by its next sync, with nothing changed: the handler edge
+    /// an older sync lost comes back. The other Swift lanes' markers stay, so
+    /// none of them re-resolves the route file.
+    #[test]
+    fn an_index_without_the_vapor_marker_re_resolves_the_route_files() {
+        let version = Some(crate::vapor_routes::VERSION.to_string());
+        let dir = TestDir::new("vapor-routes-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [VAPOR_PACKAGE, VAPOR_ROUTES, VAPOR_REQUEST];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::vapor_routes::VERSION_KEY), version);
+        assert!(vapor_routed(&db), "{:#?}", edge_projection(&db));
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'references' AND source IN (SELECT id FROM \
+                     nodes WHERE kind = 'route' AND file_path = 'Sources/App/routes.swift')",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the handler edge an older sync lost");
+            store
+                .delete_project_metadata(crate::vapor_routes::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lane_marker(&db, crate::vapor_routes::VERSION_KEY), version);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const RUST_WORKSPACE: (&str, &str) = (
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n",
+    );
+    const RUST_ALPHA_MANIFEST: (&str, &str) = (
+        "crates/alpha/Cargo.toml",
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+    );
+    const RUST_ALPHA: (&str, &str) = ("crates/alpha/src/lib.rs", "use beta::Thing;\n");
+    const RUST_BETA_MANIFEST: (&str, &str) = (
+        "crates/beta/Cargo.toml",
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+    );
+    const RUST_BETA_MAIN: (&str, &str) = ("crates/beta/src/main.rs", "fn main() {}\n");
+    const RUST_BETA_LIB: (&str, &str) = ("crates/beta/src/lib.rs", "pub struct Thing;\n");
+
+    /// Whether the member `alpha`'s `use beta::…` links the crate root at
+    /// `root`.
+    fn rust_use_links(db: &Path, root: &str) -> bool {
+        edge_projection(db).iter().any(|edge| {
+            edge.starts_with(&format!("{}:", RUST_ALPHA.0))
+                && edge.contains(&format!("-[imports]-> {root}:"))
+                && edge.contains("\"framework\":\"rust\"")
+        })
+    }
+
+    /// W7-19h: a sync failing after it gave the member `beta` its
+    /// `src/lib.rs`, before resolving, leaves the Rust crate roots marker
+    /// away, and the next sync, with nothing changed, links `alpha`'s
+    /// `use beta::…` to that `lib.rs`, as a fresh index has it. (The Rust
+    /// receivers marker the failure also withdrew re-resolves every Rust file
+    /// too, so the marker itself is what this test reads.)
+    #[test]
+    fn a_rust_crate_root_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::rust_crate_roots::VERSION.to_string());
+        let dir = TestDir::new("rust-crate-roots-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            RUST_WORKSPACE,
+            RUST_ALPHA_MANIFEST,
+            RUST_ALPHA,
+            RUST_BETA_MANIFEST,
+            RUST_BETA_MAIN,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+        assert!(
+            rust_use_links(&db, RUST_BETA_MAIN.0),
+            "{:#?}",
+            edge_projection(&db)
+        );
+
+        write_files(dir.path(), &[RUST_BETA_LIB]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [RUST_BETA_LIB.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [
+            RUST_WORKSPACE,
+            RUST_ALPHA_MANIFEST,
+            RUST_ALPHA,
+            RUST_BETA_MANIFEST,
+            RUST_BETA_MAIN,
+            RUST_BETA_LIB,
+        ];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("rust-crate-roots-fresh", &fresh)
+        );
+        assert!(
+            rust_use_links(&db, RUST_BETA_LIB.0),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+    }
+
+    /// W7-19h: an index without the Rust crate roots marker (built before
+    /// it, or a sync that stopped) has every Rust file re-resolved by its
+    /// next sync, with nothing changed: the crate root edge an older sync
+    /// lost comes back.
+    #[test]
+    fn an_index_without_the_rust_crate_roots_marker_re_resolves_every_rust_file() {
+        let version = Some(crate::rust_crate_roots::VERSION.to_string());
+        let dir = TestDir::new("rust-crate-roots-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            RUST_WORKSPACE,
+            RUST_ALPHA_MANIFEST,
+            RUST_ALPHA,
+            RUST_BETA_MANIFEST,
+            RUST_BETA_LIB,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+        assert!(
+            rust_use_links(&db, RUST_BETA_LIB.0),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        let expected = edge_projection(&db);
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'imports' \
+                     AND source = 'file:crates/alpha/src/lib.rs' \
+                     AND target = 'file:crates/beta/src/lib.rs'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1, "the crate root edge an older sync lost");
+            store
+                .delete_project_metadata(crate::rust_crate_roots::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            lane_marker(&db, crate::rust_crate_roots::VERSION_KEY),
+            version
+        );
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const RN_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+    );
+    const RN_SWIFT: (&str, &str) = (
+        "ios/CaptureView.swift",
+        "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n",
+    );
+    const RN_SHIM_EMPTY: (&str, &str) = (
+        "ios/CaptureView.m",
+        "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\n@end\n",
+    );
+    const RN_SHIM: (&str, &str) = (
+        "ios/CaptureView.m",
+        "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n",
+    );
+    const RN_SAVE: (&str, &str) = (
+        "src/save.ts",
+        "import { NativeModules } from 'react-native';\n\nexport function save() {\n  NativeModules.CaptureView.syncSettings();\n}\n",
+    );
+
+    /// Whether the JS call is the bridge's edge to the Swift method the shim
+    /// exports.
+    fn rn_bridged(db: &Path) -> bool {
+        edge_projection(db).iter().any(|edge| {
+            edge.starts_with(
+                "src/save.ts:save -[calls]-> ios/CaptureView.swift:CaptureView::syncSettings ",
+            ) && edge.contains("\"framework\":\"react-native-bridge\"")
+        })
+    }
+
+    fn rn_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(
+                codegraph_resolve::frameworks::react_native::ROW_KEY_PREFIX,
+            )
+            .unwrap()
+    }
+
+    /// W7-21: a sync failing after it gave the shim its method, before
+    /// resolving, leaves the bridge marker away, and the next sync, with
+    /// nothing changed, links the JS call to the Swift method and writes the
+    /// shim's new row, as a fresh index has them. (The other lanes' markers
+    /// the failure withdrew re-resolve their own files too, so the marker and
+    /// the rows are what this test reads.)
+    #[test]
+    fn a_bridge_sync_failing_after_its_mutations_leaves_the_next_one_to_reconcile() {
+        let version = Some(crate::rn_bridges::VERSION.to_string());
+        let dir = TestDir::new("rn-bridges-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RN_PACKAGE, RN_SWIFT, RN_SHIM_EMPTY, RN_SAVE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+        assert!(!rn_bridged(&db), "{:#?}", edge_projection(&db));
+        let empty_rows = rn_rows(&db);
+
+        write_files(dir.path(), &[RN_SHIM]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [RN_SHIM.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lane_marker(&db, crate::rn_bridges::VERSION_KEY),
+            None,
+            "a failed sync leaves the marker away"
+        );
+        assert_eq!(rn_rows(&db), empty_rows, "rows are written last");
+        assert!(!rn_bridged(&db), "{:#?}", edge_projection(&db));
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = [RN_PACKAGE, RN_SWIFT, RN_SHIM, RN_SAVE];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("rn-bridges-fresh", &fresh)
+        );
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
+        assert_ne!(rn_rows(&db), empty_rows);
+        let fresh_dir = TestDir::new("rn-bridges-fresh-rows");
+        write_files(fresh_dir.path(), &fresh);
+        let fresh_db = default_db_path(fresh_dir.path()).unwrap();
+        sync_changed_paths(
+            fresh_dir.path(),
+            &fresh_db,
+            fresh.iter().map(|(path, _)| *path),
+        )
+        .unwrap();
+        assert_eq!(rn_rows(&db), rn_rows(&fresh_db));
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+    }
+
+    const RN_CACHE: (&str, &str) = (
+        "ios/Cache.m",
+        "#import <Foundation/Foundation.h>\n\n@implementation Cache\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n- (void)run:(CaptureView *)view {\n  [view syncSettingsWithMode:1];\n}\n@end\n",
+    );
+    const RN_CALLER: (&str, &str) = (
+        "ios/Caller.swift",
+        "import Foundation\n\nfunc load(cache: Cache) {\n  _ = cache.fetchEntry(forKey: \"x\")\n}\n",
+    );
+
+    /// W7-21: an index without the bridge marker (built before it, or a sync
+    /// that stopped) rebuilds every bridge row, a row of no file's facts
+    /// dropped, and re-resolves the JS, Swift and Objective-C files of a
+    /// project that shows a bridge, with nothing changed: the bridge edges
+    /// an older sync lost, from each of the three languages, come back. The
+    /// other lanes' markers stay, so none of them re-resolves those files.
+    #[test]
+    fn an_index_without_the_bridge_marker_rebuilds_its_rows_and_re_resolves_the_bridged_files() {
+        let version = Some(crate::rn_bridges::VERSION.to_string());
+        let dir = TestDir::new("rn-bridges-bootstrap");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RN_PACKAGE, RN_SWIFT, RN_SHIM, RN_SAVE, RN_CACHE, RN_CALLER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
+        let expected = edge_projection(&db);
+        let bridged = |edges: &[String], from: &str| {
+            edges.iter().any(|edge| {
+                edge.starts_with(from) && edge.contains("\"framework\":\"swift-objc-bridge\"")
+            })
+        };
+        assert!(
+            bridged(
+                &expected,
+                "ios/Caller.swift:load -[calls]-> ios/Cache.m:Cache::fetchEntryForKey: "
+            ),
+            "{expected:#?}"
+        );
+        assert!(
+            bridged(
+                &expected,
+                "ios/Cache.m:Cache::run: -[calls]-> ios/CaptureView.swift:CaptureView::syncSettings "
+            ),
+            "{expected:#?}"
+        );
+        let rows = rn_rows(&db);
+        assert!(
+            rows.iter()
+                .any(|(key, _)| key.ends_with("ios/CaptureView.m")),
+            "{rows:#?}"
+        );
+        {
+            let store = Store::open(&db).unwrap();
+            let dropped = store
+                .connection()
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'calls' AND json_extract(metadata, \
+                     '$.resolvedBy') = 'framework' AND source IN (SELECT id FROM nodes WHERE \
+                     file_path IN ('src/save.ts', 'ios/Caller.swift', 'ios/Cache.m'))",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 3, "the bridge edges an older sync lost");
+            for (key, _) in &rows {
+                store.delete_project_metadata(key).unwrap();
+            }
+            store
+                .set_project_metadata(
+                    &codegraph_resolve::frameworks::react_native::row_key("src/gone.ts"),
+                    "{\"aliases\":[[\"gone\",\"Gone\"]]}",
+                )
+                .unwrap();
+            store
+                .delete_project_metadata(crate::rn_bridges::VERSION_KEY)
+                .unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        assert_eq!(rn_rows(&db).len(), 1, "only the stale row is left");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(lane_marker(&db, crate::rn_bridges::VERSION_KEY), version);
+        assert_eq!(rn_rows(&db), rows);
+        assert_eq!(edge_projection(&db), expected);
+    }
+
+    const RN_CAM_EXPORT: (&str, &str) = (
+        "ios/Cam.m",
+        "#import <React/RCTBridgeModule.h>\n\n@implementation Cam\nRCT_EXPORT_MODULE()\nRCT_EXPORT_METHOD(snap:(id)options) {}\n@end\n",
+    );
+    const RN_SHOOT: (&str, &str) = (
+        "src/shoot.ts",
+        "import { NativeModules } from 'react-native';\n\nexport function shoot() {\n  NativeModules.Cam.snap();\n}\n",
+    );
+
+    /// W7-21: a bootstrap re-resolves a project that shows one bridge only,
+    /// the Swift–Objective-C one, or the React Native one by its macro with
+    /// no `package.json` naming React Native (so no Fabric beside it), as
+    /// it does one that shows them all.
+    #[test]
+    fn a_bootstrap_re_resolves_a_project_that_shows_one_bridge() {
+        let version = Some(crate::rn_bridges::VERSION.to_string());
+        for (tag, files, from) in [
+            (
+                "rn-bridges-bootstrap-swift-objc",
+                &[RN_CACHE, RN_CALLER][..],
+                "ios/Caller.swift:load -[calls]-> ",
+            ),
+            (
+                "rn-bridges-bootstrap-macro",
+                &[RN_CAM_EXPORT, RN_SHOOT][..],
+                "src/shoot.ts:shoot -[calls]-> ",
+            ),
+        ] {
+            let dir = TestDir::new(tag);
+            let db = default_db_path(dir.path()).unwrap();
+            write_files(dir.path(), files);
+            sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+            let expected = edge_projection(&db);
+            assert!(
+                expected.iter().any(|edge| {
+                    edge.starts_with(from) && edge.contains("\"resolvedBy\":\"framework\"")
+                }),
+                "{tag}: {expected:#?}"
+            );
+            {
+                let store = Store::open(&db).unwrap();
+                let dropped = store
+                    .connection()
+                    .execute(
+                        "DELETE FROM edges WHERE kind = 'calls' AND json_extract(metadata, \
+                         '$.resolvedBy') = 'framework'",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(dropped, 1, "{tag}: the bridge edge an older sync lost");
+                store
+                    .delete_project_metadata(crate::rn_bridges::VERSION_KEY)
+                    .unwrap();
+            }
+            assert_ne!(edge_projection(&db), expected, "{tag}");
+            sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+            assert_eq!(
+                lane_marker(&db, crate::rn_bridges::VERSION_KEY),
+                version,
+                "{tag}"
+            );
+            assert_eq!(edge_projection(&db), expected, "{tag}");
+        }
+    }
+
+    /// W7-21: a sync reads an unchanged file's bridge facts from its row,
+    /// not its text: with the shim's row naming another module, the JS call
+    /// a sync re-resolves finds no `CaptureView` method, until the shim
+    /// itself changes and is read again.
+    #[test]
+    fn a_sync_reads_an_unchanged_files_bridge_facts_from_its_row() {
+        let dir = TestDir::new("rn-bridges-trusted");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [RN_PACKAGE, RN_SWIFT, RN_SHIM, RN_SAVE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
+        {
+            let elsewhere = RN_SHIM.1.replace(
+                "RCT_EXTERN_MODULE(CaptureView",
+                "RCT_EXTERN_MODULE(Elsewhere",
+            );
+            let facts = codegraph_resolve::frameworks::react_native::BridgeFacts::of_text(
+                RN_SHIM.0, &elsewhere,
+            );
+            assert_eq!(facts.externs[0].module, "Elsewhere");
+            Store::open(&db)
+                .unwrap()
+                .set_project_metadata(
+                    &codegraph_resolve::frameworks::react_native::row_key(RN_SHIM.0),
+                    &facts.encode(),
+                )
+                .unwrap();
+        }
+        let save = format!("{}\nexport function spare() {{}}\n", RN_SAVE.1);
+        write_files(dir.path(), &[(RN_SAVE.0, save.as_str())]);
+        sync_changed_paths(dir.path(), &db, [RN_SAVE.0]).unwrap();
+        assert!(!rn_bridged(&db), "{:#?}", edge_projection(&db));
+        let shim = format!("{}\n", RN_SHIM.1);
+        write_files(dir.path(), &[(RN_SHIM.0, shim.as_str())]);
+        sync_changed_paths(dir.path(), &db, [RN_SHIM.0]).unwrap();
+        assert!(rn_bridged(&db), "{:#?}", edge_projection(&db));
     }
 
     fn dart_marker(db: &Path) -> Option<String> {
@@ -7684,6 +9882,224 @@ pub(crate) mod tests {
         assert!(stored_refs_marker(&db).is_some(), "a full index writes it");
     }
 
+    const TABLE_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+    );
+    const TABLE_ADMIN: (&str, &str) = (
+        "src/adminRoutes.js",
+        "import Reports from './Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n",
+    );
+    const TABLE_PAGE: (&str, &str) = (
+        "src/Reports.js",
+        "export default function Reports() {\n  return null;\n}\n",
+    );
+    const TABLE_LAYOUT: (&str, &str) = (
+        "src/Layout.js",
+        "export default function Layout() {\n  return null;\n}\n",
+    );
+    const MOUNTED_AT_ADMIN: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return <Routes><Route path=\"/admin\">{adminRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const MOUNTED_AT_MANAGE: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return <Routes><Route path=\"/manage\">{adminRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const SELF_MAPPED: (&str, &str) = (
+        "src/table.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport Layout from './Layout';\nimport Reports from './Reports';\n\nexport const tableRoutes = [{ path: 'reports', element: <Reports/> }];\n\nexport function Shell() {\n  return <Routes><Route path=\"/\" element={<Layout/>}>{tableRoutes.map((route) => <Route key={route.path} {...route}/>)}</Route></Routes>;\n}\n",
+    );
+    const EARLIER_HANDS: (&str, &str) = (
+        "src/a.js",
+        "import { useRoutes } from 'react-router-dom';\nimport { tableRoutes } from './table';\n\nexport default function App() {\n  return useRoutes(tableRoutes);\n}\n",
+    );
+    const EARLIER_QUIET: (&str, &str) = (
+        "src/a.js",
+        "import { useNavigate } from 'react-router-dom';\n\nexport default function App() {\n  return null;\n}\n",
+    );
+    const NAV_TO_REPORTS: (&str, &str) = (
+        "src/nav.js",
+        "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/reports');\n  return <button onClick={open} />;\n}\n",
+    );
+
+    /// The `references` edges out of the routes `/admin/reports`,
+    /// `/manage/reports` and `/reports` of `db`, the table routes of the
+    /// W7-09d tests.
+    fn table_route_edges(db: &Path) -> Vec<String> {
+        edge_projection(db)
+            .into_iter()
+            .filter(|edge| {
+                let (source, _) = edge.split_once(" -[references]-> ").unwrap_or_default();
+                source.ends_with("/reports")
+            })
+            .collect()
+    }
+
+    /// W7-09d: a sync that fails after the table pass replaced the route of a
+    /// table another file mounts leaves the new route's reference pending
+    /// and the marker away. The next sync, with nothing changed, re-reads
+    /// every JavaScript file from its extraction, which keeps the references
+    /// of the routes no single file's extraction makes, and resolves them as
+    /// a fresh index does.
+    #[test]
+    fn a_sync_failing_after_the_table_pass_heals_on_the_next() {
+        let initial = [TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_ADMIN];
+        let (dir, db) = fully_indexed("table-pass-fail", &initial);
+        assert_eq!(
+            table_route_edges(&db),
+            [
+                "src/adminRoutes.js:src/adminRoutes.js::route:/admin/reports -[references]-> src/Reports.js:Reports {\"confidence\":0.9,\"resolvedBy\":\"import\"}"
+            ]
+        );
+
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, ["src/routes.js"]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(stored_refs_marker(&db), None);
+        assert!(
+            table_route_edges(&db).is_empty(),
+            "the route was replaced, its reference left pending"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-fail-fresh",
+            &[TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_MANAGE],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+        assert_eq!(table_route_edges(&db).len(), 1, "{fresh:#?}");
+    }
+
+    /// W7-09d: the orphan sweep runs the table pass before it resolves every
+    /// pending reference, as a full index does, and a route it replaces puts
+    /// the references whose edges reached it back among them: here the
+    /// earlier file stopped handing the table over before a sync heard of
+    /// it, so `/reports` keeps its id and gains its file's layout, and the
+    /// navigation into it binds again.
+    #[test]
+    fn the_orphan_sweep_reconciles_the_tables_and_rebinds_what_reached_them() {
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            NAV_TO_REPORTS,
+        ];
+        let (dir, db) = fully_indexed("table-pass-sweep", &initial);
+        let navigates = |db: &Path| {
+            edge_projection(db)
+                .into_iter()
+                .filter(|edge| edge.contains("-[navigates]->"))
+                .count()
+        };
+        assert_eq!(navigates(&db), 1);
+        assert_eq!(table_route_edges(&db).len(), 1, "no layout yet");
+
+        // The earlier file stops; no sync is told.
+        write_files(dir.path(), &[EARLIER_QUIET]);
+        Store::open(&db)
+            .unwrap()
+            .set_resolution_incomplete()
+            .unwrap();
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(table_route_edges(&db).len(), 2, "the layout came");
+        assert_eq!(navigates(&db), 1, "the navigation found the route again");
+
+        // The sync that hears of it changes nothing more.
+        sync_changed_paths(dir.path(), &db, ["src/a.js"]).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-sweep-fresh",
+            &[
+                TABLE_PACKAGE,
+                TABLE_PAGE,
+                TABLE_LAYOUT,
+                SELF_MAPPED,
+                EARLIER_QUIET,
+                NAV_TO_REPORTS,
+            ],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+    }
+
+    /// W7-09d: when the table pass makes a sync's first change — every file
+    /// unchanged, another lane rebuilding — it withdraws the markers first,
+    /// so a failure after it leaves the next sync to re-read every
+    /// JavaScript file, and the replaced route's pending reference resolves.
+    #[test]
+    fn the_table_pass_withdraws_the_markers_before_its_first_change() {
+        let initial = [TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_ADMIN];
+        let (dir, db) = fully_indexed("table-pass-first", &initial);
+        // An unchanged index whose Java lane rebuilds, and a mount that
+        // moved under no sync's notice.
+        crate::java_heads::withdraw_marker(&Store::open(&db).unwrap()).unwrap();
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the table pass withdrew it");
+
+        sync_changed_paths(dir.path(), &db, ["src/routes.js"]).unwrap();
+        let fresh = fresh_edges(
+            "table-pass-first-fresh",
+            &[TABLE_PACKAGE, TABLE_ADMIN, TABLE_PAGE, MOUNTED_AT_MANAGE],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+        assert_eq!(table_route_edges(&db).len(), 1);
+    }
+
+    /// W7-09d: the routes the table pass made compare equal to the ones it
+    /// wants, their references with them, so a reconciled project plans no
+    /// change, and a sync that touches no table neither replaces a route nor
+    /// withdraws a marker. A sync's own reconciliation is one the next plan
+    /// keeps too.
+    #[test]
+    fn a_reconciled_project_plans_no_table_change() {
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_ADMIN,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            NAV_TO_REPORTS,
+            MOUNTED_AT_ADMIN,
+        ];
+        let (dir, db) = fully_indexed("table-pass-reconciled", &initial);
+        let plans_a_change = || {
+            let store = Store::open(&db).unwrap();
+            let paths = index_paths(dir.path()).unwrap();
+            let scope = ProjectScope::load(dir.path(), &paths).unwrap();
+            let mut resolver = ReferenceResolver::new(dir.path().to_string_lossy())
+                .with_max_file_size(scope.options.max_file_size);
+            {
+                let context = resolver.store_context(&store);
+                resolver.initialize(&context);
+            }
+            resolver
+                .plan_cross_file_nodes(&store)
+                .unwrap()
+                .changes_store()
+        };
+        assert_eq!(table_route_edges(&db).len(), 2, "/admin/reports, /reports");
+        assert!(!plans_a_change(), "the full index reconciled every table");
+
+        write_files(dir.path(), &[MOUNTED_AT_MANAGE]);
+        sync_changed_paths(dir.path(), &db, ["src/routes.js"]).unwrap();
+        assert!(!plans_a_change(), "the sync reconciled the moved mount");
+        assert_eq!(table_route_edges(&db).len(), 2, "/manage/reports, /reports");
+    }
+
     /// W5-09e: `project.godot`'s extraction maps `uid://` autoloads through
     /// every `.gd.uid` and `.tscn`, so it is extracted even under the
     /// marker. No resolution rule gives it an outgoing edge today, so no sync
@@ -7738,6 +10154,7 @@ pub(crate) mod tests {
             &BTreeMap::new(),
             &HashSet::new(),
             true,
+            &codegraph_resolve::CrossFilePlan::default(),
         )
         .unwrap();
         assert_eq!(
@@ -8957,5 +11374,284 @@ pub(crate) mod tests {
             store.file_by_path("src/consumer.ts").unwrap().is_some(),
             "the consumer must survive the helper's deletion"
         );
+    }
+
+    // W7-19a0: a sync whose touched names are only framework nodes its
+    // re-extraction left out and its passes put back retries no name.
+
+    const RESTORE_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+    );
+    const RESTORE_PAGE: (&str, &str) = (
+        "src/Reports.js",
+        "export default function Reports() {\n  return null;\n}\n",
+    );
+    const RESTORE_ROUTES: (&str, &str) = (
+        "src/routes.js",
+        "import { Routes, Route } from 'react-router-dom';\nimport Reports from './Reports';\n\nexport default function Router() {\n  return <Routes><Route path=\"/reports\" element={<Reports/>}/></Routes>;\n}\n",
+    );
+
+    /// `file` with a comment appended: no node of its own moves.
+    fn with_comment(file: (&str, &str)) -> (String, String) {
+        (file.0.to_string(), format!("{}// edited\n", file.1))
+    }
+
+    fn write_owned(root: &Path, files: &[&(String, String)]) {
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        write_files(root, &files);
+    }
+
+    /// The names the one sync of `paths` retried parked references by.
+    fn retried_by(dir: &TestDir, db: &Path, paths: &[&str]) -> Vec<String> {
+        take_retry_names();
+        sync_changed_paths(dir.path(), db, paths.iter().copied()).unwrap();
+        let mut syncs = take_retry_names();
+        assert_eq!(syncs.len(), 1, "one sync: {syncs:?}");
+        syncs.pop().unwrap()
+    }
+
+    fn restore_fixture(name: &str, extra: &[(&str, &str)]) -> (TestDir, PathBuf) {
+        let dir = TestDir::new(name);
+        let db = default_db_path(dir.path()).unwrap();
+        let mut initial = vec![RESTORE_PACKAGE, RESTORE_PAGE, RESTORE_ROUTES];
+        initial.extend_from_slice(extra);
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let routes = Store::open(&db).unwrap().nodes_by_name("/reports").unwrap();
+        assert!(
+            routes.iter().any(|node| node.kind == NodeKind::Route),
+            "the fixture's route is a framework node: {routes:?}"
+        );
+        (dir, db)
+    }
+
+    /// Given a route file whose re-extraction leaves its React Router route
+    /// out, when a comment is appended, the route comes back as it was: the
+    /// sync retries no name, and its graph is a fresh index's.
+    #[test]
+    fn a_sync_that_only_puts_framework_nodes_back_retries_no_name() {
+        let (dir, db) = restore_fixture("restore-only", &[]);
+        let edited = with_comment(RESTORE_ROUTES);
+        write_owned(dir.path(), &[&edited]);
+        assert_eq!(
+            retried_by(&dir, &db, &[RESTORE_ROUTES.0]),
+            Vec::<String>::new()
+        );
+        let fresh = fresh_edges(
+            "restore-only-fresh",
+            &[RESTORE_PACKAGE, RESTORE_PAGE, (&edited.0, &edited.1)],
+        );
+        assert_eq!(edge_projection(&db), fresh);
+    }
+
+    /// A route whose path changed comes back as another node: the sync
+    /// retries by the names its file's comparison touched.
+    #[test]
+    fn a_sync_that_changes_a_framework_node_retries_by_its_names() {
+        let (dir, db) = restore_fixture("restore-changed", &[]);
+        write_files(
+            dir.path(),
+            &[(
+                RESTORE_ROUTES.0,
+                &RESTORE_ROUTES.1.replace("\"/reports\"", "\"/report\""),
+            )],
+        );
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0]);
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+    }
+
+    /// A file the same sync removed touched its names through the removal
+    /// lane, not a node comparison: the retry runs.
+    #[test]
+    fn a_removed_file_keeps_the_retry_of_a_sync_that_put_framework_nodes_back() {
+        let spare = (
+            "src/Spare.js",
+            "export function Spare() {\n  return null;\n}\n",
+        );
+        let (dir, db) = restore_fixture("restore-removed", &[spare]);
+        write_owned(dir.path(), &[&with_comment(RESTORE_ROUTES)]);
+        fs::remove_file(dir.path().join(spare.0)).unwrap();
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0, spare.0]);
+        assert!(retried.contains(&"Spare".to_string()), "{retried:?}");
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+    }
+
+    /// Another changed file whose own nodes held gains a route: the
+    /// framework extraction made a node no comparison saw, so the retry
+    /// runs.
+    #[test]
+    fn a_framework_node_another_changed_file_gains_keeps_the_retry() {
+        let more = (
+            "src/More.js",
+            "import { Routes, Route } from 'react-router-dom';\n\nexport function More() {\n  return null;\n}\n",
+        );
+        let (dir, db) = restore_fixture("restore-gained", &[more]);
+        assert!(
+            Store::open(&db)
+                .unwrap()
+                .nodes_by_name("/more")
+                .unwrap()
+                .is_empty()
+        );
+        write_owned(dir.path(), &[&with_comment(RESTORE_ROUTES)]);
+        write_files(
+            dir.path(),
+            &[(
+                more.0,
+                &more.1.replace(
+                    "return null;",
+                    "return <Routes><Route path=\"/more\" element={null}/></Routes>;",
+                ),
+            )],
+        );
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0, more.0]);
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+        assert!(
+            Store::open(&db)
+                .unwrap()
+                .nodes_by_name("/more")
+                .unwrap()
+                .iter()
+                .any(|node| node.kind == NodeKind::Route)
+        );
+    }
+
+    /// The constant a route in an unchanged file is named from changes past
+    /// the 100 characters its node records: the post-extract pass renames a
+    /// node no comparison saw, so the retry runs.
+    #[test]
+    fn a_post_extract_rename_in_another_file_keeps_the_retry() {
+        let paths = (
+            "src/config/paths.js",
+            "export const paths = {\n  app: { reports: { path: '/reports' }, settings: { path: '/settings' }, profile: { path: '/profile' }, root: { path: '/app' } },\n};\n",
+        );
+        let router = (
+            "src/router.js",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { paths } from './config/paths';\nimport Reports from './Reports';\n\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <Reports /> },\n]);\n",
+        );
+        let (dir, db) = restore_fixture("restore-renamed", &[paths, router]);
+        let route_named = |db: &Path, name: &str| {
+            Store::open(db)
+                .unwrap()
+                .nodes_by_name(name)
+                .unwrap()
+                .iter()
+                .any(|node| node.kind == NodeKind::Route && node.file_path == router.0)
+        };
+        assert!(route_named(&db, "/app"));
+        write_owned(dir.path(), &[&with_comment(RESTORE_ROUTES)]);
+        write_files(
+            dir.path(),
+            &[(paths.0, &paths.1.replace("'/app'", "'/dash'"))],
+        );
+        let retried = retried_by(&dir, &db, &[RESTORE_ROUTES.0, paths.0]);
+        assert!(route_named(&db, "/dash"), "the pass renamed the route");
+        assert!(retried.contains(&"/reports".to_string()), "{retried:?}");
+    }
+
+    /// An unchanged-looking file stops handing a table to the router: the
+    /// cross-file pass changes the table's routes, so the retry runs.
+    #[test]
+    fn a_cross_file_route_change_keeps_the_retry() {
+        let extra = (
+            "src/extra.js",
+            "import { Routes, Route } from 'react-router-dom';\nimport Reports from './Reports';\n\nexport function Extra() {\n  return <Routes><Route path=\"/extra\" element={<Reports/>}/></Routes>;\n}\n",
+        );
+        let dir = TestDir::new("restore-cross-file");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            TABLE_PACKAGE,
+            TABLE_PAGE,
+            TABLE_LAYOUT,
+            SELF_MAPPED,
+            EARLIER_HANDS,
+            extra,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let before = table_route_edges(&db);
+        write_owned(dir.path(), &[&with_comment(extra)]);
+        write_files(
+            dir.path(),
+            &[(
+                EARLIER_HANDS.0,
+                &EARLIER_HANDS
+                    .1
+                    .replace("useRoutes(tableRoutes)", "useRoutes([])"),
+            )],
+        );
+        let retried = retried_by(&dir, &db, &[extra.0, EARLIER_HANDS.0]);
+        assert_ne!(table_route_edges(&db), before, "the table's routes moved");
+        assert!(retried.contains(&"/extra".to_string()), "{retried:?}");
+    }
+
+    #[test]
+    fn a_name_touched_outside_a_node_comparison_stops_the_restore_check() {
+        let mut names = ChangedNames::default();
+        names.note_all(Vec::<String>::new());
+        names.note_any(Vec::<String>::new());
+        assert!(!names.restored.abandoned, "no name, no touch");
+        names.note_any(["x".to_string()]);
+        assert!(names.restored.abandoned);
+        let mut names = ChangedNames::default();
+        names.note_all(["x".to_string()]);
+        assert!(names.restored.abandoned);
+    }
+
+    #[test]
+    fn the_restore_check_keeps_each_file_once_and_within_its_limit() {
+        let node = |id: &str| Node {
+            id: id.to_string(),
+            kind: NodeKind::Route,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: "src/a.js".to_string(),
+            language: Language::JavaScript,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        };
+        let before = vec![node("route:a"), node("route:b")];
+        let mut touched = ChangedNames::default();
+        touched.note_node_diff(&before, &[]);
+        assert!(!touched.touches_nothing());
+        let mut quiet = ChangedNames::default();
+        quiet.note_node_diff(&before, &before);
+        assert!(quiet.touches_nothing());
+
+        let mut names = ChangedNames::default();
+        names.note_restorable("src/a.js", &before, &quiet);
+        assert!(
+            names.restored.files.is_empty(),
+            "nothing touched, nothing kept"
+        );
+        names.restored.nodes = RESTORE_CHECK_NODE_LIMIT - 2;
+        names.note_restorable("src/a.js", &before, &touched);
+        assert!(!names.restored.abandoned, "at the limit");
+        assert_eq!(names.restored.files.len(), 1);
+        names.note_restorable("src/b.js", &before[..1], &touched);
+        assert!(names.restored.abandoned, "past the limit");
+        assert!(names.restored.files.is_empty());
+
+        let mut names = ChangedNames::default();
+        names.note_restorable("src/a.js", &before, &touched);
+        names.note_restorable("src/a.js", &before, &touched);
+        assert!(names.restored.abandoned, "a file kept twice");
     }
 }

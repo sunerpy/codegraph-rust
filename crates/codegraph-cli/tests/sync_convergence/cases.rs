@@ -1072,6 +1072,72 @@ pub fn tsx_tag_becomes_a_parameter_body_edit() -> Case {
         .no_edge_after("function Widgets", "references", "function Widget @src/Widget.tsx")
 }
 
+/// Upstream #841: a `<Route>` in a `.tsx` file is a route, and an edit to
+/// the element it renders moves its edge, as a fresh index of the edit finds.
+pub fn tsx_route_element_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"react\":\"^18.0.0\",\"react-router-dom\":\"^6.0.0\"}}\n",
+        )
+        .file("src/Home.tsx", "export function Home() {\n  return <h1 />;\n}\n")
+        .file("src/About.tsx", "export function About() {\n  return <h2 />;\n}\n")
+        .file(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nimport { About } from './About';\n\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/page\" element={<Home />} />\n    </Routes>\n  );\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom';\nimport { Home } from './Home';\nimport { About } from './About';\n\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/page\" element={<About />} />\n    </Routes>\n  );\n}\n",
+        )
+        .edge_before("route src/App.tsx::route:/page", "references", "function Home")
+        .edge_after("route src/App.tsx::route:/page", "references", "function About")
+        .no_edge_after("route src/App.tsx::route:/page", "references", "function Home")
+}
+
+/// Upstream #2420: a component value a `.tsx` file declares renders the
+/// function it wraps, wherever the file uses it; an edit to what it wraps
+/// moves the tag's edge, never to another file's namesake.
+pub fn tsx_wrapper_value_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file("src/other/Table.tsx", "export function Table() {\n  return <p />;\n}\n")
+        .file(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nfunction TableOuter() {\n  return <section />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nfunction TableOuter() {\n  return <section />;\n}\nconst Table = observer(TableOuter);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .edge_before("function App", "references", "function TableInner")
+        .edge_after("function App", "references", "function TableOuter")
+        .no_edge_after("function App", "references", "function TableInner")
+        .no_edge_after("function App", "references", "function Table @src/other/Table.tsx")
+}
+
+/// W7-04b (upstream #2159): the edge the React resolver makes names it in
+/// `metadata.framework`, and the file's re-extraction draws it again with the
+/// name, as a fresh index does.
+pub fn tsx_framework_edge_keeps_its_resolvers_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { observer } from 'mobx-react';\n\nfunction TableInner() {\n  return <table className=\"wide\" />;\n}\nconst Table = observer(TableInner);\n\nexport function App() {\n  return <Table />;\n}\n",
+        )
+        .edge_after("function App", "references", "function TableInner")
+        .edge_metadata_after(
+            ("function App", "references", "function TableInner"),
+            "framework",
+            "react",
+        )
+}
+
 /// Upstream #2418: an interface moved into a `declare module 'x'` body is
 /// exported, so another file's type reference reaches it by name, as a fresh
 /// index of the edit finds.
@@ -2729,6 +2795,31 @@ pub fn java_subclass_gains_a_base_its_caller_reaches() -> Case {
             "package app;\n\nclass Child extends Base {\n}\n\npublic class Use {\n    public void go() {\n        Child c = new Child();\n        c.run();\n    }\n}\n",
         )
         .edge_after("method app::Use::go", "calls", "method app::Base::run")
+}
+
+/// A Java class gains a second interface: `implements Repo, Store` is a
+/// `type_list` read type by type, so both resolve, as on a fresh index.
+pub fn java_class_gains_a_second_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Java])
+        .file(
+            "src/app/Repo.java",
+            "package app;\n\npublic interface Repo {\n    void save();\n}\n",
+        )
+        .file(
+            "src/app/Store.java",
+            "package app;\n\npublic interface Store {\n    void load();\n}\n",
+        )
+        .file(
+            "src/app/JpaRepo.java",
+            "package app;\n\npublic class JpaRepo implements Repo {\n    public void save() { }\n    public void load() { }\n}\n",
+        )
+        .write(
+            "src/app/JpaRepo.java",
+            "package app;\n\npublic class JpaRepo implements Repo, Store {\n    public void save() { }\n    public void load() { }\n}\n",
+        )
+        .edge_before("class app::JpaRepo", "implements", "interface app::Repo")
+        .edge_after("class app::JpaRepo", "implements", "interface app::Repo")
+        .edge_after("class app::JpaRepo", "implements", "interface app::Store")
 }
 
 /// Upstream #2172: a bare Kotlin call reaches a member of what the class
@@ -10003,8 +10094,10 @@ pub fn typescript_tsconfig_past_64_mib_replaced_with_its_size_and_mtime_kept() -
         .edge_after("file:src/main.ts", "imports", "function double")
 }
 
-/// Found by this matrix: only a fresh index detects React, mints the hook node
-/// and resolves the call through it.
+/// Found by this matrix: only a fresh index detected React. React coming into
+/// `package.json` makes the data router's table a route that renders its
+/// component (the React resolver's extraction runs only once React is
+/// detected).
 pub fn typescript_react_dependency_appears_in_package_json() -> Case {
     Case::new(Change::ControlFile, &[Language::TypeScript])
         .file(
@@ -10012,19 +10105,19 @@ pub fn typescript_react_dependency_appears_in_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function useCart")
-        .edge_after("function page", "calls", "function src/hooks.ts::useCart")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
 }
 
 /// W5-06: a `jsconfig.json` gaining `paths` makes the alias import resolve.
@@ -10085,6 +10178,121 @@ pub fn typescript_tsconfig_extends_target_appears() -> Case {
         .edge_after("file:src/main.ts", "imports", "function double")
 }
 
+/// The two `format` modules an app's `@/lib/format` import may name: the
+/// root's alias sends it to `shared/`, the app's own to its `src/`.
+fn app_alias_files(case: Case) -> Case {
+    case.file(
+        "tsconfig.json",
+        "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./shared/*\"]}}}",
+    )
+    .file(
+        "shared/lib/format.ts",
+        "export function format(value: number): string {\n  return String(value);\n}\n",
+    )
+    .file(
+        "apps/web/src/lib/format.ts",
+        "export function format(value: number): string {\n  return value.toFixed(2);\n}\n",
+    )
+    .file(
+        "apps/web/src/main.ts",
+        "import { format } from '@/lib/format';\n\nexport function render(): string {\n  return format(1);\n}\n",
+    )
+}
+
+/// W7-09a (upstream #2165): an app's own tsconfig appearing with `paths`
+/// takes its imports from the root's alias to its own, as a fresh index
+/// reads the nearest config first.
+pub fn typescript_app_tsconfig_paths_appear() -> Case {
+    app_alias_files(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .edge_before(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @shared/lib/format.ts",
+        )
+        .write(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .edge_after(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @apps/web/src/lib/format.ts",
+        )
+}
+
+/// W7-09a: an app's tsconfig losing its `paths` gives its imports back to
+/// the root's alias.
+pub fn typescript_app_tsconfig_paths_retarget_to_the_root() -> Case {
+    app_alias_files(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .edge_before(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @apps/web/src/lib/format.ts",
+        )
+        .write(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"strict\":true}}",
+        )
+        .edge_after(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @shared/lib/format.ts",
+        )
+}
+
+/// W7-09a: an app's tsconfig deleted, its imports fall back to the root's
+/// alias.
+pub fn typescript_app_tsconfig_is_deleted() -> Case {
+    app_alias_files(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file(
+            "apps/web/tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .edge_before(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @apps/web/src/lib/format.ts",
+        )
+        .remove("apps/web/tsconfig.json")
+        .edge_after(
+            "file:apps/web/src/main.ts",
+            "imports",
+            "function format @shared/lib/format.ts",
+        )
+}
+
+/// W7-09a: an app's jsconfig appearing beside its sources gives it `~/*`,
+/// which no root config declares (LibreChat's `client/`). The namesake
+/// beside the importer is the one a bare-name match would pick.
+pub fn javascript_app_jsconfig_paths_appear() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file(
+            "client/src/lib/format.js",
+            "export function format(value) {\n  return String(value);\n}\n",
+        )
+        .file(
+            "client/src/format.js",
+            "export function format(value) {\n  return `${value}`;\n}\n",
+        )
+        .file(
+            "client/src/main.js",
+            "import { format } from '~/lib/format';\n\nexport function render() {\n  return format(1);\n}\n",
+        )
+        .write(
+            "client/jsconfig.json",
+            "{\"compilerOptions\":{\"paths\":{\"~/*\":[\"./src/*\"]}}}",
+        )
+        .edge_after(
+            "file:client/src/main.js",
+            "imports",
+            "function format @client/src/lib/format.js",
+        )
+}
+
 /// W5-06: `paths` pointed elsewhere moves what a barrel's alias source
 /// resolves to, and the import through the barrel follows.
 pub fn typescript_paths_retarget_moves_a_barrel_source() -> Case {
@@ -10114,8 +10322,8 @@ pub fn typescript_paths_retarget_moves_a_barrel_source() -> Case {
         .edge_after("function run", "calls", "function double @src/alt/math.ts")
 }
 
-/// W5-06: React leaving `package.json` takes the framework's hook node with
-/// it, and the call resolves by name again.
+/// W5-06: React leaving `package.json` takes the framework's route node with
+/// it; the import of the component stays.
 pub fn typescript_react_dependency_leaves_package_json() -> Case {
     Case::new(Change::ControlFile, &[Language::TypeScript])
         .file(
@@ -10123,19 +10331,4777 @@ pub fn typescript_react_dependency_leaves_package_json() -> Case {
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
         )
         .file(
-            "src/hooks.ts",
-            "export function useCart(): number {\n  return 1;\n}\n",
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
         )
         .file(
-            "src/page.ts",
-            "export function page(): number {\n  return useCart();\n}\n",
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
         )
         .write(
             "package.json",
             "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
         )
-        .edge_before("function page", "calls", "function src/hooks.ts::useCart")
-        .edge_after("function page", "calls", "function useCart")
+        .edge_before("route src/routes.ts::route:/dash", "references", "function Dashboard")
+        .edge_after("file:src/routes.ts", "imports", "function Dashboard")
+}
+
+/// Upstream #2395: React coming into an app's manifest rather than the
+/// root's detects React as the root's does
+/// ([`typescript_react_dependency_appears_in_package_json`]).
+pub fn typescript_react_dependency_appears_in_an_app_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\"}}\n",
+        )
+        .file(
+            "apps/web/src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
+        )
+        .file(
+            "apps/web/src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
+        )
+        .write(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"left-pad\":\"1.3.0\",\"react\":\"18.2.0\"}}\n",
+        )
+        .edge_before("file:apps/web/src/routes.ts", "imports", "function Dashboard")
+        .edge_after(
+            "route apps/web/src/routes.ts::route:/dash",
+            "references",
+            "function Dashboard",
+        )
+}
+
+/// Upstream #2395: detection reads a manifest one directory down whatever is
+/// indexed below it, so React declared in `frontend/package.json` beside
+/// only a Python build script detects React on the next sync too.
+pub fn typescript_react_dependency_appears_above_no_script() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
+        .file("frontend/build.py", "def build():\n    return 1\n")
+        .file(
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
+        )
+        .file(
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
+        )
+        .write(
+            "frontend/package.json",
+            "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
+        )
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
+}
+
+/// Upstream #2395: a file of any language arriving one directory down brings
+/// the manifest beside it into detection: React declared in
+/// `frontend/package.json` is detected once `frontend/build.py` is indexed,
+/// and the sync records that manifest among the JS inputs, as a fresh index
+/// does.
+pub fn typescript_react_dependency_beside_an_added_script() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"web\",\"private\":true}\n")
+        .file(
+            "frontend/package.json",
+            "{\"name\":\"assets\",\"devDependencies\":{\"react\":\"18.2.0\"}}\n",
+        )
+        .file(
+            "src/dashboard.ts",
+            "export function Dashboard(): null {\n  return null;\n}\n",
+        )
+        .file(
+            "src/routes.ts",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { Dashboard } from './dashboard';\n\nexport const router = createBrowserRouter([{ path: '/dash', Component: Dashboard }]);\n",
+        )
+        .write("frontend/build.py", "def build():\n    return 1\n")
+        .edge_before("file:src/routes.ts", "imports", "function Dashboard")
+        .edge_after("route src/routes.ts::route:/dash", "references", "function Dashboard")
+}
+
+const NEST_PACKAGE: &str = "{\"name\":\"api\",\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\"}}\n";
+
+const NEST_USERS_CONTROLLER: &str = "import { Controller, Get } from '@nestjs/common';\n\n@Controller('users')\nexport class UsersController {\n  @Get(':id')\n  findOne() {\n    return 1;\n  }\n}\n";
+
+/// W7-02: the bootstrap comes to set a global prefix (upstream #2117): every
+/// route of its app is renamed though no controller file changed.
+pub fn typescript_nestjs_bootstrap_sets_a_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .named_before("route", "GET /users/:id")
+        .named_after("route", "GET /api/v1/users/:id")
+        .edge_throughout(
+            "route src/users/users.controller.ts::GET:/users/:id",
+            "references",
+            "method UsersController::findOne",
+        )
+}
+
+/// W7-02: the bootstrap stops setting a global prefix: a route an earlier
+/// sync renamed gets its in-file name back, as a fresh index names it.
+pub fn typescript_nestjs_bootstrap_drops_its_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/main.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n",
+        )
+        .named_before("route", "GET /api/v1/users/:id")
+        .named_after("route", "GET /users/:id")
+}
+
+/// W7-02b (KEEP-RUST): one feature's e2e spec comes to set a global prefix:
+/// only that feature's routes are renamed; the feature beside it, whose own
+/// spec configures nothing, keeps its routes as written.
+pub fn typescript_nestjs_e2e_spec_sets_a_global_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "integration/security/e2e/csrf.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('protects', async () => {\n  const app = await NestFactory.create(AppModule);\n  await app.init();\n});\n",
+        )
+        .file(
+            "integration/security/src/csrf.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n\n@Controller('csrf')\nexport class CsrfController {\n  @Get()\n  token() {\n    return 1;\n  }\n}\n",
+        )
+        .file(
+            "integration/cookies/e2e/cookies.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('sets', async () => {\n  const app = await NestFactory.create(AppModule);\n  await app.init();\n});\n",
+        )
+        .file(
+            "integration/cookies/src/cookies.controller.ts",
+            "import { Controller, Get } from '@nestjs/common';\n\n@Controller('cookies')\nexport class CookiesController {\n  @Get('set')\n  set() {\n    return 1;\n  }\n}\n",
+        )
+        .write(
+            "integration/security/e2e/csrf.spec.ts",
+            "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from '../src/app.module';\n\nit('protects', async () => {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  await app.init();\n});\n",
+        )
+        .named_before("route", "GET /csrf")
+        .named_after("route", "GET /api/csrf")
+        .named_after("route", "GET /cookies/set")
+}
+
+/// W7-02: a RouterModule registration goes away: the routes it prefixed get
+/// their in-file names back (the RouterModule pass renamed them; nothing
+/// renamed them back before).
+pub fn typescript_nestjs_router_module_registration_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { RouterModule } from '@nestjs/core';\nimport { AdminModule } from './admin.module';\n\n@Module({ imports: [AdminModule, RouterModule.register([{ path: 'admin', module: AdminModule }])] })\nexport class AppModule {}\n",
+        )
+        .file(
+            "src/admin.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AdminModule {}\n",
+        )
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .write(
+            "src/app.module.ts",
+            "import { Module } from '@nestjs/common';\nimport { RouterModule } from '@nestjs/core';\nimport { AdminModule } from './admin.module';\n\n@Module({ imports: [AdminModule] })\nexport class AppModule {}\n",
+        )
+        .named_before("route", "GET /admin/users/:id")
+        .named_after("route", "GET /users/:id")
+}
+
+/// W7-02: the convention file beside a controller appears (upstream #2246):
+/// the provider it injects is that file's class, not another feature's.
+pub fn typescript_nestjs_provider_beside_its_controller_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/admin/users.service.ts", "export class UsersService {}\n")
+        .file(
+            "src/users/users.controller.ts",
+            "export class UsersController {\n  constructor(private readonly users: UsersService) {}\n}\n",
+        )
+        .write("src/users/users.service.ts", "export class UsersService {}\n")
+        .edge_after(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/users/users.service.ts",
+        )
+        .no_edge_after(
+            "method UsersController::constructor",
+            "references",
+            "class UsersService @src/admin/users.service.ts",
+        )
+}
+
+const EXPRESS_PACKAGE: &str =
+    "{\"name\":\"app\",\"private\":true,\"dependencies\":{\"express\":\"^4.0.0\"}}\n";
+
+const PLAIN_PACKAGE: &str = "{\"name\":\"app\",\"private\":true,\"dependencies\":{}}\n";
+
+/// An Express app that loads a router, without mounting it.
+const EXPRESS_APP: &str = "const express = require('express');\nconst users = require('./routes/users');\nconst app = express();\n";
+
+/// The same app mounting the router at `/api`.
+const EXPRESS_APP_MOUNT: &str = "const express = require('express');\nconst users = require('./routes/users');\nconst app = express();\napp.use('/api', users);\n";
+
+/// A router whose inline handler calls `loadUser`.
+const EXPRESS_USERS: &str = "const router = require('express').Router();\nrouter.get('/users/:id', (req, res) => res.json(loadUser(req.params.id)));\nfunction loadUser(id) {\n  return { id };\n}\nfunction findUser(id) {\n  return { id };\n}\nmodule.exports = router;\n";
+
+const EXPRESS_USERS_ROUTE: &str = "route routes/users.js::GET:/users/:id";
+
+/// W7-19a: a mount appears (upstream `postExtract`): the mounted router's
+/// routes are renamed under its prefix, though their file did not change.
+pub fn javascript_express_mount_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write("app.js", EXPRESS_APP_MOUNT)
+        .named_before("route", "GET /users/:id")
+        .named_after("route", "GET /api/users/:id")
+        .edge_throughout(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+        .edge_after("route app.js::USE:/api", "references", "constant router")
+}
+
+/// W7-19a: the mount goes away: a route an earlier sync renamed gets its
+/// in-file name back, as a fresh index names it.
+pub fn javascript_express_mount_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write("app.js", EXPRESS_APP)
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /users/:id")
+        .edge_throughout(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+}
+
+/// W7-19a: the mount's prefix changes.
+pub fn javascript_express_mount_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write(
+            "app.js",
+            "const express = require('express');\nconst users = require('./routes/users');\nconst app = express();\napp.use('/v2', users);\n",
+        )
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /v2/users/:id")
+        .edge_after("route app.js::USE:/v2", "references", "constant router")
+}
+
+/// W7-19a: a second file mounts the same router at another path: one name
+/// cannot be two paths, so the routes get their in-file names back.
+pub fn javascript_express_second_mount_of_a_router_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write(
+            "admin.js",
+            "const app = require('express')();\napp.use('/admin', require('./routes/users'));\n",
+        )
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /users/:id")
+        .named_after("route", "USE /admin")
+}
+
+/// W7-19a: the mounted router's handler is edited: its re-extracted route
+/// is renamed again under the unchanged mount.
+pub fn javascript_express_mounted_handler_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("app.js", EXPRESS_APP_MOUNT)
+        .file("routes/users.js", EXPRESS_USERS)
+        .write(
+            "routes/users.js",
+            "const router = require('express').Router();\nrouter.get('/users/:id', (req, res) => res.json(findUser(req.params.id)));\nfunction loadUser(id) {\n  return { id };\n}\nfunction findUser(id) {\n  return { id };\n}\nmodule.exports = router;\n",
+        )
+        .named_before("route", "GET /api/users/:id")
+        .named_after("route", "GET /api/users/:id")
+        .edge_before(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+        .edge_after(EXPRESS_USERS_ROUTE, "calls", "function findUser")
+        .no_edge_after(EXPRESS_USERS_ROUTE, "calls", "function loadUser")
+}
+
+const EXPRESS_SERVER: &str = "const express = require('express');\nconst app = express();\napp.get('/health', health);\nfunction health(req, res) {}\n";
+
+/// W7-19a: the manifest comes to declare Express: Express is detected and
+/// every file is extracted again, so the app's route appears.
+pub fn javascript_express_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", PLAIN_PACKAGE)
+        .file("server/app.js", EXPRESS_SERVER)
+        .write("package.json", EXPRESS_PACKAGE)
+        .edge_after(
+            "route server/app.js::GET:/health",
+            "references",
+            "function health",
+        )
+}
+
+/// W7-19a: without a manifest that declares it, Express is detected by a
+/// file under a `routes` path that reads like a router (upstream's path
+/// scan); one arriving brings every file's routes.
+pub fn javascript_express_routes_file_appears_without_a_dependency() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", PLAIN_PACKAGE)
+        .file("server/app.js", EXPRESS_SERVER)
+        .write(
+            "src/routes/users.js",
+            "const router = require('express').Router();\nrouter.get('/users', list);\nfunction list(req, res) {}\nmodule.exports = router;\n",
+        )
+        .edge_after(
+            "route server/app.js::GET:/health",
+            "references",
+            "function health",
+        )
+        .edge_after(
+            "route src/routes/users.js::GET:/users",
+            "references",
+            "function list",
+        )
+}
+
+const EXPRESS_ONE_AUTH: &str =
+    "function auth(req, res, next) {\n  next();\n}\nfunction setup() {\n  auth();\n}\n";
+
+const EXPRESS_TWO_AUTH: &str = "function auth(req, res, next) {\n  next();\n}\nfunction setup() {\n  auth();\n}\nfunction auth(req, res, next) {\n  next();\n}\n";
+
+/// W7-19a: a second `auth` appears in the calling file. Express proposes
+/// nothing for two candidates, so the call follows the name matcher: its
+/// sole-candidate edge becomes the ambiguous one.
+pub fn javascript_express_second_middleware_appears_in_the_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_ONE_AUTH)
+        .write("server/app.js", EXPRESS_TWO_AUTH)
+        .edge_before("function setup", "calls", "function auth @server/app.js:1")
+        .edge_after("function setup", "calls", "function auth @server/app.js:7")
+        .no_edge_after("function setup", "calls", "function auth @server/app.js:1")
+}
+
+/// W7-19a: the second `auth` goes away again.
+pub fn javascript_express_second_middleware_is_removed_from_the_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_TWO_AUTH)
+        .write("server/app.js", EXPRESS_ONE_AUTH)
+        .edge_before("function setup", "calls", "function auth @server/app.js:7")
+        .edge_after("function setup", "calls", "function auth @server/app.js:1")
+}
+
+const EXPRESS_HANDLERS: &str = "function list(req, res) {}\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n";
+
+const EXPRESS_HANDLERS_LIST: (&str, &str, &str) = (
+    "function handle",
+    "calls",
+    "function list @src/user.handlers.js",
+);
+
+/// W7-19a: another file whose path names the controller gains a `list`:
+/// two candidates, so Express's edge to the calling file's `list` goes and
+/// the call stays unresolved.
+pub fn javascript_express_controller_method_gains_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.handlers.js", EXPRESS_HANDLERS)
+        .write("src/user.store.js", "function list() {}\n")
+        .edge_metadata_before(EXPRESS_HANDLERS_LIST, "framework", "express")
+        .no_edge_after(
+            EXPRESS_HANDLERS_LIST.0,
+            EXPRESS_HANDLERS_LIST.1,
+            EXPRESS_HANDLERS_LIST.2,
+        )
+}
+
+/// W7-19a: the other `list` goes away: the calling file's is the sole
+/// candidate again, Express's edge.
+pub fn javascript_express_controller_method_loses_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.handlers.js", EXPRESS_HANDLERS)
+        .file("src/user.store.js", "function list() {}\n")
+        .remove("src/user.store.js")
+        .edge_metadata_after(EXPRESS_HANDLERS_LIST, "framework", "express")
+}
+
+const EXPRESS_API: &str = "function lookup(id) {}\nfunction show(req, res) {\n  return userService.lookup(req.params.id);\n}\n";
+
+const EXPRESS_API_LOOKUP: (&str, &str, &str) =
+    ("function show", "calls", "function lookup @src/user.api.js");
+
+/// W7-19a: another file whose path names the service gains a `lookup`.
+pub fn javascript_express_service_method_gains_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.api.js", EXPRESS_API)
+        .write("src/user.store.js", "function lookup(id) {}\n")
+        .edge_metadata_before(EXPRESS_API_LOOKUP, "framework", "express")
+        .no_edge_after(
+            EXPRESS_API_LOOKUP.0,
+            EXPRESS_API_LOOKUP.1,
+            EXPRESS_API_LOOKUP.2,
+        )
+}
+
+/// W7-19a: the other `lookup` goes away.
+pub fn javascript_express_service_method_loses_a_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/user.api.js", EXPRESS_API)
+        .file("src/user.store.js", "function lookup(id) {}\n")
+        .remove("src/user.store.js")
+        .edge_metadata_after(EXPRESS_API_LOOKUP, "framework", "express")
+}
+
+const EXPRESS_CORS_APP: &str = "import { corsMiddleware } from 'cors-kit';\nfunction cors(req, res, next) {\n  next();\n}\nfunction setup(app) {\n  corsMiddleware();\n}\n";
+
+/// W7-19a: a declaration of `corsMiddleware` appears in another file.
+/// Upstream's second middleware tier is not ported, so Express proposes
+/// nothing either way: the call follows the name matcher alone.
+pub fn javascript_express_x_middleware_declaration_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_CORS_APP)
+        .write("lib/kit.js", "export function corsMiddleware() {}\n")
+        .edge_after(
+            "function setup",
+            "calls",
+            "function corsMiddleware @lib/kit.js",
+        )
+        .no_edge_after("function setup", "calls", "function cors")
+}
+
+/// W7-19a: the `corsMiddleware` declaration goes away again.
+pub fn javascript_express_x_middleware_declaration_is_removed() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.js", EXPRESS_CORS_APP)
+        .file("lib/kit.js", "export function corsMiddleware() {}\n")
+        .remove("lib/kit.js")
+        .edge_before(
+            "function setup",
+            "calls",
+            "function corsMiddleware @lib/kit.js",
+        )
+        .no_edge_after("function setup", "calls", "function cors")
+}
+
+const EXPRESS_OBJECT_CALLER: &str = "import { userController } from './user.objects';\nfunction handle(req, res) {\n  userController.list(req, res);\n}\n";
+
+const EXPRESS_OBJECT: &str = "export const userController = {\n  list(req, res) {},\n};\n";
+
+/// W7-19a: the imported `userController` object appears. Upstream's second
+/// controller tier is not ported and the object's `list` is not in the
+/// calling file, so Express proposes nothing: the import resolves the call.
+pub fn javascript_express_controller_object_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/handlers.js", EXPRESS_OBJECT_CALLER)
+        .write("src/user.objects.js", EXPRESS_OBJECT)
+        .edge_after("function handle", "calls", "function userController::list")
+}
+
+/// W7-19a: the imported `userController` object goes away.
+pub fn javascript_express_controller_object_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("src/handlers.js", EXPRESS_OBJECT_CALLER)
+        .file("src/user.objects.js", EXPRESS_OBJECT)
+        .remove("src/user.objects.js")
+        .edge_before("function handle", "calls", "function userController::list")
+}
+
+const ASTRO_PACKAGE: &str =
+    "{\"name\":\"site\",\"private\":true,\"dependencies\":{\"astro\":\"^5.0.0\"}}\n";
+
+/// W7-19a: a page appears under `src/pages/`: a route served by its own
+/// component (upstream #2267).
+pub fn astro_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Astro])
+        .file("package.json", ASTRO_PACKAGE)
+        .file("src/pages/index.astro", "<h1>home</h1>\n")
+        .write("src/pages/about.astro", "<p>about</p>\n")
+        .edge_throughout(
+            "route src/pages/index.astro::route:/",
+            "calls",
+            "component src/pages/index.astro::index",
+        )
+        .edge_metadata_after(
+            (
+                "route src/pages/about.astro::route:/about",
+                "calls",
+                "component src/pages/about.astro::about",
+            ),
+            "framework",
+            "astro",
+        )
+}
+
+/// W7-19a: an endpoint comes to export another verb.
+pub fn typescript_astro_endpoint_verb_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", ASTRO_PACKAGE)
+        .file(
+            "src/pages/api/hello.ts",
+            "export const GET = async () => new Response('hi');\n",
+        )
+        .write(
+            "src/pages/api/hello.ts",
+            "export const POST = async () => new Response('hi');\n",
+        )
+        .edge_before(
+            "route src/pages/api/hello.ts::route:/api/hello",
+            "references",
+            "function GET",
+        )
+        .edge_after(
+            "route src/pages/api/hello.ts::route:/api/hello",
+            "references",
+            "function POST",
+        )
+}
+
+/// W7-19a: the root manifest stops declaring Astro, and no `.astro` file
+/// remains to detect it: the endpoint is no route any more.
+pub fn typescript_astro_dependency_leaves_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", ASTRO_PACKAGE)
+        .file(
+            "src/pages/api/hello.ts",
+            "export const GET = async () => new Response('hi');\n",
+        )
+        .write("package.json", PLAIN_PACKAGE)
+        .edge_before(
+            "route src/pages/api/hello.ts::route:/api/hello",
+            "references",
+            "function GET",
+        )
+}
+
+const ASTRO_CARD: &str = "---\nconst { t } = Astro.props;\n---\n<div>{t}</div>\n";
+
+const ASTRO_GALLERY_CARD: (&str, &str, &str) = (
+    "component src/components/Gallery.astro::Gallery",
+    "references",
+    "component src/components/cards/Card.astro::Card",
+);
+
+fn astro_gallery(case: Case) -> Case {
+    case.file("package.json", ASTRO_PACKAGE)
+        .file(
+            "src/components/Gallery.astro",
+            "<section><Card t=\"x\" /></section>\n",
+        )
+        .file("src/components/cards/Card.astro", ASTRO_CARD)
+        .file("src/layouts/Card.astro", ASTRO_CARD)
+}
+
+/// W7-19a: a second `Card` appears under the tag's directory: Astro
+/// proposes nothing for two, so its edge becomes the name matcher's.
+pub fn astro_second_component_appears_in_the_directory() -> Case {
+    astro_gallery(Case::new(Change::AddCompetitor, &[Language::Astro]))
+        .write("src/components/more/Card.astro", ASTRO_CARD)
+        .edge_metadata_before(ASTRO_GALLERY_CARD, "framework", "astro")
+        .edge_after(
+            ASTRO_GALLERY_CARD.0,
+            ASTRO_GALLERY_CARD.1,
+            ASTRO_GALLERY_CARD.2,
+        )
+        .no_edge_metadata_after(ASTRO_GALLERY_CARD, "framework", "astro")
+}
+
+/// W7-19a: the second `Card` goes away: the directory's sole one is
+/// Astro's edge again.
+pub fn astro_second_component_leaves_the_directory() -> Case {
+    astro_gallery(Case::new(Change::AddCompetitor, &[Language::Astro]))
+        .file("src/components/more/Card.astro", ASTRO_CARD)
+        .remove("src/components/more/Card.astro")
+        .edge_before(
+            ASTRO_GALLERY_CARD.0,
+            ASTRO_GALLERY_CARD.1,
+            ASTRO_GALLERY_CARD.2,
+        )
+        .edge_metadata_after(ASTRO_GALLERY_CARD, "framework", "astro")
+}
+
+const ASTRO_LOGIN: &str = "---\nimport { getCollection } from 'astro:content';\nconst posts = await getCollection('blog');\nif (!Astro.cookies.has('s')) return Astro.redirect('/login');\nconst { title } = Astro.props;\n---\n<h1>{title}</h1>\n";
+
+const ASTRO_NAV: &str = "export function redirect(to: string) { return to; }\nexport function has(x: string) { return !!x; }\n";
+
+const ASTRO_LOGIN_SELF: (&str, &str, &str) = (
+    "component src/pages/login.astro::login",
+    "calls",
+    "component src/pages/login.astro::login",
+);
+
+/// W7-19a: a module declaring `redirect` and `has` appears. `Astro.redirect`
+/// and `Astro.cookies.has` are the runtime's whatever the project declares:
+/// their edges to the page's own component stay.
+pub fn astro_global_member_namesakes_appear() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::Astro, Language::TypeScript],
+    )
+    .file("package.json", ASTRO_PACKAGE)
+    .file("src/pages/login.astro", ASTRO_LOGIN)
+    .write("src/lib/nav.ts", ASTRO_NAV)
+    .edge_metadata_before(ASTRO_LOGIN_SELF, "framework", "astro")
+    .edge_metadata_after(ASTRO_LOGIN_SELF, "framework", "astro")
+    .no_edge_after(ASTRO_LOGIN_SELF.0, "calls", "function redirect")
+    .no_edge_after(ASTRO_LOGIN_SELF.0, "calls", "function has")
+}
+
+/// W7-19a: the module declaring `redirect` and `has` goes away.
+pub fn astro_global_member_namesakes_leave() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::Astro, Language::TypeScript],
+    )
+    .file("package.json", ASTRO_PACKAGE)
+    .file("src/pages/login.astro", ASTRO_LOGIN)
+    .file("src/lib/nav.ts", ASTRO_NAV)
+    .remove("src/lib/nav.ts")
+    .edge_metadata_before(ASTRO_LOGIN_SELF, "framework", "astro")
+    .edge_metadata_after(ASTRO_LOGIN_SELF, "framework", "astro")
+}
+
+// ---- W7-19b: Django, Flask and FastAPI ----
+
+const DJANGO_VIEWS: &str =
+    "def product_list(request):\n    return None\n\n\ndef order_list(request):\n    return None\n";
+
+const DJANGO_URLS: &str = "from django.urls import path\nfrom . import views\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n]\n";
+
+const DJANGO_URLS_TWO: &str = "from django.urls import path\nfrom . import views\n\nurlpatterns = [\n    path(\"products/\", views.product_list),\n    path(\"orders/\", views.order_list),\n]\n";
+
+const DJANGO_PRODUCTS_ROUTE: &str = "route shop/urls.py::route:products/";
+
+const DJANGO_ORDERS_ROUTE: &str = "route shop/urls.py::route:orders/";
+
+/// W7-19b: `django` comes into the root `requirements.txt`, which no index
+/// holds: the `python` control kind makes the sync detect the frameworks, and
+/// Django's coming extracts every file again.
+pub fn python_django_requirement_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("requirements.txt", "requests\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("requirements.txt", "requests\ndjango\n")
+        .edge_after(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: `django` leaves the root `requirements.txt`: its routes go.
+pub fn python_django_requirement_leaves() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("requirements.txt", "requests\ndjango\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("requirements.txt", "requests\n")
+        .edge_before(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: a root `manage.py` appears: Django is detected.
+pub fn python_django_manage_py_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("manage.py", "import sys\n")
+        .edge_after(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: the root `manage.py` is deleted: Django is no longer detected.
+pub fn python_django_manage_py_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .remove("manage.py")
+        .edge_before(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+/// W7-19b: a URLconf gains a `path(…)`.
+pub fn python_django_urlconf_gains_a_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("shop/urls.py", DJANGO_URLS_TWO)
+        .edge_throughout(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+        .edge_after(DJANGO_ORDERS_ROUTE, "references", "function order_list")
+}
+
+/// W7-19b: a URLconf loses a `path(…)`.
+pub fn python_django_urlconf_loses_a_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("shop/urls.py", DJANGO_URLS_TWO)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("shop/urls.py", DJANGO_URLS)
+        .edge_before(DJANGO_ORDERS_ROUTE, "references", "function order_list")
+        .edge_throughout(DJANGO_PRODUCTS_ROUTE, "references", "function product_list")
+}
+
+const DJANGO_ROOT_URLS: &str = "from django.urls import path, include\n\nurlpatterns = [\n    path(\"shop/\", include(\"shop.urls\")),\n]\n";
+
+const DJANGO_INCLUDE_ROUTE: &str = "route config/urls.py::route:shop/";
+
+/// W7-19b: the URLconf an `include('shop.urls')` imports is deleted.
+pub fn python_django_included_urlconf_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("config/urls.py", DJANGO_ROOT_URLS)
+        .file("shop/urls.py", DJANGO_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .remove("shop/urls.py")
+        .edge_before(DJANGO_INCLUDE_ROUTE, "imports", "file:shop/urls.py")
+}
+
+/// W7-19b: the URLconf an `include('shop.urls')` imports comes back: the
+/// include is resolved again (#2392's import retry, by the name's tail).
+pub fn python_django_included_urlconf_reappears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("config/urls.py", DJANGO_ROOT_URLS)
+        .file("shop/views.py", DJANGO_VIEWS)
+        .write("shop/urls.py", DJANGO_URLS)
+        .edge_after(DJANGO_INCLUDE_ROUTE, "imports", "file:shop/urls.py")
+}
+
+const FLASK_HELLO: &str = "from flask import Blueprint\n\nbp = Blueprint(\"web\", __name__)\n\n\n@bp.route(\"/hello\")\ndef hello():\n    return \"hi\"\n";
+
+/// W7-19b: `flask` comes into the root `Pipfile`, which no index holds.
+pub fn python_flask_dependency_appears_in_pipfile() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("Pipfile", "[packages]\nrequests = \"*\"\n")
+        .file("web/views.py", FLASK_HELLO)
+        .write("Pipfile", "[packages]\nrequests = \"*\"\nflask = \"*\"\n")
+        .edge_after(
+            "route web/views.py::GET:/hello",
+            "references",
+            "function hello",
+        )
+}
+
+/// W7-19b: `flask` leaves the root `Pipfile`.
+pub fn python_flask_dependency_leaves_pipfile() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file("Pipfile", "[packages]\nrequests = \"*\"\nflask = \"*\"\n")
+        .file("web/views.py", FLASK_HELLO)
+        .write("Pipfile", "[packages]\nrequests = \"*\"\n")
+        .edge_before(
+            "route web/views.py::GET:/hello",
+            "references",
+            "function hello",
+        )
+}
+
+const FLASK_PING: &str = "from flask import Blueprint\n\nbp = Blueprint(\"web\", __name__)\n\n\ndef ping():\n    return \"pong\"\n";
+
+const FLASK_PING_RULE: &str = "from flask import Blueprint\n\nbp = Blueprint(\"web\", __name__)\n\n\ndef ping():\n    return \"pong\"\n\n\nbp.add_url_rule(\"/ping\", view_func=ping)\n";
+
+/// W7-19b: an `add_url_rule(…, view_func=…)` appears (#2154).
+pub fn python_flask_url_rule_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "flask\n")
+        .file("web/views.py", FLASK_PING)
+        .write("web/views.py", FLASK_PING_RULE)
+        .edge_after(
+            "route web/views.py::GET:/ping",
+            "references",
+            "function ping",
+        )
+}
+
+/// W7-19b: the `add_url_rule` goes away again.
+pub fn python_flask_url_rule_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "flask\n")
+        .file("web/views.py", FLASK_PING_RULE)
+        .write("web/views.py", FLASK_PING)
+        .edge_before(
+            "route web/views.py::GET:/ping",
+            "references",
+            "function ping",
+        )
+}
+
+const FLASK_LOGIN: &str = "from flask import Blueprint\nfrom flask.views import MethodView\nfrom web.helpers import register_view\n\nbp = Blueprint(\"auth\", __name__)\n\n\nclass Login(MethodView):\n    def get(self):\n        return \"form\"\n\n\nregister_view(bp, routes=[\"/login\"], view_func=Login.as_view(\"login\"))\n";
+
+const FLASK_LOGIN_SIGNIN: &str = "from flask import Blueprint\nfrom flask.views import MethodView\nfrom web.helpers import register_view\n\nbp = Blueprint(\"auth\", __name__)\n\n\nclass Login(MethodView):\n    def get(self):\n        return \"form\"\n\n\nregister_view(bp, routes=[\"/login\", \"/signin\"], view_func=Login.as_view(\"login\"))\n";
+
+const FLASK_HELPERS: &str = "def register_view(bp_or_app, routes, view_func, **kwargs):\n    for route in routes:\n        bp_or_app.add_url_rule(route, view_func=view_func, **kwargs)\n";
+
+/// W7-19b: a wrapper's list of paths gains one (#2154, flaskbb's
+/// `register_view`).
+pub fn python_flask_register_view_gains_a_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "flask\n")
+        .file("web/helpers.py", FLASK_HELPERS)
+        .file("web/auth.py", FLASK_LOGIN)
+        .write("web/auth.py", FLASK_LOGIN_SIGNIN)
+        .edge_throughout("route web/auth.py::ANY:/login", "references", "class Login")
+        .edge_after(
+            "route web/auth.py::ANY:/signin",
+            "references",
+            "class Login",
+        )
+}
+
+const FASTAPI_ITEMS: &str = "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n@router.get(\"/items\")\ndef list_items():\n    return []\n\n\ndef find_items():\n    return []\n";
+
+const FASTAPI_ITEMS_FIND: &str = "from fastapi import APIRouter\n\nrouter = APIRouter()\n\n\n@router.get(\"/items\")\ndef find_items():\n    return []\n\n\ndef list_items():\n    return []\n";
+
+const FASTAPI_MAIN: &str = "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router)\n";
+
+const FASTAPI_MAIN_MOUNT: &str = "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router, prefix=\"/api\")\n";
+
+const FASTAPI_ITEMS_ROUTE: &str = "route svc/items.py::GET:/items";
+
+/// W7-19b: `fastapi` comes into the root `pyproject.toml`, which no index
+/// holds (no script of the project calls `FastAPI(`).
+pub fn python_fastapi_dependency_appears_in_pyproject() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = []\n",
+        )
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = [\"fastapi\"]\n",
+        )
+        .edge_after(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: `fastapi` leaves the root `pyproject.toml`.
+pub fn python_fastapi_dependency_leaves_pyproject() -> Case {
+    Case::new(Change::ControlFile, &[Language::Python])
+        .file(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = [\"fastapi\"]\n",
+        )
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "pyproject.toml",
+            "[project]\nname = \"svc\"\ndependencies = []\n",
+        )
+        .edge_before(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: a mount gains a prefix (upstream `postExtract`, `bc45e907`): the
+/// mounted router's route is renamed, though its file did not change.
+pub fn python_fastapi_mount_gains_a_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /api/items")
+        .edge_throughout(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: the mount loses its prefix: a route an earlier sync renamed gets
+/// its in-file name back, as a fresh index names it.
+pub fn python_fastapi_mount_loses_its_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/main.py", FASTAPI_MAIN)
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /items")
+        .edge_throughout(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+/// W7-19b: the mount's prefix changes.
+pub fn python_fastapi_mount_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "svc/main.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router, prefix=\"/v2\")\n",
+        )
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /v2/items")
+}
+
+/// W7-19b: the prefix becomes computed: unknown, so the route gets its
+/// in-file name back.
+pub fn python_fastapi_mount_prefix_becomes_computed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "svc/main.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\napp = FastAPI()\napp.include_router(router, prefix=settings.API)\n",
+        )
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /items")
+}
+
+/// W7-19b: a second file mounts the same router at another path: one name
+/// cannot be two paths, so the route gets its in-file name back.
+pub fn python_fastapi_second_mount_of_a_router_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write(
+            "svc/admin.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\nadmin = FastAPI()\nadmin.include_router(router, prefix=\"/admin\")\n",
+        )
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /items")
+}
+
+/// W7-19b: the second mount goes away again.
+pub fn python_fastapi_second_mount_of_a_router_is_deleted() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .file(
+            "svc/admin.py",
+            "from fastapi import FastAPI\nfrom .items import router\n\nadmin = FastAPI()\nadmin.include_router(router, prefix=\"/admin\")\n",
+        )
+        .remove("svc/admin.py")
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /api/items")
+}
+
+const FASTAPI_OWN_PREFIX: &str = "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/items\")\n\n\n@router.get(\"\")\ndef list_items():\n    return []\n";
+
+/// W7-19b: a router's own `APIRouter(prefix=…)` changes, in the route's own
+/// file.
+pub fn python_fastapi_router_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/items.py", FASTAPI_OWN_PREFIX)
+        .write(
+            "svc/items.py",
+            "from fastapi import APIRouter\n\nrouter = APIRouter(prefix=\"/things\")\n\n\n@router.get(\"\")\ndef list_items():\n    return []\n",
+        )
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /things")
+        .edge_throughout("route svc/items.py::GET:", "references", "function list_items")
+}
+
+const FASTAPI_V1: &str = "from fastapi import APIRouter\nfrom .items import router as items_router\n\napi_router = APIRouter()\n";
+
+const FASTAPI_V1_INCLUDES: &str = "from fastapi import APIRouter\nfrom .items import router as items_router\n\napi_router = APIRouter()\napi_router.include_router(items_router)\n";
+
+const FASTAPI_MAIN_V1: &str = "from fastapi import FastAPI\nfrom .v1 import api_router\n\napp = FastAPI()\napp.include_router(api_router, prefix=\"/api/v1\")\n";
+
+/// W7-19b: an aggregate router comes to include a router through an alias
+/// import, and is mounted at a prefix: two levels compose.
+pub fn python_fastapi_alias_import_mount_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_V1)
+        .file("svc/v1.py", FASTAPI_V1)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/v1.py", FASTAPI_V1_INCLUDES)
+        .named_before("route", "GET /items")
+        .named_after("route", "GET /api/v1/items")
+}
+
+/// W7-19b: the aggregate router no longer includes it.
+pub fn python_fastapi_alias_import_mount_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_V1)
+        .file("svc/v1.py", FASTAPI_V1_INCLUDES)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/v1.py", FASTAPI_V1)
+        .named_before("route", "GET /api/v1/items")
+        .named_after("route", "GET /items")
+}
+
+/// W7-19b: the mounted router's handler changes: its re-extracted route is
+/// renamed again under the unchanged mount.
+pub fn python_fastapi_mounted_handler_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("requirements.txt", "fastapi\n")
+        .file("svc/main.py", FASTAPI_MAIN_MOUNT)
+        .file("svc/items.py", FASTAPI_ITEMS)
+        .write("svc/items.py", FASTAPI_ITEMS_FIND)
+        .named_before("route", "GET /api/items")
+        .named_after("route", "GET /api/items")
+        .edge_before(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+        .edge_after(FASTAPI_ITEMS_ROUTE, "references", "function find_items")
+        .no_edge_after(FASTAPI_ITEMS_ROUTE, "references", "function list_items")
+}
+
+const MODEL_ARTICLE: &str = "class Article:\n    pass\n";
+
+/// A function named like the model: the name matcher sees two candidates,
+/// so the model's edge is the heuristic's.
+const HELPER_ARTICLE: &str = "def Article():\n    return None\n";
+
+const MAKE_ARTICLE: &str = "def make():\n    return Article()\n";
+
+const MAKE_INSTANTIATES: (&str, &str) = ("function make", "instantiates");
+
+/// W7-19b (#2225): a namesake of the model appears in the referencing file's
+/// directory, a tier before the models folder: Django's pick moves to it.
+pub fn python_django_model_gains_a_namesake_in_the_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .write("api/article.py", MODEL_ARTICLE)
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @api/article.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225): the namesake leaves the directory again.
+pub fn python_django_model_loses_its_namesake_in_the_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .file("api/article.py", MODEL_ARTICLE)
+        .remove("api/article.py")
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @api/article.py",
+            ),
+            "framework",
+            "django",
+        )
+        .edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225, KEEP-RUST): a second model of the name appears in the
+/// pick's tier: Django proposes nothing, and the reference is left to the
+/// other strategies.
+pub fn python_django_model_gains_a_second_candidate_in_its_tier() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .write("shop/models.py", MODEL_ARTICLE)
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @shop/models.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225): the second model goes away: the pick is Django's again.
+pub fn python_django_model_loses_its_second_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("shop/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .remove("shop/models.py")
+        .edge_metadata_after(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+}
+
+/// W7-19b (#2225): the model moves into a function's body, out of every
+/// other file's reach.
+pub fn python_django_model_moves_into_a_function_body() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .write(
+            "blog/models.py",
+            "def build():\n    class Article:\n        pass\n    return Article\n",
+        )
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_after(
+            MAKE_INSTANTIATES.0,
+            MAKE_INSTANTIATES.1,
+            "class build::Article @blog/models.py",
+        )
+}
+
+/// W7-19b (#2225): the model moves under `tests/`, out of reach of code
+/// that is no test.
+pub fn python_django_model_moves_under_tests() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("manage.py", "import sys\n")
+        .file("blog/models.py", MODEL_ARTICLE)
+        .file("lib/helpers.py", HELPER_ARTICLE)
+        .file("api/views.py", MAKE_ARTICLE)
+        .rename("blog/models.py", "tests/models.py")
+        .edge_metadata_before(
+            (
+                MAKE_INSTANTIATES.0,
+                MAKE_INSTANTIATES.1,
+                "class Article @blog/models.py",
+            ),
+            "framework",
+            "django",
+        )
+        .no_edge_after(
+            MAKE_INSTANTIATES.0,
+            MAKE_INSTANTIATES.1,
+            "class Article @tests/models.py",
+        )
+}
+
+// --- W7-19c: Spring and Play (upstream `java.ts`, `play.ts` at e8ddc4e2) ---
+
+/// A root `pom.xml` naming no framework.
+const PLAIN_POM: &str = "<project><artifactId>app</artifactId></project>\n";
+
+/// A root `pom.xml` naming Spring Boot.
+const SPRING_POM: &str = "<project><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></project>\n";
+
+/// A root `build.gradle` naming no framework, and one naming Spring Boot.
+const PLAIN_GRADLE: &str = "plugins {\n    id 'java'\n}\n";
+const SPRING_GRADLE: &str = "plugins {\n    id 'java'\n}\n\ndependencies {\n    implementation 'org.springframework.boot:spring-boot-starter-web'\n}\n";
+
+const SPRING_CONTROLLER_FILE: &str = "src/main/java/demo/HelloController.java";
+
+/// A controller under a class prefix, without an annotation the annotation
+/// scan reads (`@RestController`, `@Service`, …): only a build file shows
+/// Spring.
+const SPRING_CONTROLLER: &str = "package demo;\n\n@RequestMapping(\"/api\")\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+const SPRING_HELLO_ROUTE: &str = "route src/main/java/demo/HelloController.java::route:/api/hello";
+const SPRING_HELLO: &str = "method demo::HelloController::hello";
+
+/// W7-19c: the root `build.gradle`, which is never indexed, comes to name
+/// Spring Boot: the `jvm` control kind has the sync detect the frameworks,
+/// so the controller's routes appear.
+pub fn java_spring_build_gradle_gains_spring_boot() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("build.gradle", PLAIN_GRADLE)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("build.gradle", SPRING_GRADLE)
+        .edge_after(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: Spring Boot leaves the root `build.gradle`: the routes go.
+pub fn java_spring_build_gradle_drops_spring_boot() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("build.gradle", SPRING_GRADLE)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("build.gradle", PLAIN_GRADLE)
+        .edge_before(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: the root `pom.xml` comes to name the Spring Framework.
+pub fn java_spring_pom_gains_springframework() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("pom.xml", PLAIN_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("pom.xml", SPRING_POM)
+        .edge_after(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: the Spring Framework leaves the root `pom.xml`.
+pub fn java_spring_pom_drops_springframework() -> Case {
+    Case::new(Change::ControlFile, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write("pom.xml", PLAIN_POM)
+        .edge_before(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+const USER_SERVICE_FILE: &str = "src/main/java/demo/UserService.java";
+const PLAIN_USER_SERVICE: &str = "package demo;\n\npublic class UserService {}\n";
+const ANNOTATED_USER_SERVICE: &str = "package demo;\n\n@Service\npublic class UserService {}\n";
+
+/// W7-19c: with no build file naming it, Spring is detected by an
+/// annotation of a `.java` file: one gaining `@Service` brings every
+/// controller's routes.
+pub fn java_spring_service_annotation_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", PLAIN_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .file(USER_SERVICE_FILE, PLAIN_USER_SERVICE)
+        .write(USER_SERVICE_FILE, ANNOTATED_USER_SERVICE)
+        .edge_after(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: the only `@Service` goes: Spring is no longer detected.
+pub fn java_spring_service_annotation_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", PLAIN_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .file(USER_SERVICE_FILE, ANNOTATED_USER_SERVICE)
+        .write(USER_SERVICE_FILE, PLAIN_USER_SERVICE)
+        .edge_before(SPRING_HELLO_ROUTE, "references", SPRING_HELLO)
+}
+
+/// W7-19c: [`SPRING_CONTROLLER`] with its mapping path changed.
+const SPRING_CONTROLLER_HI: &str = "package demo;\n\n@RequestMapping(\"/api\")\npublic class HelloController {\n    @GetMapping(\"/hi\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+/// W7-19c: [`SPRING_CONTROLLER`] under another class prefix.
+const SPRING_CONTROLLER_V2: &str = "package demo;\n\n@RequestMapping(\"/v2\")\npublic class HelloController {\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+/// W7-19c: a route's mapping path changes: its node is renamed in place.
+pub fn java_spring_mapping_path_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER_HI)
+        .named_before("route", "GET /api/hello")
+        .named_after("route", "GET /api/hi")
+}
+
+/// W7-19c: the class prefix changes.
+pub fn java_spring_class_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER)
+        .write(SPRING_CONTROLLER_FILE, SPRING_CONTROLLER_V2)
+        .named_before("route", "GET /api/hello")
+        .named_after("route", "GET /v2/hello")
+}
+
+/// W7-19c: a controller whose class prefix is a constant of its file.
+const SPRING_CONSTANT_PREFIX: &str = "package demo;\n\n@RequestMapping(BASE)\npublic class HelloController {\n    static final String BASE = \"/api\";\n\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+const SPRING_CONSTANT_PREFIX_V3: &str = "package demo;\n\n@RequestMapping(BASE)\npublic class HelloController {\n    static final String BASE = \"/v3\";\n\n    @GetMapping(\"/hello\")\n    public String hello() {\n        return \"hi\";\n    }\n}\n";
+
+/// W7-19c: the constant the class prefix names changes its value.
+pub fn java_spring_prefix_constant_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(SPRING_CONTROLLER_FILE, SPRING_CONSTANT_PREFIX)
+        .write(SPRING_CONTROLLER_FILE, SPRING_CONSTANT_PREFIX_V3)
+        .named_before("route", "GET /api/hello")
+        .named_after("route", "GET /v3/hello")
+}
+
+const JWT_UTIL_FILE: &str = "src/main/java/demo/JwtUtil.java";
+
+/// Two `@Value` bindings.
+const JWT_UTIL: &str = "package demo;\n\npublic class JwtUtil {\n    @Value(\"${jwt.secret}\")\n    private String secret;\n    @Value(\"${jwt.tokenHead}\")\n    private String head;\n}\n";
+
+const JWT_SECRET_BINDING: &str = "constant src/main/java/demo/JwtUtil.java::@Value:jwt.secret";
+const JWT_HEAD_BINDING: &str = "constant src/main/java/demo/JwtUtil.java::@Value:jwt.tokenHead";
+const APP_YML: &str = "src/main/resources/application.yml";
+const DEV_YML: &str = "src/main/resources/application-dev.yml";
+const APP_PROPERTIES: &str = "src/main/resources/application.properties";
+const JWT_SECRET_BASE: &str = "constant jwt.secret @src/main/resources/application.yml";
+const JWT_SECRET_DEV: &str = "constant jwt.secret @src/main/resources/application-dev.yml";
+
+/// W7-19c: `application.yml` gains the key a binding names: the binding is
+/// linked to it.
+pub fn java_spring_config_key_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  token-head: Bearer\n")
+        .write(APP_YML, "jwt:\n  token-head: Bearer\n  secret: s\n")
+        .edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+}
+
+/// W7-19c: the key goes: the binding is left unresolved, never linked to
+/// itself.
+pub fn java_spring_config_key_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  token-head: Bearer\n  secret: s\n")
+        .write(APP_YML, "jwt:\n  token-head: Bearer\n")
+        .edge_before(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+        .no_edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_BINDING)
+}
+
+/// W7-19c: a key changes its relaxed spelling: the binding follows it.
+pub fn java_spring_config_key_changes_its_relaxed_spelling() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  token-head: Bearer\n")
+        .write(APP_YML, "jwt:\n  token_head: Bearer\n")
+        .edge_before(JWT_HEAD_BINDING, "references", "constant jwt.token-head")
+        .edge_after(JWT_HEAD_BINDING, "references", "constant jwt.token_head")
+}
+
+/// W7-19c: the base file gains a key a profile file defined alone: the
+/// binding moves to the base file's, at 0.75.
+pub fn java_spring_config_key_appears_in_the_base_file_beside_a_profile() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(DEV_YML, "jwt:\n  secret: d\n")
+        .write(APP_YML, "jwt:\n  secret: s\n")
+        .edge_before(JWT_SECRET_BINDING, "references", JWT_SECRET_DEV)
+        .edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+}
+
+/// W7-19c: a profile file gains the base file's key: the binding stays,
+/// at 0.75.
+pub fn java_spring_config_key_appears_in_a_profile_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(JWT_UTIL_FILE, JWT_UTIL)
+        .file(APP_YML, "jwt:\n  secret: s\n")
+        .write(DEV_YML, "jwt:\n  secret: d\n")
+        .edge_throughout(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+}
+
+/// W7-19c: the base file goes: the binding moves to the profile file's
+/// key, at 0.9.
+pub fn java_spring_config_base_file_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Java, Language::Yaml],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(JWT_UTIL_FILE, JWT_UTIL)
+    .file(APP_YML, "jwt:\n  secret: s\n")
+    .file(DEV_YML, "jwt:\n  secret: d\n")
+    .remove(APP_YML)
+    .edge_before(JWT_SECRET_BINDING, "references", JWT_SECRET_BASE)
+    .edge_after(JWT_SECRET_BINDING, "references", JWT_SECRET_DEV)
+}
+
+const PORTAL_JWT_UTIL_FILE: &str = "portal/src/main/java/demo/JwtUtil.java";
+const PORTAL_JWT_SECRET_BINDING: &str =
+    "constant portal/src/main/java/demo/JwtUtil.java::@Value:jwt.secret";
+const ADMIN_YML: &str = "admin/src/main/resources/application.yml";
+const PORTAL_YML: &str = "portal/src/main/resources/application.yml";
+const JWT_SECRET_ADMIN: &str = "constant jwt.secret @admin/src/main/resources/application.yml";
+const JWT_SECRET_PORTAL: &str = "constant jwt.secret @portal/src/main/resources/application.yml";
+
+/// W7-19c: a module gains its own `application.yml` defining the key that
+/// another module's defines alike: the module's binding moves to its own
+/// (KNOWN_DIFFS; upstream takes its store's first).
+pub fn java_spring_module_gains_its_own_config_key() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(PORTAL_JWT_UTIL_FILE, JWT_UTIL)
+        .file(ADMIN_YML, "jwt:\n  secret: a\n")
+        .write(PORTAL_YML, "jwt:\n  secret: p\n")
+        .edge_before(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_ADMIN)
+        .edge_after(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_PORTAL)
+}
+
+/// W7-19c: the module's own `application.yml` goes: the binding moves
+/// back to the other module's key.
+pub fn java_spring_module_loses_its_own_config_key() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Java, Language::Yaml],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(PORTAL_JWT_UTIL_FILE, JWT_UTIL)
+    .file(ADMIN_YML, "jwt:\n  secret: a\n")
+    .file(PORTAL_YML, "jwt:\n  secret: p\n")
+    .remove(PORTAL_YML)
+    .edge_before(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_PORTAL)
+    .edge_after(PORTAL_JWT_SECRET_BINDING, "references", JWT_SECRET_ADMIN)
+}
+
+const CACHE_PROPS_FILE: &str = "src/main/java/demo/CacheProps.java";
+const CACHE_PROPS: &str = "package demo;\n\n@ConfigurationProperties(prefix = \"app.cache\")\npublic class CacheProps {}\n";
+const CACHE_BINDING: &str =
+    "constant src/main/java/demo/CacheProps.java::@ConfigurationProperties:app.cache";
+const CACHE_LONG: &str = "app:\n  cache:\n    name:\n      user-token: u\n";
+const CACHE_SHORT: &str = "app:\n  cache:\n    ttl: 60\n    name:\n      user-token: u\n";
+
+/// W7-19c: the prefix's subtree gains a shorter key: the binding moves to
+/// it.
+pub fn java_spring_configuration_properties_gains_a_shorter_key() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(CACHE_PROPS_FILE, CACHE_PROPS)
+        .file(APP_YML, CACHE_LONG)
+        .write(APP_YML, CACHE_SHORT)
+        .edge_before(
+            CACHE_BINDING,
+            "references",
+            "constant app.cache.name.user-token",
+        )
+        .edge_after(CACHE_BINDING, "references", "constant app.cache.ttl")
+}
+
+/// W7-19c: the shorter key goes again.
+pub fn java_spring_configuration_properties_loses_its_shorter_key() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java, Language::Yaml])
+        .file("pom.xml", SPRING_POM)
+        .file(CACHE_PROPS_FILE, CACHE_PROPS)
+        .file(APP_YML, CACHE_SHORT)
+        .write(APP_YML, CACHE_LONG)
+        .edge_before(CACHE_BINDING, "references", "constant app.cache.ttl")
+        .edge_after(
+            CACHE_BINDING,
+            "references",
+            "constant app.cache.name.user-token",
+        )
+}
+
+/// W7-19c: an `application.properties` key comes to be the one a binding
+/// names.
+pub fn java_spring_properties_key_is_renamed_to_a_binding() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Java, Language::Properties],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(JWT_UTIL_FILE, JWT_UTIL)
+    .file(APP_PROPERTIES, "jwt.secrets=s\n")
+    .write(APP_PROPERTIES, "jwt.secret=s\n")
+    .edge_after(
+        JWT_SECRET_BINDING,
+        "references",
+        "constant jwt.secret @src/main/resources/application.properties",
+    )
+}
+
+/// W7-19c: the key is renamed away again.
+pub fn java_spring_properties_key_is_renamed_away_from_a_binding() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Java, Language::Properties],
+    )
+    .file("pom.xml", SPRING_POM)
+    .file(JWT_UTIL_FILE, JWT_UTIL)
+    .file(APP_PROPERTIES, "jwt.secret=s\n")
+    .write(APP_PROPERTIES, "jwt.secrets=s\n")
+    .edge_before(
+        JWT_SECRET_BINDING,
+        "references",
+        "constant jwt.secret @src/main/resources/application.properties",
+    )
+}
+
+/// One package's controller and `UserService`s: the Service convention
+/// prefers the one under `/service/` to the one under `/legacy/`.
+const USER_CONTROLLER_FILE: &str = "src/main/java/demo/web/UserController.java";
+const USER_CONTROLLER: &str =
+    "package demo;\n\npublic class UserController {\n    private UserService users;\n}\n";
+const DEMO_USER_SERVICE: &str = "package demo;\n\npublic class UserService {}\n";
+const SERVICE_USER_SERVICE: &str = "src/main/java/demo/service/UserService.java";
+const LEGACY_USER_SERVICE: &str = "src/main/java/demo/legacy/UserService.java";
+const IMPL_USER_SERVICE: &str = "src/main/java/demo/service/impl/UserService.java";
+const USERS_PICK: (&str, &str, &str) = (
+    "field demo::UserController::users",
+    "references",
+    "class demo::UserService @src/main/java/demo/service/UserService.java",
+);
+
+/// W7-19c: a second `UserService` appears in the tier the Service
+/// convention prefers: its pick declines, and the conventions stop there
+/// rather than guess again by the entity rule (KNOWN_DIFFS).
+pub fn java_spring_service_convention_gains_a_second_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(USER_CONTROLLER_FILE, USER_CONTROLLER)
+        .file(SERVICE_USER_SERVICE, DEMO_USER_SERVICE)
+        .file(LEGACY_USER_SERVICE, DEMO_USER_SERVICE)
+        .write(IMPL_USER_SERVICE, DEMO_USER_SERVICE)
+        .edge_metadata_before(USERS_PICK, "framework", "spring")
+        .no_edge_metadata_after(USERS_PICK, "framework", "spring")
+}
+
+/// W7-19c: the second `UserService` of the tier goes again: the
+/// convention picks the one left.
+pub fn java_spring_service_convention_loses_its_second_candidate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(USER_CONTROLLER_FILE, USER_CONTROLLER)
+        .file(SERVICE_USER_SERVICE, DEMO_USER_SERVICE)
+        .file(LEGACY_USER_SERVICE, DEMO_USER_SERVICE)
+        .file(IMPL_USER_SERVICE, DEMO_USER_SERVICE)
+        .remove(IMPL_USER_SERVICE)
+        .edge_metadata_after(USERS_PICK, "framework", "spring")
+}
+
+/// A Play controller, and a Scala call through its class name, which is
+/// no routes line: the qualified name match's, Play detected or not.
+const PLAY_HOME: &str = "package controllers\n\nclass HomeController {\n  def index(): Int = 1\n  def about(): Int = 2\n}\n";
+const PLAY_BOOT: &str =
+    "package boot\n\nobject Boot {\n  def run(): Int = HomeController.index()\n}\n";
+const PLAY_HOME_FILE: &str = "app/controllers/HomeController.scala";
+const PLAY_INDEX: &str = "method HomeController::index";
+const PLAY_BOOT_CALL: (&str, &str, &str) = ("method Boot::run", "calls", PLAY_INDEX);
+const PLAY_SBT: &str = "lazy val root = (project in file(\".\")).enablePlugins(PlayScala)\n";
+
+/// W7-19c: the root `build.sbt`, never indexed, comes to name Play: Play
+/// is detected, and leaves the Scala `Controller.action` call alone.
+pub fn scala_play_build_sbt_gains_play_scala() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("build.sbt", "name := \"app\"\n")
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .write("build.sbt", PLAY_SBT)
+        .detected_before("play", false)
+        .detected_after("play", true)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+        .no_edge_metadata_after(PLAY_BOOT_CALL, "framework", "play")
+}
+
+/// W7-19c: Play leaves the root `build.sbt`.
+pub fn scala_play_build_sbt_drops_play_scala() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("build.sbt", PLAY_SBT)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .write("build.sbt", "name := \"app\"\n")
+        .detected_before("play", true)
+        .detected_after("play", false)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+}
+
+/// W7-19c: a root `conf/application.conf`, never indexed, appears.
+pub fn scala_play_application_conf_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .write(
+            "conf/application.conf",
+            "play.http.secret.key = \"changeme\"\n",
+        )
+        .detected_before("play", false)
+        .detected_after("play", true)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+        .no_edge_metadata_after(PLAY_BOOT_CALL, "framework", "play")
+}
+
+/// W7-19c: the root `conf/application.conf` is deleted.
+pub fn scala_play_application_conf_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file(
+            "conf/application.conf",
+            "play.http.secret.key = \"changeme\"\n",
+        )
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/boot/Boot.scala", PLAY_BOOT)
+        .remove("conf/application.conf")
+        .detected_before("play", true)
+        .detected_after("play", false)
+        .edge_throughout(PLAY_BOOT_CALL.0, PLAY_BOOT_CALL.1, PLAY_BOOT_CALL.2)
+}
+
+const PLAY_ROUTES: &str = "GET / controllers.HomeController.index\n";
+const PLAY_ROUTES_ABOUT: &str =
+    "GET / controllers.HomeController.index\nGET /about controllers.HomeController.about\n";
+
+/// W7-19c: a project in a subdirectory gains its `conf/routes` (#2156):
+/// Play is detected and the routes link to their actions.
+pub fn scala_play_routes_file_appears_in_a_subproject() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("web/app/controllers/HomeController.scala", PLAY_HOME)
+        .write("web/conf/routes", PLAY_ROUTES)
+        .edge_after("route web/conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the subproject's `conf/routes` is deleted.
+pub fn scala_play_routes_file_in_a_subproject_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Scala])
+        .file("web/app/controllers/HomeController.scala", PLAY_HOME)
+        .file("web/conf/routes", PLAY_ROUTES)
+        .remove("web/conf/routes")
+        .edge_before("route web/conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the routes file gains a line.
+pub fn scala_play_routes_gains_a_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write("conf/routes", PLAY_ROUTES_ABOUT)
+        .edge_after(
+            "route conf/routes::GET:/about",
+            "references",
+            "method HomeController::about",
+        )
+}
+
+/// W7-19c: the routes file loses the line again.
+pub fn scala_play_routes_loses_a_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES_ABOUT)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write("conf/routes", PLAY_ROUTES)
+        .edge_before(
+            "route conf/routes::GET:/about",
+            "references",
+            "method HomeController::about",
+        )
+}
+
+const PLAY_NEAR_JAVA_FILE: &str = "web/app/controllers/HomeController.java";
+const PLAY_NEAR_JAVA: &str = "package controllers;\n\npublic class HomeController {\n    public int index() {\n        return 1;\n    }\n}\n";
+const PLAY_INDEX_FAR: &str = "method HomeController::index @app/controllers/HomeController.scala";
+const PLAY_INDEX_NEAR: &str =
+    "method controllers::HomeController::index @web/app/controllers/HomeController.java";
+
+/// W7-19c: a controller of the name appears nearer the routes file: the
+/// route moves to it (KNOWN_DIFFS: upstream takes its store's first).
+pub fn scala_play_nearer_controller_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Scala, Language::Java])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(PLAY_NEAR_JAVA_FILE, PLAY_NEAR_JAVA)
+        .edge_before("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+        .edge_after(
+            "route web/conf/routes::GET:/",
+            "references",
+            PLAY_INDEX_NEAR,
+        )
+}
+
+/// W7-19c: the nearer controller goes: the route moves back.
+pub fn scala_play_nearer_controller_is_deleted() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Scala, Language::Java])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file(PLAY_NEAR_JAVA_FILE, PLAY_NEAR_JAVA)
+        .remove(PLAY_NEAR_JAVA_FILE)
+        .edge_before(
+            "route web/conf/routes::GET:/",
+            "references",
+            PLAY_INDEX_NEAR,
+        )
+        .edge_after("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+}
+
+/// W7-19c: the action is renamed: the route is left unresolved.
+pub fn scala_play_action_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(
+            PLAY_HOME_FILE,
+            "package controllers\n\nclass HomeController {\n  def start(): Int = 1\n  def about(): Int = 2\n}\n",
+        )
+        .edge_before("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the action is deleted.
+pub fn scala_play_action_is_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(
+            PLAY_HOME_FILE,
+            "package controllers\n\nclass HomeController {\n  def about(): Int = 2\n}\n",
+        )
+        .edge_before("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+const PLAY_MAIN: &str = "package controllers\n\nclass MainController {\n  def index(): Int = 1\n  def about(): Int = 2\n}\n";
+
+/// W7-19c: the controller class is renamed: the route is left unresolved.
+pub fn scala_play_controller_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .write(PLAY_HOME_FILE, PLAY_MAIN)
+        .edge_before("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: the class is renamed back: the route links again.
+pub fn scala_play_controller_is_renamed_back() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Scala])
+        .file("conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_MAIN)
+        .write(PLAY_HOME_FILE, PLAY_HOME)
+        .edge_after("route conf/routes::GET:/", "references", PLAY_INDEX)
+}
+
+/// W7-19c: a routes file moves into another project's directory: its
+/// route moves to that project's controller.
+pub fn scala_play_routes_file_moves_into_another_project() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Scala])
+        .file("a/conf/routes", PLAY_ROUTES)
+        .file("a/app/controllers/HomeController.scala", PLAY_HOME)
+        .file("b/app/controllers/HomeController.scala", PLAY_HOME)
+        .rename("a/conf/routes", "b/conf/routes")
+        .edge_before(
+            "route a/conf/routes::GET:/",
+            "references",
+            "method HomeController::index @a/app/controllers/HomeController.scala",
+        )
+        .edge_after(
+            "route b/conf/routes::GET:/",
+            "references",
+            "method HomeController::index @b/app/controllers/HomeController.scala",
+        )
+}
+
+const KOTLIN_INDEX: &str = "package controllers\n\nfun index(): Int = 1\n";
+const KOTLIN_INDEX_AND_CLASS: &str =
+    "package controllers\n\nfun index(): Int = 1\n\nclass HomeController\n";
+
+/// W7-19c: a Kotlin file whose function `index` was already there gains
+/// only a class `HomeController`: nearer the routes file, it takes the
+/// route, though no `index` changed.
+pub fn kotlin_play_class_joins_an_existing_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala, Language::Kotlin])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("web/app/controllers/Home.kt", KOTLIN_INDEX)
+        .write("web/app/controllers/Home.kt", KOTLIN_INDEX_AND_CLASS)
+        .edge_before("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+        .edge_after(
+            "route web/conf/routes::GET:/",
+            "references",
+            "function controllers::index @web/app/controllers/Home.kt",
+        )
+}
+
+/// W7-19c: the same at the depth of the controller the route links to:
+/// two candidates tie, so Play declines, and the route is left unresolved
+/// (KNOWN_DIFFS: no other strategy guesses a routes line).
+pub fn kotlin_play_class_joins_an_action_at_the_same_depth() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Scala, Language::Kotlin])
+        .file("web/conf/routes", PLAY_ROUTES)
+        .file(PLAY_HOME_FILE, PLAY_HOME)
+        .file("app/controllers/Home.kt", KOTLIN_INDEX)
+        .write("app/controllers/Home.kt", KOTLIN_INDEX_AND_CLASS)
+        .edge_metadata_before(
+            ("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR),
+            "framework",
+            "play",
+        )
+        .no_edge_after("route web/conf/routes::GET:/", "references", PLAY_INDEX_FAR)
+        .no_edge_after(
+            "route web/conf/routes::GET:/",
+            "references",
+            "function controllers::index @app/controllers/Home.kt",
+        )
+}
+
+/// More routes naming one `Controller.action` no class answers than the
+/// name lane's per-tail ceiling retries.
+static PLAY_PARKED_ROUTES: LazyLock<String> = LazyLock::new(|| {
+    (0..600)
+        .map(|index| format!("GET /p{index} controllers.Missing.go\n"))
+        .collect()
+});
+
+/// W7-19c: a class appears that 600 parked routes name: all of them link,
+/// past the name lane's per-tail ceiling.
+pub fn scala_play_parked_routes_reach_an_added_controller_past_the_tail_ceiling() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Scala])
+        .file("conf/routes", PLAY_PARKED_ROUTES.as_str())
+        .write(
+            "app/controllers/Missing.scala",
+            "package controllers\n\nclass Missing {\n  def go(): Int = 1\n}\n",
+        )
+        .edge_after(
+            "route conf/routes::GET:/p0",
+            "references",
+            "method Missing::go",
+        )
+        .edge_after(
+            "route conf/routes::GET:/p599",
+            "references",
+            "method Missing::go",
+        )
+}
+
+/// 600 routes naming `C.m`.
+static PLAY_CTL_ROUTES: LazyLock<String> = LazyLock::new(|| {
+    (0..600)
+        .map(|index| format!("GET /c{index} controllers.C.m\n"))
+        .collect()
+});
+const CTL_FILE: &str = "app/controllers/C.ctl";
+const CTL_SOURCE: &str = "class C { public void m() {} }\n";
+const CTL_SOURCE_PADDED: &str = "class C { public void m() {} }\n\n";
+const CTL_AS_CSHARP: &str = "{\"extensions\":{\".ctl\":\"csharp\"}}\n";
+const CTL_AS_JAVA: &str = "{\"extensions\":{\".ctl\":\"java\"}}\n";
+
+/// W7-19c: `codegraph.json` maps the controller's extension from C# to
+/// Java, and the file gains only trailing whitespace: no name changes, but
+/// the 600 routes a cross-family pick parked all link.
+pub fn java_play_extension_override_brings_a_controller_into_the_jvm() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::Scala, Language::Java, Language::CSharp],
+    )
+    .file(".codegraph/codegraph.json", CTL_AS_CSHARP)
+    .file("conf/routes", PLAY_CTL_ROUTES.as_str())
+    .file(CTL_FILE, CTL_SOURCE)
+    .write(".codegraph/codegraph.json", CTL_AS_JAVA)
+    .write(CTL_FILE, CTL_SOURCE_PADDED)
+    .file_language_after(CTL_FILE, "java")
+    .edge_after("route conf/routes::GET:/c0", "references", "method C::m")
+    .edge_after("route conf/routes::GET:/c599", "references", "method C::m")
+}
+
+/// W7-19c: mapped back to C#: the 600 routes are all unlinked again.
+pub fn java_play_extension_override_takes_a_controller_out_of_the_jvm() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::Scala, Language::Java, Language::CSharp],
+    )
+    .file(".codegraph/codegraph.json", CTL_AS_JAVA)
+    .file("conf/routes", PLAY_CTL_ROUTES.as_str())
+    .file(CTL_FILE, CTL_SOURCE)
+    .write(".codegraph/codegraph.json", CTL_AS_CSHARP)
+    .write(CTL_FILE, CTL_SOURCE_PADDED)
+    .file_language_after(CTL_FILE, "csharp")
+    .edge_before("route conf/routes::GET:/c599", "references", "method C::m")
+}
+
+/// The root `artisan` Laravel is detected by, never indexed.
+const LARAVEL_ARTISAN: &str = "#!/usr/bin/env php\n<?php\n";
+/// A route naming its controller by its namespace path below the
+/// controllers root, and the file that path names.
+const LARAVEL_WEB: &str = "<?php\n\nRoute::get('/users', 'Admin\\UserController@index');\n";
+const LARAVEL_USERS_FILE: &str = "app/Http/Controllers/Admin/UserController.php";
+const LARAVEL_USERS: &str = "<?php\n\nnamespace App\\Http\\Controllers\\Admin;\n\nclass UserController\n{\n    public function index() { return 1; }\n    public function show() { return 2; }\n}\n";
+const LARAVEL_USERS_SHOW: &str = "<?php\n\nnamespace App\\Http\\Controllers\\Admin;\n\nclass UserController\n{\n    public function show() { return 2; }\n}\n";
+const LARAVEL_USERS_ROUTE: &str = "route routes/web.php::route:/users";
+const LARAVEL_USERS_INDEX: &str = "method App\\Http\\Controllers\\Admin::UserController::index";
+const LARAVEL_KERNEL: &str = "<?php\n\nclass Kernel\n{\n}\n";
+
+/// W7-19d: the root `artisan` appears: Laravel is detected, and the route
+/// links to its controller's action.
+pub fn php_laravel_artisan_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write("artisan", LARAVEL_ARTISAN)
+        .detected_before("laravel", false)
+        .detected_after("laravel", true)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the root `artisan` is deleted.
+pub fn php_laravel_artisan_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .remove("artisan")
+        .detected_before("laravel", true)
+        .detected_after("laravel", false)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: `app/Http/Kernel.php`, which detection reads by path whether
+/// indexed or not, appears.
+pub fn php_laravel_kernel_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write("app/Http/Kernel.php", LARAVEL_KERNEL)
+        .detected_before("laravel", false)
+        .detected_after("laravel", true)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: `app/Http/Kernel.php` is deleted.
+pub fn php_laravel_kernel_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php])
+        .file("app/Http/Kernel.php", LARAVEL_KERNEL)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .remove("app/Http/Kernel.php")
+        .detected_before("laravel", true)
+        .detected_after("laravel", false)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller gains the action the route names: the route's
+/// `Admin\UserController@index`, waiting under its whole name, links.
+pub fn php_laravel_controller_gains_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS_SHOW)
+        .write(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller loses the action.
+pub fn php_laravel_controller_loses_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write(LARAVEL_USERS_FILE, LARAVEL_USERS_SHOW)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller file the route's namespace path names appears:
+/// the parked route links.
+pub fn php_laravel_controller_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .write(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the controller file is deleted: the route waits again.
+pub fn php_laravel_controller_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .remove(LARAVEL_USERS_FILE)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// A route naming its controller by class, which no file under
+/// `app/Http/Controllers/` matches by path: the one controller class of
+/// the name answers.
+const LARAVEL_SHORT: &str = "<?php\n\nRoute::get('/users', [UserController::class, 'index']);\n";
+const LARAVEL_BILLING_FILE: &str = "modules/Billing/Controllers/UserController.php";
+const LARAVEL_BILLING: &str = "<?php\n\nnamespace Modules\\Billing\\Controllers;\n\nclass UserController\n{\n    public function index() { return 2; }\n}\n";
+
+/// W7-19d: a second `UserController` with the action appears in another
+/// `Controllers` directory: of two candidates Laravel takes neither
+/// (KNOWN_DIFFS: upstream takes its store's first).
+pub fn php_laravel_same_named_controller_appears_in_another_controllers_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_SHORT)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .write(LARAVEL_BILLING_FILE, LARAVEL_BILLING)
+        .edge_before(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+        .no_edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the second `UserController` goes: the route links again.
+pub fn php_laravel_same_named_controller_leaves_the_other_controllers_directory() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_SHORT)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .file(LARAVEL_BILLING_FILE, LARAVEL_BILLING)
+        .remove(LARAVEL_BILLING_FILE)
+        .edge_after(LARAVEL_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// A resource route naming its controller by a namespace path, and the
+/// one controller whose file ends with it.
+const LARAVEL_RESOURCE: &str = "<?php\n\nRoute::resource('photos', 'Media\\PhotoController');\n";
+const LARAVEL_PHOTO_FILE: &str = "app/Http/Controllers/Media/PhotoController.php";
+const LARAVEL_PHOTO: &str =
+    "<?php\n\nnamespace App\\Http\\Controllers\\Media;\n\nclass PhotoController\n{\n}\n";
+const LARAVEL_API_PHOTO_FILE: &str = "app/Http/Controllers/Api/Media/PhotoController.php";
+const LARAVEL_API_PHOTO: &str =
+    "<?php\n\nnamespace App\\Http\\Controllers\\Api\\Media;\n\nclass PhotoController\n{\n}\n";
+const LARAVEL_PHOTOS_ROUTE: &str = "route routes/web.php::route:/photos";
+const LARAVEL_PHOTO_CLASS: &str = "class App\\Http\\Controllers\\Media::PhotoController";
+
+/// W7-19d: a second controller whose file ends with the resource's
+/// `Media\PhotoController` path appears: Laravel takes neither (akaunting's
+/// `Common\Companies`; KNOWN_DIFFS).
+pub fn php_laravel_resource_gains_a_second_path_match() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_RESOURCE)
+        .file(LARAVEL_PHOTO_FILE, LARAVEL_PHOTO)
+        .write(LARAVEL_API_PHOTO_FILE, LARAVEL_API_PHOTO)
+        .edge_before(LARAVEL_PHOTOS_ROUTE, "imports", LARAVEL_PHOTO_CLASS)
+        .no_edge_after(LARAVEL_PHOTOS_ROUTE, "imports", LARAVEL_PHOTO_CLASS)
+}
+
+/// W7-19d: the second path match goes: the resource imports its
+/// controller again.
+pub fn php_laravel_resource_loses_its_second_path_match() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_RESOURCE)
+        .file(LARAVEL_PHOTO_FILE, LARAVEL_PHOTO)
+        .file(LARAVEL_API_PHOTO_FILE, LARAVEL_API_PHOTO)
+        .remove(LARAVEL_API_PHOTO_FILE)
+        .edge_after(LARAVEL_PHOTOS_ROUTE, "imports", LARAVEL_PHOTO_CLASS)
+}
+
+/// A routes file the `RouteServiceProvider` mounts, unprefixed or under
+/// `admin`.
+const LARAVEL_ADMIN_ROUTES: &str = "<?php\n\nRoute::get('users', 'Admin\\UserController@index');\n";
+const LARAVEL_PROVIDER_FILE: &str = "app/Providers/RouteServiceProvider.php";
+const LARAVEL_PROVIDER: &str = "<?php\n\nclass RouteServiceProvider\n{\n    public function boot()\n    {\n        Route::middleware('web')->group(base_path('routes/admin.php'));\n    }\n}\n";
+const LARAVEL_PROVIDER_PREFIXED: &str = "<?php\n\nclass RouteServiceProvider\n{\n    public function boot()\n    {\n        Route::middleware('web')->prefix('admin')->group(base_path('routes/admin.php'));\n    }\n}\n";
+const LARAVEL_ADMIN_USERS_ROUTE: &str = "route routes/admin.php::route:/users";
+
+/// W7-19d: the `RouteServiceProvider` mounts its file under a prefix: the
+/// file's route takes it in its name (#2099).
+pub fn php_laravel_route_service_provider_gains_a_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/admin.php", LARAVEL_ADMIN_ROUTES)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .file(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER)
+        .write(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER_PREFIXED)
+        .named_before("route", "GET /users")
+        .named_after("route", "GET /admin/users")
+        .edge_throughout(LARAVEL_ADMIN_USERS_ROUTE, "references", LARAVEL_USERS_INDEX)
+}
+
+/// W7-19d: the prefix goes again: the route's name loses it.
+pub fn php_laravel_route_service_provider_loses_its_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/admin.php", LARAVEL_ADMIN_ROUTES)
+        .file(LARAVEL_USERS_FILE, LARAVEL_USERS)
+        .file(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER_PREFIXED)
+        .write(LARAVEL_PROVIDER_FILE, LARAVEL_PROVIDER)
+        .named_before("route", "GET /admin/users")
+        .named_after("route", "GET /users")
+}
+
+/// `routes/api.php`, and a Laravel 11 `bootstrap/app.php` mounting only the
+/// web routes (`routes/api.php` is served under `/api`), loading the routes
+/// by code (it keeps its in-file paths), or mounting it under `v2`.
+const LARAVEL_API_ROUTES: &str = "<?php\n\nRoute::get('pages', 'PageController@list');\n";
+const LARAVEL_PAGES_FILE: &str = "app/Http/Controllers/PageController.php";
+const LARAVEL_PAGES: &str = "<?php\n\nnamespace App\\Http\\Controllers;\n\nclass PageController\n{\n    public function list() { return 1; }\n    public function login() { return 2; }\n}\n";
+const LARAVEL_APP_FILE: &str = "bootstrap/app.php";
+const LARAVEL_APP_WEB: &str = "<?php\n\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        web: __DIR__.'/../routes/web.php',\n    )\n    ->create();\n";
+const LARAVEL_APP_USING: &str = "<?php\n\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        using: function () { RouteLoader::load(); },\n    )\n    ->create();\n";
+const LARAVEL_APP_API_PREFIX: &str = "<?php\n\nreturn Application::configure(basePath: dirname(__DIR__))\n    ->withRouting(\n        api: __DIR__.'/../routes/api.php',\n        apiPrefix: 'v2',\n    )\n    ->create();\n";
+
+/// W7-19d: `withRouting` comes to load the routes by code (`using:`):
+/// `routes/api.php` loses its default `/api`.
+pub fn php_laravel_with_routing_gains_using() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_USING)
+        .named_before("route", "GET /api/pages")
+        .named_after("route", "GET /pages")
+}
+
+/// W7-19d: `using:` goes again: `routes/api.php` is served under `/api`.
+pub fn php_laravel_with_routing_loses_using() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_USING)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .named_before("route", "GET /pages")
+        .named_after("route", "GET /api/pages")
+}
+
+/// W7-19d: `withRouting` mounts `routes/api.php` under its `apiPrefix`.
+pub fn php_laravel_with_routing_gains_an_api_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_API_PREFIX)
+        .named_before("route", "GET /api/pages")
+        .named_after("route", "GET /v2/pages")
+}
+
+/// W7-19d: the `api:` mount and its prefix go again.
+pub fn php_laravel_with_routing_loses_its_api_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_API_PREFIX)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .named_before("route", "GET /v2/pages")
+        .named_after("route", "GET /api/pages")
+}
+
+/// A web routes file requiring `auth.php` inside an `auth` prefix group.
+const LARAVEL_WEB_REQUIRING: &str = "<?php\n\nRoute::get('/', 'PageController@list');\nRoute::prefix('auth')->group(function () {\n    require __DIR__.'/auth.php';\n});\n";
+const LARAVEL_AUTH_ROUTES: &str = "<?php\n\nRoute::get('login', 'PageController@login');\n";
+
+/// W7-19d: the routes file an unchanged file requires appears: its route
+/// is served under the group's prefix and links to its action.
+pub fn php_laravel_required_routes_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB_REQUIRING)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .write("routes/auth.php", LARAVEL_AUTH_ROUTES)
+        .named_after("route", "GET /auth/login")
+        .edge_after(
+            "route routes/auth.php::route:/login",
+            "references",
+            "method App\\Http\\Controllers::PageController::login",
+        )
+}
+
+/// W7-19d: the required routes file is deleted.
+pub fn php_laravel_required_routes_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/web.php", LARAVEL_WEB_REQUIRING)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file("routes/auth.php", LARAVEL_AUTH_ROUTES)
+        .remove("routes/auth.php")
+        .named_before("route", "GET /auth/login")
+}
+
+/// A Drupal project: the root `composer.json` it is detected by, never
+/// indexed, a routing file's route, and its controller.
+const DRUPAL_COMPOSER: &str = "{\"require\":{\"drupal/core\":\"^10\"}}\n";
+const DRUPAL_COMPOSER_PLAIN: &str = "{\"require\":{\"php\":\">=8.1\"}}\n";
+const DRUPAL_ROUTING_FILE: &str = "modules/greeting/greeting.routing.yml";
+const DRUPAL_ROUTING: &str = "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::hello'\n";
+const DRUPAL_CONTROLLER_FILE: &str = "modules/greeting/src/Controller/GreetingController.php";
+const DRUPAL_CONTROLLER: &str = "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n    public function hello() { return []; }\n    public function bye() { return []; }\n}\n";
+const DRUPAL_CONTROLLER_BYE: &str = "<?php\n\nnamespace Drupal\\greeting\\Controller;\n\nclass GreetingController\n{\n    public function bye() { return []; }\n}\n";
+const DRUPAL_HELLO_ROUTE: &str = "route modules/greeting/greeting.routing.yml::greeting.hello";
+const DRUPAL_HELLO: &str = "method Drupal\\greeting\\Controller::GreetingController::hello";
+const DRUPAL_BYE: &str = "method Drupal\\greeting\\Controller::GreetingController::bye";
+const DRUPAL_CONTROLLER_CLASS: &str = "class Drupal\\greeting\\Controller::GreetingController";
+const DRUPAL_INFO_FILE: &str = "modules/greeting/greeting.info.yml";
+const DRUPAL_INFO: &str = "name: Greeting\ntype: module\ncore_version_requirement: ^10\n";
+
+/// W7-19d: the root `composer.json` comes to require a `drupal/` package:
+/// Drupal is detected, and the route links to its controller's method.
+pub fn php_drupal_composer_json_gains_a_drupal_dependency() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER_PLAIN)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write("composer.json", DRUPAL_COMPOSER)
+        .detected_before("drupal", false)
+        .detected_after("drupal", true)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the `drupal/` requirement goes.
+pub fn php_drupal_composer_json_drops_its_drupal_dependency() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write("composer.json", DRUPAL_COMPOSER_PLAIN)
+        .detected_before("drupal", true)
+        .detected_after("drupal", false)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: a module's `.info.yml`, indexed, appears beside its routing
+/// file: Drupal is detected without a `composer.json`.
+pub fn php_drupal_info_yml_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_INFO_FILE, DRUPAL_INFO)
+        .detected_before("drupal", false)
+        .detected_after("drupal", true)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the `.info.yml` is deleted.
+pub fn php_drupal_info_yml_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Php, Language::Yaml])
+        .file(DRUPAL_INFO_FILE, DRUPAL_INFO)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .remove(DRUPAL_INFO_FILE)
+        .detected_before("drupal", true)
+        .detected_after("drupal", false)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the controller class gains the method the route names: the
+/// route moves from the class (0.7) to the method (0.9).
+pub fn php_drupal_controller_gains_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER_BYE)
+        .write(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_CONTROLLER_CLASS)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the controller class loses the method: the route falls back
+/// to the class.
+pub fn php_drupal_controller_loses_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER_BYE)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_CONTROLLER_CLASS)
+}
+
+/// Another class of the module, without and with a method named like the
+/// route's.
+const DRUPAL_HELPER_FILE: &str = "modules/greeting/src/Helper.php";
+const DRUPAL_HELPER: &str = "<?php\n\nnamespace Drupal\\greeting;\n\nclass Helper\n{\n}\n";
+const DRUPAL_HELPER_HELLO: &str = "<?php\n\nnamespace Drupal\\greeting;\n\nclass Helper\n{\n    public function hello() { return []; }\n}\n";
+
+/// W7-19d: another class gains a method of the route's method's name: the
+/// route keeps its controller class.
+pub fn php_drupal_another_class_gains_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER_BYE)
+        .file(DRUPAL_HELPER_FILE, DRUPAL_HELPER)
+        .write(DRUPAL_HELPER_FILE, DRUPAL_HELPER_HELLO)
+        .edge_throughout(DRUPAL_HELLO_ROUTE, "references", DRUPAL_CONTROLLER_CLASS)
+        .no_edge_after(
+            DRUPAL_HELLO_ROUTE,
+            "references",
+            "method Drupal\\greeting::Helper::hello",
+        )
+}
+
+/// W7-19d: another class loses its method of the route's method's name:
+/// the route keeps its controller's method.
+pub fn php_drupal_another_class_loses_the_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_HELPER_FILE, DRUPAL_HELPER_HELLO)
+        .write(DRUPAL_HELPER_FILE, DRUPAL_HELPER)
+        .edge_throughout(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// A second `GreetingController`, in another module, without and with the
+/// route's method.
+const DRUPAL_OTHER_FILE: &str = "modules/other/src/Controller/GreetingController.php";
+const DRUPAL_OTHER: &str =
+    "<?php\n\nnamespace Drupal\\other\\Controller;\n\nclass GreetingController\n{\n}\n";
+const DRUPAL_OTHER_HELLO: &str = "<?php\n\nnamespace Drupal\\other\\Controller;\n\nclass GreetingController\n{\n    public function hello() { return []; }\n}\n";
+const DRUPAL_OTHER_HELLO_METHOD: &str =
+    "method Drupal\\other\\Controller::GreetingController::hello";
+
+/// W7-19d: a second `GreetingController` without the method appears: of
+/// the classes so named only one's file holds it, so the route keeps it
+/// (KNOWN_DIFFS: upstream takes its store's first class).
+pub fn php_drupal_same_named_class_without_the_method_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_OTHER_FILE, DRUPAL_OTHER)
+        .edge_throughout(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: a second `GreetingController` with the method appears: two
+/// files hold it, and the route is left unresolved.
+pub fn php_drupal_same_named_class_with_the_method_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_OTHER_FILE, DRUPAL_OTHER_HELLO)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .no_edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .no_edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_OTHER_HELLO_METHOD)
+}
+
+/// W7-19d: the second `GreetingController` with the method goes: the route
+/// links again.
+pub fn php_drupal_same_named_class_with_the_method_goes() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_OTHER_FILE, DRUPAL_OTHER_HELLO)
+        .remove(DRUPAL_OTHER_FILE)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// The routing file with a second route, whose `_form` handler names a
+/// form class, and the class.
+const DRUPAL_ROUTING_WITH_FORM: &str = "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::hello'\ngreeting.settings:\n  path: '/admin/greeting'\n  defaults:\n    _form: '\\Drupal\\greeting\\Form\\SettingsForm'\n";
+const DRUPAL_FORM_FILE: &str = "modules/greeting/src/Form/SettingsForm.php";
+const DRUPAL_FORM: &str =
+    "<?php\n\nnamespace Drupal\\greeting\\Form;\n\nclass SettingsForm\n{\n}\n";
+const DRUPAL_SETTINGS_ROUTE: &str =
+    "route modules/greeting/greeting.routing.yml::greeting.settings";
+const DRUPAL_FORM_CLASS: &str = "class Drupal\\greeting\\Form::SettingsForm";
+const DRUPAL_ROUTING_BYE: &str = "greeting.hello:\n  path: '/hello'\n  defaults:\n    _controller: '\\Drupal\\greeting\\Controller\\GreetingController::bye'\n";
+
+/// W7-19d: the routing file gains a route whose `_form` handler names a
+/// class: the route links to it (0.85).
+pub fn php_drupal_routing_file_gains_a_form_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_FORM_FILE, DRUPAL_FORM)
+        .write(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING_WITH_FORM)
+        .edge_after(DRUPAL_SETTINGS_ROUTE, "references", DRUPAL_FORM_CLASS)
+}
+
+/// W7-19d: the form route goes.
+pub fn php_drupal_routing_file_loses_its_form_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING_WITH_FORM)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .file(DRUPAL_FORM_FILE, DRUPAL_FORM)
+        .write(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .edge_before(DRUPAL_SETTINGS_ROUTE, "references", DRUPAL_FORM_CLASS)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+}
+
+/// W7-19d: the route's handler comes to name another method of the
+/// controller.
+pub fn php_drupal_route_handler_names_another_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::Yaml])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING)
+        .file(DRUPAL_CONTROLLER_FILE, DRUPAL_CONTROLLER)
+        .write(DRUPAL_ROUTING_FILE, DRUPAL_ROUTING_BYE)
+        .edge_before(DRUPAL_HELLO_ROUTE, "references", DRUPAL_HELLO)
+        .edge_after(DRUPAL_HELLO_ROUTE, "references", DRUPAL_BYE)
+}
+
+/// A module's `hook_help` implementation, which references `hook_help`
+/// from its own node, a second module's, and a `hook_help` definition in
+/// an `*.api.php`.
+const DRUPAL_MODULE_FILE: &str = "modules/greeting/greeting.module";
+const DRUPAL_MODULE: &str = "<?php\n\nfunction greeting_help($route_name) {\n  return '';\n}\n";
+const DRUPAL_EXTRA_FILE: &str = "modules/extra/extra.module";
+const DRUPAL_EXTRA: &str = "<?php\n\nfunction extra_help($route_name) {\n  return '';\n}\n";
+const DRUPAL_API_FILE: &str = "modules/greeting/greeting.api.php";
+const DRUPAL_API: &str = "<?php\n\nfunction hook_help($route_name) {\n}\n";
+const DRUPAL_GREETING_HELP: &str = "function greeting_help";
+
+/// W7-19d: a second module implements `hook_help`: of two implementations
+/// Drupal takes neither (KNOWN_DIFFS: upstream takes its store's first).
+pub fn php_drupal_hook_gains_a_second_implementation() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .write(DRUPAL_EXTRA_FILE, DRUPAL_EXTRA)
+        .edge_before(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+        .no_edge_after(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+}
+
+/// W7-19d: the second implementation goes: `hook_help` reaches the one
+/// left (0.75).
+pub fn php_drupal_hook_loses_its_second_implementation() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .file(DRUPAL_EXTRA_FILE, DRUPAL_EXTRA)
+        .remove(DRUPAL_EXTRA_FILE)
+        .edge_after(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+}
+
+/// W7-19d: a `hook_help` definition appears in an `*.api.php`: name
+/// matching's exact `0.9` outranks the implementation Drupal gives (0.75),
+/// though the reference it moves was resolved.
+pub fn php_drupal_hook_definition_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .write(DRUPAL_API_FILE, DRUPAL_API)
+        .edge_before(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+        .edge_after(DRUPAL_GREETING_HELP, "references", "function hook_help")
+}
+
+/// W7-19d: the definition is deleted: `hook_help` reaches the
+/// implementation again.
+pub fn php_drupal_hook_definition_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(DRUPAL_MODULE_FILE, DRUPAL_MODULE)
+        .file(DRUPAL_API_FILE, DRUPAL_API)
+        .remove(DRUPAL_API_FILE)
+        .edge_before(DRUPAL_GREETING_HELP, "references", "function hook_help")
+        .edge_after(DRUPAL_GREETING_HELP, "references", DRUPAL_GREETING_HELP)
+}
+
+/// W7-19d: in a Drupal project, a class named like a PHP `use` import's
+/// last segment appears: the import stays unresolved, as Drupal's handler
+/// rules answer a routing file's references only (KEEP-RUST).
+pub fn php_drupal_use_import_stays_unresolved_when_its_last_segment_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("composer.json", DRUPAL_COMPOSER)
+        .file(
+            "src/A.php",
+            "<?php\n\nnamespace App;\n\nuse Foo\\Bar;\n\nclass A\n{\n    public function f() { return 1; }\n}\n",
+        )
+        .write("src/B.php", "<?php\n\nnamespace Baz;\n\nclass Bar\n{\n}\n")
+        .detected_after("drupal", true)
+        .no_edge_after("namespace App", "imports", "class Baz::Bar")
+}
+
+/// The root `Gemfile` Rails is detected by, never indexed, and one that
+/// names no Rails gem.
+const RAILS_GEMFILE: &str = "gem \"rails\", \"~> 7.1\"\n";
+const RAILS_GEMFILE_PLAIN: &str = "gem \"rack\"\n";
+/// An explicit route in a file that draws no routes: once Rails is
+/// detected, upstream reads one in any Ruby file, as Rust does.
+const RAILS_API_ROUTES_FILE: &str = "lib/api_routes.rb";
+const RAILS_API_ROUTES: &str = "get '/users', to: 'users#index'\n";
+const RAILS_API_USERS_ROUTE: &str = "route lib/api_routes.rb::route:/users";
+/// The conventional controller file of `users`, with and without the
+/// action a route names.
+const RAILS_USERS_FILE: &str = "app/controllers/users_controller.rb";
+const RAILS_USERS: &str =
+    "class UsersController\n  def index\n    1\n  end\n\n  def show\n    2\n  end\nend\n";
+const RAILS_USERS_SHOW: &str = "class UsersController\n  def show\n    2\n  end\nend\n";
+const RAILS_USERS_INDEX: &str = "method UsersController::index";
+const RAILS_USERS_SHOW_METHOD: &str = "method UsersController::show";
+
+/// W7-19e: the root `Gemfile` comes to name `rails`: Rails is detected, and
+/// the explicit route in `lib/` links to its controller's action.
+pub fn ruby_rails_gemfile_gains_rails() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE_PLAIN)
+        .file(RAILS_API_ROUTES_FILE, RAILS_API_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("Gemfile", RAILS_GEMFILE)
+        .detected_before("rails", false)
+        .detected_after("rails", true)
+        .edge_after(RAILS_API_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the root `Gemfile` drops `rails`: Rails is not detected, and the
+/// route goes.
+pub fn ruby_rails_gemfile_drops_rails() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_API_ROUTES_FILE, RAILS_API_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("Gemfile", RAILS_GEMFILE_PLAIN)
+        .detected_before("rails", true)
+        .detected_after("rails", false)
+        .edge_before(RAILS_API_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// An engine's routes, drawn under a `config/` below the project root: the
+/// file alone makes Rails detected.
+const RAILS_ENGINE_ROUTES_FILE: &str = "engine/config/routes.rb";
+const RAILS_ENGINE_ROUTES: &str = "Engine.routes.draw do\n  get 'users', to: 'users#index'\nend\n";
+const RAILS_ENGINE_USERS_ROUTE: &str = "route engine/config/routes.rb::route:users#index";
+
+/// W7-19e: an engine's `config/routes.rb` appears: Rails is detected by it,
+/// and its route links.
+pub fn ruby_rails_engine_routes_file_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write(RAILS_ENGINE_ROUTES_FILE, RAILS_ENGINE_ROUTES)
+        .detected_before("rails", false)
+        .detected_after("rails", true)
+        .edge_after(RAILS_ENGINE_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the engine's `config/routes.rb` is deleted: Rails is not
+/// detected.
+pub fn ruby_rails_engine_routes_file_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Ruby])
+        .file(RAILS_ENGINE_ROUTES_FILE, RAILS_ENGINE_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .remove(RAILS_ENGINE_ROUTES_FILE)
+        .detected_before("rails", true)
+        .detected_after("rails", false)
+        .edge_before(RAILS_ENGINE_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// The application's routes, a resource limited to two actions.
+const RAILS_ROUTES: &str =
+    "Rails.application.routes.draw do\n  resources :users, only: [:index, :show]\nend\n";
+const RAILS_USERS_ROUTE: &str = "route config/routes.rb::route:users#index";
+const RAILS_USERS_SHOW_ROUTE: &str = "route config/routes.rb::route:users#show";
+
+/// W7-19e: the controller file the routes' `users` names appears: the
+/// routes, waiting under their whole names, link.
+pub fn ruby_rails_controller_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .write(RAILS_USERS_FILE, RAILS_USERS)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .edge_after(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+}
+
+/// W7-19e: the controller file is deleted: the routes wait again.
+pub fn ruby_rails_controller_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .remove(RAILS_USERS_FILE)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the controller gains the action a route names.
+pub fn ruby_rails_controller_gains_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS_SHOW)
+        .write(RAILS_USERS_FILE, RAILS_USERS)
+        .edge_throughout(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the controller loses the action.
+pub fn ruby_rails_controller_loses_the_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write(RAILS_USERS_FILE, RAILS_USERS_SHOW)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// A controller outside the conventional file, which a route reaches by
+/// its class's name.
+const RAILS_ENGINE_USERS_FILE: &str = "engine/app/controllers/users_controller.rb";
+const RAILS_MEMBERS: &str = "class MembersController\n  def index\n    1\n  end\nend\n";
+const RAILS_USERS_INDEX_ONLY: &str = "class UsersController\n  def index\n    1\n  end\nend\n";
+
+/// W7-19e: a controller outside the conventional file is renamed to the
+/// class the route's `users` names: the route links by the class.
+pub fn ruby_rails_controller_class_is_renamed_to_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_MEMBERS)
+        .write(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+}
+
+/// W7-19e: the class is renamed away again: no class answers the route.
+pub fn ruby_rails_controller_class_is_renamed_away_from_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_ENGINE_USERS_FILE, RAILS_MEMBERS)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .no_edge_after(
+            RAILS_USERS_ROUTE,
+            "references",
+            "method MembersController::index",
+        )
+}
+
+/// Another controller of the name outside the conventional file, holding
+/// the action too: of two Rails takes neither (KNOWN_DIFFS: upstream takes
+/// its store's first).
+const RAILS_ADMIN_USERS_FILE: &str = "admin/app/controllers/users_controller.rb";
+const RAILS_ENGINE_USERS_INDEX: &str =
+    "method UsersController::index @engine/app/controllers/users_controller.rb";
+
+/// W7-19e: a second `UsersController` holding the action appears: the
+/// route's link to the first goes, though nothing it links to changed.
+pub fn ruby_rails_second_controller_class_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+        .no_edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// W7-19e: the second `UsersController` goes: the route, waiting under its
+/// whole name, links to the one left.
+pub fn ruby_rails_second_controller_class_goes() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .remove(RAILS_ADMIN_USERS_FILE)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// W7-19e: another controller's class is renamed to the route's
+/// `UsersController`: two classes now hold the action, so the route's link
+/// to the first goes, though no node it links to changed and no node named
+/// as its target came or went.
+pub fn ruby_rails_second_class_is_renamed_to_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_ADMIN_USERS_FILE, RAILS_MEMBERS)
+        .write(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+        .no_edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// W7-19e: the second class is renamed away again: the route links to the
+/// one left.
+pub fn ruby_rails_second_class_is_renamed_away_from_the_routes_controller() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_ADMIN_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_ADMIN_USERS_FILE, RAILS_MEMBERS)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// The conventional controller file holding the action as a top-level
+/// function: Rails reads that file first, whatever classes it declares.
+const RAILS_USERS_FUNCTION: &str = "def index\n  1\nend\n";
+const RAILS_USERS_FUNCTION_INDEX: &str = "function index @app/controllers/users_controller.rb";
+
+/// W7-19e: the conventional controller file appears holding only a
+/// function of the action's name: the route, waiting under its whole name,
+/// links to it, though no class of the name came.
+pub fn ruby_rails_conventional_controller_file_appears_with_only_a_function() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .write(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+}
+
+/// W7-19e: that file goes: the route waits again.
+pub fn ruby_rails_conventional_controller_file_with_only_a_function_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .remove(RAILS_USERS_FILE)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+}
+
+/// W7-19e: the conventional controller file appears beside the class the
+/// route reached: the route moves to the file's action, though no class of
+/// the name came or went.
+pub fn ruby_rails_conventional_controller_file_appears_beside_the_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .write(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+}
+
+/// W7-19e: the conventional controller file goes: the route reaches the
+/// class again.
+pub fn ruby_rails_conventional_controller_file_goes_beside_the_class() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES)
+        .file(RAILS_ENGINE_USERS_FILE, RAILS_USERS_INDEX_ONLY)
+        .file(RAILS_USERS_FILE, RAILS_USERS_FUNCTION)
+        .remove(RAILS_USERS_FILE)
+        .edge_before(RAILS_USERS_ROUTE, "references", RAILS_USERS_FUNCTION_INDEX)
+        .edge_after(RAILS_USERS_ROUTE, "references", RAILS_ENGINE_USERS_INDEX)
+}
+
+/// An engine's routes naming `admin/zones`, and two `ZonesController`s
+/// holding the action: the admin one, whose file the route's path names,
+/// and the API's.
+const RAILS_ZONES_ROUTES_FILE: &str = "backend/config/routes.rb";
+const RAILS_ZONES_ROUTES: &str = "Spree::Core::Engine.routes.draw do\n  namespace :admin do\n    resources :zones, only: [:show]\n  end\nend\n";
+const RAILS_ADMIN_ZONES_FILE: &str = "backend/app/controllers/spree/admin/zones_controller.rb";
+const RAILS_MANAGE_ZONES_FILE: &str = "backend/app/controllers/spree/manage/zones_controller.rb";
+const RAILS_ADMIN_ZONES: &str = "module Spree\n  module Admin\n    class ZonesController\n      def show\n        1\n      end\n    end\n  end\nend\n";
+const RAILS_API_ZONES_FILE: &str = "api/app/controllers/spree/api/zones_controller.rb";
+const RAILS_API_ZONES: &str = "module Spree\n  module Api\n    class ZonesController\n      def show\n        2\n      end\n    end\n  end\nend\n";
+/// The admin controller without the route's `show`.
+const RAILS_ADMIN_ZONES_INDEX: &str = "module Spree\n  module Admin\n    class ZonesController\n      def index\n        1\n      end\n    end\n  end\nend\n";
+const RAILS_ZONES_ROUTE: &str = "route backend/config/routes.rb::route:admin/zones#show";
+const RAILS_ADMIN_ZONES_SHOW: &str = "method Spree::Admin::ZonesController::show";
+const RAILS_API_ZONES_SHOW: &str = "method Spree::Api::ZonesController::show";
+
+/// W7-19e: the admin controller's file moves out of `admin/`: no file ends
+/// with the route's `/admin/zones_controller.rb`, both `ZonesController`s
+/// hold `show`, and of two Rails takes neither (KNOWN_DIFFS: upstream takes
+/// its store's first).
+pub fn ruby_rails_namespaced_controller_file_moves_out_of_its_namespace() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_ADMIN_ZONES_FILE, RAILS_ADMIN_ZONES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .rename(RAILS_ADMIN_ZONES_FILE, RAILS_MANAGE_ZONES_FILE)
+        .edge_before(RAILS_ZONES_ROUTE, "references", RAILS_ADMIN_ZONES_SHOW)
+        .no_edge_after(RAILS_ZONES_ROUTE, "references", RAILS_ADMIN_ZONES_SHOW)
+        .no_edge_after(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+}
+
+/// W7-19e: the file moves back under `admin/`: the route's path names it,
+/// and the route links to it again.
+pub fn ruby_rails_namespaced_controller_file_moves_into_its_namespace() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_MANAGE_ZONES_FILE, RAILS_ADMIN_ZONES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .rename(RAILS_MANAGE_ZONES_FILE, RAILS_ADMIN_ZONES_FILE)
+        .edge_after(RAILS_ZONES_ROUTE, "references", RAILS_ADMIN_ZONES_SHOW)
+}
+
+/// W7-19e: the route's own module's controller appears without `show`:
+/// the route reads only its module's controllers now, so its link to the
+/// API's `show` goes, though no node named `show` came or went (only the
+/// lane re-opens it, by its site).
+pub fn ruby_rails_own_module_controller_without_the_action_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .write(RAILS_ADMIN_ZONES_FILE, RAILS_ADMIN_ZONES_INDEX)
+        .edge_before(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+        .no_edge_after(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+}
+
+/// W7-19e: that controller goes: the route links to the API's `show` again.
+pub fn ruby_rails_own_module_controller_without_the_action_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_ZONES_ROUTES_FILE, RAILS_ZONES_ROUTES)
+        .file(RAILS_API_ZONES_FILE, RAILS_API_ZONES)
+        .file(RAILS_ADMIN_ZONES_FILE, RAILS_ADMIN_ZONES_INDEX)
+        .remove(RAILS_ADMIN_ZONES_FILE)
+        .edge_after(RAILS_ZONES_ROUTE, "references", RAILS_API_ZONES_SHOW)
+}
+
+/// The application's routes, with one route and with a second drawn above
+/// it (the first's line, and so its id, moves).
+const RAILS_ROUTES_ONE: &str =
+    "Rails.application.routes.draw do\n  get 'users', to: 'users#index'\nend\n";
+const RAILS_ROUTES_TWO: &str = "Rails.application.routes.draw do\n  get 'users/:id', to: 'users#show'\n  get 'users', to: 'users#index'\nend\n";
+
+/// W7-19e: the routes file gains a route above the other.
+pub fn ruby_rails_routes_file_gains_a_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES_ONE)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("config/routes.rb", RAILS_ROUTES_TWO)
+        .edge_throughout(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .edge_after(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+}
+
+/// W7-19e: the routes file loses that route.
+pub fn ruby_rails_routes_file_loses_a_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file("config/routes.rb", RAILS_ROUTES_TWO)
+        .file(RAILS_USERS_FILE, RAILS_USERS)
+        .write("config/routes.rb", RAILS_ROUTES_ONE)
+        .edge_throughout(RAILS_USERS_ROUTE, "references", RAILS_USERS_INDEX)
+        .edge_before(
+            RAILS_USERS_SHOW_ROUTE,
+            "references",
+            RAILS_USERS_SHOW_METHOD,
+        )
+}
+
+/// A controller action naming the model `User`, the model in
+/// `app/models/user.rb` or moved out of `app/models/`, and another class
+/// `User` in `lib/`.
+const RAILS_USERS_QUERYING: &str = "class UsersController\n  def index\n    User.all\n  end\nend\n";
+const RAILS_MODEL_FILE: &str = "app/models/user.rb";
+const RAILS_MODEL_MOVED_FILE: &str = "app/user.rb";
+const RAILS_LEGACY_MODEL_FILE: &str = "lib/legacy/user.rb";
+const RAILS_MODEL: &str = "class User\nend\n";
+const RAILS_USER_MODEL: (&str, &str, &str) = (
+    "method UsersController::index",
+    "references",
+    "class User @app/models/user.rb",
+);
+const RAILS_USER_MOVED: (&str, &str, &str) = (
+    "method UsersController::index",
+    "references",
+    "class User @app/user.rb",
+);
+
+/// W7-19e: the model `User` moves out of `app/models/`: Rails' model
+/// lookup no longer answers, and of the two classes `User` name matching
+/// takes the nearer at its lower confidence.
+pub fn ruby_rails_model_moves_out_of_app_models() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_USERS_FILE, RAILS_USERS_QUERYING)
+        .file(RAILS_MODEL_FILE, RAILS_MODEL)
+        .file(RAILS_LEGACY_MODEL_FILE, RAILS_MODEL)
+        .rename(RAILS_MODEL_FILE, RAILS_MODEL_MOVED_FILE)
+        .edge_metadata_before(RAILS_USER_MODEL, "framework", "rails")
+        .edge_after(RAILS_USER_MOVED.0, RAILS_USER_MOVED.1, RAILS_USER_MOVED.2)
+        .no_edge_metadata_after(RAILS_USER_MOVED, "framework", "rails")
+}
+
+/// W7-19e: the model `User` moves into `app/models/`: Rails' model lookup
+/// answers with it, over name matching's nearer guess.
+pub fn ruby_rails_model_moves_into_app_models() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Ruby])
+        .file("Gemfile", RAILS_GEMFILE)
+        .file(RAILS_USERS_FILE, RAILS_USERS_QUERYING)
+        .file(RAILS_MODEL_MOVED_FILE, RAILS_MODEL)
+        .file(RAILS_LEGACY_MODEL_FILE, RAILS_MODEL)
+        .rename(RAILS_MODEL_MOVED_FILE, RAILS_MODEL_FILE)
+        .edge_before(RAILS_USER_MOVED.0, RAILS_USER_MOVED.1, RAILS_USER_MOVED.2)
+        .edge_metadata_after(RAILS_USER_MODEL, "framework", "rails")
+}
+
+// ---- W7-19f: ASP.NET ----
+
+/// A controller in a file no detection rule reads by its name, so the root
+/// files decide whether ASP.NET is detected.
+const ASPNET_USERS_FILE: &str = "src/Web/Api/Users.cs";
+const ASPNET_USERS: &str = "[Route(\"api/users\")]\npublic class UsersController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n";
+const ASPNET_USERS_ROUTE: &str = "route src/Web/Api/Users.cs::route:/api/users";
+const ASPNET_USERS_LIST: &str = "method UsersController::List";
+const ASPNET_STARTUP: &str = "public class Startup\n{\n}\n";
+
+/// W7-19f: a root `Startup.cs` appears: ASP.NET is detected, and the
+/// controller's route links to its action.
+pub fn csharp_aspnet_root_startup_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .write("Startup.cs", ASPNET_STARTUP)
+        .detected_before("aspnet", false)
+        .detected_after("aspnet", true)
+        .edge_after(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// W7-19f: the root `Startup.cs` is deleted: ASP.NET is not detected, and
+/// the route goes.
+pub fn csharp_aspnet_root_startup_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file("Startup.cs", ASPNET_STARTUP)
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .remove("Startup.cs")
+        .detected_before("aspnet", true)
+        .detected_after("aspnet", false)
+        .edge_before(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// The configuration keeps the root `Program.cs` out of the index: only the
+/// `dotnet` control kind tells a sync it changed.
+const ASPNET_EXCLUDE_PROGRAM: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"Program.cs\"]\n";
+const ASPNET_PROGRAM_PLAIN: &str = "var app = Builder.Create(args);\n";
+const ASPNET_PROGRAM_WEB: &str = "var app = WebApplication.Create(args);\n";
+
+/// W7-19f: the root `Program.cs`, which the configuration keeps out of the
+/// index, comes to build a web host: ASP.NET is detected.
+pub fn csharp_aspnet_excluded_program_gains_a_web_host() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(".codegraph/config.toml", ASPNET_EXCLUDE_PROGRAM)
+        .file("Program.cs", ASPNET_PROGRAM_PLAIN)
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .write("Program.cs", ASPNET_PROGRAM_WEB)
+        .detected_before("aspnet", false)
+        .detected_after("aspnet", true)
+        .edge_after(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// W7-19f: the excluded root `Program.cs` no longer builds one: ASP.NET is
+/// not detected.
+pub fn csharp_aspnet_excluded_program_loses_its_web_host() -> Case {
+    Case::new(Change::ControlFile, &[Language::CSharp])
+        .file(".codegraph/config.toml", ASPNET_EXCLUDE_PROGRAM)
+        .file("Program.cs", ASPNET_PROGRAM_WEB)
+        .file(ASPNET_USERS_FILE, ASPNET_USERS)
+        .write("Program.cs", ASPNET_PROGRAM_PLAIN)
+        .detected_before("aspnet", true)
+        .detected_after("aspnet", false)
+        .edge_before(ASPNET_USERS_ROUTE, "references", ASPNET_USERS_LIST)
+}
+
+/// A controller detection reads by its name, with and without a second
+/// action.
+const ASPNET_CONTROLLER_FILE: &str = "src/Web/Controllers/OrdersController.cs";
+const ASPNET_CONTROLLER: &str = "[ApiController]\n[Route(\"api/orders\")]\npublic class OrdersController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n";
+const ASPNET_CONTROLLER_TWO: &str = "[ApiController]\n[Route(\"api/orders\")]\npublic class OrdersController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult List() => Ok();\n\n    [HttpGet(\"{id}\")]\n    public IActionResult Get(int id) => Ok();\n}\n";
+const ASPNET_ORDERS_ROUTE: &str =
+    "route src/Web/Controllers/OrdersController.cs::route:/api/orders";
+const ASPNET_ORDER_ROUTE: &str =
+    "route src/Web/Controllers/OrdersController.cs::route:/api/orders/{id}";
+
+/// W7-19f: a controller gains an `[HttpGet("{id}")]` action: a route for it
+/// links to the method.
+pub fn csharp_aspnet_controller_gains_an_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER)
+        .write(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER_TWO)
+        .edge_throughout(
+            ASPNET_ORDERS_ROUTE,
+            "references",
+            "method OrdersController::List",
+        )
+        .edge_after(
+            ASPNET_ORDER_ROUTE,
+            "references",
+            "method OrdersController::Get",
+        )
+}
+
+/// W7-19f: the controller loses the action and its route.
+pub fn csharp_aspnet_controller_loses_an_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER_TWO)
+        .write(ASPNET_CONTROLLER_FILE, ASPNET_CONTROLLER)
+        .edge_before(
+            ASPNET_ORDER_ROUTE,
+            "references",
+            "method OrdersController::Get",
+        )
+        .edge_throughout(
+            ASPNET_ORDERS_ROUTE,
+            "references",
+            "method OrdersController::List",
+        )
+}
+
+/// A FastEndpoints endpoint whose path is a constant in the request's own
+/// file, in an app a root `Program.cs` shows.
+const ASPNET_WEB_PROGRAM: &str = "var builder = WebApplication.CreateBuilder(args);\n";
+const ASPNET_ENDPOINT_FILE: &str = "src/Web/Contributors/Create.cs";
+const ASPNET_ENDPOINT: &str = "public class Create : Endpoint<CreateContributorRequest>\n{\n  public override void Configure()\n  {\n    Post(CreateContributorRequest.Route);\n  }\n\n  public override async Task ExecuteAsync(CreateContributorRequest request, CancellationToken ct)\n  {\n  }\n}\n";
+const ASPNET_REQUEST_FILE: &str = "src/Web/Contributors/Create.CreateContributorRequest.cs";
+const ASPNET_REQUEST: &str = "public class CreateContributorRequest\n{\n  public const string Route = \"/Contributors\";\n}\n";
+const ASPNET_REQUEST_PEOPLE: &str =
+    "public class CreateContributorRequest\n{\n  public const string Route = \"/People\";\n}\n";
+const ASPNET_REQUEST_BARE: &str =
+    "public class CreateContributorRequest\n{\n  public string Name { get; set; } = \"\";\n}\n";
+
+/// W7-19f: the constant's value changes: the route, in a file the sync
+/// does not read, is named by the new value.
+pub fn csharp_aspnet_endpoint_constant_changes_its_value() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST_PEOPLE)
+        .named_before("route", "POST /Contributors")
+        .named_after("route", "POST /People")
+}
+
+/// W7-19f: the constant's value changes back.
+pub fn csharp_aspnet_endpoint_constant_changes_its_value_back() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST_PEOPLE)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .named_before("route", "POST /People")
+        .named_after("route", "POST /Contributors")
+}
+
+/// W7-19f: the constant is deleted: the route gets back the name its own
+/// file gives it (KEEP-RUST: upstream's sync keeps the last value).
+pub fn csharp_aspnet_endpoint_constant_is_deleted() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST_BARE)
+        .named_before("route", "POST /Contributors")
+        .named_after("route", "POST CreateContributorRequest.Route")
+}
+
+/// W7-19f: the constant comes back.
+pub fn csharp_aspnet_endpoint_constant_comes_back() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_ENDPOINT_FILE, ASPNET_ENDPOINT)
+        .file(ASPNET_REQUEST_FILE, ASPNET_REQUEST_BARE)
+        .write(ASPNET_REQUEST_FILE, ASPNET_REQUEST)
+        .named_before("route", "POST CreateContributorRequest.Route")
+        .named_after("route", "POST /Contributors")
+}
+
+/// An endpoint group detection reads by its directory, and the app's
+/// extension that writes the group head.
+const ASPNET_GROUP_FILE: &str = "src/Web/Endpoints/TodoItems.cs";
+const ASPNET_GROUP: &str = "public class TodoItems : IEndpointGroup\n{\n    public static void Map(RouteGroupBuilder groupBuilder)\n    {\n        groupBuilder.MapPost(CreateTodoItem);\n    }\n    public static int CreateTodoItem() => 1;\n}\n";
+const ASPNET_GROUP_PREFIXED: &str = "public class TodoItems : IEndpointGroup\n{\n    public static string RoutePrefix => \"/todo\";\n    public static void Map(RouteGroupBuilder groupBuilder)\n    {\n        groupBuilder.MapPost(CreateTodoItem);\n    }\n    public static int CreateTodoItem() => 1;\n}\n";
+const ASPNET_HEAD_FILE: &str = "src/Web/Infrastructure/WebApplicationExtensions.cs";
+const ASPNET_HEAD: &str = "public static class WebApplicationExtensions\n{\n    public static void MapEndpoints(WebApplication app, string groupName)\n    {\n        var group = app.MapGroup($\"/api/{groupName}\");\n    }\n}\n";
+
+/// W7-19f: the file writing the group head appears: the group's route,
+/// in a file the sync does not read, is named under it.
+pub fn csharp_aspnet_group_head_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .write(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .named_before("route", "POST /TodoItems")
+        .named_after("route", "POST /api/TodoItems")
+}
+
+/// W7-19f: the head's file is deleted: the route gets back its file's name
+/// (KEEP-RUST: upstream's sync keeps the head's).
+pub fn csharp_aspnet_group_head_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .file(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .remove(ASPNET_HEAD_FILE)
+        .named_before("route", "POST /api/TodoItems")
+        .named_after("route", "POST /TodoItems")
+}
+
+/// W7-19f: the group class comes to give its own `RoutePrefix` literal: its
+/// route is named under it, not under the head.
+pub fn csharp_aspnet_group_gains_a_route_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .file(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .write(ASPNET_GROUP_FILE, ASPNET_GROUP_PREFIXED)
+        .named_before("route", "POST /api/TodoItems")
+        .named_after("route", "POST /todo")
+}
+
+/// W7-19f: the group class drops its `RoutePrefix` literal: the head names
+/// its route again.
+pub fn csharp_aspnet_group_loses_its_route_prefix() -> Case {
+    Case::new(Change::BodyEdit, &[Language::CSharp])
+        .file(ASPNET_GROUP_FILE, ASPNET_GROUP_PREFIXED)
+        .file(ASPNET_HEAD_FILE, ASPNET_HEAD)
+        .write(ASPNET_GROUP_FILE, ASPNET_GROUP)
+        .named_before("route", "POST /todo")
+        .named_after("route", "POST /api/TodoItems")
+}
+
+/// Two classes named `OrderService`, one in a `/Services/` folder Pattern 2
+/// prefers; a parameter of that type, in a controller that shows ASP.NET.
+const ASPNET_SERVICE: &str = "public class OrderService\n{\n}\n";
+const ASPNET_SERVICE_FILE: &str = "src/App/Services/OrderService.cs";
+const ASPNET_SERVICE_MOVED_FILE: &str = "src/App/Core/OrderService.cs";
+const ASPNET_LEGACY_SERVICE_FILE: &str = "src/Legacy/OrderService.cs";
+const ASPNET_CHECKOUT_FILE: &str = "src/Web/CheckoutController.cs";
+const ASPNET_CHECKOUT: &str = "public class CheckoutController : ControllerBase\n{\n    public int Pay(OrderService service) { return 1; }\n}\n";
+const ASPNET_PAY_SERVICE: (&str, &str, &str) = (
+    "method CheckoutController::Pay",
+    "references",
+    "class OrderService @src/App/Services/OrderService.cs",
+);
+
+/// W7-19f (#2225): the service moves out of `/Services/`: of two
+/// candidates in no preferred folder Pattern 2 takes neither (KEEP-RUST),
+/// leaving the reference to the name matcher's guess.
+pub fn csharp_aspnet_service_moves_out_of_services() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(ASPNET_CHECKOUT_FILE, ASPNET_CHECKOUT)
+        .file(ASPNET_SERVICE_FILE, ASPNET_SERVICE)
+        .file(ASPNET_LEGACY_SERVICE_FILE, ASPNET_SERVICE)
+        .rename(ASPNET_SERVICE_FILE, ASPNET_SERVICE_MOVED_FILE)
+        .edge_metadata_before(ASPNET_PAY_SERVICE, "framework", "aspnet")
+        .no_edge_metadata_after(
+            (
+                ASPNET_PAY_SERVICE.0,
+                ASPNET_PAY_SERVICE.1,
+                "class OrderService @src/App/Core/OrderService.cs",
+            ),
+            "framework",
+            "aspnet",
+        )
+        .no_edge_metadata_after(
+            (
+                ASPNET_PAY_SERVICE.0,
+                ASPNET_PAY_SERVICE.1,
+                "class OrderService @src/Legacy/OrderService.cs",
+            ),
+            "framework",
+            "aspnet",
+        )
+}
+
+/// W7-19f (#2225): the service moves into `/Services/`: Pattern 2 takes it.
+pub fn csharp_aspnet_service_moves_into_services() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::CSharp])
+        .file(ASPNET_CHECKOUT_FILE, ASPNET_CHECKOUT)
+        .file(ASPNET_SERVICE_MOVED_FILE, ASPNET_SERVICE)
+        .file(ASPNET_LEGACY_SERVICE_FILE, ASPNET_SERVICE)
+        .rename(ASPNET_SERVICE_MOVED_FILE, ASPNET_SERVICE_FILE)
+        .edge_metadata_after(ASPNET_PAY_SERVICE, "framework", "aspnet")
+}
+
+/// A Razor page's `@model IndexModel`, with the PageModel of the parent
+/// page and perhaps its own beside it.
+const ASPNET_BASKET_PAGE: &str = "Pages/Basket/Index.cshtml";
+const ASPNET_BASKET_PAGE_SRC: &str = "@page\n@model IndexModel\n<h1>Basket</h1>\n";
+const ASPNET_BASKET_MODEL_FILE: &str = "Pages/Basket/Index.cshtml.cs";
+const ASPNET_INDEX_MODEL_FILE: &str = "Pages/Index.cshtml.cs";
+const ASPNET_INDEX_MODEL: &str = "public class IndexModel : PageModel\n{\n}\n";
+const ASPNET_BASKET_COMPONENT: &str = "component Pages/Basket/Index.cshtml::Index";
+
+/// W7-19f (#2415): the PageModel beside the basket page appears: the
+/// page's `@model` moves to it from the parent page's.
+pub fn razor_aspnet_page_model_beside_the_page_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Razor, Language::CSharp])
+        .file("Program.cs", ASPNET_WEB_PROGRAM)
+        .file(ASPNET_BASKET_PAGE, ASPNET_BASKET_PAGE_SRC)
+        .file(ASPNET_INDEX_MODEL_FILE, ASPNET_INDEX_MODEL)
+        .write(ASPNET_BASKET_MODEL_FILE, ASPNET_INDEX_MODEL)
+        .edge_before(
+            ASPNET_BASKET_COMPONENT,
+            "references",
+            "class IndexModel @Pages/Index.cshtml.cs",
+        )
+        .edge_after(
+            ASPNET_BASKET_COMPONENT,
+            "references",
+            "class IndexModel @Pages/Basket/Index.cshtml.cs",
+        )
+}
+
+/// W7-19f (#2415): the PageModel beside the page is deleted: the `@model`
+/// goes back to the parent page's.
+pub fn razor_aspnet_page_model_beside_the_page_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Razor, Language::CSharp],
+    )
+    .file("Program.cs", ASPNET_WEB_PROGRAM)
+    .file(ASPNET_BASKET_PAGE, ASPNET_BASKET_PAGE_SRC)
+    .file(ASPNET_INDEX_MODEL_FILE, ASPNET_INDEX_MODEL)
+    .file(ASPNET_BASKET_MODEL_FILE, ASPNET_INDEX_MODEL)
+    .remove(ASPNET_BASKET_MODEL_FILE)
+    .edge_before(
+        ASPNET_BASKET_COMPONENT,
+        "references",
+        "class IndexModel @Pages/Basket/Index.cshtml.cs",
+    )
+    .edge_after(
+        ASPNET_BASKET_COMPONENT,
+        "references",
+        "class IndexModel @Pages/Index.cshtml.cs",
+    )
+}
+
+/// A root `Package.swift` that names `vapor`, which Vapor is detected by, and
+/// one that names no package.
+const VAPOR_PACKAGE: &str = "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: \"App\", dependencies: [.package(url: \"https://github.com/vapor/vapor.git\", from: \"4.0.0\")])\n";
+const VAPOR_PACKAGE_PLAIN: &str =
+    "// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: \"App\")\n";
+const VAPOR_ROUTES_FILE: &str = "Sources/App/routes.swift";
+
+/// A route whose handler is a method of a type no file declares yet.
+const VAPOR_MISSING_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"missing\", use: MissingController.show)\n}\n";
+const VAPOR_MISSING_FILE: &str = "Sources/App/Controllers/MissingController.swift";
+const VAPOR_MISSING: &str = "import Vapor\nenum MissingController {\n    static func show(req: Request) async throws -> String { \"missing\" }\n}\n";
+const VAPOR_MISSING_ROUTE: &str = "route Sources/App/routes.swift::route:/missing";
+const VAPOR_MISSING_SHOW: &str = "method MissingController::show";
+
+/// W7-19g (#2106): the type a route's `use:` names comes to declare the
+/// handler, in a file of its own: the route, waiting under its whole name
+/// `MissingController@show`, links.
+pub fn swift_vapor_handler_type_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .write(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .edge_after(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// W7-19g: the handler's file is deleted: the route waits again.
+pub fn swift_vapor_handler_type_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .file(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .remove(VAPOR_MISSING_FILE)
+        .edge_before(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// Two overloads of a route's handler: the second comes to take the
+/// `Request` Vapor calls a handler with, a change of text that renames
+/// nothing.
+const VAPOR_SITEMAP_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"sitemap\", use: SiteMapController.index)\n}\n";
+const VAPOR_SITEMAP_FILE: &str = "Sources/App/Controllers/SiteMapController.swift";
+const VAPOR_SITEMAP_NO_REQUEST: &str = "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(names: [String]) async throws -> String { \"\" }\n}\n";
+const VAPOR_SITEMAP_REQUEST: &str = "import Vapor\nenum SiteMapController {\n    static func index(packages: [String]) -> String { packages.joined() }\n    static func index(req: Request) async throws -> String { \"\" }\n}\n";
+const VAPOR_SITEMAP_ROUTE: (&str, &str, &str) = (
+    "route Sources/App/routes.swift::route:/sitemap",
+    "references",
+    "method SiteMapController::index @Sources/App/Controllers/SiteMapController.swift:4",
+);
+
+/// W7-19g: of two overloads neither of which takes the `Request`, the
+/// route takes none (KEEP-RUST); the second comes to take it, and the
+/// route links to it.
+pub fn swift_vapor_handler_overload_gains_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_SITEMAP_ROUTES)
+        .file(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_NO_REQUEST)
+        .write(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_REQUEST)
+        .edge_after(
+            VAPOR_SITEMAP_ROUTE.0,
+            VAPOR_SITEMAP_ROUTE.1,
+            VAPOR_SITEMAP_ROUTE.2,
+        )
+}
+
+/// W7-19g: the overload stops taking the `Request`: the route takes
+/// neither.
+pub fn swift_vapor_handler_overload_loses_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_SITEMAP_ROUTES)
+        .file(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_REQUEST)
+        .write(VAPOR_SITEMAP_FILE, VAPOR_SITEMAP_NO_REQUEST)
+        .edge_before(
+            VAPOR_SITEMAP_ROUTE.0,
+            VAPOR_SITEMAP_ROUTE.1,
+            VAPOR_SITEMAP_ROUTE.2,
+        )
+}
+
+/// A handler and a rival overload in another extension of its type: a
+/// change of the rival's file alone moves the route, whose edge points into
+/// the handler's file, which no change touches.
+const VAPOR_RIVAL_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"rival\", use: RivalController.index)\n}\n";
+const VAPOR_RIVAL_FILE: &str = "Sources/App/Controllers/RivalController.swift";
+const VAPOR_RIVAL: &str = "import Vapor\nenum RivalController {\n    static func index(req: Request) async throws -> String { \"\" }\n}\n";
+const VAPOR_RIVAL_EXTENSION_FILE: &str = "Sources/App/Controllers/RivalController+Legacy.swift";
+const VAPOR_RIVAL_NO_REQUEST: &str = "import Vapor\nextension RivalController {\n    static func index(names: [String]) -> String { names.joined() }\n}\n";
+const VAPOR_RIVAL_REQUEST: &str = "import Vapor\nextension RivalController {\n    static func index(req: Request, names: [String]) -> String { names.joined() }\n}\n";
+const VAPOR_RIVAL_ROUTE: (&str, &str, &str) = (
+    "route Sources/App/routes.swift::route:/rival",
+    "references",
+    "method RivalController::index @Sources/App/Controllers/RivalController.swift:3",
+);
+
+/// W7-19g: the rival comes to take the `Request` too: of two overloads
+/// taking it the route takes none (KEEP-RUST), though the handler's file
+/// is unchanged.
+pub fn swift_vapor_handler_rival_overload_gains_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_RIVAL_ROUTES)
+        .file(VAPOR_RIVAL_FILE, VAPOR_RIVAL)
+        .file(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_NO_REQUEST)
+        .write(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_REQUEST)
+        .edge_before(
+            VAPOR_RIVAL_ROUTE.0,
+            VAPOR_RIVAL_ROUTE.1,
+            VAPOR_RIVAL_ROUTE.2,
+        )
+}
+
+/// W7-19g: the rival stops taking the `Request`: the route links to the
+/// handler again.
+pub fn swift_vapor_handler_rival_overload_loses_the_request() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_RIVAL_ROUTES)
+        .file(VAPOR_RIVAL_FILE, VAPOR_RIVAL)
+        .file(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_REQUEST)
+        .write(VAPOR_RIVAL_EXTENSION_FILE, VAPOR_RIVAL_NO_REQUEST)
+        .edge_after(
+            VAPOR_RIVAL_ROUTE.0,
+            VAPOR_RIVAL_ROUTE.1,
+            VAPOR_RIVAL_ROUTE.2,
+        )
+}
+
+/// The route's type, declaring no handler yet, in the file it keeps: a
+/// change of that file adds a callable of a name it declared none of.
+const VAPOR_MISSING_EMPTY: &str = "import Vapor\nenum MissingController {\n}\n";
+
+/// W7-19g: the type's own file comes to declare the route's handler: the
+/// route, waiting under its whole name, links.
+pub fn swift_vapor_handler_type_gains_the_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .file(VAPOR_MISSING_FILE, VAPOR_MISSING_EMPTY)
+        .write(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .edge_after(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// W7-19g: the handler goes from its type's file: the route waits again.
+pub fn swift_vapor_handler_type_loses_the_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_MISSING_ROUTES)
+        .file(VAPOR_MISSING_FILE, VAPOR_MISSING)
+        .write(VAPOR_MISSING_FILE, VAPOR_MISSING_EMPTY)
+        .edge_before(VAPOR_MISSING_ROUTE, "references", VAPOR_MISSING_SHOW)
+}
+
+/// A handler declared in `extension API.SearchController`, whose method's
+/// qualified name is `SearchController::get`: only the extension's head
+/// names the `API` type, and a head that drops it renames nothing.
+const VAPOR_API_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"api\", \"search\", use: API.SearchController.get)\n}\n";
+const VAPOR_API_FILE: &str = "Sources/App/Controllers/API/API.swift";
+const VAPOR_API: &str = "enum API {}\n";
+const VAPOR_API_SEARCH_FILE: &str = "Sources/App/Controllers/API/API+SearchController.swift";
+const VAPOR_API_SEARCH: &str = "import Vapor\nextension API {\n    enum SearchController {}\n}\nextension API.SearchController {\n    static func get(req: Request) async throws -> String { \"api search\" }\n}\n";
+const VAPOR_API_SEARCH_BARE: &str = "import Vapor\nextension API {\n    enum SearchController {}\n}\nextension SearchController {\n    static func get(req: Request) async throws -> String { \"api search\" }\n}\n";
+const VAPOR_API_SEARCH_ROUTE: &str = "route Sources/App/routes.swift::route:/api/search";
+const VAPOR_API_SEARCH_GET: &str = "method SearchController::get";
+
+/// W7-19g (#2106): the extension's head comes to write `API.`: the route
+/// `API.SearchController.get` links to its method.
+pub fn swift_vapor_extension_gains_its_api_path() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_API_ROUTES)
+        .file(VAPOR_API_FILE, VAPOR_API)
+        .file(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH_BARE)
+        .write(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH)
+        .edge_after(VAPOR_API_SEARCH_ROUTE, "references", VAPOR_API_SEARCH_GET)
+}
+
+/// W7-19g: the head drops its `API.`: the route links to nothing.
+pub fn swift_vapor_extension_loses_its_api_path() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_API_ROUTES)
+        .file(VAPOR_API_FILE, VAPOR_API)
+        .file(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH)
+        .write(VAPOR_API_SEARCH_FILE, VAPOR_API_SEARCH_BARE)
+        .edge_before(VAPOR_API_SEARCH_ROUTE, "references", VAPOR_API_SEARCH_GET)
+}
+
+/// A handler on the type a route names, in an extension of its own file or
+/// in the type's body.
+const VAPOR_PACKAGES_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"packages\", use: PackageController.show)\n}\n";
+const VAPOR_PACKAGE_TYPE_FILE: &str = "Sources/App/Controllers/PackageController.swift";
+const VAPOR_PACKAGE_TYPE: &str = "import Vapor\nenum PackageController {}\n";
+const VAPOR_PACKAGE_TYPE_SHOW: &str = "import Vapor\nenum PackageController {\n    static func show(req: Request) async throws -> String { \"package\" }\n}\n";
+const VAPOR_PACKAGE_ROUTES_FILE: &str = "Sources/App/Controllers/PackageController+routes.swift";
+const VAPOR_PACKAGE_EXTENSION: &str = "import Vapor\nextension PackageController {\n    static func show(req: Request) async throws -> String { \"package\" }\n}\n";
+const VAPOR_PACKAGE_EXTENSION_EMPTY: &str = "import Vapor\nextension PackageController {\n}\n";
+const VAPOR_PACKAGES_ROUTE: &str = "route Sources/App/routes.swift::route:/packages";
+
+/// W7-19g: the handler moves from the type's extension into the type's own
+/// body, in another file: the route follows it.
+pub fn swift_vapor_handler_moves_into_its_type() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_PACKAGES_ROUTES)
+        .file(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE)
+        .file(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION)
+        .write(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION_EMPTY)
+        .write(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE_SHOW)
+        .edge_before(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController+routes.swift",
+        )
+        .edge_after(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController.swift",
+        )
+}
+
+/// W7-19g: the handler moves back into the extension.
+pub fn swift_vapor_handler_moves_into_an_extension() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_PACKAGES_ROUTES)
+        .file(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE_SHOW)
+        .file(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION_EMPTY)
+        .write(VAPOR_PACKAGE_TYPE_FILE, VAPOR_PACKAGE_TYPE)
+        .write(VAPOR_PACKAGE_ROUTES_FILE, VAPOR_PACKAGE_EXTENSION)
+        .edge_before(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController.swift",
+        )
+        .edge_after(
+            VAPOR_PACKAGES_ROUTE,
+            "references",
+            "method PackageController::show @Sources/App/Controllers/PackageController+routes.swift",
+        )
+}
+
+/// A route collection whose `self.index` names a method its type declares
+/// in another file's extension.
+const VAPOR_TAGS_FILE: &str = "Sources/App/Controllers/Tags.swift";
+const VAPOR_TAGS: &str = "import Vapor\nstruct TagController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        routes.get(\"tags\", use: self.index)\n    }\n}\n";
+const VAPOR_TAG_HANDLERS_FILE: &str = "Sources/App/Controllers/Tags+handlers.swift";
+const VAPOR_TAG_HANDLERS: &str = "import Vapor\nextension TagController {\n    func index(req: Request) async throws -> String { \"tags\" }\n}\n";
+const VAPOR_TAGS_ROUTE: &str = "route Sources/App/Controllers/Tags.swift::route:/tags";
+const VAPOR_TAGS_INDEX: &str = "method TagController::index";
+
+/// W7-19g (#2106): the extension that declares `self.index` appears: the
+/// route links to it.
+pub fn swift_vapor_self_handler_extension_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_TAGS_FILE, VAPOR_TAGS)
+        .write(VAPOR_TAG_HANDLERS_FILE, VAPOR_TAG_HANDLERS)
+        .edge_after(VAPOR_TAGS_ROUTE, "references", VAPOR_TAGS_INDEX)
+}
+
+/// W7-19g: the extension is deleted: the route waits again.
+pub fn swift_vapor_self_handler_extension_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_TAGS_FILE, VAPOR_TAGS)
+        .file(VAPOR_TAG_HANDLERS_FILE, VAPOR_TAG_HANDLERS)
+        .remove(VAPOR_TAG_HANDLERS_FILE)
+        .edge_before(VAPOR_TAGS_ROUTE, "references", VAPOR_TAGS_INDEX)
+}
+
+/// A top-level route whose bare `use: hello` is the project's one function
+/// of that name, until another file declares a second.
+const VAPOR_HELLO_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"hello\", use: hello)\n}\n";
+const VAPOR_HELLO_FILE: &str = "Sources/App/Hello.swift";
+const VAPOR_HELLO: &str = "import Vapor\nfunc hello(req: Request) -> String { \"hi\" }\n";
+const VAPOR_HELLO_TWIN_FILE: &str = "Sources/Tools/Hello.swift";
+const VAPOR_HELLO_TWIN: &str = "func hello(name: String) -> String { name }\n";
+const VAPOR_HELLO_ROUTE: (&str, &str, &str) = (
+    "route Sources/App/routes.swift::route:/hello",
+    "references",
+    "function hello @Sources/App/Hello.swift",
+);
+
+/// W7-19g (#2106): a second function `hello` appears: the bare handler names
+/// no one function of the project, and links to nothing.
+pub fn swift_vapor_bare_handler_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_HELLO_ROUTES)
+        .file(VAPOR_HELLO_FILE, VAPOR_HELLO)
+        .write(VAPOR_HELLO_TWIN_FILE, VAPOR_HELLO_TWIN)
+        .edge_before(
+            VAPOR_HELLO_ROUTE.0,
+            VAPOR_HELLO_ROUTE.1,
+            VAPOR_HELLO_ROUTE.2,
+        )
+        .no_edge_after(
+            VAPOR_HELLO_ROUTE.0,
+            VAPOR_HELLO_ROUTE.1,
+            VAPOR_HELLO_ROUTE.2,
+        )
+}
+
+/// W7-19g: the second `hello` is deleted: the route links to the one left.
+pub fn swift_vapor_bare_handler_loses_its_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_HELLO_ROUTES)
+        .file(VAPOR_HELLO_FILE, VAPOR_HELLO)
+        .file(VAPOR_HELLO_TWIN_FILE, VAPOR_HELLO_TWIN)
+        .remove(VAPOR_HELLO_TWIN_FILE)
+        .edge_after(
+            VAPOR_HELLO_ROUTE.0,
+            VAPOR_HELLO_ROUTE.1,
+            VAPOR_HELLO_ROUTE.2,
+        )
+}
+
+/// Routes and a handler that import nothing, so that only the root
+/// `Package.swift` or another file can show Vapor.
+const VAPOR_USERS_ROUTES: &str = "func routes(_ app: Application) throws {\n    app.get(\"users\", use: UserController.index)\n}\n";
+const VAPOR_USER_CONTROLLER_FILE: &str = "Sources/App/Controllers/UserController.swift";
+const VAPOR_USER_CONTROLLER: &str =
+    "enum UserController {\n    static func index(req: Request) -> String { \"users\" }\n}\n";
+const VAPOR_USERS_ROUTE: &str = "route Sources/App/routes.swift::route:/users";
+const VAPOR_USERS_INDEX: &str = "method UserController::index";
+
+/// W7-19g: the root `Package.swift` comes to name `vapor`: Vapor is
+/// detected, and the route links.
+pub fn swift_vapor_package_gains_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE)
+        .detected_before("vapor", false)
+        .detected_after("vapor", true)
+        .edge_after(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// W7-19g: the root `Package.swift` drops `vapor`: Vapor is not detected,
+/// and the route goes.
+pub fn swift_vapor_package_drops_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .detected_before("vapor", true)
+        .detected_after("vapor", false)
+        .edge_before(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// The configuration keeps the root `Package.swift` out of the index: only
+/// the `swift` control kind tells a sync it changed.
+const VAPOR_EXCLUDE_PACKAGE: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"Package.swift\"]\n";
+
+/// W7-19g: the root `Package.swift`, which the configuration keeps out of
+/// the index, comes to name `vapor`: Vapor is detected.
+pub fn swift_vapor_excluded_package_gains_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file(".codegraph/config.toml", VAPOR_EXCLUDE_PACKAGE)
+        .file("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE)
+        .detected_before("vapor", false)
+        .detected_after("vapor", true)
+        .edge_after(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// W7-19g: the excluded `Package.swift` drops `vapor`: Vapor is not
+/// detected.
+pub fn swift_vapor_excluded_package_drops_vapor() -> Case {
+    Case::new(Change::ControlFile, &[Language::Swift])
+        .file(".codegraph/config.toml", VAPOR_EXCLUDE_PACKAGE)
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .write("Package.swift", VAPOR_PACKAGE_PLAIN)
+        .detected_before("vapor", true)
+        .detected_after("vapor", false)
+        .edge_before(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// A file that routes nothing, with and without the `import Vapor` that
+/// shows Vapor.
+const VAPOR_CONFIGURE_FILE: &str = "Sources/App/configure.swift";
+const VAPOR_CONFIGURE_PLAIN: &str = "func configure() {}\n";
+const VAPOR_CONFIGURE_IMPORT: &str = "import Vapor\nfunc configure() {}\n";
+
+/// W7-19g: a file that routes nothing comes to `import Vapor`: Vapor is
+/// detected, and the route in another file links.
+pub fn swift_vapor_import_appears_in_a_file_that_routes_nothing() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_PLAIN)
+        .write(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_IMPORT)
+        .detected_before("vapor", false)
+        .detected_after("vapor", true)
+        .edge_after(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// W7-19g: the `import Vapor` goes: Vapor is not detected.
+pub fn swift_vapor_import_goes_from_a_file_that_routes_nothing() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(VAPOR_ROUTES_FILE, VAPOR_USERS_ROUTES)
+        .file(VAPOR_USER_CONTROLLER_FILE, VAPOR_USER_CONTROLLER)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_IMPORT)
+        .write(VAPOR_CONFIGURE_FILE, VAPOR_CONFIGURE_PLAIN)
+        .detected_before("vapor", true)
+        .detected_after("vapor", false)
+        .edge_before(VAPOR_USERS_ROUTE, "references", VAPOR_USERS_INDEX)
+}
+
+/// Two `ProfileView` structs, one in a `/Views/` folder SwiftUI's view
+/// convention prefers, and a screen in neither folder that makes one; a
+/// file that comes to show SwiftUI or goes.
+const SWIFTUI_APP_FILE: &str = "App/App.swift";
+const SWIFTUI_APP_PLAIN: &str = "struct AppRoot {\n}\n";
+const SWIFTUI_APP_IMPORT: &str = "import SwiftUI\nstruct AppRoot {\n}\n";
+const SWIFTUI_SCREEN_FILE: &str = "App/Screens/HomeScreen.swift";
+const SWIFTUI_SCREEN: &str =
+    "struct HomeScreen {\n    func makeProfile() {\n        _ = ProfileView()\n    }\n}\n";
+const SWIFTUI_PROFILE_VIEW: &str = "struct ProfileView {\n}\n";
+const SWIFTUI_MAKE_PROFILE: (&str, &str, &str) = (
+    "method HomeScreen::makeProfile",
+    "instantiates",
+    "struct ProfileView @App/Views/ProfileView.swift",
+);
+
+/// W7-19g: a file comes to `import SwiftUI`: SwiftUI is detected, and the
+/// view the screen makes is the one under `/Views/`.
+pub fn swiftui_import_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_PLAIN)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_SCREEN)
+        .file("App/Views/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .file("App/Legacy/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .write(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .detected_before("swiftui", false)
+        .detected_after("swiftui", true)
+        .edge_metadata_after(SWIFTUI_MAKE_PROFILE, "framework", "swiftui")
+}
+
+/// W7-19g: the `import SwiftUI` goes: SwiftUI is not detected, and no edge
+/// names it.
+pub fn swiftui_import_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_SCREEN)
+        .file("App/Views/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .file("App/Legacy/ProfileView.swift", SWIFTUI_PROFILE_VIEW)
+        .write(SWIFTUI_APP_FILE, SWIFTUI_APP_PLAIN)
+        .detected_before("swiftui", true)
+        .detected_after("swiftui", false)
+        .edge_metadata_before(SWIFTUI_MAKE_PROFILE, "framework", "swiftui")
+        .no_edge_metadata_after(SWIFTUI_MAKE_PROFILE, "framework", "swiftui")
+}
+
+/// Two `SettingsViewController` classes, one in a `/ViewControllers/`
+/// folder UIKit's convention prefers; a file whose comment comes to name
+/// `UIView`, which shows UIKit as upstream reads it.
+const UIKIT_SHELL_FILE: &str = "App/Shell.swift";
+const UIKIT_SHELL_PLAIN: &str = "struct Shell {\n}\n";
+const UIKIT_SHELL_COMMENT: &str = "// Hosts a UIView.\nstruct Shell {\n}\n";
+const UIKIT_COORDINATOR_FILE: &str = "App/Coordinators/AppCoordinator.swift";
+const UIKIT_COORDINATOR: &str = "final class AppCoordinator {\n    func start() {\n        _ = SettingsViewController()\n    }\n}\n";
+const UIKIT_SETTINGS: &str = "final class SettingsViewController {\n}\n";
+const UIKIT_START_SETTINGS: (&str, &str, &str) = (
+    "method AppCoordinator::start",
+    "instantiates",
+    "class SettingsViewController @App/ViewControllers/SettingsViewController.swift",
+);
+
+/// W7-19g: a comment comes to name `UIView`: UIKit is detected, and the
+/// controller the coordinator makes is the one under `/ViewControllers/`.
+pub fn uikit_view_mention_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(UIKIT_SHELL_FILE, UIKIT_SHELL_PLAIN)
+        .file(UIKIT_COORDINATOR_FILE, UIKIT_COORDINATOR)
+        .file(
+            "App/ViewControllers/SettingsViewController.swift",
+            UIKIT_SETTINGS,
+        )
+        .file("App/Legacy/SettingsViewController.swift", UIKIT_SETTINGS)
+        .write(UIKIT_SHELL_FILE, UIKIT_SHELL_COMMENT)
+        .detected_before("uikit", false)
+        .detected_after("uikit", true)
+        .edge_metadata_after(UIKIT_START_SETTINGS, "framework", "uikit")
+}
+
+/// W7-19g: the comment goes: UIKit is not detected.
+pub fn uikit_view_mention_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(UIKIT_SHELL_FILE, UIKIT_SHELL_COMMENT)
+        .file(UIKIT_COORDINATOR_FILE, UIKIT_COORDINATOR)
+        .file(
+            "App/ViewControllers/SettingsViewController.swift",
+            UIKIT_SETTINGS,
+        )
+        .file("App/Legacy/SettingsViewController.swift", UIKIT_SETTINGS)
+        .write(UIKIT_SHELL_FILE, UIKIT_SHELL_PLAIN)
+        .detected_before("uikit", true)
+        .detected_after("uikit", false)
+        .edge_metadata_before(UIKIT_START_SETTINGS, "framework", "uikit")
+        .no_edge_metadata_after(UIKIT_START_SETTINGS, "framework", "uikit")
+}
+
+/// A closure route whose body calls a method of a type in another file.
+const VAPOR_CLOSURE_ROUTES: &str = "import Vapor\nfunc routes(_ app: Application) throws {\n    app.get(\"hello\", \":name\") { req async throws -> String in\n        Greeter.audit(\"x\")\n        return \"hi\"\n    }\n}\n";
+const VAPOR_GREETER_FILE: &str = "Sources/App/Greeter.swift";
+const VAPOR_GREETER: &str =
+    "import Vapor\nenum Greeter {\n    static func audit(_ name: String) {}\n}\n";
+const VAPOR_CLOSURE_ROUTE: &str = "route Sources/App/routes.swift::route:/hello/:name";
+const VAPOR_GREETER_AUDIT: &str = "method Greeter::audit";
+
+/// W7-19g (#2273): the type a closure route's body calls appears: the
+/// route calls its method.
+pub fn swift_vapor_closure_call_target_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_CLOSURE_ROUTES)
+        .write(VAPOR_GREETER_FILE, VAPOR_GREETER)
+        .named_before("route", "GET /hello/:name")
+        .edge_after(VAPOR_CLOSURE_ROUTE, "calls", VAPOR_GREETER_AUDIT)
+}
+
+/// W7-19g: the type is deleted: the call waits again.
+pub fn swift_vapor_closure_call_target_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_ROUTES_FILE, VAPOR_CLOSURE_ROUTES)
+        .file(VAPOR_GREETER_FILE, VAPOR_GREETER)
+        .remove(VAPOR_GREETER_FILE)
+        .edge_before(VAPOR_CLOSURE_ROUTE, "calls", VAPOR_GREETER_AUDIT)
+}
+
+/// Two `TodoController` structs, one in a `/Controllers/` folder Vapor's
+/// convention prefers, and a function in neither folder that makes one.
+const VAPOR_TODO: &str = "struct TodoController {\n}\n";
+const VAPOR_TODO_FILE: &str = "Sources/App/Controllers/TodoController.swift";
+const VAPOR_TODO_MOVED_FILE: &str = "Sources/App/Models/TodoController.swift";
+const VAPOR_TODO_LEGACY_FILE: &str = "Sources/Legacy/TodoController.swift";
+const VAPOR_MAKES_TODO: &str = "func configure() {\n    _ = TodoController()\n}\n";
+const VAPOR_CONFIGURE_TODO: (&str, &str, &str) = (
+    "function configure",
+    "instantiates",
+    "struct TodoController @Sources/App/Controllers/TodoController.swift",
+);
+
+/// W7-19g (#2225): the controller moves out of `/Controllers/`: of two
+/// candidates in no preferred folder the convention takes neither
+/// (KEEP-RUST), leaving the reference to the name matcher's guess.
+pub fn swift_vapor_controller_moves_out_of_controllers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_MAKES_TODO)
+        .file(VAPOR_TODO_FILE, VAPOR_TODO)
+        .file(VAPOR_TODO_LEGACY_FILE, VAPOR_TODO)
+        .rename(VAPOR_TODO_FILE, VAPOR_TODO_MOVED_FILE)
+        .edge_metadata_before(VAPOR_CONFIGURE_TODO, "framework", "vapor")
+        .no_edge_metadata_after(
+            (
+                VAPOR_CONFIGURE_TODO.0,
+                VAPOR_CONFIGURE_TODO.1,
+                "struct TodoController @Sources/App/Models/TodoController.swift",
+            ),
+            "framework",
+            "vapor",
+        )
+        .no_edge_metadata_after(
+            (
+                VAPOR_CONFIGURE_TODO.0,
+                VAPOR_CONFIGURE_TODO.1,
+                "struct TodoController @Sources/Legacy/TodoController.swift",
+            ),
+            "framework",
+            "vapor",
+        )
+}
+
+/// W7-19g (#2225): the controller moves into `/Controllers/`: the
+/// convention takes it.
+pub fn swift_vapor_controller_moves_into_controllers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_CONFIGURE_FILE, VAPOR_MAKES_TODO)
+        .file(VAPOR_TODO_MOVED_FILE, VAPOR_TODO)
+        .file(VAPOR_TODO_LEGACY_FILE, VAPOR_TODO)
+        .rename(VAPOR_TODO_MOVED_FILE, VAPOR_TODO_FILE)
+        .edge_metadata_after(VAPOR_CONFIGURE_TODO, "framework", "vapor")
+}
+
+/// Two `Profile` structs, one in a `/Models/` folder SwiftUI's model
+/// convention prefers, a screen that makes one, and an extension of the
+/// model beside it: the extension is a class node of the same name, so the
+/// preferred folder holds two candidates.
+const SWIFTUI_MODEL_SCREEN: &str =
+    "struct HomeScreen {\n    func makeProfile() {\n        _ = Profile()\n    }\n}\n";
+const SWIFTUI_MODEL: &str = "struct Profile {\n}\n";
+const SWIFTUI_MODEL_EXTENSION_FILE: &str = "App/Models/Profile+Codable.swift";
+const SWIFTUI_MODEL_EXTENSION: &str = "extension Profile {\n}\n";
+const SWIFTUI_MAKE_MODEL: (&str, &str, &str) = (
+    "method HomeScreen::makeProfile",
+    "instantiates",
+    "struct Profile @App/Models/Profile.swift",
+);
+
+/// W7-19g (#2225): an extension of the model appears beside it: the
+/// preferred folder holds two candidates, and the convention takes neither
+/// (KEEP-RUST).
+pub fn swiftui_model_gains_an_extension_beside_it() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_MODEL_SCREEN)
+        .file("App/Models/Profile.swift", SWIFTUI_MODEL)
+        .file("App/Legacy/Profile.swift", SWIFTUI_MODEL)
+        .write(SWIFTUI_MODEL_EXTENSION_FILE, SWIFTUI_MODEL_EXTENSION)
+        .edge_metadata_before(SWIFTUI_MAKE_MODEL, "framework", "swiftui")
+        .no_edge_metadata_after(SWIFTUI_MAKE_MODEL, "framework", "swiftui")
+}
+
+/// W7-19g: the extension is deleted: the convention takes the model again.
+pub fn swiftui_model_loses_its_extension() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift])
+        .file(SWIFTUI_APP_FILE, SWIFTUI_APP_IMPORT)
+        .file(SWIFTUI_SCREEN_FILE, SWIFTUI_MODEL_SCREEN)
+        .file("App/Models/Profile.swift", SWIFTUI_MODEL)
+        .file("App/Legacy/Profile.swift", SWIFTUI_MODEL)
+        .file(SWIFTUI_MODEL_EXTENSION_FILE, SWIFTUI_MODEL_EXTENSION)
+        .remove(SWIFTUI_MODEL_EXTENSION_FILE)
+        .edge_metadata_after(SWIFTUI_MAKE_MODEL, "framework", "swiftui")
+}
+
+/// A route collection's group, renamed in its own file.
+const VAPOR_TODOS_FILE: &str = "Sources/App/Controllers/Collections.swift";
+const VAPOR_TODOS: &str = "import Vapor\nstruct TodoController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        let todos = routes.grouped(\"todos\")\n        todos.get(use: index)\n    }\n    func index(req: Request) async throws -> String { \"todos\" }\n}\n";
+const VAPOR_TASKS: &str = "import Vapor\nstruct TodoController: RouteCollection {\n    func boot(routes: RoutesBuilder) throws {\n        let todos = routes.grouped(\"tasks\")\n        todos.get(use: index)\n    }\n    func index(req: Request) async throws -> String { \"todos\" }\n}\n";
+
+/// W7-19g: a group's prefix changes in the routes' own file: the route is
+/// renamed with it, and still reaches its handler.
+pub fn swift_vapor_group_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file("Package.swift", VAPOR_PACKAGE)
+        .file(VAPOR_TODOS_FILE, VAPOR_TODOS)
+        .write(VAPOR_TODOS_FILE, VAPOR_TASKS)
+        .named_before("route", "GET /todos")
+        .named_after("route", "GET /tasks")
+        .edge_after(
+            "route Sources/App/Controllers/Collections.swift::route:/tasks",
+            "references",
+            "method TodoController::index",
+        )
+}
+
+// ---- W7-19h: Rust's axum and actix routes and Cargo workspace crates ----
+
+/// A workspace of the members `alpha` and `beta`, `alpha` naming the crate
+/// `beta` in a `use`.
+const RUST_WORKSPACE: &str = "[workspace]\nmembers = [\"crates/alpha\", \"crates/beta\"]\n";
+const RUST_ALPHA_MANIFEST: &str = "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n";
+const RUST_BETA_MANIFEST: &str = "[package]\nname = \"beta\"\nversion = \"0.1.0\"\n";
+const RUST_GAMMA_MANIFEST: &str = "[package]\nname = \"gamma\"\nversion = \"0.1.0\"\n";
+const RUST_USES_BETA: &str = "use beta::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n";
+const RUST_THING: &str = "pub struct Thing;\n";
+const RUST_MAIN: &str = "fn main() {}\n";
+/// The `use beta::…`'s crate root edge, to the member's `lib.rs` or
+/// `main.rs`.
+const RUST_ALPHA_TO_BETA_LIB: (&str, &str, &str) = (
+    "file:crates/alpha/src/lib.rs",
+    "imports",
+    "file:crates/beta/src/lib.rs",
+);
+const RUST_ALPHA_TO_BETA_MAIN: (&str, &str, &str) = (
+    "file:crates/alpha/src/lib.rs",
+    "imports",
+    "file:crates/beta/src/main.rs",
+);
+
+/// W7-19h (#151): the member `beta`, a binary, gains a `src/lib.rs`: the
+/// crate root `use beta::…` links is the library, no longer the `main.rs`.
+pub fn rust_workspace_member_gains_a_lib_beside_its_main() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/main.rs", RUST_MAIN)
+        .write("crates/beta/src/lib.rs", RUST_THING)
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_MAIN, "framework", "rust")
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (#151): the member's `src/lib.rs` is deleted: the crate root is
+/// its `main.rs` again.
+pub fn rust_workspace_member_loses_its_lib_beside_its_main() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/main.rs", RUST_MAIN)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .remove("crates/beta/src/lib.rs")
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_MAIN, "framework", "rust")
+}
+
+/// Files declaring no name `use beta::Thing` writes, so that no name their
+/// nodes touch reaches the reference.
+const RUST_HELPER: &str = "pub fn helper() {}\n";
+const RUST_OTHER: &str = "pub fn other() {}\n";
+
+/// W7-19h (#151): the member `beta`, whose `src/` holds no crate root yet,
+/// gains its `src/lib.rs`: the `use beta::…` nothing answered links that
+/// crate root. No manifest changes, and the member's `src/util.rs` already
+/// put its directories' manifests among the Rust control inputs, so only
+/// the lane's retry by name reaches the reference.
+pub fn rust_workspace_member_gains_its_crate_root() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/util.rs", RUST_HELPER)
+        .write("crates/beta/src/lib.rs", RUST_OTHER)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (#151): the member's only crate root is deleted: `use beta::…`
+/// links nothing.
+pub fn rust_workspace_member_loses_its_crate_root() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/util.rs", RUST_HELPER)
+        .file("crates/beta/src/lib.rs", RUST_OTHER)
+        .remove("crates/beta/src/lib.rs")
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// A root package that is also a workspace of the member `beta`, its
+/// `main.rs` naming `beta` in a `use`.
+const RUST_ROOT_WORKSPACE: &str =
+    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[workspace]\nmembers = [\"crates/beta\"]\n";
+const RUST_ROOT_USES_BETA: &str = "use beta::Thing;\n";
+const RUST_ROOT_TO_BETA_CRATE: (&str, &str, &str) =
+    ("file:src/main.rs", "imports", "file:crates/beta/src/lib.rs");
+const RUST_ROOT_TO_BETA_MODULE: (&str, &str, &str) =
+    ("file:src/main.rs", "imports", "file:src/beta.rs");
+
+/// W7-19h: the root gains a module `src/beta.rs`: the module rule reads the
+/// root's modules before the workspace's crates, so `beta` is that module,
+/// no longer the crate.
+pub fn rust_root_module_appears_over_a_workspace_crate() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file("Cargo.toml", RUST_ROOT_WORKSPACE)
+        .file("src/main.rs", RUST_ROOT_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("src/beta.rs", RUST_THING)
+        .edge_metadata_before(RUST_ROOT_TO_BETA_CRATE, "framework", "rust")
+        .edge_metadata_after(RUST_ROOT_TO_BETA_MODULE, "framework", "rust")
+}
+
+/// W7-19h: the root module `src/beta.rs` is deleted: `beta` is the
+/// workspace's crate again.
+pub fn rust_root_module_over_a_workspace_crate_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_ROOT_WORKSPACE)
+        .file("src/main.rs", RUST_ROOT_USES_BETA)
+        .file("src/beta.rs", RUST_THING)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .remove("src/beta.rs")
+        .edge_metadata_before(RUST_ROOT_TO_BETA_MODULE, "framework", "rust")
+        .edge_metadata_after(RUST_ROOT_TO_BETA_CRATE, "framework", "rust")
+}
+
+/// An index root configuration whose `max_file_size` keeps a file holding
+/// [`RUST_THING_OVER_LIMIT`] out of extraction and every other file of the
+/// cases below in. A file over the limit stays tracked, recorded without any
+/// node: no file node either.
+const RUST_SIZE_LIMIT_CONFIG: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nmax_file_size = 120\n";
+/// [`RUST_THING`] behind a comment that puts it over that limit.
+const RUST_THING_OVER_LIMIT: &str = "// A file over the index root's max_file_size is recorded without any node, its file node included, until it shrinks back under the limit.\npub struct Thing;\n";
+
+/// W7-19h (gate r1): the root module `src/beta.rs` was over `max_file_size`,
+/// so `beta` was the workspace's crate; it shrinks back under the limit. The
+/// file stays tracked, so the sync adds no file, but its file node appears
+/// and `beta` is the module.
+pub fn rust_root_module_shrinks_under_the_size_limit() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file(".codegraph/config.toml", RUST_SIZE_LIMIT_CONFIG)
+        .file("Cargo.toml", RUST_ROOT_WORKSPACE)
+        .file("src/main.rs", RUST_ROOT_USES_BETA)
+        .file("src/beta.rs", RUST_THING_OVER_LIMIT)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("src/beta.rs", RUST_THING)
+        .edge_metadata_before(RUST_ROOT_TO_BETA_CRATE, "framework", "rust")
+        .edge_metadata_after(RUST_ROOT_TO_BETA_MODULE, "framework", "rust")
+}
+
+/// W7-19h (gate r1): the root module `src/beta.rs` grows over the limit: its
+/// file node goes, and `beta` is the workspace's crate again.
+pub fn rust_root_module_grows_over_the_size_limit() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file(".codegraph/config.toml", RUST_SIZE_LIMIT_CONFIG)
+        .file("Cargo.toml", RUST_ROOT_WORKSPACE)
+        .file("src/main.rs", RUST_ROOT_USES_BETA)
+        .file("src/beta.rs", RUST_THING)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("src/beta.rs", RUST_THING_OVER_LIMIT)
+        .edge_metadata_before(RUST_ROOT_TO_BETA_MODULE, "framework", "rust")
+        .edge_metadata_after(RUST_ROOT_TO_BETA_CRATE, "framework", "rust")
+}
+
+/// W7-19h (gate r1): the member `beta`'s only crate root `src/lib.rs` was
+/// over the limit, so the `use beta::…` nothing answered waited; it shrinks
+/// back under the limit and the reference links it. The file was tracked,
+/// a Rust file of the member already, so only the lane's retry by name
+/// reaches the reference.
+pub fn rust_workspace_crate_root_shrinks_under_the_size_limit() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file(".codegraph/config.toml", RUST_SIZE_LIMIT_CONFIG)
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING_OVER_LIMIT)
+        .write("crates/beta/src/lib.rs", RUST_THING)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (gate r1): the member's only crate root grows over the limit:
+/// `use beta::…` links nothing.
+pub fn rust_workspace_crate_root_grows_over_the_size_limit() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file(".codegraph/config.toml", RUST_SIZE_LIMIT_CONFIG)
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("crates/beta/src/lib.rs", RUST_THING_OVER_LIMIT)
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+const RUST_WORKSPACE_A: &str = "[workspace]\nmembers = [\"crates/a\"]\n";
+const RUST_WORKSPACE_A_B: &str = "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n";
+const RUST_A_MANIFEST: &str = "[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+const RUST_B_MANIFEST: &str = "[package]\nname = \"b\"\nversion = \"0.1.0\"\n";
+const RUST_USES_B: &str = "use b::Thing;\n\npub fn make() -> Thing {\n    Thing\n}\n";
+const RUST_A_TO_B: (&str, &str, &str) = (
+    "file:crates/a/src/lib.rs",
+    "imports",
+    "file:crates/b/src/lib.rs",
+);
+
+/// W7-19h (#151): the root's `members` gains `crates/b`: `use b::…` links
+/// that crate's root.
+pub fn rust_workspace_members_gain_a_crate() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_A)
+        .file("crates/a/Cargo.toml", RUST_A_MANIFEST)
+        .file("crates/a/src/lib.rs", RUST_USES_B)
+        .file("crates/b/Cargo.toml", RUST_B_MANIFEST)
+        .file("crates/b/src/lib.rs", RUST_THING)
+        .write("Cargo.toml", RUST_WORKSPACE_A_B)
+        .edge_metadata_after(RUST_A_TO_B, "framework", "rust")
+}
+
+/// W7-19h (#151): the root's `members` loses `crates/b`: `b` names no crate.
+pub fn rust_workspace_members_lose_a_crate() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_A_B)
+        .file("crates/a/Cargo.toml", RUST_A_MANIFEST)
+        .file("crates/a/src/lib.rs", RUST_USES_B)
+        .file("crates/b/Cargo.toml", RUST_B_MANIFEST)
+        .file("crates/b/src/lib.rs", RUST_THING)
+        .write("Cargo.toml", RUST_WORKSPACE_A)
+        .edge_metadata_before(RUST_A_TO_B, "framework", "rust")
+        .no_edge_after(RUST_A_TO_B.0, RUST_A_TO_B.1, RUST_A_TO_B.2)
+}
+
+/// W7-19h (#151): the member `beta` renames its package `gamma`: `beta`
+/// names no crate.
+pub fn rust_workspace_member_renames_its_package() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("crates/beta/Cargo.toml", RUST_GAMMA_MANIFEST)
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+        .no_edge_after(
+            RUST_ALPHA_TO_BETA_LIB.0,
+            RUST_ALPHA_TO_BETA_LIB.1,
+            RUST_ALPHA_TO_BETA_LIB.2,
+        )
+}
+
+/// W7-19h (#151): the member takes the package name `beta` back.
+pub fn rust_workspace_member_takes_its_package_name_back() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_GAMMA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .write("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+const RUST_WORKSPACE_GLOB: &str = "[workspace]\nmembers = [\"crates/*\"]\n";
+
+/// W7-19h (#151): a directory the `crates/*` glob matches appears, with a
+/// manifest and a `src/lib.rs`: `use beta::…` links that crate's root.
+pub fn rust_workspace_glob_gains_a_member() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_GLOB)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .write("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .write("crates/beta/src/lib.rs", RUST_THING)
+        .edge_metadata_after(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// W7-19h (#151): the glob's member directory goes: `beta` names no crate.
+pub fn rust_workspace_glob_loses_a_member() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_WORKSPACE_GLOB)
+        .file("crates/alpha/Cargo.toml", RUST_ALPHA_MANIFEST)
+        .file("crates/alpha/src/lib.rs", RUST_USES_BETA)
+        .file("crates/beta/Cargo.toml", RUST_BETA_MANIFEST)
+        .file("crates/beta/src/lib.rs", RUST_THING)
+        .remove("crates/beta/Cargo.toml")
+        .remove("crates/beta/src/lib.rs")
+        .edge_metadata_before(RUST_ALPHA_TO_BETA_LIB, "framework", "rust")
+}
+
+/// An axum application whose route's handler is declared beside it.
+const RUST_AXUM_APP: &str = "use axum::{routing::get, Router};\n\nfn list_users() {}\n\nfn app() -> Router {\n    Router::new().route(\"/users\", get(list_users))\n}\n";
+const RUST_USERS_ROUTE: &str = "route src/main.rs::route:/users";
+const RUST_APP_MANIFEST: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+
+/// W7-19h (#2359): a root `Cargo.toml` appears: Rust's frameworks are
+/// detected, and the axum route links its handler.
+pub fn rust_root_manifest_appears_beside_axum_routes() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("src/main.rs", RUST_AXUM_APP)
+        .write("Cargo.toml", RUST_APP_MANIFEST)
+        .detected_before("rust", false)
+        .detected_after("rust", true)
+        .named_after("route", "GET /users")
+        .edge_after(RUST_USERS_ROUTE, "references", "function list_users")
+}
+
+/// W7-19h (#2359): the root `Cargo.toml` is deleted: no Rust framework is
+/// detected, and the route goes.
+pub fn rust_root_manifest_beside_axum_routes_is_deleted() -> Case {
+    Case::new(Change::ControlFile, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_APP)
+        .remove("Cargo.toml")
+        .detected_before("rust", true)
+        .detected_after("rust", false)
+        .edge_before(RUST_USERS_ROUTE, "references", "function list_users")
+}
+
+/// An axum route whose handler is written through the module `handlers`.
+const RUST_AXUM_THROUGH_HANDLERS: &str = "mod handlers;\n\nuse axum::{routing::get, Router};\n\nfn app() -> Router {\n    Router::new().route(\"/users\", get(handlers::list_users))\n}\n";
+const RUST_LIST_USERS: &str = "pub fn list_users() {}\n";
+
+/// W7-19h (#2359): the module holding the route's handler appears: the
+/// route, whose reference sits where the handler is written, links it.
+pub fn rust_route_handler_module_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_THROUGH_HANDLERS)
+        .write("src/handlers.rs", RUST_LIST_USERS)
+        .edge_after(
+            RUST_USERS_ROUTE,
+            "references",
+            "function list_users @src/handlers.rs",
+        )
+}
+
+/// W7-19h (#2359): the handler's module is deleted: the route links
+/// nothing.
+pub fn rust_route_handler_module_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_THROUGH_HANDLERS)
+        .file("src/handlers.rs", RUST_LIST_USERS)
+        .remove("src/handlers.rs")
+        .edge_before(
+            RUST_USERS_ROUTE,
+            "references",
+            "function list_users @src/handlers.rs",
+        )
+}
+
+/// An axum route naming `items::list_handler`, which two modules `items`
+/// declare.
+const RUST_AXUM_ITEMS: &str = "mod web;\nmod admin;\n\nuse axum::{routing::get, Router};\n\nfn app() -> Router {\n    Router::new().route(\"/items\", get(items::list_handler))\n}\n";
+const RUST_LIST_HANDLER: &str = "pub fn list_handler() {}\n";
+const RUST_ITEMS_ROUTE: &str = "route src/main.rs::route:/items";
+
+/// W7-19h: one of two `list_handler`s moves into `src/handlers/`: the
+/// handler rule picks the one its folders prefer.
+pub fn rust_handler_moves_into_handlers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_ITEMS)
+        .file("src/web/items.rs", RUST_LIST_HANDLER)
+        .file("src/admin/items.rs", RUST_LIST_HANDLER)
+        .rename("src/admin/items.rs", "src/handlers/items.rs")
+        .edge_before(
+            RUST_ITEMS_ROUTE,
+            "references",
+            "function list_handler @src/admin/items.rs",
+        )
+        .edge_metadata_after(
+            (
+                RUST_ITEMS_ROUTE,
+                "references",
+                "function list_handler @src/handlers/items.rs",
+            ),
+            "framework",
+            "rust",
+        )
+}
+
+/// W7-19h: the preferred `list_handler` moves out of `src/handlers/`: with
+/// two candidates and none preferred the handler rule declines, and name
+/// matching answers.
+pub fn rust_handler_moves_out_of_handlers() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Rust])
+        .file("Cargo.toml", RUST_APP_MANIFEST)
+        .file("src/main.rs", RUST_AXUM_ITEMS)
+        .file("src/web/items.rs", RUST_LIST_HANDLER)
+        .file("src/handlers/items.rs", RUST_LIST_HANDLER)
+        .rename("src/handlers/items.rs", "src/admin/items.rs")
+        .edge_metadata_before(
+            (
+                RUST_ITEMS_ROUTE,
+                "references",
+                "function list_handler @src/handlers/items.rs",
+            ),
+            "framework",
+            "rust",
+        )
+        .no_edge_metadata_after(
+            (
+                RUST_ITEMS_ROUTE,
+                "references",
+                "function list_handler @src/admin/items.rs",
+            ),
+            "framework",
+            "rust",
+        )
+}
+
+// ---- W7-19i: Go ----
+
+const GO_SHOP_MOD: &str = "module example.com/shop\n\ngo 1.22\n";
+
+/// A router file and its handler, with and without the route line.
+const GO_ROUTES_FILE: &str = "server/routes.go";
+const GO_ROUTES_NONE: &str =
+    "package server\n\nfunc listUsers(c int) {}\n\nfunc setup(r Router) {\n}\n";
+const GO_ROUTES: &str = "package server\n\nfunc listUsers(c int) {}\n\nfunc setup(r Router) {\n\tr.GET(\"/users\", listUsers)\n}\n";
+const GO_ROUTES_RELATIVE: &str = "package server\n\nfunc listUsers(c int) {}\n\nfunc setup(r Router) {\n\tr.GET(\"users\", listUsers)\n}\n";
+const GO_USERS_ROUTE: &str = "route server/routes.go::route:/users";
+
+/// W7-19i: a router file gains a route line: a route node and its
+/// reference to the handler.
+pub fn go_router_gains_a_route_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_NONE)
+        .write(GO_ROUTES_FILE, GO_ROUTES)
+        .named_after("route", "GET /users")
+        .edge_after(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// W7-19i: the route line goes, with its node and reference.
+pub fn go_router_loses_a_route_line() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES)
+        .write(GO_ROUTES_FILE, GO_ROUTES_NONE)
+        .named_before("route", "GET /users")
+        .edge_before(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// W7-19i (#1259): the route's path loses its leading `/`: the call is no
+/// route.
+pub fn go_route_path_loses_its_leading_slash() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES)
+        .write(GO_ROUTES_FILE, GO_ROUTES_RELATIVE)
+        .named_before("route", "GET /users")
+        .edge_before(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// W7-19i (#1259): the path gets its leading `/` back: the route returns.
+pub fn go_route_path_regains_its_leading_slash() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_RELATIVE)
+        .write(GO_ROUTES_FILE, GO_ROUTES)
+        .named_after("route", "GET /users")
+        .edge_after(GO_USERS_ROUTE, "references", "function listUsers")
+}
+
+/// A `net/http` mux registration, with and without a Go 1.22 method.
+const GO_MUX_METHOD: &str = "package main\n\nfunc h(w int, r int) {}\n\nfunc main() {\n\tmux.HandleFunc(\"GET /x\", h)\n}\n";
+const GO_MUX_ANY: &str =
+    "package main\n\nfunc h(w int, r int) {}\n\nfunc main() {\n\tmux.HandleFunc(\"/x\", h)\n}\n";
+const GO_MUX_ROUTE: &str = "route main.go::route:/x";
+
+/// W7-19i (`e1f339f`): the pattern drops its method: the route serves
+/// `ANY`, under a new id and name.
+pub fn go_mux_pattern_loses_its_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file("main.go", GO_MUX_METHOD)
+        .write("main.go", GO_MUX_ANY)
+        .named_before("route", "GET /x")
+        .named_after("route", "ANY /x")
+        .edge_throughout(GO_MUX_ROUTE, "references", "function h")
+}
+
+/// W7-19i (`e1f339f`): the pattern gains the method `GET`.
+pub fn go_mux_pattern_gains_a_method() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file("main.go", GO_MUX_ANY)
+        .write("main.go", GO_MUX_METHOD)
+        .named_before("route", "ANY /x")
+        .named_after("route", "GET /x")
+        .edge_throughout(GO_MUX_ROUTE, "references", "function h")
+}
+
+/// A route whose handler another file of its package declares.
+const GO_ROUTES_ONLY: &str =
+    "package server\n\nfunc setup(r Router) {\n\tr.GET(\"/users\", listUsers)\n}\n";
+const GO_USERS_FILE: &str = "server/users.go";
+const GO_USERS: &str = "package server\n\nfunc listUsers(c int) {}\n";
+const GO_LIST_USERS_ELSEWHERE: &str = "function listUsers @server/users.go";
+
+/// W7-19i: the handler appears in another file of the route's package.
+pub fn go_route_handler_appears_in_another_file_of_its_package() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_ONLY)
+        .write(GO_USERS_FILE, GO_USERS)
+        .edge_after(GO_USERS_ROUTE, "references", GO_LIST_USERS_ELSEWHERE)
+}
+
+/// W7-19i: the handler's file is deleted.
+pub fn go_route_handler_leaves_another_file_of_its_package() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_ROUTES_FILE, GO_ROUTES_ONLY)
+        .file(GO_USERS_FILE, GO_USERS)
+        .remove(GO_USERS_FILE)
+        .edge_before(GO_USERS_ROUTE, "references", GO_LIST_USERS_ELSEWHERE)
+}
+
+/// A bare parameter type `Order`, its package's own `type Order` (and a
+/// build-tag twin of it) perhaps beside it, and namesakes in other
+/// packages; once with the type written through `model`.
+const GO_SHIP_FILE: &str = "api/ship.go";
+const GO_SHIP: &str = "package api\n\nfunc Ship(o Order) int { return 0 }\n";
+const GO_SHIP_QUALIFIED: &str = "package api\n\nimport \"example.com/shop/model\"\n\nfunc Ship(o model.Order) int { return 0 }\n";
+const GO_API_ORDER_FILE: &str = "api/order.go";
+const GO_API_ORDER: &str = "package api\n\ntype Order struct{}\n";
+const GO_API_ORDER_TWIN_FILE: &str = "api/order_windows.go";
+const GO_API_ORDER_TWIN: &str = "//go:build windows\n\npackage api\n\ntype Order struct{}\n";
+const GO_MODEL_ORDER_FILE: &str = "model/order.go";
+const GO_MODEL_ORDER: &str = "package model\n\ntype Order struct{}\n";
+const GO_STORE_ORDER_FILE: &str = "store/order.go";
+const GO_STORE_ORDER: &str = "package store\n\ntype Order struct{}\n";
+const GO_SHIP_API_ORDER: (&str, &str, &str) =
+    ("function Ship", "references", "struct Order @api/order.go");
+const GO_SHIP_MODEL_ORDER: (&str, &str, &str) = (
+    "function Ship",
+    "references",
+    "struct Order @model/order.go",
+);
+const GO_SHIP_ORDER_TWIN: (&str, &str, &str) = (
+    "function Ship",
+    "references",
+    "struct Order @api/order_windows.go",
+);
+
+/// W7-19i (#2408): the bare type's own package comes to declare it: Pattern
+/// 4 takes the package's own, where name matching linked `model/`'s.
+pub fn go_bare_type_gains_a_namesake_in_its_own_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_API_ORDER_FILE, GO_API_ORDER)
+        .edge_before(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the package's own declaration goes: no convention
+/// guesses `model/`'s.
+pub fn go_bare_type_loses_its_own_package_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .remove(GO_API_ORDER_FILE)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_after(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .no_edge_metadata_after(GO_SHIP_MODEL_ORDER, "framework", "go")
+}
+
+/// W7-19i (KEEP-RUST): the picked type gains a build-tag twin: of two
+/// candidates in the package Pattern 4 takes neither, leaving the
+/// reference to name matching.
+pub fn go_picked_type_gains_a_build_tag_twin() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_API_ORDER_TWIN_FILE, GO_API_ORDER_TWIN)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .no_edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+        .no_edge_metadata_after(GO_SHIP_ORDER_TWIN, "framework", "go")
+}
+
+/// W7-19i: the twin goes again: Pattern 4 takes the one left.
+pub fn go_picked_type_loses_its_build_tag_twin() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_API_ORDER_TWIN_FILE, GO_API_ORDER_TWIN)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .remove(GO_API_ORDER_TWIN_FILE)
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): another package comes to declare the picked type's
+/// name: nothing changes.
+pub fn go_picked_type_gains_a_namesake_in_another_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_STORE_ORDER_FILE, GO_STORE_ORDER)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the other package's namesake goes: nothing changes.
+pub fn go_picked_type_loses_a_namesake_in_another_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .file(GO_STORE_ORDER_FILE, GO_STORE_ORDER)
+        .remove(GO_STORE_ORDER_FILE)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the bare type comes to be written through `model`: no
+/// convention reads it, and the import names `model/`'s.
+pub fn go_bare_type_is_written_through_a_package() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_SHIP_FILE, GO_SHIP_QUALIFIED)
+        .edge_metadata_before(GO_SHIP_API_ORDER, "framework", "go")
+        .edge_after(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .no_edge_metadata_after(GO_SHIP_MODEL_ORDER, "framework", "go")
+}
+
+/// W7-19i (#2408): the type is written bare again: Pattern 4 takes the
+/// package's own.
+pub fn go_qualified_type_is_written_bare() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_SHIP_FILE, GO_SHIP_QUALIFIED)
+        .file(GO_API_ORDER_FILE, GO_API_ORDER)
+        .file(GO_MODEL_ORDER_FILE, GO_MODEL_ORDER)
+        .write(GO_SHIP_FILE, GO_SHIP)
+        .edge_before(
+            GO_SHIP_MODEL_ORDER.0,
+            GO_SHIP_MODEL_ORDER.1,
+            GO_SHIP_MODEL_ORDER.2,
+        )
+        .edge_metadata_after(GO_SHIP_API_ORDER, "framework", "go")
+}
+
+/// A struct embedding the bare interface `Reader`, which `model/` declares
+/// and its own package perhaps too.
+const GO_STORE_FILE: &str = "api/store.go";
+const GO_STORE: &str = "package api\n\ntype Store struct {\n\tReader\n}\n";
+const GO_API_READER_FILE: &str = "api/reader.go";
+const GO_API_READER: &str = "package api\n\ntype Reader interface{ Read() }\n";
+const GO_MODEL_READER_FILE: &str = "model/reader.go";
+const GO_MODEL_READER: &str = "package model\n\ntype Reader interface{ Read() }\n";
+const GO_STORE_API_READER: (&str, &str, &str) = (
+    "struct Store",
+    "implements",
+    "interface Reader @api/reader.go",
+);
+const GO_STORE_MODEL_READER: (&str, &str, &str) = (
+    "struct Store",
+    "implements",
+    "interface Reader @model/reader.go",
+);
+
+/// W7-19i (#2397): the embedded type's own package comes to declare it:
+/// name matching links it, never a convention.
+pub fn go_embedded_type_gains_a_namesake_in_its_own_package() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_STORE_FILE, GO_STORE)
+        .file(GO_MODEL_READER_FILE, GO_MODEL_READER)
+        .write(GO_API_READER_FILE, GO_API_READER)
+        .edge_before(
+            GO_STORE_MODEL_READER.0,
+            GO_STORE_MODEL_READER.1,
+            GO_STORE_MODEL_READER.2,
+        )
+        .edge_after(
+            GO_STORE_API_READER.0,
+            GO_STORE_API_READER.1,
+            GO_STORE_API_READER.2,
+        )
+        .no_edge_metadata_after(GO_STORE_API_READER, "framework", "go")
+}
+
+/// W7-19i (#2397): the own package's declaration goes again.
+pub fn go_embedded_type_loses_its_own_package_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GO_SHOP_MOD)
+        .file(GO_STORE_FILE, GO_STORE)
+        .file(GO_MODEL_READER_FILE, GO_MODEL_READER)
+        .file(GO_API_READER_FILE, GO_API_READER)
+        .remove(GO_API_READER_FILE)
+        .edge_before(
+            GO_STORE_API_READER.0,
+            GO_STORE_API_READER.1,
+            GO_STORE_API_READER.2,
+        )
+        .edge_after(
+            GO_STORE_MODEL_READER.0,
+            GO_STORE_MODEL_READER.1,
+            GO_STORE_MODEL_READER.2,
+        )
+        .no_edge_metadata_after(GO_STORE_MODEL_READER, "framework", "go")
+}
+
+/// A JavaScript project, perhaps with a Go tool or a root `go.mod`.
+const GO_WEB_PACKAGE: &str = "{\"name\":\"web\"}\n";
+const GO_WEB_APP_FILE: &str = "src/app.js";
+const GO_WEB_APP: &str = "export const ready = true;\n";
+const GO_TOOL_FILE: &str = "tools/gen.go";
+const GO_TOOL: &str = "package main\n\nfunc main() {}\n";
+
+/// W7-19i: a JavaScript project's first `.go` file appears: Go is
+/// detected.
+pub fn go_first_go_file_appears_in_a_javascript_project() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Go],
+    )
+    .file("package.json", GO_WEB_PACKAGE)
+    .file(GO_WEB_APP_FILE, GO_WEB_APP)
+    .write(GO_TOOL_FILE, GO_TOOL)
+    .detected_before("go", false)
+    .detected_after("go", true)
+}
+
+/// W7-19i: its last `.go` file is deleted: Go is not detected.
+pub fn go_last_go_file_leaves_a_javascript_project() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Go],
+    )
+    .file("package.json", GO_WEB_PACKAGE)
+    .file(GO_WEB_APP_FILE, GO_WEB_APP)
+    .file(GO_TOOL_FILE, GO_TOOL)
+    .remove(GO_TOOL_FILE)
+    .detected_before("go", true)
+    .detected_after("go", false)
+}
+
+/// W7-19i: a root `go.mod`, never indexed, appears in a project without a
+/// `.go` file: Go is detected.
+pub fn go_root_go_mod_appears_in_a_project_without_go_files() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", GO_WEB_PACKAGE)
+        .file(GO_WEB_APP_FILE, GO_WEB_APP)
+        .write("go.mod", GO_SHOP_MOD)
+        .detected_before("go", false)
+        .detected_after("go", true)
+}
+
+/// W7-19i: the root `go.mod` is deleted: Go is not detected.
+pub fn go_root_go_mod_leaves_a_project_without_go_files() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript])
+        .file("package.json", GO_WEB_PACKAGE)
+        .file(GO_WEB_APP_FILE, GO_WEB_APP)
+        .file("go.mod", GO_SHOP_MOD)
+        .remove("go.mod")
+        .detected_before("go", true)
+        .detected_after("go", false)
+}
+
+/// W7-03: a `nuxt.config.ts` appears in a Vue app (upstream #2130): Nuxt is
+/// detected, and its `pages/` become routes served by their components.
+pub fn vue_nuxt_config_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("pages/admin.vue", "<template><div>admin</div></template>\n")
+        .file("src/main.ts", "export const ready = true;\n")
+        .write("nuxt.config.ts", "export default {};\n")
+        .edge_after(
+            "route pages/admin.vue::route:/admin",
+            "calls",
+            "component pages/admin.vue::admin",
+        )
+}
+
+/// W7-03: an app's manifest comes to declare Nuxt (upstream #2129 and
+/// #2130): the files of that app now make Nuxt routes, though no page
+/// changed, while the other app's `pages/` stay components.
+pub fn vue_nuxt_app_manifest_gains_nuxt() -> Case {
+    Case::new(Change::ControlFile, &[Language::Vue])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/site/package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+        )
+        .file("apps/site/pages/about.vue", "<template><div/></template>\n")
+        .file(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file(
+            "apps/admin/pages/users.vue",
+            "<template><div/></template>\n",
+        )
+        .file(
+            "apps/blog/package.json",
+            "{\"name\":\"blog\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("apps/blog/pages/post.vue", "<template><div/></template>\n")
+        .write(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"vue\":\"3\",\"nuxt\":\"3\"}}\n",
+        )
+        .edge_throughout(
+            "route apps/site/pages/about.vue::route:/about",
+            "calls",
+            "component apps/site/pages/about.vue::about",
+        )
+        .edge_after(
+            "route apps/admin/pages/users.vue::route:/users",
+            "calls",
+            "component apps/admin/pages/users.vue::users",
+        )
+}
+
+/// W7-03: a Nuxt page's template is edited (upstream #2267): its route
+/// still references its own component, not the same-named one elsewhere.
+pub fn vue_nuxt_page_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"dependencies\":{\"nuxt\":\"3\"}}\n",
+        )
+        .file("pages/index.vue", "<template><div>home</div></template>\n")
+        .file(
+            "components/index.vue",
+            "<template><div>not a page</div></template>\n",
+        )
+        .write(
+            "pages/index.vue",
+            "<template><section>welcome</section></template>\n",
+        )
+        .edge_throughout(
+            "route pages/index.vue::route:/",
+            "calls",
+            "component pages/index.vue::index",
+        )
+        .no_edge_after(
+            "route pages/index.vue::route:/",
+            "calls",
+            "component components/index.vue::index",
+        )
 }
 
 /// W5-06: a package the manifest comes to declare is outside the project,
@@ -10245,6 +15211,2694 @@ pub fn tauri_command_attribute_makes_an_invoke_call_its_edge() -> Case {
             "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
         )
         .edge_after("file:src/main.ts", "calls", "function greet")
+}
+
+/// W7-04b (upstream #2159): the invoke edge the Tauri resolver makes names it
+/// in `metadata.framework`; an edit to the command's body re-resolves the
+/// call at its site, and the edge keeps the name, as a fresh index has it.
+pub fn tauri_command_body_edit_keeps_the_invoke_edges_resolver_name() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Rust])
+        .file(
+            "src/main.ts",
+            "import { invoke } from '@tauri-apps/api/core';\n\nexport function run(): Promise<unknown> {\n  return invoke('greet');\n}\n",
+        )
+        .file(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::new()\n}\n\nfn main() {}\n",
+        )
+        .write(
+            "src-tauri/src/main.rs",
+            "#[tauri::command] pub fn greet() -> String {\n    String::from(\"hi\")\n}\n\nfn main() {}\n",
+        )
+        .edge_throughout("file:src/main.ts", "calls", "function greet")
+        .edge_metadata_after(
+            ("file:src/main.ts", "calls", "function greet"),
+            "framework",
+            "tauri",
+        )
+}
+
+/// W7-07: a navigation call's file is edited to name another page
+/// (upstream F3): the `navigates` edge follows the href.
+pub fn typescript_next_navigation_call_names_another_page() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "app/users/page.tsx",
+            "export default function UsersPage() {\n  return null\n}\n",
+        )
+        .file(
+            "app/login/page.tsx",
+            "export default function LoginPage() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/users')\n}\n",
+        )
+        .write(
+            "lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/login')\n}\n",
+        )
+        .edge_before(
+            "function leave",
+            "navigates",
+            "route app/users/page.tsx::route:/users",
+        )
+        .edge_after(
+            "function leave",
+            "navigates",
+            "route app/login/page.tsx::route:/login",
+        )
+        .no_edge_after(
+            "function leave",
+            "navigates",
+            "route app/users/page.tsx::route:/users",
+        )
+        .edge_metadata_after(
+            (
+                "function leave",
+                "navigates",
+                "route app/login/page.tsx::route:/login",
+            ),
+            "href",
+            "/login",
+        )
+}
+
+/// W7-07: a page's body is edited (upstream F3): its route still calls its
+/// component, and the call in another file still navigates to it.
+pub fn tsx_next_page_body_edit_keeps_its_navigations() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "app/users/[id]/page.tsx",
+            "export default function UserPage() {\n  return null\n}\n",
+        )
+        .file(
+            "components/form.ts",
+            "import { useRouter } from 'next/navigation'\nexport function submit(id: string) {\n  const router = useRouter()\n  router.push(`/users/${id}`)\n}\n",
+        )
+        .write(
+            "app/users/[id]/page.tsx",
+            "export default function UserPage() {\n  return <p>user</p>\n}\n",
+        )
+        .edge_throughout(
+            "route app/users/[id]/page.tsx::route:/users/:id",
+            "calls",
+            "function UserPage",
+        )
+        .edge_throughout(
+            "function submit",
+            "navigates",
+            "route app/users/[id]/page.tsx::route:/users/:id",
+        )
+}
+
+/// W7-07: the static page a call names is deleted (upstream F3): the call
+/// navigates to the dynamic route that now serves its path, as a fresh index
+/// does.
+pub fn tsx_next_static_page_delete_falls_back_to_the_dynamic_route() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file(
+        "package.json",
+        "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+    )
+    .file(
+        "app/users/new/page.tsx",
+        "export default function NewUser() {\n  return null\n}\n",
+    )
+    .file(
+        "app/users/[id]/page.tsx",
+        "export default function UserPage() {\n  return null\n}\n",
+    )
+    .file(
+        "lib/nav.ts",
+        "import { redirect } from 'next/navigation'\nexport function create() {\n  redirect('/users/new')\n}\n",
+    )
+    .remove("app/users/new/page.tsx")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route app/users/new/page.tsx::route:/users/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route app/users/[id]/page.tsx::route:/users/:id",
+    )
+}
+
+/// W7-07: the manifest comes to declare Next (upstream F3): Next is
+/// detected, its pages become routes, and a call names one, though no source
+/// changed.
+pub fn typescript_next_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "app/login/page.tsx",
+            "export default function LoginPage() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/login')\n}\n",
+        )
+        .write(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\",\"next\":\"15\"}}\n",
+        )
+        .edge_after(
+            "route app/login/page.tsx::route:/login",
+            "calls",
+            "function LoginPage",
+        )
+        .edge_after(
+            "function leave",
+            "navigates",
+            "route app/login/page.tsx::route:/login",
+        )
+}
+
+/// W7-07: a `next.config.mjs` appears beside the pages of an app that
+/// declares no Next dependency (upstream F3): Next is detected by its config.
+pub fn typescript_next_config_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "pages/about.tsx",
+            "export default function About() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "export function go(router: { push(path: string): void }) {\n  router.push('/about')\n}\n",
+        )
+        .write("next.config.mjs", "export default {}\n")
+        .edge_after(
+            "route pages/about.tsx::route:/about",
+            "calls",
+            "function About",
+        )
+        .edge_after(
+            "function go",
+            "navigates",
+            "route pages/about.tsx::route:/about",
+        )
+}
+
+/// W7-07: one app's manifest comes to declare Next while another app of the
+/// monorepo already does (upstream #2129): that app's pages become routes
+/// and its own call navigates to its own page; the other app is unchanged.
+pub fn typescript_next_app_manifest_gains_next() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", "{\"name\":\"mono\",\"private\":true}\n")
+        .file(
+            "apps/web/package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "apps/web/app/login/page.tsx",
+            "export default function WebLogin() {\n  return null\n}\n",
+        )
+        .file(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "apps/admin/app/login/page.tsx",
+            "export default function AdminLogin() {\n  return null\n}\n",
+        )
+        .file(
+            "apps/admin/lib/nav.ts",
+            "import { redirect } from 'next/navigation'\nexport function leave() {\n  redirect('/login')\n}\n",
+        )
+        .write(
+            "apps/admin/package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"react\":\"19\",\"next\":\"15\"}}\n",
+        )
+        .edge_throughout(
+            "route apps/web/app/login/page.tsx::route:/login",
+            "calls",
+            "function WebLogin",
+        )
+        .edge_after(
+            "route apps/admin/app/login/page.tsx::route:/login",
+            "calls",
+            "function AdminLogin",
+        )
+        .edge_after(
+            "function leave",
+            "navigates",
+            "route apps/admin/app/login/page.tsx::route:/login",
+        )
+        .no_edge_after(
+            "function leave",
+            "navigates",
+            "route apps/web/app/login/page.tsx::route:/login",
+        )
+}
+
+/// W7-07: a route handler's body is edited (upstream F3): each exported
+/// method stays its own endpoint, referencing its function.
+pub fn typescript_next_route_handler_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n",
+        )
+        .file(
+            "app/api/users/route.ts",
+            "export async function GET() {\n  return Response.json([])\n}\nexport async function POST(req: Request) {\n  return Response.json({})\n}\n",
+        )
+        .write(
+            "app/api/users/route.ts",
+            "export async function GET() {\n  return Response.json([1])\n}\nexport async function POST(req: Request) {\n  return Response.json({ ok: true })\n}\n",
+        )
+        .edge_throughout(
+            "route app/api/users/route.ts::GET:/api/users",
+            "references",
+            "function GET",
+        )
+        .edge_throughout(
+            "route app/api/users/route.ts::POST:/api/users",
+            "references",
+            "function POST",
+        )
+}
+
+/// W7-08: a navigation call's file is edited to name another screen
+/// (upstream F2): the `navigates` edge follows the href.
+pub fn typescript_expo_navigation_call_names_another_screen() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n")
+        .file(
+            "app/settings.tsx",
+            "export default function Settings() {\n  return null\n}\n",
+        )
+        .file(
+            "app/profile.tsx",
+            "export default function Profile() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function open() {\n  router.push('/settings')\n}\n",
+        )
+        .write(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function open() {\n  router.push('/profile')\n}\n",
+        )
+        .edge_before(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route app/profile.tsx::route:/profile",
+        )
+        .no_edge_after(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+        .edge_metadata_after(
+            (
+                "function open",
+                "navigates",
+                "route app/profile.tsx::route:/profile",
+            ),
+            "framework",
+            "expo-router",
+        )
+}
+
+/// W7-08: a screen's body is edited (upstream F2): its route still calls
+/// its component, and the call in another file still navigates to it.
+pub fn tsx_expo_screen_body_edit_keeps_its_navigations() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n")
+        .file(
+            "app/item/[id].tsx",
+            "export default function Item() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function openItem(id: string) {\n  router.push(`/item/${id}`)\n}\n",
+        )
+        .write(
+            "app/item/[id].tsx",
+            "export default function Item() {\n  return <p>item</p>\n}\n",
+        )
+        .edge_throughout(
+            "route app/item/[id].tsx::route:/item/[id]",
+            "calls",
+            "function Item",
+        )
+        .edge_throughout(
+            "function openItem",
+            "navigates",
+            "route app/item/[id].tsx::route:/item/[id]",
+        )
+}
+
+/// W7-08: the static screen a call names is deleted (upstream F2): the call
+/// navigates to the dynamic screen that now serves its path.
+pub fn tsx_expo_static_screen_delete_falls_back_to_the_dynamic_route() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n")
+    .file(
+        "app/item/new.tsx",
+        "export default function NewItem() {\n  return null\n}\n",
+    )
+    .file(
+        "app/item/[id].tsx",
+        "export default function Item() {\n  return null\n}\n",
+    )
+    .file(
+        "lib/nav.ts",
+        "import { router } from 'expo-router'\nexport function create() {\n  router.push('/item/new')\n}\n",
+    )
+    .remove("app/item/new.tsx")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route app/item/new.tsx::route:/item/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route app/item/[id].tsx::route:/item/[id]",
+    )
+}
+
+/// W7-08: the manifest comes to declare Expo Router (upstream F2): its
+/// screens become routes and a call names one, though no source changed.
+pub fn typescript_expo_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\"}}\n",
+        )
+        .file(
+            "app/settings.tsx",
+            "export default function Settings() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "import { router } from 'expo-router'\nexport function open() {\n  router.push('/settings')\n}\n",
+        )
+        .write(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\"}}\n",
+        )
+        .edge_after(
+            "route app/settings.tsx::route:/settings",
+            "calls",
+            "function Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+}
+
+/// W7-08: an `app.config.ts` appears beside an app's `_layout` in a project
+/// whose manifest names no router (upstream F2): Expo Router is detected by
+/// them.
+pub fn typescript_expo_config_appears_beside_a_layout() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file(
+            "app/_layout.tsx",
+            "export default function Layout() {\n  return null\n}\n",
+        )
+        .file(
+            "app/settings.tsx",
+            "export default function Settings() {\n  return null\n}\n",
+        )
+        .file(
+            "lib/nav.ts",
+            "export function open(router: { push(path: string): void }) {\n  router.push('/settings')\n}\n",
+        )
+        .write("app.config.ts", "export default {}\n")
+        .edge_after(
+            "route app/settings.tsx::route:/settings",
+            "calls",
+            "function Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route app/settings.tsx::route:/settings",
+        )
+}
+
+/// W7-08: an Expo API route's body is edited (upstream #2135): each
+/// exported method stays its own endpoint, referencing its function.
+pub fn typescript_expo_api_route_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"expo-router\":\"4\"}}\n",
+        )
+        .file(
+            "app/users+api.ts",
+            "export async function GET() {\n  return Response.json([])\n}\n",
+        )
+        .write(
+            "app/users+api.ts",
+            "export async function GET() {\n  return Response.json([1])\n}\n",
+        )
+        .edge_throughout(
+            "route app/users+api.ts::GET:/users",
+            "references",
+            "function GET",
+        )
+}
+
+// ----- TanStack Router (W7-10) ----------------------------------------------
+
+/// The package of the W7-10 cases.
+const TANSTACK_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n";
+
+/// A file route at `/settings` rendering `Settings`.
+const TANSTACK_SETTINGS: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/settings')({ component: Settings })\nfunction Settings() {\n  return null\n}\n";
+/// A file route at `/profile` rendering `Profile`.
+const TANSTACK_PROFILE: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/profile')({ component: Profile })\nfunction Profile() {\n  return null\n}\n";
+/// A file route at `/posts/$postId` rendering `Post`.
+const TANSTACK_POST: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/$postId')({ component: Post })\nfunction Post() {\n  return null\n}\n";
+/// A file route at `/posts/new` rendering `NewPost`.
+const TANSTACK_NEW_POST: &str = "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/new')({ component: NewPost })\nfunction NewPost() {\n  return null\n}\n";
+
+/// W7-10 (upstream F5): a navigation call's file is edited to name another
+/// route: the `navigates` edge follows the pattern.
+pub fn typescript_tanstack_navigation_call_names_another_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+        .file("src/routes/profile.tsx", TANSTACK_PROFILE)
+        .file(
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/settings' })\n}\n",
+        )
+        .write(
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/profile' })\n}\n",
+        )
+        .edge_before(
+            "function open",
+            "navigates",
+            "route src/routes/settings.tsx::route:/settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/profile.tsx::route:/profile",
+        )
+        .no_edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/settings.tsx::route:/settings",
+        )
+        .edge_metadata_after(
+            (
+                "function open",
+                "navigates",
+                "route src/routes/profile.tsx::route:/profile",
+            ),
+            "framework",
+            "tanstack-router",
+        )
+}
+
+/// W7-10 (upstream F5): a route's body is edited: it still calls its
+/// component, and the call in another file still navigates to it by its
+/// pattern.
+pub fn tsx_tanstack_route_body_edit_keeps_its_navigations() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file(
+            "src/routes/posts.$postId.tsx",
+            TANSTACK_POST,
+        )
+        .file(
+            "src/lib/nav.ts",
+            "export function openPost(navigate, postId) {\n  navigate({ to: '/posts/$postId', params: { postId } })\n}\n",
+        )
+        .write(
+            "src/routes/posts.$postId.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/$postId')({ component: Post })\nfunction Post() {\n  return <article />\n}\n",
+        )
+        .edge_throughout(
+            "route src/routes/posts.$postId.tsx::route:/posts/:postId",
+            "calls",
+            "function Post",
+        )
+        .edge_throughout(
+            "function openPost",
+            "navigates",
+            "route src/routes/posts.$postId.tsx::route:/posts/:postId",
+        )
+}
+
+/// W7-10 (upstream F5): the static route a call names is deleted: the call
+/// navigates to the dynamic route that now serves its path.
+pub fn tsx_tanstack_static_route_delete_falls_back_to_the_dynamic_route() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", TANSTACK_PACKAGE)
+    .file("src/routes/posts.new.tsx", TANSTACK_NEW_POST)
+    .file("src/routes/posts.$postId.tsx", TANSTACK_POST)
+    .file(
+        "src/lib/nav.ts",
+        "export function create(navigate) {\n  navigate({ to: '/posts/new' })\n}\n",
+    )
+    .remove("src/routes/posts.new.tsx")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/routes/posts.new.tsx::route:/posts/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/posts.$postId.tsx::route:/posts/:postId",
+    )
+}
+
+/// W7-10 (upstream F5): the manifest comes to declare TanStack Router: its
+/// files' routes appear and a call names one, though no source changed.
+pub fn typescript_tanstack_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\"}}\n",
+        )
+        .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+        .file(
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/settings' })\n}\n",
+        )
+        .write("package.json", TANSTACK_PACKAGE)
+        .edge_after(
+            "route src/routes/settings.tsx::route:/settings",
+            "calls",
+            "function Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/settings.tsx::route:/settings",
+        )
+}
+
+/// The manifest of a Vue Router app.
+const VUE_ROUTER_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n";
+/// A Vue Router table of lazy views, by name: `home` at `/`, `login`,
+/// `settings`, and `/posts/new` beside `/posts/:id`.
+const VUE_ROUTER_TABLE: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'login', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'settings', path: '/settings', component: () => import('../views/Settings.vue') },\n    { name: 'new-post', path: '/posts/new', component: () => import('../views/NewPost.vue') },\n    { name: 'post', path: '/posts/:id', component: () => import('../views/Post.vue') },\n  ],\n})\n";
+/// [`VUE_ROUTER_TABLE`] with `login` renamed `sign-in` at the same path.
+const VUE_ROUTER_TABLE_RENAMED: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'sign-in', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'settings', path: '/settings', component: () => import('../views/Settings.vue') },\n    { name: 'new-post', path: '/posts/new', component: () => import('../views/NewPost.vue') },\n    { name: 'post', path: '/posts/:id', component: () => import('../views/Post.vue') },\n  ],\n})\n";
+/// [`VUE_ROUTER_TABLE`] without its `/posts/new` route.
+const VUE_ROUTER_TABLE_WITHOUT_NEW_POST: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'login', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'settings', path: '/settings', component: () => import('../views/Settings.vue') },\n    { name: 'post', path: '/posts/:id', component: () => import('../views/Post.vue') },\n  ],\n})\n";
+/// A `.vue` view rendering `name`.
+const VUE_VIEW: &str =
+    "<template><div>view</div></template>\n<script setup>\nconst view = 1\n</script>\n";
+
+/// A Vue Router app: its manifest, its table and the views it names.
+fn vue_router_app(case: Case) -> Case {
+    case.file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.js", VUE_ROUTER_TABLE)
+        .file("src/views/Home.vue", VUE_VIEW)
+        .file("src/views/Login.vue", VUE_VIEW)
+        .file("src/views/Settings.vue", VUE_VIEW)
+        .file("src/views/NewPost.vue", VUE_VIEW)
+        .file("src/views/Post.vue", VUE_VIEW)
+}
+
+/// W7-11 (upstream F6): a navigation call's file is edited to name another
+/// route by name: the `navigates` edge follows the name.
+pub fn javascript_vue_router_navigation_call_names_another_route() -> Case {
+    vue_router_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'login' })\n}\n",
+    )
+    .write(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'settings' })\n}\n",
+    )
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/settings",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_metadata_after(
+        (
+            "function open",
+            "navigates",
+            "route src/router/index.js::route:/settings",
+        ),
+        "framework",
+        "vue-router",
+    )
+}
+
+/// W7-11 (upstream F6): the table renames a route and keeps its path, so
+/// its node keeps its id: the call in another file that named the old name
+/// navigates nowhere.
+pub fn javascript_vue_router_route_rename_drops_its_named_navigation() -> Case {
+    vue_router_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'login' })\n}\n",
+    )
+    .write("src/router/index.js", VUE_ROUTER_TABLE_RENAMED)
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_throughout(
+        "route src/router/index.js::route:/login",
+        "calls",
+        "component src/views/Login.vue::Login",
+    )
+}
+
+/// W7-11 (upstream F6): the static route a call names by path leaves the
+/// table: the call navigates to the dynamic route that now serves it.
+pub fn javascript_vue_router_static_route_delete_falls_back_to_the_dynamic_route() -> Case {
+    vue_router_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function create(router) {\n  router.push('/posts/new')\n}\n",
+    )
+    .write("src/router/index.js", VUE_ROUTER_TABLE_WITHOUT_NEW_POST)
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/router/index.js::route:/posts/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/router/index.js::route:/posts/:id",
+    )
+}
+
+/// W7-11 (upstream F6): the manifest comes to declare Vue Router: the
+/// table's routes appear, bound to their views, and a call names one,
+/// though no source changed.
+pub fn javascript_vue_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::JavaScript, Language::Vue])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\"}}\n",
+        )
+        .file("src/router/index.js", VUE_ROUTER_TABLE)
+        .file("src/views/Settings.vue", VUE_VIEW)
+        .file(
+            "src/lib/nav.js",
+            "export function open(router) {\n  router.push({ name: 'settings' })\n}\n",
+        )
+        .write("package.json", VUE_ROUTER_PACKAGE)
+        .edge_after(
+            "route src/router/index.js::route:/settings",
+            "calls",
+            "component src/views/Settings.vue::Settings",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/router/index.js::route:/settings",
+        )
+}
+
+/// W7-11 (upstream F6): the layout a child route renders inside is edited:
+/// the child still references it as its layout.
+pub fn javascript_vue_router_layout_body_edit_keeps_the_layout() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter } from 'vue-router'\nimport Layout from '../layout/index.vue'\nexport default createRouter({\n  routes: [\n    {\n      path: '/admin',\n      component: Layout,\n      redirect: '/admin/users',\n      children: [{ path: 'users', component: () => import('../views/Users.vue') }],\n    },\n  ],\n})\n",
+        )
+        .file("src/layout/index.vue", VUE_VIEW)
+        .file("src/views/Users.vue", VUE_VIEW)
+        .write(
+            "src/layout/index.vue",
+            "<template><main><router-view /></main></template>\n<script setup>\nconst frame = 1\n</script>\n",
+        )
+        .edge_throughout(
+            "route src/router/index.js::route:/admin/users",
+            "references",
+            "component src/layout/index.vue::index",
+        )
+        .edge_throughout(
+            "route src/router/index.js::route:/admin/users",
+            "calls",
+            "component src/views/Users.vue::Users",
+        )
+}
+
+/// W7-11 (upstream F6): a Nuxt app's `router.push` is edited to name another
+/// page: the `navigates` edge follows the path to the Nuxt page. (A bare
+/// `navigateTo` is the Vue resolver's Nuxt auto-import at `e8ddc4e2`, so it
+/// navigates nowhere; upstream #2826 changes that after the audited range.)
+pub fn typescript_nuxt_router_push_names_another_page() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"site\",\"dependencies\":{\"nuxt\":\"3\",\"vue\":\"3\"}}\n",
+        )
+        .file("pages/index.vue", VUE_VIEW)
+        .file("pages/about.vue", VUE_VIEW)
+        .file(
+            "composables/useGo.ts",
+            "export function go(router) {\n  return router.push('/about')\n}\n",
+        )
+        .write(
+            "composables/useGo.ts",
+            "export function go(router) {\n  return router.push('/')\n}\n",
+        )
+        .edge_before(
+            "function go",
+            "navigates",
+            "route pages/about.vue::route:/about",
+        )
+        .edge_after("function go", "navigates", "route pages/index.vue::route:/")
+        .no_edge_after(
+            "function go",
+            "navigates",
+            "route pages/about.vue::route:/about",
+        )
+}
+
+/// W7-11 (upstream F6): the view a lazy route names appears after the
+/// table: the route calls its component, as in a fresh index.
+pub fn javascript_vue_router_lazy_view_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Vue],
+    )
+    .file("package.json", VUE_ROUTER_PACKAGE)
+    .file("src/router/index.js", VUE_ROUTER_TABLE)
+    .write("src/views/Settings.vue", VUE_VIEW)
+    .edge_after(
+        "route src/router/index.js::route:/settings",
+        "calls",
+        "component src/views/Settings.vue::Settings",
+    )
+}
+
+/// W7-11: a lazy route's view module that is no SFC renders the function
+/// its `export default` names. The default moves to another function of
+/// the module, both kept: the route calls the new default, as in a fresh
+/// index, though the routes file is untouched.
+pub fn javascript_vue_router_lazy_module_default_export_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter } from 'vue-router'\nexport default createRouter({\n  routes: [{ path: '/home', component: () => import('../views/home.js') }],\n})\n",
+        )
+        .file(
+            "src/views/home.js",
+            "export function Banner() {\n  return null\n}\nexport default function HomeView() {\n  return null\n}\n",
+        )
+        .write(
+            "src/views/home.js",
+            "export default function Banner() {\n  return null\n}\nexport function HomeView() {\n  return null\n}\n",
+        )
+        .edge_before(
+            "route src/router/index.js::route:/home",
+            "calls",
+            "function HomeView",
+        )
+        .edge_after(
+            "route src/router/index.js::route:/home",
+            "calls",
+            "function Banner",
+        )
+        .no_edge_after(
+            "route src/router/index.js::route:/home",
+            "calls",
+            "function HomeView",
+        )
+}
+
+/// W7-11: the same move written as a separate `export default` statement:
+/// neither function changes, only the statement naming one.
+pub fn javascript_vue_router_lazy_module_default_statement_names_another() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter } from 'vue-router'\nexport default createRouter({\n  routes: [{ path: '/home', component: () => import('../views/home.js') }],\n})\n",
+        )
+        .file(
+            "src/views/home.js",
+            "function Banner() {\n  return null\n}\nfunction HomeView() {\n  return null\n}\nexport default HomeView\n",
+        )
+        .write(
+            "src/views/home.js",
+            "function Banner() {\n  return null\n}\nfunction HomeView() {\n  return null\n}\nexport default Banner\n",
+        )
+        .edge_before("route src/router/index.js::route:/home", "calls", "function HomeView")
+        .edge_after("route src/router/index.js::route:/home", "calls", "function Banner")
+        .no_edge_after("route src/router/index.js::route:/home", "calls", "function HomeView")
+}
+
+/// The routes file the W7-11 import cases share: a route renders the
+/// layout its named import takes.
+const VUE_ROUTER_IMPORTED_LAYOUT: &str = "import { createRouter } from 'vue-router'\nimport { FrameLayout } from '../layouts'\nexport default createRouter({\n  routes: [{ path: '/frame', component: FrameLayout }],\n})\n";
+
+/// W7-11: the module a route's named import names appears after the routes
+/// file: the route calls the export, as in a fresh index.
+pub fn typescript_vue_router_imported_layout_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Vue],
+    )
+    .file("package.json", VUE_ROUTER_PACKAGE)
+    .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+    .file("src/layouts/frame.vue", VUE_VIEW)
+    .write(
+        "src/layouts/index.ts",
+        "export const FrameLayout = () => import('./frame.vue')\n",
+    )
+    .edge_after(
+        "route src/router/index.ts::route:/frame",
+        "calls",
+        "function FrameLayout",
+    )
+}
+
+/// W7-11: the barrel a route's named import goes through re-exports
+/// another layout under the name: the route calls the new one, as in a
+/// fresh index, though the routes file is untouched.
+pub fn typescript_vue_router_barrel_reexports_another_layout() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+        .file(
+            "src/layouts/index.ts",
+            "export { default as FrameLayout } from './frame.vue'\n",
+        )
+        .file("src/layouts/frame.vue", VUE_VIEW)
+        .file("src/layouts/wide.vue", VUE_VIEW)
+        .write(
+            "src/layouts/index.ts",
+            "export { default as FrameLayout } from './wide.vue'\n",
+        )
+        .edge_before(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "component src/layouts/frame.vue::frame",
+        )
+        .edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "component src/layouts/wide.vue::wide",
+        )
+        .no_edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "component src/layouts/frame.vue::frame",
+        )
+}
+
+/// The layouts module of the W7-11 declarator cases: the layout is a
+/// statement's second declarator, unexported and exported.
+const VUE_ROUTER_SECOND_DECLARATOR: &str =
+    "const Other = 1, FrameLayout = () => import('./frame.vue')\n";
+const VUE_ROUTER_EXPORTED_SECOND_DECLARATOR: &str =
+    "export const Other = 1, FrameLayout = () => import('./frame.vue')\n";
+
+/// W7-11: the statement declaring a route's layout as its second declarator
+/// gains `export`: the route calls the layout, as in a fresh index, though
+/// the routes file is untouched.
+pub fn typescript_vue_router_second_declarator_gains_its_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+        .file("src/layouts/index.ts", VUE_ROUTER_SECOND_DECLARATOR)
+        .file("src/layouts/frame.vue", VUE_VIEW)
+        .write(
+            "src/layouts/index.ts",
+            VUE_ROUTER_EXPORTED_SECOND_DECLARATOR,
+        )
+        .edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "function FrameLayout",
+        )
+}
+
+/// W7-11: the statement declaring a route's layout as its second declarator
+/// loses `export`: the route calls nothing, as in a fresh index.
+pub fn typescript_vue_router_second_declarator_loses_its_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Vue])
+        .file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/router/index.ts", VUE_ROUTER_IMPORTED_LAYOUT)
+        .file(
+            "src/layouts/index.ts",
+            VUE_ROUTER_EXPORTED_SECOND_DECLARATOR,
+        )
+        .file("src/layouts/frame.vue", VUE_VIEW)
+        .write("src/layouts/index.ts", VUE_ROUTER_SECOND_DECLARATOR)
+        .edge_before(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "function FrameLayout",
+        )
+        .no_edge_after(
+            "route src/router/index.ts::route:/frame",
+            "calls",
+            "function FrameLayout",
+        )
+}
+
+/// The manifest of a SvelteKit app.
+const SVELTEKIT_PACKAGE: &str =
+    "{\"name\":\"site\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n";
+/// A SvelteKit page with nothing to navigate.
+const SVELTEKIT_PAGE: &str = "<h1>page</h1>\n";
+
+/// A SvelteKit app: `/`, `/login`, `/settings`, `/article/new` beside
+/// `/article/[slug]`, and `/about` in a `(marketing)` group.
+fn sveltekit_app(case: Case) -> Case {
+    case.file("package.json", SVELTEKIT_PACKAGE)
+        .file("src/routes/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/login/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/settings/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/article/new/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/article/[slug]/+page.svelte", SVELTEKIT_PAGE)
+        .file("src/routes/(marketing)/about/+page.svelte", SVELTEKIT_PAGE)
+}
+
+/// W7-12 (upstream F6): a `goto` is edited to name another page: the
+/// `navigates` edge follows it.
+pub fn javascript_sveltekit_goto_names_another_page() -> Case {
+    sveltekit_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "import { goto } from '$app/navigation'\nexport function open() {\n  goto('/login')\n}\n",
+    )
+    .write(
+        "src/lib/nav.js",
+        "import { goto } from '$app/navigation'\nexport function open() {\n  goto('/settings')\n}\n",
+    )
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/settings/+page.svelte::route:/settings",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+    .edge_metadata_after(
+        (
+            "function open",
+            "navigates",
+            "route src/routes/settings/+page.svelte::route:/settings",
+        ),
+        "framework",
+        "sveltekit-router",
+    )
+}
+
+/// W7-12 (upstream F6): a loader's `redirect` is edited to name another
+/// page, after the status as before.
+pub fn javascript_sveltekit_server_redirect_names_another_page() -> Case {
+    sveltekit_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/routes/settings/+page.server.js",
+        "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/login')\n}\n",
+    )
+    .write(
+        "src/routes/settings/+page.server.js",
+        "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/')\n}\n",
+    )
+    .edge_before(
+        "function load",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+    .edge_after(
+        "function load",
+        "navigates",
+        "route src/routes/+page.svelte::route:/",
+    )
+    .no_edge_after(
+        "function load",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+}
+
+/// W7-12 (upstream F6): the static page a call names is deleted: the call
+/// navigates to the `[slug]` page that now serves its path.
+pub fn javascript_sveltekit_static_page_delete_falls_back_to_the_dynamic_page() -> Case {
+    sveltekit_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function create() {\n  goto('/article/new')\n}\n",
+    )
+    .remove("src/routes/article/new/+page.svelte")
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/routes/article/new/+page.svelte::route:/article/new",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/article/[slug]/+page.svelte::route:/article/:slug",
+    )
+}
+
+/// W7-12 (upstream #2131): a page moves to another `(group)` folder: its
+/// address stays, and the call that names it navigates to the moved page.
+pub fn javascript_sveltekit_group_folder_rename_keeps_the_address() -> Case {
+    sveltekit_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function about() {\n  goto('/about')\n}\n",
+    )
+    .rename(
+        "src/routes/(marketing)/about/+page.svelte",
+        "src/routes/(site)/about/+page.svelte",
+    )
+    .edge_before(
+        "function about",
+        "navigates",
+        "route src/routes/(marketing)/about/+page.svelte::route:/about",
+    )
+    .edge_after(
+        "function about",
+        "navigates",
+        "route src/routes/(site)/about/+page.svelte::route:/about",
+    )
+}
+
+/// W7-12 (upstream F6): the manifest comes to declare SvelteKit: the
+/// `goto` of a Svelte app names a page, though no source changed.
+pub fn javascript_sveltekit_dependency_appears_in_package_json() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::JavaScript, Language::Svelte],
+    )
+    .file(
+        "package.json",
+        "{\"name\":\"site\",\"devDependencies\":{\"svelte\":\"5\"}}\n",
+    )
+    .file("src/routes/login/+page.svelte", SVELTEKIT_PAGE)
+    .file(
+        "src/lib/nav.js",
+        "export function open() {\n  goto('/login')\n}\n",
+    )
+    .write("package.json", SVELTEKIT_PACKAGE)
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/login/+page.svelte::route:/login",
+    )
+}
+
+/// W7-12 (upstream #2425's shape): a page appears at the path a call in
+/// another file already names: the call navigates to it, as in a fresh
+/// index.
+pub fn javascript_sveltekit_page_appears_where_a_goto_points() -> Case {
+    sveltekit_app(Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Svelte],
+    ))
+    .file(
+        "src/lib/nav.js",
+        "export function open() {\n  goto('/pricing')\n}\n",
+    )
+    .write("src/routes/pricing/+page.svelte", SVELTEKIT_PAGE)
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/pricing/+page.svelte::route:/pricing",
+    )
+}
+
+/// W7-12: a static page appears at the path a call reached through the
+/// `[slug]` page: the call navigates to the static page.
+pub fn javascript_sveltekit_static_page_appears_beside_the_dynamic_page() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Svelte],
+    )
+    .file("package.json", SVELTEKIT_PACKAGE)
+    .file("src/routes/article/[slug]/+page.svelte", SVELTEKIT_PAGE)
+    .file(
+        "src/lib/nav.js",
+        "export function create() {\n  goto('/article/new')\n}\n",
+    )
+    .write("src/routes/article/new/+page.svelte", SVELTEKIT_PAGE)
+    .edge_before(
+        "function create",
+        "navigates",
+        "route src/routes/article/[slug]/+page.svelte::route:/article/:slug",
+    )
+    .edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/article/new/+page.svelte::route:/article/new",
+    )
+    .no_edge_after(
+        "function create",
+        "navigates",
+        "route src/routes/article/[slug]/+page.svelte::route:/article/:slug",
+    )
+}
+
+/// W7-12: a second page that shortens to the path a call reached through
+/// an `[[optional]]` page appears in another group: two pages of the app
+/// serve that path now, so the call reaches neither, as in a fresh index
+/// that lists the pages in another order.
+pub fn javascript_sveltekit_second_optional_page_makes_the_short_path_ambiguous() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::JavaScript, Language::Svelte],
+    )
+    .file("package.json", SVELTEKIT_PACKAGE)
+    .file(
+        "src/routes/(shop)/menu/[[lang]]/+page.svelte",
+        SVELTEKIT_PAGE,
+    )
+    .file(
+        "src/lib/nav.js",
+        "export function open() {\n  goto('/menu')\n}\n",
+    )
+    .write("src/routes/(app)/menu/[[tab]]/+page.svelte", SVELTEKIT_PAGE)
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/routes/(shop)/menu/[[lang]]/+page.svelte::route:/menu/:lang?",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/(shop)/menu/[[lang]]/+page.svelte::route:/menu/:lang?",
+    )
+    .no_edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/(app)/menu/[[tab]]/+page.svelte::route:/menu/:tab?",
+    )
+}
+
+/// W7-12: the module a hook imports through `$lib` appears: the import
+/// links the file, as in a fresh index.
+pub fn typescript_sveltekit_lib_module_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Svelte],
+    )
+    .file("package.json", SVELTEKIT_PACKAGE)
+    .file("src/routes/+page.svelte", SVELTEKIT_PAGE)
+    .file(
+        "src/hooks.server.ts",
+        "import { db } from '$lib/server/db'\nexport async function handle({ event, resolve }) {\n  return resolve(event)\n}\n",
+    )
+    .write("src/lib/server/db.ts", "export const db = {}\n")
+    .edge_after(
+        "file src/hooks.server.ts",
+        "imports",
+        "file src/lib/server/db.ts",
+    )
+}
+
+/// The manifest of an Angular app.
+const ANGULAR_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"@angular/core\":\"19\",\"@angular/router\":\"19\"}}\n";
+/// An Angular app's sign-in screen.
+const ANGULAR_AUTH: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-auth', template: '' })\nexport class AuthComponent {}\n";
+/// An Angular app's profile screen.
+const ANGULAR_PROFILE: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-profile', template: '' })\nexport class ProfileComponent {}\n";
+/// An Angular app's account screen.
+const ANGULAR_ACCOUNT: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-account', template: '' })\nexport class AccountComponent {}\n";
+/// An Angular app's users screen.
+const ANGULAR_USERS: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-users', template: '' })\nexport class UsersComponent {}\n";
+/// The app's routes: `/login`, and the profile routes mounted at `profile`.
+const ANGULAR_APP_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const routes: Routes = [\n  { path: 'login', component: AuthComponent },\n  { path: 'profile', loadChildren: () => import('./profile/profile.routes') },\n];\n";
+/// The profile routes file, which knows only its own `:username`.
+const ANGULAR_PROFILE_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { ProfileComponent } from './profile.component';\nexport default [{ path: ':username', component: ProfileComponent }] satisfies Routes;\n";
+/// A routing module: `users`, in no NgModule yet.
+const ANGULAR_ADMIN_ROUTING: &str = "import { NgModule } from '@angular/core';\nimport { RouterModule, Routes } from '@angular/router';\nimport { UsersComponent } from './users.component';\nconst routes: Routes = [{ path: 'users', component: UsersComponent }];\n@NgModule({ imports: [RouterModule.forChild(routes)], exports: [RouterModule] })\nexport class AdminRoutingModule {}\n";
+/// An Nx shell that lazy-loads the `@ws/home` library at `home`.
+const ANGULAR_NX_SHELL: &str = "import { Route } from '@angular/router';\nexport const shellRoutes: Route[] = [\n  { path: 'home', loadChildren: async () => (await import('@ws/home')).HomeModule },\n];\n";
+/// An Nx library module whose `''` route renders its home.
+const ANGULAR_NX_HOME_MODULE: &str = "import { NgModule } from '@angular/core';\nimport { RouterModule } from '@angular/router';\nimport { HomeComponent } from './home.component';\n@NgModule({ imports: [RouterModule.forChild([{ path: '', component: HomeComponent }])] })\nexport class HomeModule {}\n";
+/// Another library module: `welcome`.
+const ANGULAR_NX_LANDING_MODULE: &str = "import { NgModule } from '@angular/core';\nimport { RouterModule } from '@angular/router';\nimport { LandingComponent } from './landing.component';\n@NgModule({ imports: [RouterModule.forChild([{ path: 'welcome', component: LandingComponent }])] })\nexport class LandingModule {}\n";
+/// The library components the modules render.
+const ANGULAR_NX_HOME: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'ws-home', template: '' })\nexport class HomeComponent {}\n";
+const ANGULAR_NX_LANDING: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'ws-landing', template: '' })\nexport class LandingComponent {}\n";
+
+/// An Angular app: the app routes, the profile routes they mount, and the
+/// screens both render.
+fn angular_app(case: Case) -> Case {
+    case.file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("src/app/profile/profile.component.ts", ANGULAR_PROFILE)
+}
+
+/// An Nx workspace: the shell lazy-loads `@ws/home`, whose barrel names
+/// one of two library modules.
+fn angular_nx(case: Case) -> Case {
+    case.file("package.json", ANGULAR_PACKAGE)
+        .file(
+            "tsconfig.base.json",
+            "{\"compilerOptions\":{\"paths\":{\"@ws/home\":[\"libs/home/src/index.ts\"]}}}\n",
+        )
+        .file("libs/shell/src/lib/shell.routes.ts", ANGULAR_NX_SHELL)
+        .file("libs/home/src/lib/home.module.ts", ANGULAR_NX_HOME_MODULE)
+        .file("libs/home/src/lib/home.component.ts", ANGULAR_NX_HOME)
+        .file(
+            "libs/home/src/lib/landing.module.ts",
+            ANGULAR_NX_LANDING_MODULE,
+        )
+        .file("libs/home/src/lib/landing.component.ts", ANGULAR_NX_LANDING)
+}
+
+/// W7-13 (upstream #2113): the mount that lazy-loads a routes file is
+/// edited: the loaded file's routes take the new prefix, though the file is
+/// untouched.
+pub fn typescript_angular_mount_path_edit_moves_the_loaded_routes() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .write(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const routes: Routes = [\n  { path: 'login', component: AuthComponent },\n  { path: 'user', loadChildren: () => import('./profile/profile.routes') },\n];\n",
+        )
+        .named_before("route", "/profile/:username")
+        .named_after("route", "/user/:username")
+        .edge_throughout(
+            "route src/app/profile/profile.routes.ts::route:/:username",
+            "references",
+            "class ProfileComponent",
+        )
+}
+
+/// W7-13 (upstream #2113): the constant a route's path is written with
+/// changes in another file: the route is renamed, though its routes file
+/// is untouched.
+pub fn typescript_angular_constant_path_edit_renames_the_route() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/account.component.ts", ANGULAR_ACCOUNT)
+        .file(
+            "src/app/routes.constants.ts",
+            "export const internalRoutes = {\n  account: { path: 'account' },\n};\n",
+        )
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { internalRoutes } from './routes.constants';\nexport const routes: Routes = [\n  { path: internalRoutes.account.path, component: AccountComponent },\n];\n",
+        )
+        .write(
+            "src/app/routes.constants.ts",
+            "export const internalRoutes = {\n  account: { path: 'my-account' },\n};\n",
+        )
+        .named_before("route", "/account")
+        .named_after("route", "/my-account")
+        .edge_throughout(
+            "route src/app/app.routes.ts::route:/{internalRoutes.account.path}",
+            "references",
+            "class AccountComponent",
+        )
+}
+
+/// W7-13 (upstream #2133): the barrel a constant is imported through comes
+/// to re-export it from another file: the route takes that file's value.
+pub fn typescript_angular_constant_barrel_reexports_another_file() -> Case {
+    angular_app(Case::new(Change::ReexportEdit, &[Language::TypeScript]))
+        .file("src/app/account.component.ts", ANGULAR_ACCOUNT)
+        .file(
+            "src/app/paths/en.ts",
+            "export const internalRoutes = { account: { path: 'account' } };\n",
+        )
+        .file(
+            "src/app/paths/de.ts",
+            "export const internalRoutes = { account: { path: 'konto' } };\n",
+        )
+        .file("src/app/paths/index.ts", "export * from './en';\n")
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AccountComponent } from './account.component';\nimport { internalRoutes } from './paths';\nexport const routes: Routes = [\n  { path: internalRoutes.account.path, component: AccountComponent },\n];\n",
+        )
+        .write("src/app/paths/index.ts", "export * from './de';\n")
+        .named_before("route", "/account")
+        .named_after("route", "/konto")
+}
+
+/// W7-13 (upstream #2113): an NgModule a mount lazy-loads comes to import
+/// its routing module: the routing module's routes sit under the mount.
+pub fn typescript_angular_ng_module_imports_its_routing_module() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/admin/users.component.ts", ANGULAR_USERS)
+        .file("src/app/admin/admin-routing.module.ts", ANGULAR_ADMIN_ROUTING)
+        .file(
+            "src/app/admin/admin.module.ts",
+            "import { NgModule } from '@angular/core';\nimport { CommonModule } from '@angular/common';\n@NgModule({ imports: [CommonModule] })\nexport class AdminModule {}\n",
+        )
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'admin', loadChildren: () => import('./admin/admin.module').then((m) => m.AdminModule) },\n];\n",
+        )
+        .write(
+            "src/app/admin/admin.module.ts",
+            "import { NgModule } from '@angular/core';\nimport { CommonModule } from '@angular/common';\nimport { AdminRoutingModule } from './admin-routing.module';\n@NgModule({ imports: [CommonModule, AdminRoutingModule] })\nexport class AdminModule {}\n",
+        )
+        .named_before("route", "/users")
+        .named_after("route", "/admin/users")
+}
+
+/// W7-13 (upstream #2133): an Nx library's barrel comes to forward another
+/// module: that module's routes sit under the shell's mount, and the old
+/// one's no longer do.
+pub fn typescript_angular_nx_barrel_forwards_another_module() -> Case {
+    angular_nx(Case::new(Change::ReexportEdit, &[Language::TypeScript]))
+        .file(
+            "libs/home/src/index.ts",
+            "export * from './lib/home.module';\n",
+        )
+        .write(
+            "libs/home/src/index.ts",
+            "export * from './lib/landing.module';\n",
+        )
+        .named_before("route", "/home")
+        .named_before("route", "/welcome")
+        .named_after("route", "/")
+        .named_after("route", "/home/welcome")
+}
+
+/// W7-13 (upstream #2133): the path alias an Nx shell lazy-loads by comes
+/// to name another library: that library's routes sit under the mount.
+pub fn typescript_angular_nx_alias_retargets_the_mount() -> Case {
+    angular_nx(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file(
+            "libs/home/src/index.ts",
+            "export * from './lib/home.module';\n",
+        )
+        .file(
+            "libs/landing/src/index.ts",
+            "export * from '../../home/src/lib/landing.module';\n",
+        )
+        .write(
+            "tsconfig.base.json",
+            "{\"compilerOptions\":{\"paths\":{\"@ws/home\":[\"libs/landing/src/index.ts\"]}}}\n",
+        )
+        .named_before("route", "/home")
+        .named_after("route", "/home/welcome")
+}
+
+/// W7-13 (upstream #2113): the component file a route lazy-loads moves its
+/// default export to another of its components: the route references that
+/// one, though the routes file is untouched.
+pub fn typescript_angular_lazy_component_default_export_moves() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'home', loadComponent: () => import('./home/home.component') },\n];\n",
+        )
+        .file(
+            "src/app/home/home.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'app-home', template: '' })\nexport default class HomeComponent {}\n@Component({ selector: 'app-legacy', template: '' })\nexport class LegacyHomeComponent {}\n",
+        )
+        .write(
+            "src/app/home/home.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'app-home', template: '' })\nexport class HomeComponent {}\n@Component({ selector: 'app-legacy', template: '' })\nexport default class LegacyHomeComponent {}\n",
+        )
+        .edge_before(
+            "route src/app/app.routes.ts::route:/home",
+            "references",
+            "class HomeComponent",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/home",
+            "references",
+            "class LegacyHomeComponent",
+        )
+        .no_edge_after(
+            "route src/app/app.routes.ts::route:/home",
+            "references",
+            "class HomeComponent",
+        )
+}
+
+/// W7-13 (upstream #2113): the component file a route lazy-loads appears:
+/// the route references its component, as in a fresh index.
+pub fn typescript_angular_lazy_component_appears() -> Case {
+    angular_app(Case::new(Change::AddImportTarget, &[Language::TypeScript]))
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'about', loadComponent: () => import('./about/about.component').then((m) => m.AboutComponent) },\n];\n",
+        )
+        .write(
+            "src/app/about/about.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'app-about', template: '' })\nexport class AboutComponent {}\n",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/about",
+            "references",
+            "class AboutComponent",
+        )
+}
+
+/// W7-13 (upstream #2113): the routes file a mount lazy-loads appears: its
+/// routes sit under the mount, as in a fresh index.
+pub fn typescript_angular_mounted_routes_file_appears() -> Case {
+    angular_app(Case::new(Change::AddImportTarget, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .write("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .named_after("route", "/profile/:username")
+        .edge_after(
+            "route src/app/profile/profile.routes.ts::route:/:username",
+            "references",
+            "class ProfileComponent",
+        )
+}
+
+/// W7-13: a file earlier in path order comes to mount the same routes file:
+/// a routes file mounted from two places sits under the first in path
+/// order, so the loaded routes move there, as in a fresh index.
+pub fn typescript_angular_earlier_file_mounts_the_routes_too() -> Case {
+    angular_app(Case::new(Change::AddCompetitor, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .write(
+            "src/app/admin.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const adminRoutes: Routes = [\n  { path: 'people', loadChildren: () => import('./profile/profile.routes') },\n];\n",
+        )
+        .named_before("route", "/profile/:username")
+        .named_after("route", "/people/:username")
+}
+
+/// W7-13 (upstream #2113): the manifest comes to declare Angular: the app's
+/// routes appear, though no source changed.
+pub fn typescript_angular_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", "{\"name\":\"app\"}\n")
+        .file("src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("src/app/profile/profile.component.ts", ANGULAR_PROFILE)
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .write("package.json", ANGULAR_PACKAGE)
+        .named_after("route", "/login")
+        .named_after("route", "/profile/:username")
+        .edge_after(
+            "route src/app/app.routes.ts::route:/login",
+            "references",
+            "class AuthComponent",
+        )
+}
+
+/// A component whose `go` navigates to `/login`.
+const ANGULAR_NAV_LOGIN: &str = "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go() { this.router.navigate(['/login']); }\n}\n";
+/// Routes `/x1` and `/x2`, and `go` redirecting to `x1`.
+const ANGULAR_X_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nimport { ProfileComponent } from './profile/profile.component';\nexport const routes: Routes = [\n  { path: 'x1', component: AuthComponent },\n  { path: 'x2', component: ProfileComponent },\n  { path: 'go', redirectTo: 'x1' },\n];\n";
+
+/// W7-13 (upstream #2113): a `navigate` is edited to name another route:
+/// the `navigates` edge follows it.
+pub fn typescript_angular_navigation_call_names_another_route() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .file("src/app/nav.component.ts", ANGULAR_NAV_LOGIN)
+        .write(
+            "src/app/nav.component.ts",
+            "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go(name) { this.router.navigate(['/profile', name]); }\n}\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/profile/profile.routes.ts::route:/:username",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .edge_metadata_after(
+            (
+                "method NavComponent::go",
+                "navigates",
+                "route src/app/profile/profile.routes.ts::route:/:username",
+            ),
+            "framework",
+            "angular-router",
+        )
+}
+
+/// W7-13: the redirect a call's redirect leads through is edited in
+/// another file to send the user elsewhere: the call follows the chain to
+/// the new route, though neither its file nor the first redirect's
+/// changed.
+pub fn typescript_angular_redirect_chain_link_moves() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/x.routes.ts", ANGULAR_X_ROUTES)
+        .file(
+            "src/app/chain.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const chainRoutes: Routes = [\n  { path: 'chain', component: AuthComponent },\n  { path: 'start', redirectTo: 'go' },\n];\n",
+        )
+        .file(
+            "src/app/nav.component.ts",
+            "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go() { this.router.navigate(['/start']); }\n}\n",
+        )
+        .write(
+            "src/app/x.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nimport { ProfileComponent } from './profile/profile.component';\nexport const routes: Routes = [\n  { path: 'x1', component: AuthComponent },\n  { path: 'x2', component: ProfileComponent },\n  { path: 'go', redirectTo: 'x2' },\n];\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x1",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x2",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x1",
+        )
+}
+
+/// The code-based route tree the W7-10 reparenting case edits. It exports
+/// the tree: in a module that exports nothing, a route is no other file's to
+/// reach (KEEP-RUST, W7-10).
+const TANSTACK_CODE_TREE: &str = "import { createRootRoute, createRoute } from '@tanstack/react-router'\nconst rootRoute = createRootRoute({ component: Root })\nconst postsRoute = createRoute({\n  getParentRoute: () => rootRoute,\n  path: 'posts',\n  component: Posts,\n})\nconst postRoute = createRoute({\n  getParentRoute: () => postsRoute,\n  path: '$postId',\n  component: Post,\n})\nfunction Root() {\n  return null\n}\nfunction Posts() {\n  return null\n}\nfunction Post() {\n  return null\n}\nexport const routeTree = rootRoute.addChildren([postsRoute, postRoute])\n";
+
+/// The same tree with `postRoute` moved under the root.
+const TANSTACK_CODE_TREE_REPARENTED: &str = "import { createRootRoute, createRoute } from '@tanstack/react-router'\nconst rootRoute = createRootRoute({ component: Root })\nconst postsRoute = createRoute({\n  getParentRoute: () => rootRoute,\n  path: 'posts',\n  component: Posts,\n})\nconst postRoute = createRoute({\n  getParentRoute: () => rootRoute,\n  path: '$postId',\n  component: Post,\n})\nfunction Root() {\n  return null\n}\nfunction Posts() {\n  return null\n}\nfunction Post() {\n  return null\n}\nexport const routeTree = rootRoute.addChildren([postsRoute, postRoute])\n";
+
+/// W7-10 (upstream F5): a code route tree moves a route under another
+/// parent: its address changes, and the call that named the old address
+/// names no route, not even the moved one.
+pub fn tsx_tanstack_code_route_moves_under_another_parent() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file("src/router.tsx", TANSTACK_CODE_TREE)
+        .file(
+            "src/lib/nav.ts",
+            "export function openPost(navigate, postId) {\n  navigate({ to: '/posts/$postId', params: { postId } })\n}\n",
+        )
+        .write(
+            "src/router.tsx",
+            TANSTACK_CODE_TREE_REPARENTED,
+        )
+        .edge_before(
+            "function openPost",
+            "navigates",
+            "route src/router.tsx::route:/posts/:postId",
+        )
+        .no_edge_after(
+            "function openPost",
+            "navigates",
+            "route src/router.tsx::route:/:postId",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/:postId",
+            "calls",
+            "function Post",
+        )
+}
+
+/// The React Router app the W7-09b cases edit: two routes in `src/App.tsx`,
+/// their pages, and a navigation call in `src/nav.ts`.
+const REACT_ROUTER_PACKAGE: &str =
+    "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n";
+const REACT_ROUTER_APP: &str = "import { Routes, Route } from 'react-router-dom'\nimport { Login } from './pages/Login'\nimport { SignIn } from './pages/SignIn'\nimport { Help } from './pages/Help'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/login\" element={<Login />} />\n      <Route path=\"/help\" element={<Help />} />\n    </Routes>\n  )\n}\n";
+const REACT_ROUTER_LOGIN: &str = "export function Login() {\n  return null\n}\n";
+const REACT_ROUTER_SIGN_IN: &str = "export function SignIn() {\n  return null\n}\n";
+const REACT_ROUTER_HELP: &str = "export function Help() {\n  return null\n}\n";
+const REACT_ROUTER_NAV: &str = "import { useNavigate } from 'react-router-dom'\nexport function goLogin() {\n  const navigate = useNavigate()\n  navigate('/login')\n}\n";
+
+/// The React Router app before an edit.
+fn react_router_app(change: Change) -> Case {
+    Case::new(change, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/App.tsx", REACT_ROUTER_APP)
+        .file("src/pages/Login.tsx", REACT_ROUTER_LOGIN)
+        .file("src/pages/SignIn.tsx", REACT_ROUTER_SIGN_IN)
+        .file("src/pages/Help.tsx", REACT_ROUTER_HELP)
+        .file("src/nav.ts", REACT_ROUTER_NAV)
+}
+
+/// W7-09b: the route file gives a route another element (upstream F4): the
+/// route renders the new page, and the navigation to it stays.
+pub fn tsx_react_router_route_renders_another_page() -> Case {
+    react_router_app(Change::BodyEdit)
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom'\nimport { Login } from './pages/Login'\nimport { SignIn } from './pages/SignIn'\nimport { Help } from './pages/Help'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/login\" element={<SignIn />} />\n      <Route path=\"/help\" element={<Help />} />\n    </Routes>\n  )\n}\n",
+        )
+        .edge_before(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_after(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function SignIn",
+        )
+        .no_edge_after(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_throughout(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+        .edge_metadata_after(
+            (
+                "function goLogin",
+                "navigates",
+                "route src/App.tsx::route:/login",
+            ),
+            "framework",
+            "react-router",
+        )
+}
+
+/// W7-09b: a route's page is edited (upstream F4): the route still renders
+/// it, and the navigation to the route stays.
+pub fn tsx_react_router_page_body_edit_keeps_its_route() -> Case {
+    react_router_app(Change::BodyEdit)
+        .write(
+            "src/pages/Login.tsx",
+            "export function Login() {\n  return <form />\n}\n",
+        )
+        .edge_throughout(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_throughout(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: a route's page is deleted (upstream F4): the route stays an
+/// address, rendering nothing, and the navigation to it stays.
+pub fn tsx_react_router_page_delete_leaves_its_route() -> Case {
+    react_router_app(Change::DeleteImportedModule)
+        .remove("src/pages/Login.tsx")
+        .edge_before(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .named_after("route", "/login")
+        .edge_throughout(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: a navigation call is edited to name another route (upstream F4):
+/// the `navigates` edge follows the href.
+pub fn typescript_react_router_navigation_call_names_another_route() -> Case {
+    react_router_app(Change::BodyEdit)
+        .write(
+            "src/nav.ts",
+            "import { useNavigate } from 'react-router-dom'\nexport function goLogin() {\n  const navigate = useNavigate()\n  navigate('/help')\n}\n",
+        )
+        .edge_before(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+        .edge_after(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/help",
+        )
+        .no_edge_after(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: `react-router-dom` appears in the manifest of a React app whose
+/// routes React already reads (upstream F4): React Router is detected, and
+/// the navigation call binds.
+pub fn typescript_react_router_dependency_appears_in_package_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\"}}\n",
+        )
+        .file("src/App.tsx", REACT_ROUTER_APP)
+        .file("src/pages/Login.tsx", REACT_ROUTER_LOGIN)
+        .file("src/pages/SignIn.tsx", REACT_ROUTER_SIGN_IN)
+        .file("src/pages/Help.tsx", REACT_ROUTER_HELP)
+        .file("src/nav.ts", REACT_ROUTER_NAV)
+        .write("package.json", REACT_ROUTER_PACKAGE)
+        .edge_throughout(
+            "route src/App.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_after(
+            "function goLogin",
+            "navigates",
+            "route src/App.tsx::route:/login",
+        )
+}
+
+/// W7-09b: the constant a route's path is built from changes (upstream
+/// #2165 and `postExtract`): the route, whose own file did not change, is
+/// renamed in place before anything resolves. (A navigation call in another
+/// file bound to the old name is retried by the sync navigation pass, W7-23.)
+pub fn typescript_react_router_route_constant_renames_the_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        )
+        .file(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' }, team: { path: 'team' } },\n} as const\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nimport { Team } from './Team'\nexport const router = createBrowserRouter([\n  {\n    path: paths.app.root.path,\n    element: <AppRoot />,\n    children: [{ path: paths.app.team.path, element: <Team /> }],\n  },\n])\n",
+        )
+        .file(
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        )
+        .file("src/Team.tsx", "export function Team() {\n  return null\n}\n")
+        .write(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/dashboard' }, team: { path: 'team' } },\n} as const\n",
+        )
+        .named_before("route", "/app")
+        .named_before("route", "/app/team")
+        .named_after("route", "/dashboard")
+        .named_after("route", "/dashboard/team")
+        .edge_throughout(
+            "route src/router.tsx::route:/{paths.app.root.path}",
+            "references",
+            "function AppRoot",
+        )
+}
+
+/// W7-09b: the routes file whose route a constant names is edited, and a
+/// navigation in it names the route's path (upstream `postExtract` before
+/// resolution): the sync renames the re-extracted route before it resolves
+/// the call, as a full index does, so the call still navigates to it.
+pub fn tsx_react_router_routes_file_edit_names_its_route_before_resolving() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        )
+        .file(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' } },\n} as const\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  return redirect('/app')\n}\n",
+        )
+        .file(
+            "src/AppRoot.tsx",
+            "export function AppRoot() {\n  return null\n}\n",
+        )
+        .write(
+            "src/router.tsx",
+            "import { createBrowserRouter, redirect } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\nexport function goApp() {\n  console.log('leaving')\n  return redirect('/app')\n}\n",
+        )
+        .named_before("route", "/app")
+        .named_after("route", "/app")
+        .edge_throughout(
+            "function goApp",
+            "navigates",
+            "route src/router.tsx::route:/{paths.app.root.path}",
+        )
+}
+
+/// W7-09b: the page a lazy route's barrel imports appears (upstream
+/// `react-router-barrel-imports.test.ts`, sync): the parked `lazy-import:`
+/// reference waits under its path's last segment, which the new page's
+/// folder is, so the sync retries it. (A page appearing deeper under the
+/// barrel is #2560's, W7-23.)
+pub fn tsx_react_router_lazy_barrel_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('./auth/login') },\n]);\n",
+        )
+        .file(
+            "src/auth/login/index.ts",
+            "import Login from './Login';\n\nexport default Login;\n",
+        )
+        .write(
+            "src/auth/login/Login.tsx",
+            "export default function Login() {\n  return null;\n}\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+}
+
+/// W7-09b: the page a lazy route's barrel imports moves its default export
+/// to another component, the old one staying (upstream
+/// `react-router-barrel-imports.test.ts`, sync): the route renders the new
+/// default.
+pub fn tsx_react_router_lazy_page_default_export_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('./auth/login') },\n]);\n",
+        )
+        .file(
+            "src/auth/login/index.ts",
+            "import Login from './Login';\n\nexport default Login;\n",
+        )
+        .file(
+            "src/auth/login/Login.tsx",
+            "export default function Login() {\n  return null;\n}\n",
+        )
+        .write(
+            "src/auth/login/Login.tsx",
+            "export function Login() {\n  return null;\n}\n\nexport default function SignIn() {\n  return null;\n}\n",
+        )
+        .edge_before(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function SignIn",
+        )
+}
+
+/// The package of the W7-09c cases: React Router 7.
+const REACT_ROUTER_7_PACKAGE: &str = "{\"name\":\"ui\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n";
+
+/// The `/reports` route of the W7-09c cases, its loader picking
+/// `ReportList` from the `reports` barrel.
+const REPORTS_ROUTER_LIST: &str = "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/reports',\n    lazy: async () => {\n      const { ReportList } = await import('./reports');\n      return { Component: ReportList };\n    },\n  },\n]);\n";
+
+/// The same route, its loader picking `ReportPage`.
+const REPORTS_ROUTER_PAGE: &str = "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/reports',\n    lazy: async () => {\n      const { ReportPage } = await import('./reports');\n      return { Component: ReportPage };\n    },\n  },\n]);\n";
+
+/// W7-09c (upstream #2480): a route's loader is edited to pick another
+/// export of the module it loads: the route renders the new pick.
+pub fn tsx_react_router_loader_picks_another_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", REACT_ROUTER_7_PACKAGE)
+        .file("src/router.tsx", REPORTS_ROUTER_LIST)
+        .file(
+            "src/reports/index.ts",
+            "export * from './report_list';\nexport * from './report_page';\n",
+        )
+        .file(
+            "src/reports/report_list.tsx",
+            "export function ReportList() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/reports/report_page.tsx",
+            "export function ReportPage() {\n  return null;\n}\n",
+        )
+        .write("src/router.tsx", REPORTS_ROUTER_PAGE)
+        .edge_before(
+            "route src/router.tsx::route:/reports",
+            "references",
+            "function ReportList",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/reports",
+            "references",
+            "function ReportPage",
+        )
+}
+
+/// W7-09c (upstream `react-router-lazy-member.test.ts`, sync): the module a
+/// loader picks the default export of moves its default to another
+/// component, the old one staying: the route renders the new default.
+pub fn tsx_react_router_picked_default_export_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", REACT_ROUTER_7_PACKAGE)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/login',\n    lazy: async () => {\n      const { default: Component } = await import('./pages/login');\n      return { Component };\n    },\n  },\n]);\n",
+        )
+        .file(
+            "src/pages/login.tsx",
+            "export default function LoginPage() {\n  return null;\n}\n",
+        )
+        .write(
+            "src/pages/login.tsx",
+            "export function LoginPage() {\n  return null;\n}\n\nexport default function SignIn() {\n  return null;\n}\n",
+        )
+        .edge_before(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function LoginPage",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function SignIn",
+        )
+}
+
+/// W7-09c (upstream `react-router-lazy-member.test.ts`, sync): the module a
+/// loader picks an export from appears, in a folder of its own. The parked
+/// `import:./reports#ReportList` waits under no key the new files carry;
+/// the sync retries it because a file in a new folder moves the JS control
+/// inputs (the manifests framework detection reads), which re-resolves every
+/// JavaScript-family file whole. The same module appearing beside the route
+/// file, and an edit that gives the module the export, stay W7-23's.
+pub fn tsx_react_router_picked_export_module_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", REACT_ROUTER_7_PACKAGE)
+    .file("src/router.tsx", REPORTS_ROUTER_LIST)
+    .write("src/reports/index.ts", "export * from './report_list';\n")
+    .write(
+        "src/reports/report_list.tsx",
+        "export function ReportList() {\n  return null;\n}\n",
+    )
+    .edge_after(
+        "route src/router.tsx::route:/reports",
+        "references",
+        "function ReportList",
+    )
+}
+
+/// W7-09b: a lazily loaded route module's body is edited (upstream F4): the
+/// route still renders its default export, and still inside its layout.
+pub fn tsx_react_router_lazy_page_body_edit_keeps_its_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router-dom'\nimport { Layout } from './Layout'\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    element: <Layout />,\n    children: [{ path: 'team', lazy: () => import('./pages/Team') }],\n  },\n])\n",
+        )
+        .file(
+            "src/Layout.tsx",
+            "export function Layout() {\n  return null\n}\n",
+        )
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() {\n  return null\n}\n",
+        )
+        .write(
+            "src/pages/Team.tsx",
+            "export default function Team() {\n  return <ul />\n}\n",
+        )
+        .edge_throughout(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function Team",
+        )
+        .edge_throughout(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function Layout",
+        )
+}
+
+// ----- Route tables another file hands React Router (W7-09d) ----------
+
+/// The route table of the W7-09d cases (upstream `react-router.test.ts`, "a
+/// route table as the files around it change"): the index route and
+/// `/counter`.
+const APP_ROUTES_TABLE: &str = "import { Counter } from './Counter';\nimport { Home } from './Home';\nimport { FetchData } from './FetchData';\n\nconst AppRoutes = [\n  { index: true, element: <Home /> },\n  { path: '/counter', element: <Counter /> },\n];\n\nexport default AppRoutes;\n";
+
+/// The same table with `/fetch-data` in front.
+const APP_ROUTES_TABLE_WITH_FETCH: &str = "import { Counter } from './Counter';\nimport { Home } from './Home';\nimport { FetchData } from './FetchData';\n\nconst AppRoutes = [\n  { path: '/fetch-data', element: <FetchData /> },\n  { index: true, element: <Home /> },\n  { path: '/counter', element: <Counter /> },\n];\n\nexport default AppRoutes;\n";
+
+/// The file that maps the table into `<Route>`s.
+const APP_MAPS_THE_TABLE: &str = "import { Route, Routes } from 'react-router-dom';\nimport AppRoutes from './AppRoutes';\nimport { Counter } from './Counter';\n\nexport default function App() {\n  return (\n    <Routes>\n      {AppRoutes.map(({ element, ...rest }, index) => <Route key={index} {...rest} element={element} />)}\n    </Routes>\n  );\n}\n";
+
+/// The same file with a route of its own instead.
+const APP_WRITES_A_ROUTE: &str = "import { Route, Routes } from 'react-router-dom';\nimport AppRoutes from './AppRoutes';\nimport { Counter } from './Counter';\n\nexport default function App() {\n  return (\n    <Routes>\n      <Route path=\"/static\" element={<Counter />} />\n    </Routes>\n  );\n}\n";
+
+/// A navigation call to the table's index route.
+const NAV_MENU_HOME: &str = "import { useNavigate } from 'react-router-dom';\nexport function NavMenu() {\n  const navigate = useNavigate();\n  const goHome = () => navigate('/');\n  return <button onClick={goHome}>Home</button>;\n}\n";
+
+const COUNTER_PAGE: &str = "export function Counter() {\n  return <div>Counter</div>;\n}\n";
+const HOME_PAGE: &str = "export function Home() {\n  return <div>Home</div>;\n}\n";
+const FETCH_DATA_PAGE: &str = "export function FetchData() {\n  return <div>FetchData</div>;\n}\n";
+
+/// W7-09d (upstream #2400): an edit to a table another file hands the
+/// router moves its routes; the navigation that named one still does.
+pub fn jsx_react_router_table_edit_moves_its_routes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_MAPS_THE_TABLE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .file("src/NavMenu.js", NAV_MENU_HOME)
+        .write("src/AppRoutes.js", APP_ROUTES_TABLE_WITH_FETCH)
+        .edge_after(
+            "route src/AppRoutes.js::route:/fetch-data",
+            "references",
+            "function FetchData",
+        )
+        .edge_throughout(
+            "function NavMenu::goHome",
+            "navigates",
+            "route src/AppRoutes.js::route:/",
+        )
+}
+
+/// W7-09d (upstream #2400): the file that handed the router a table writes
+/// a route of its own instead: the table's routes go, and the navigation
+/// that named one names nothing.
+pub fn jsx_react_router_consumer_stops_handing_its_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_MAPS_THE_TABLE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .file("src/NavMenu.js", NAV_MENU_HOME)
+        .write("src/App.js", APP_WRITES_A_ROUTE)
+        .edge_before(
+            "function NavMenu::goHome",
+            "navigates",
+            "route src/AppRoutes.js::route:/",
+        )
+        .edge_after(
+            "route src/App.js::route:/static",
+            "references",
+            "function Counter",
+        )
+}
+
+/// W7-09d (upstream #2400): a file starts handing the router a table. No
+/// navigation names its routes before they exist: a call parked then is
+/// W7-23's (#2425).
+pub fn jsx_react_router_consumer_starts_handing_a_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_WRITES_A_ROUTE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .write("src/App.js", APP_MAPS_THE_TABLE)
+        .edge_after(
+            "route src/AppRoutes.js::route:/counter",
+            "references",
+            "function Counter",
+        )
+        .edge_after(
+            "route src/AppRoutes.js::route:/",
+            "references",
+            "function Home",
+        )
+}
+
+/// W7-09d: the file that hands the router a table is deleted, the module
+/// that imported it with it: the table's routes go.
+pub fn jsx_react_router_table_consumer_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::JavaScript, Language::Jsx],
+    )
+    .file("package.json", REACT_ROUTER_PACKAGE)
+    .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+    .file("src/App.js", APP_MAPS_THE_TABLE)
+    .file(
+        "src/index.js",
+        "import App from './App';\n\nexport default App;\n",
+    )
+    .file("src/Home.js", HOME_PAGE)
+    .file("src/Counter.js", COUNTER_PAGE)
+    .file("src/FetchData.js", FETCH_DATA_PAGE)
+    .file("src/NavMenu.js", NAV_MENU_HOME)
+    .remove("src/App.js")
+    .edge_before(
+        "route src/AppRoutes.js::route:/counter",
+        "references",
+        "function Counter",
+    )
+    .edge_before(
+        "function NavMenu::goHome",
+        "navigates",
+        "route src/AppRoutes.js::route:/",
+    )
+}
+
+/// W7-09d: a page a table's route renders moves within its file: the route
+/// renders it where it is now.
+pub fn jsx_react_router_table_page_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_MAPS_THE_TABLE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .write(
+            "src/Counter.js",
+            "\nexport function Counter() {\n  return <div>Counter</div>;\n}\n",
+        )
+        .edge_throughout(
+            "route src/AppRoutes.js::route:/counter",
+            "references",
+            "function Counter",
+        )
+}
+
+/// The routes of a W7-09d case that maps another file's table inside
+/// `<Route path="/admin">`.
+const ADMIN_MAPS_THE_TABLE: &str = "import { Routes, Route } from 'react-router-dom';\nimport AdminLayout from './layouts/admin';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/admin\" element={<AdminLayout/>}>\n        {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// The same routes under `/manage`.
+const MANAGE_MAPS_THE_TABLE: &str = "import { Routes, Route } from 'react-router-dom';\nimport AdminLayout from './layouts/admin';\nimport { adminRoutes } from './adminRoutes';\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/manage\" element={<AdminLayout/>}>\n        {adminRoutes.map((route) => <Route key={route.path} {...route}/>)}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// W7-09d (upstream `react-router.test.ts`, "a table mapped inside <Route
+/// path>"): the file that mounts another file's table moves it to another
+/// path. The table's file is unchanged; its route is replaced under the new
+/// path, and the navigation to the old path names nothing.
+pub fn jsx_react_router_consumer_moves_another_files_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/routes.js", ADMIN_MAPS_THE_TABLE)
+        .file(
+            "src/adminRoutes.js",
+            "import Reports from './pages/Reports';\n\nexport const adminRoutes = [{ path: 'reports', element: <Reports/> }];\n",
+        )
+        .file(
+            "src/layouts/admin.js",
+            "export default function AdminLayout() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/pages/Reports.js",
+            "export default function Reports() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/nav.js",
+            "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/admin/reports');\n  return <button onClick={open} />;\n}\n",
+        )
+        .write("src/routes.js", MANAGE_MAPS_THE_TABLE)
+        .edge_before(
+            "function Menu::open",
+            "navigates",
+            "route src/adminRoutes.js::route:/admin/reports",
+        )
+        .edge_after(
+            "route src/adminRoutes.js::route:/manage/reports",
+            "references",
+            "function Reports",
+        )
+}
+
+/// A table mapped inside the `<Route>` of the file it is written in, which
+/// renders `DashboardLayout`.
+const DASHBOARD_TABLE_IN_LAYOUT: &str = "import { Routes, Route } from 'react-router-dom';\nimport DashboardLayout from './layouts/dashboard';\nimport OtherLayout from './layouts/other';\nimport DashboardApp from './pages/DashboardApp';\n\nconst DashboardRoutes = [\n  { path: 'app', element: <DashboardApp/> },\n];\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/dashboard\" element={<DashboardLayout/>}>\n        {DashboardRoutes.map((route, index) => {\n          const { element, ...rest } = route;\n          return <Route key={index} {...rest} element={element}/>;\n        })}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// The same file, the `<Route>` rendering `OtherLayout`.
+const DASHBOARD_TABLE_IN_OTHER_LAYOUT: &str = "import { Routes, Route } from 'react-router-dom';\nimport DashboardLayout from './layouts/dashboard';\nimport OtherLayout from './layouts/other';\nimport DashboardApp from './pages/DashboardApp';\n\nconst DashboardRoutes = [\n  { path: 'app', element: <DashboardApp/> },\n];\n\nexport default function Router() {\n  return (\n    <Routes>\n      <Route path=\"/dashboard\" element={<OtherLayout/>}>\n        {DashboardRoutes.map((route, index) => {\n          const { element, ...rest } = route;\n          return <Route key={index} {...rest} element={element}/>;\n        })}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// W7-09d (upstream #2423): the layout around a table mapped in its own file
+/// changes: the table's route renders inside the new one only.
+pub fn jsx_react_router_layout_around_a_same_file_table_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/routes.js", DASHBOARD_TABLE_IN_LAYOUT)
+        .file(
+            "src/layouts/dashboard.js",
+            "export default function DashboardLayout() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/layouts/other.js",
+            "export default function OtherLayout() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/pages/DashboardApp.js",
+            "export default function DashboardApp() {\n  return <div />;\n}\n",
+        )
+        .write("src/routes.js", DASHBOARD_TABLE_IN_OTHER_LAYOUT)
+        .edge_before(
+            "route src/routes.js::route:/dashboard/app",
+            "references",
+            "function DashboardLayout",
+        )
+        .edge_after(
+            "route src/routes.js::route:/dashboard/app",
+            "references",
+            "function OtherLayout",
+        )
+        .no_edge_after(
+            "route src/routes.js::route:/dashboard/app",
+            "references",
+            "function DashboardLayout",
+        )
+}
+
+/// A table mapped inside a layout of its own file, and handed over again by
+/// an earlier file.
+const SELF_MAPPED_TABLE: &str = "import { Routes, Route } from 'react-router-dom';\nimport Layout from './Layout';\nimport Reports from './Reports';\n\nexport const tableRoutes = [{ path: 'reports', element: <Reports/> }];\n\nexport function Shell() {\n  return (\n    <Routes>\n      <Route path=\"/\" element={<Layout/>}>\n        {tableRoutes.map((route) => <Route key={route.path} {...route}/>)}\n      </Route>\n    </Routes>\n  );\n}\n";
+
+/// A file read before the table's own that hands it to `useRoutes`.
+const EARLIER_CONSUMER: &str = "import { useRoutes } from 'react-router-dom';\nimport { tableRoutes } from './table';\n\nexport default function App() {\n  return useRoutes(tableRoutes);\n}\n";
+
+/// The same file handing over nothing.
+const EARLIER_FILE_QUIET: &str = "import { useNavigate } from 'react-router-dom';\n\nexport default function App() {\n  return null;\n}\n";
+
+/// A navigation call to the `/reports` route of the earlier-consumer cases.
+const NAV_TO_REPORTS: &str = "import { useNavigate } from 'react-router-dom';\nexport function Menu() {\n  const navigate = useNavigate();\n  const open = () => navigate('/reports');\n  return <button onClick={open} />;\n}\n";
+
+/// W7-09d: of two files handing over one table at the same address, the
+/// first read gives its routes, here outside the layout the table's own file
+/// maps it inside. When it stops, the route keeps its id and name and gains
+/// that layout: a route whose references changed is replaced, where
+/// upstream's rename in place keeps the old ones, and the navigation into
+/// it finds it again.
+pub fn jsx_react_router_earlier_consumer_stops_handing_a_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/nav.js", NAV_TO_REPORTS)
+        .file("src/a.js", EARLIER_CONSUMER)
+        .file("src/table.js", SELF_MAPPED_TABLE)
+        .file(
+            "src/Layout.js",
+            "export default function Layout() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/Reports.js",
+            "export default function Reports() {\n  return null;\n}\n",
+        )
+        .write("src/a.js", EARLIER_FILE_QUIET)
+        .edge_throughout(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Reports",
+        )
+        .edge_throughout(
+            "function Menu::open",
+            "navigates",
+            "route src/table.js::route:/reports",
+        )
+        .edge_after(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Layout",
+        )
+}
+
+/// W7-09d: the reverse: an earlier file starts handing over the table, and
+/// the route renders outside the layout from then on.
+pub fn jsx_react_router_earlier_consumer_starts_handing_a_table() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/nav.js", NAV_TO_REPORTS)
+        .file("src/a.js", EARLIER_FILE_QUIET)
+        .file("src/table.js", SELF_MAPPED_TABLE)
+        .file(
+            "src/Layout.js",
+            "export default function Layout() {\n  return null;\n}\n",
+        )
+        .file(
+            "src/Reports.js",
+            "export default function Reports() {\n  return null;\n}\n",
+        )
+        .write("src/a.js", EARLIER_CONSUMER)
+        .edge_before(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Layout",
+        )
+        .edge_throughout(
+            "function Menu::open",
+            "navigates",
+            "route src/table.js::route:/reports",
+        )
+        .no_edge_after(
+            "route src/table.js::route:/reports",
+            "references",
+            "function Layout",
+        )
+}
+
+// ----- A JSX tag imported from the project renders what its module exports (W7-09e) --
+
+/// The package of the W7-09e cases.
+const MOBX_REACT_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^9\"}}\n";
+
+/// outline's `Sidebar/App.tsx`: the default export wraps the component.
+const APP_SIDEBAR: &str = "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nexport default observer(AppSidebar);\n";
+
+/// The same file wrapping another component.
+const APP_SIDEBAR_WRAPS_COMPACT: &str = "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nfunction CompactSidebar() {\n  return <nav />;\n}\n\nexport default observer(CompactSidebar);\n";
+
+/// Another module with a wrapped default export.
+const SHARED_SIDEBAR: &str = "import { observer } from 'mobx-react';\n\nfunction SharedSidebar() {\n  return <nav />;\n}\n\nexport default observer(SharedSidebar);\n";
+
+/// A same-named component nothing imports.
+const ASIDE_SIDEBAR: &str = "export function Sidebar() {\n  return <aside />;\n}\n";
+
+/// outline's `Sidebar/index.ts`: it forwards `App`'s default export.
+const INDEX_FORWARDS_APP: &str = "import Sidebar from './App';\n\nexport default Sidebar;\n";
+
+/// The page that renders `<Sidebar>` through the index.
+const HOME_RENDERS_SIDEBAR: &str = "import Sidebar from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n";
+
+/// W7-09e (upstream `sync-jsx-import-forwarding`, #2563): only the index
+/// changes which module it forwards; the page that renders the tag is
+/// untouched and draws it to the other module's component.
+pub fn tsx_jsx_tag_forwarding_index_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import Sidebar from './Shared';\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e (upstream `sync-jsx-import-forwarding`): the index starts holding
+/// the other module's component in a value (outline's `const Avatar =
+/// AvatarWithHoverCard`).
+pub fn tsx_jsx_tag_index_value_holds_another_component() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import Shared from './Shared';\n\nconst Sidebar = Shared;\n\nexport default Sidebar;\n",
+        )
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e (upstream `sync-jsx-import-forwarding`): the module behind the
+/// index wraps another component in its default export.
+pub fn tsx_jsx_tag_module_behind_the_index_wraps_another() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write("src/components/Sidebar/App.tsx", APP_SIDEBAR_WRAPS_COMPACT)
+        .edge_after("function Home", "references", "function CompactSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: two modules forward the component, and the middle one changes
+/// which module it forwards; neither the page nor the index changes.
+pub fn tsx_jsx_tag_middle_module_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/mid.ts", INDEX_FORWARDS_APP)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import Sidebar from './mid';\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/mid.ts",
+            "import Sidebar from './Shared';\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+}
+
+/// W7-09e: the index comes to declare the component its default export
+/// names, so the tag renders the index's own.
+pub fn tsx_jsx_tag_index_declares_its_export() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/index.ts", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import Forwarded from './App';\n\nfunction Sidebar() {\n  return null;\n}\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: the module the index forwards is deleted.
+pub fn tsx_jsx_tag_forwarded_module_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Tsx, Language::TypeScript],
+    )
+    .file("package.json", MOBX_REACT_PACKAGE)
+    .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+    .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+    .file("src/components/Sidebar/mid.ts", INDEX_FORWARDS_APP)
+    .file(
+        "src/components/Sidebar/index.ts",
+        "import Sidebar from './mid';\n\nexport default Sidebar;\n",
+    )
+    .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+    .remove("src/components/Sidebar/mid.ts")
+    .edge_before("function Home", "references", "function AppSidebar")
+    .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e (upstream `jsx-child-disambiguation`, mastodon's `blurhash.tsx`):
+/// the component a memo wrapper hands over is renamed; the tag that imports
+/// the wrapper under the old name renders the renamed one.
+pub fn tsx_jsx_tag_memo_wrapped_component_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Tsx])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file(
+            "app/components/blurhash.tsx",
+            "import { memo } from 'react';\n\nfunction Blurhash({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(Blurhash);\n\nexport { MemoizedBlurhash as Blurhash };\n",
+        )
+        .file(
+            "app/components/media_item.tsx",
+            "import { Blurhash } from './blurhash';\n\nexport function MediaItem() {\n  return <div><Blurhash hash=\"x\" /></div>;\n}\n",
+        )
+        .write(
+            "app/components/blurhash.tsx",
+            "import { memo } from 'react';\n\nfunction BlurhashCanvas({ hash }: { hash: string }) {\n  return <canvas data-hash={hash} />;\n}\n\nconst MemoizedBlurhash = memo(BlurhashCanvas);\n\nexport { MemoizedBlurhash as Blurhash };\n",
+        )
+        .edge_before("function MediaItem", "references", "function Blurhash")
+        .edge_after("function MediaItem", "references", "function BlurhashCanvas")
+}
+
+/// W7-09e: the value the index exports is a later declarator of its
+/// statement (`const unused = 1, Sidebar = App`), and only the index changes
+/// which module that value's import names.
+pub fn tsx_jsx_tag_index_later_declarator_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\n\nconst unused = 1, Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\n\nconst unused = 1, Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: as [`tsx_jsx_tag_index_later_declarator_re_points`], through an
+/// export list and a named import. Import resolution binds no node to the
+/// page's `{ Sidebar }`, so the #2450 lane re-resolves the page whatever the
+/// surface says; the case holds the surface to it should that change.
+pub fn tsx_jsx_tag_index_listed_later_declarator_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\n\nconst unused = 1, Sidebar = App;\n\nexport { Sidebar };\n",
+        )
+        .file(
+            "src/scenes/Home.tsx",
+            "import { Sidebar } from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n",
+        )
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\n\nconst unused = 1, Sidebar = App;\n\nexport { Sidebar };\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: the value the index exports carries a function type, whose `=>`
+/// comes before the initializer's `=`, and only the index changes which
+/// module that value's import names.
+pub fn tsx_jsx_tag_index_annotated_value_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\n\nconst Sidebar: (props: object) => JSX.Element = App;\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\n\nconst Sidebar: (props: object) => JSX.Element = App;\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-09e: a function in the index declares a `const` of the exported
+/// value's name before the module's own, and only the index changes which
+/// module the module's own value's import names.
+pub fn tsx_jsx_tag_index_shadowed_value_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.tsx", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.tsx", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.tsx", SHARED_SIDEBAR)
+        .file(
+            "src/components/Sidebar/index.ts",
+            "import App from './App';\nimport Other from './Aside';\n\nexport function pick() {\n  const Sidebar = Other;\n  return Sidebar;\n}\n\nconst Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .file("src/scenes/Home.tsx", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.ts",
+            "import App from './Shared';\nimport Other from './Aside';\n\nexport function pick() {\n  const Sidebar = Other;\n  return Sidebar;\n}\n\nconst Sidebar = App;\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
 }
 
 /// W5-06, fail closed: only the manifest's `version` changes; every JS file
@@ -12636,4 +20290,4436 @@ pub fn dart_chain_link_reaches_an_unnamed_extension_once_its_file_joins_the_libr
         )
         .edge_after("function run", "calls", "method <anonymous>::area")
         .edge_after("function run", "calls", "method Item::save")
+}
+
+const SYNTH_SCENE: &str = "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n";
+const SYNTH_APP_RENDER: &str = "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n";
+const SYNTH_APP_PAINT: &str = "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerPaint);\n  }\n  triggerRender() {\n    return 1;\n  }\n  triggerPaint() {\n    return 2;\n  }\n}\n";
+const SYNTH_BUS: &str = "export function save(bus) {\n  bus.emit('save');\n}\nexport function wire(bus) {\n  bus.on('save', handleSave);\n}\n";
+
+/// W7-14: a field registration moves to another method; the synthesized
+/// dispatch edge follows it.
+pub fn typescript_synthesis_registration_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .write("src/app.ts", SYNTH_APP_PAINT)
+        .edge_before(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .no_edge_after(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .edge_metadata_after(
+            (
+                "method Scene::triggerUpdate",
+                "calls",
+                "method App::triggerPaint",
+            ),
+            "synthesizedBy",
+            "callback",
+        )
+}
+
+/// W7-14: the file holding a channel's registrar and dispatcher goes, and
+/// with it every edge the channel synthesized.
+pub fn typescript_synthesis_channel_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .remove("src/scene.ts")
+        .edge_before(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+}
+
+/// W7-14: an edit to a file no pass reads recomputes the stage to the same
+/// synthesized edges.
+pub fn typescript_synthesis_survives_an_unrelated_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .file(
+            "src/util.ts",
+            "export function twice(n: number) {\n  return n * 2;\n}\n",
+        )
+        .write(
+            "src/util.ts",
+            "export function twice(n: number) {\n  return n + n;\n}\n",
+        )
+        .edge_throughout(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .edge_metadata_after(
+            (
+                "method Scene::triggerUpdate",
+                "calls",
+                "method App::triggerRender",
+            ),
+            "synthesizedBy",
+            "callback",
+        )
+}
+
+/// W7-14: a definition of a synthesized edge's target's name appears in
+/// another file. The registration binds `this.triggerRender`, so the edge
+/// stays, and the sync's site machinery leaves it to the stage.
+pub fn typescript_synthesis_target_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("src/scene.ts", SYNTH_SCENE)
+        .file("src/app.ts", SYNTH_APP_RENDER)
+        .write(
+            "src/other.ts",
+            "export function triggerRender() {\n  return 3;\n}\n",
+        )
+        .edge_throughout(
+            "method Scene::triggerUpdate",
+            "calls",
+            "method App::triggerRender",
+        )
+        .edge_metadata_after(
+            (
+                "method Scene::triggerUpdate",
+                "calls",
+                "method App::triggerRender",
+            ),
+            "synthesizedBy",
+            "callback",
+        )
+}
+
+/// W7-14: a second definition of an emitter handler's name appears in a
+/// file the registration does not name: the name means no one function
+/// any more (KEEP-RUST), so the edge goes, as a fresh index leaves it out.
+pub fn javascript_emitter_handler_gains_a_competitor() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file("src/app.js", SYNTH_BUS)
+        .file(
+            "src/handlers.js",
+            "export function handleSave() {\n  return 1;\n}\n",
+        )
+        .write(
+            "src/other.js",
+            "export function handleSave() {\n  return 2;\n}\n",
+        )
+        .edge_before(
+            "function save",
+            "calls",
+            "function handleSave @src/handlers.js",
+        )
+        .no_edge_after(
+            "function save",
+            "calls",
+            "function handleSave @src/handlers.js",
+        )
+}
+
+/// W7-14: the competing definition is renamed, the handler's name means
+/// one function again, and the edge appears.
+pub fn javascript_emitter_handler_loses_a_competitor() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::JavaScript])
+        .file("src/app.js", SYNTH_BUS)
+        .file(
+            "src/handlers.js",
+            "export function handleSave() {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/other.js",
+            "export function handleSave() {\n  return 2;\n}\n",
+        )
+        .write(
+            "src/other.js",
+            "export function handleOther() {\n  return 2;\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "function save",
+                "calls",
+                "function handleSave @src/handlers.js",
+            ),
+            "synthesizedBy",
+            "event-emitter",
+        )
+}
+
+/// W7-14: `complete` iterates both fields `feed` appends to, so the first
+/// field the pass walks names its edge. The pass walks callables in
+/// upstream's order (the methods by file, line and id); a sync rewrites the
+/// edited file's node rows after the others', and the edge keeps a fresh
+/// index's field.
+pub fn swift_closure_collection_keeps_its_field_after_an_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift])
+        .file(
+            "Sources/A.swift",
+            "class Early {\n    var handlers: [() -> Void] = []\n\n    func runHandlers() {\n        handlers.forEach { $0() }\n    }\n}\n",
+        )
+        .file(
+            "Sources/B.swift",
+            "class Late {\n    var validators: [() -> Void] = []\n    var handlers: [() -> Void] = []\n\n    func complete() {\n        validators.forEach { $0() }\n        handlers.forEach { $0() }\n    }\n}\n",
+        )
+        .file(
+            "Sources/C.swift",
+            "class Feeder {\n    func feed(_ job: @escaping () -> Void) {\n        validators.append(job)\n        handlers.append(job)\n    }\n}\n",
+        )
+        .write(
+            "Sources/A.swift",
+            "class Early {\n    var handlers: [() -> Void] = []\n\n    func runHandlers() {\n        let count = handlers.count\n        handlers.forEach { $0() }\n    }\n}\n",
+        )
+        .edge_metadata_after(
+            ("method Late::complete", "calls", "method Feeder::feed"),
+            "field",
+            "handlers",
+        )
+}
+
+const SYNTH_COUNTER: &str = "export class Counter extends Component {\n  increment() {\n    this.setState({ count: 1 });\n  }\n  render() {\n    return null;\n  }\n}\n";
+const SYNTH_EXPECT: &str = "package app\n\nexpect fun platformName(): String\n";
+const SYNTH_MAPPER: &str =
+    "package com.example;\n\npublic interface UserMapper {\n    User findById(long id);\n}\n";
+const SYNTH_MAPPER_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE mapper PUBLIC \"-//mybatis.org//DTD Mapper 3.0//EN\" \"http://mybatis.org/dtd/mybatis-3-mapper.dtd\">\n<mapper namespace=\"com.example.UserMapper\">\n  <select id=\"findById\" resultType=\"User\">\n    SELECT * FROM users WHERE id = #{id}\n  </select>\n</mapper>\n";
+
+/// W7-14b: a React class method stops setting state; its re-render edge to
+/// `render` goes.
+pub fn typescript_react_state_update_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/counter.ts", SYNTH_COUNTER)
+        .write(
+            "src/counter.ts",
+            "export class Counter extends Component {\n  increment() {\n    return 1;\n  }\n  render() {\n    return null;\n  }\n}\n",
+        )
+        .edge_before("method Counter::increment", "calls", "method Counter::render")
+        .no_edge_after("method Counter::increment", "calls", "method Counter::render")
+}
+
+/// W7-14b: one platform's `actual` file goes; the `expect` declaration keeps
+/// its edge to the other platform's.
+pub fn kotlin_actual_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Kotlin])
+        .file("src/commonMain/kotlin/Platform.kt", SYNTH_EXPECT)
+        .file(
+            "src/jvmMain/kotlin/Platform.jvm.kt",
+            "package app\n\nactual fun platformName(): String = \"JVM\"\n",
+        )
+        .file(
+            "src/iosMain/kotlin/Platform.ios.kt",
+            "package app\n\nactual fun platformName(): String = \"iOS\"\n",
+        )
+        .remove("src/jvmMain/kotlin/Platform.jvm.kt")
+        .edge_before(
+            "function app::platformName @src/commonMain/kotlin/Platform.kt",
+            "calls",
+            "function app::platformName @src/jvmMain/kotlin/Platform.jvm.kt",
+        )
+        .edge_metadata_after(
+            (
+                "function app::platformName @src/commonMain/kotlin/Platform.kt",
+                "calls",
+                "function app::platformName @src/iosMain/kotlin/Platform.ios.kt",
+            ),
+            "synthesizedBy",
+            "kotlin-expect-actual",
+        )
+}
+
+/// W7-14b: a C++ subclass renames its override; the base method no longer
+/// reaches it.
+pub fn cpp_override_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Cpp])
+        .file(
+            "include/iterator.h",
+            "class Iterator {\n public:\n  virtual void Next() = 0;\n};\n",
+        )
+        .file(
+            "src/db_iter.cc",
+            "#include \"iterator.h\"\nclass DBIter : public Iterator {\n public:\n  void Next() override {}\n};\n",
+        )
+        .write(
+            "src/db_iter.cc",
+            "#include \"iterator.h\"\nclass DBIter : public Iterator {\n public:\n  void Advance() {}\n};\n",
+        )
+        .edge_before("method Iterator::Next", "calls", "method DBIter::Next")
+        .no_edge_after("method Iterator::Next", "calls", "method DBIter::Advance")
+}
+
+/// W7-14b: a Delphi unit's form appears beside it; the unit references it.
+pub fn pascal_form_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Pascal])
+        .file(
+            "src/UFRMAbout.pas",
+            "unit UFRMAbout;\n\ninterface\n\nimplementation\n\n{$R *.dfm}\n\nend.\n",
+        )
+        .write(
+            "src/UFRMAbout.dfm",
+            "object FRMAbout: TFRMAbout\n  Caption = 'About'\nend\n",
+        )
+        .edge_metadata_after(
+            (
+                "file:src/UFRMAbout.pas",
+                "references",
+                "file:src/UFRMAbout.dfm",
+            ),
+            "synthesizedBy",
+            "pascal-form",
+        )
+}
+
+/// W7-14b: a second Java class of a mapper's simple name appears; the
+/// statement's mapper method is ambiguous and the edge goes.
+pub fn java_mybatis_mapper_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Java, Language::Xml])
+        .file("src/main/java/com/example/UserMapper.java", SYNTH_MAPPER)
+        .file("src/main/resources/mapper/UserMapper.xml", SYNTH_MAPPER_XML)
+        .write(
+            "src/main/java/com/other/UserMapper.java",
+            "package com.other;\n\npublic class UserMapper {\n    public User findById(long id) {\n        return null;\n    }\n}\n",
+        )
+        .edge_before(
+            "method com.example::UserMapper::findById",
+            "calls",
+            "method com.example.UserMapper::findById",
+        )
+        .no_edge_after(
+            "method com.example::UserMapper::findById",
+            "calls",
+            "method com.example.UserMapper::findById",
+        )
+}
+
+/// W7-14c: a TypeScript class stops implementing an interface; the
+/// interface method no longer reaches its method.
+pub fn typescript_class_drops_its_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::TypeScript])
+        .file("src/shape.ts", "export interface Shape {\n  area(): number;\n}\n")
+        .file(
+            "src/circle.ts",
+            "import { Shape } from './shape';\nexport class Circle implements Shape {\n  area() {\n    return 1;\n  }\n}\n",
+        )
+        .write(
+            "src/circle.ts",
+            "import { Shape } from './shape';\nexport class Circle {\n  area() {\n    return 1;\n  }\n}\n",
+        )
+        .edge_before("method Shape::area", "calls", "method Circle::area")
+        .no_edge_after("method Shape::area", "calls", "method Circle::area")
+}
+
+/// W7-14c: an extension in another file gives a Swift protocol a default
+/// implementation; it reaches the conformer's override.
+pub fn swift_protocol_extension_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Swift])
+        .file(
+            "Sources/EventMonitor.swift",
+            "protocol EventMonitor {\n    func request()\n}\n",
+        )
+        .file(
+            "Sources/Logger.swift",
+            "final class Logger: EventMonitor {\n    func request() {}\n}\n",
+        )
+        .write(
+            "Sources/EventMonitor+Defaults.swift",
+            "extension EventMonitor {\n    func request() {}\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "method EventMonitor::request",
+                "calls",
+                "method Logger::request",
+            ),
+            "synthesizedBy",
+            "interface-impl",
+        )
+}
+
+/// W7-14c: one of a Java class's two interfaces loses its file; the other
+/// interface's method keeps its edge to the class's method.
+pub fn java_interface_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Java])
+        .file(
+            "src/main/java/app/Repo.java",
+            "package app;\n\npublic interface Repo {\n    void save();\n}\n",
+        )
+        .file(
+            "src/main/java/app/Store.java",
+            "package app;\n\npublic interface Store {\n    void save();\n}\n",
+        )
+        .file(
+            "src/main/java/app/JpaRepo.java",
+            "package app;\n\npublic class JpaRepo implements Repo, Store {\n    public void save() {}\n}\n",
+        )
+        .remove("src/main/java/app/Repo.java")
+        .edge_before(
+            "method app::Repo::save",
+            "calls",
+            "method app::JpaRepo::save",
+        )
+        .edge_metadata_after(
+            (
+                "method app::Store::save",
+                "calls",
+                "method app::JpaRepo::save",
+            ),
+            "synthesizedBy",
+            "interface-impl",
+        )
+}
+
+const REGISTRY_SAVE: &str = "export function saveDoc(x: string) { return x; }\n";
+const REGISTRY_LOAD: &str = "export function loadDoc(x: string) { return x; }\n";
+const REGISTRY_ROUTE: &str = "import { saveDoc } from './save';\nimport { loadDoc } from './load';\nconst handlers = { save: saveDoc, load: loadDoc };\nexport function route(action: string, x: string) {\n  return handlers[action](x);\n}\n";
+
+/// W7-14d: an object registry gains a handler defined in another file; the
+/// dispatching function reaches it.
+pub fn typescript_registry_gains_a_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/save.ts", REGISTRY_SAVE)
+        .file("src/load.ts", REGISTRY_LOAD)
+        .file(
+            "src/open.ts",
+            "export function openDoc(x: string) { return x; }\n",
+        )
+        .file("src/route.ts", REGISTRY_ROUTE)
+        .write(
+            "src/route.ts",
+            "import { saveDoc } from './save';\nimport { loadDoc } from './load';\nimport { openDoc } from './open';\nconst handlers = { save: saveDoc, load: loadDoc, open: openDoc };\nexport function route(action: string, x: string) {\n  return handlers[action](x);\n}\n",
+        )
+        .edge_metadata_after(
+            ("function route", "calls", "function openDoc"),
+            "synthesizedBy",
+            "object-registry",
+        )
+}
+
+/// W7-14d: a registered handler's file is deleted; the dispatch keeps its
+/// edge to the other handler only.
+pub fn typescript_registry_handler_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("src/save.ts", REGISTRY_SAVE)
+        .file("src/load.ts", REGISTRY_LOAD)
+        .file("src/route.ts", REGISTRY_ROUTE)
+        .remove("src/load.ts")
+        .edge_before("function route", "calls", "function loadDoc")
+        .edge_metadata_after(
+            ("function route", "calls", "function saveDoc"),
+            "synthesizedBy",
+            "object-registry",
+        )
+}
+
+/// W7-14d: the dispatch is edited away; the registry's edges go with it.
+pub fn typescript_registry_dispatch_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/save.ts", REGISTRY_SAVE)
+        .file("src/load.ts", REGISTRY_LOAD)
+        .file("src/route.ts", REGISTRY_ROUTE)
+        .write(
+            "src/route.ts",
+            "import { saveDoc } from './save';\nimport { loadDoc } from './load';\nconst handlers = { save: saveDoc, load: loadDoc };\nexport function route(action: string, x: string) {\n  return x;\n}\n",
+        )
+        .edge_before("function route", "calls", "function saveDoc")
+        .no_edge_after("function route", "calls", "function saveDoc")
+}
+
+const JSX_APP: &str =
+    "import { Card } from './card';\nexport function App() {\n  return <Card />;\n}\n";
+const JSX_CARD: &str = "export function Card() {\n  return <div />;\n}\n";
+
+/// W7-14e (#2452's JSX half): the component a tag imports appears in a new
+/// file; the unchanged parent renders it.
+pub fn tsx_rendered_component_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("src/app.tsx", JSX_APP)
+        .write("src/card.tsx", JSX_CARD)
+        .edge_metadata_after(
+            ("function App", "calls", "function Card"),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-14e: one rendered component's file is deleted; the parent keeps
+/// rendering the other.
+pub fn tsx_rendered_component_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Tsx])
+        .file(
+            "src/app.tsx",
+            "import { Card } from './card';\nimport { Badge } from './badge';\nexport function App() {\n  return (\n    <div>\n      <Card />\n      <Badge />\n    </div>\n  );\n}\n",
+        )
+        .file("src/card.tsx", JSX_CARD)
+        .file(
+            "src/badge.tsx",
+            "export function Badge() {\n  return <span />;\n}\n",
+        )
+        .remove("src/card.tsx")
+        .edge_before("function App", "calls", "function Card")
+        .edge_metadata_after(
+            ("function App", "calls", "function Badge"),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-14e: the tag is edited out of the parent; its edge goes with it.
+pub fn tsx_tag_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("src/app.tsx", JSX_APP)
+        .file("src/card.tsx", JSX_CARD)
+        .write(
+            "src/app.tsx",
+            "import { Card } from './card';\nexport function App() {\n  return null;\n}\n",
+        )
+        .edge_before("function App", "calls", "function Card")
+        .no_edge_after("function App", "calls", "function Card")
+}
+
+const GO_SAVER: &str =
+    "package svc\n\ntype Store struct{}\n\ntype Saver interface {\n\tSave(key string) error\n}\n";
+const GO_SAVE: &str = "package svc\n\nfunc (s *Store) Save(key string) error { return nil }\n";
+
+/// W7-15b: a file of the package declares a method of a type in an
+/// unchanged file; the type owns it (`go-method-contains`) and satisfies
+/// the interface asking for it (`go-implements`).
+pub fn go_method_in_an_added_file_gains_its_owner() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("svc/types.go", GO_SAVER)
+        .write("svc/methods.go", GO_SAVE)
+        .edge_metadata_after(
+            ("struct Store", "contains", "method Store::Save"),
+            "synthesizedBy",
+            "go-method-contains",
+        )
+        .edge_metadata_after(
+            ("struct Store", "implements", "interface Saver"),
+            "synthesizedBy",
+            "go-implements",
+        )
+}
+
+/// W7-15b: the interface's method is renamed; the struct declaring the old
+/// name no longer satisfies it.
+pub fn go_interface_method_renamed_off_its_implementer() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("svc/types.go", GO_SAVER)
+        .file("svc/methods.go", GO_SAVE)
+        .write(
+            "svc/types.go",
+            "package svc\n\ntype Store struct{}\n\ntype Saver interface {\n\tKeep(key string) error\n}\n",
+        )
+        .edge_before("struct Store", "implements", "interface Saver")
+        .no_edge_after("struct Store", "implements", "interface Saver")
+}
+
+const GO_BASE: &str =
+    "package base\n\ntype Base struct{}\n\nfunc (Base) Close() error { return nil }\n";
+const GO_NAMED_CLOSER: &str =
+    "package api\n\ntype NamedCloser interface {\n\tClose() error\n\tName() string\n}\n";
+const GO_WRAPPER: &str = "package wrap\n\nimport \"example.com/app/base\"\n\ntype Wrapper struct{ base.Base }\n\nfunc (Wrapper) Name() string { return \"\" }\n";
+
+/// W7-15b: the struct stops embedding the type its `Close` came from; it no
+/// longer satisfies the interface.
+pub fn go_embedding_removed_drops_the_interface() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("api/api.go", GO_NAMED_CLOSER)
+        .file("base/base.go", GO_BASE)
+        .file("wrap/wrap.go", GO_WRAPPER)
+        .write(
+            "wrap/wrap.go",
+            "package wrap\n\ntype Wrapper struct{}\n\nfunc (Wrapper) Name() string { return \"\" }\n",
+        )
+        .edge_before("struct Wrapper", "implements", "interface NamedCloser")
+        .no_edge_after("struct Wrapper", "implements", "interface NamedCloser")
+}
+
+/// W7-15b (upstream's sync case): only the embedded type changes, in a file
+/// neither the struct's nor the interface's.
+pub fn go_embedded_type_renames_its_method() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("api/api.go", GO_NAMED_CLOSER)
+        .file("base/base.go", GO_BASE)
+        .file("wrap/wrap.go", GO_WRAPPER)
+        .write(
+            "base/base.go",
+            "package base\n\ntype Base struct{}\n\nfunc (Base) Shutdown() error { return nil }\n",
+        )
+        .edge_before("struct Wrapper", "implements", "interface NamedCloser")
+        .no_edge_after("struct Wrapper", "implements", "interface NamedCloser")
+}
+
+/// W7-15b (upstream's sync case): the interface embeds another
+/// standard-library type, read back from resolution's failed `extends` row;
+/// an `io.Reader` has to `Read`, which the struct can't.
+pub fn go_interface_embeds_another_std_type() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "api/api.go",
+            "package api\n\nimport stdio \"io\"\n\ntype SyncWriter interface {\n\tstdio.Writer\n\tSync() error\n}\n",
+        )
+        .file(
+            "log/file.go",
+            "package log\n\ntype file struct{}\n\nfunc (f *file) Write(p []byte) (int, error) { return len(p), nil }\nfunc (f *file) Sync() error { return nil }\n",
+        )
+        .write(
+            "api/api.go",
+            "package api\n\nimport stdio \"io\"\n\ntype SyncWriter interface {\n\tstdio.Reader\n\tSync() error\n}\n",
+        )
+        .edge_before("struct file", "implements", "interface SyncWriter")
+        .no_edge_after("struct file", "implements", "interface SyncWriter")
+}
+
+const GO_GREETER_STUB: &str = "package svc\n\ntype UnimplementedGreeterServer struct{}\n\nfunc (UnimplementedGreeterServer) SayHello() error { return nil }\nfunc (UnimplementedGreeterServer) SayBye() error   { return nil }\nfunc (UnimplementedGreeterServer) mustEmbedUnimplementedGreeterServer() {}\n";
+
+/// W7-15c: the hand-written server gains the RPC it lacked, in a file of its
+/// own; the generated stub's methods now link to its (`go-grpc-stub-impl`).
+pub fn go_grpc_server_gains_its_missing_rpc() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("svc/greeter_grpc.pb.go", GO_GREETER_STUB)
+        .file(
+            "svc/server.go",
+            "package svc\n\ntype server struct{}\n\nfunc (s *server) SayHello() error { return nil }\n",
+        )
+        .write(
+            "svc/bye.go",
+            "package svc\n\nfunc (s *server) SayBye() error { return nil }\n",
+        )
+        .edge_metadata_after(
+            (
+                "method UnimplementedGreeterServer::SayHello",
+                "calls",
+                "method server::SayHello",
+            ),
+            "synthesizedBy",
+            "go-grpc-stub-impl",
+        )
+        .edge_metadata_after(
+            (
+                "method UnimplementedGreeterServer::SayBye",
+                "calls",
+                "method server::SayBye",
+            ),
+            "synthesizedBy",
+            "go-grpc-stub-impl",
+        )
+}
+
+const GO_GIN_CONTEXT: &str = "package gin\n\ntype HandlerFunc func(*Context)\n\ntype Context struct {\n\thandlers []HandlerFunc\n\tindex    int\n}\n\nfunc (c *Context) Next() {\n\tfor c.index < len(c.handlers) {\n\t\tc.handlers[c.index](c)\n\t\tc.index++\n\t}\n}\n\ntype Engine struct{}\n\nfunc (e *Engine) Use(h ...HandlerFunc)          {}\nfunc (e *Engine) GET(p string, h ...HandlerFunc) {}\n";
+
+/// W7-15c: a route registration moves from one function body to another
+/// file's; the chain dispatcher's edge to the handler names the new site.
+pub fn go_gin_registration_moves_to_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("gin.go", GO_GIN_CONTEXT)
+        .file(
+            "app.go",
+            "package gin\n\nfunc getUser(c *Context) {}\n\nfunc setup(e *Engine) {\n\te.GET(\"/users\", getUser)\n}\n",
+        )
+        .file("routes.go", "package gin\n\nfunc routes(e *Engine) {\n}\n")
+        .write(
+            "app.go",
+            "package gin\n\nfunc getUser(c *Context) {}\n\nfunc setup(e *Engine) {\n}\n",
+        )
+        .write(
+            "routes.go",
+            "package gin\n\nfunc routes(e *Engine) {\n\te.GET(\"/users\", getUser)\n}\n",
+        )
+        .edge_before("method Context::Next", "calls", "function getUser")
+        .edge_metadata_after(
+            ("method Context::Next", "calls", "function getUser"),
+            "registeredAt",
+            "routes.go:4",
+        )
+}
+
+/// W7-15c: the dispatcher stops calling into its handler slice; it links
+/// to no registered handler.
+pub fn go_gin_dispatch_call_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("gin.go", GO_GIN_CONTEXT)
+        .file(
+            "app.go",
+            "package gin\n\nfunc Logger(c *Context) {}\n\nfunc setup(e *Engine) {\n\te.Use(Logger)\n}\n",
+        )
+        .write(
+            "gin.go",
+            "package gin\n\ntype HandlerFunc func(*Context)\n\ntype Context struct {\n\thandlers []HandlerFunc\n\tindex    int\n}\n\nfunc (c *Context) Next() {\n\tfor c.index < len(c.handlers) {\n\t\t_ = c.handlers[c.index]\n\t\tc.index++\n\t}\n}\n\ntype Engine struct{}\n\nfunc (e *Engine) Use(h ...HandlerFunc)          {}\nfunc (e *Engine) GET(p string, h ...HandlerFunc) {}\n",
+        )
+        .edge_before("method Context::Next", "calls", "function Logger")
+        .no_edge_after("method Context::Next", "calls", "function Logger")
+}
+
+/// W7-15d0 (upstream #2682, #693): a member a `var ( … )` group gains is a
+/// variable of its own, and the call its initializer makes is its own.
+pub fn go_var_group_gains_a_member_whose_initializer_calls_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/shapes\n\ngo 1.22\n")
+        .file(
+            "errors.go",
+            "package shapes\n\nfunc newError(msg string) error { return nil }\n",
+        )
+        .file(
+            "shapes.go",
+            "package shapes\n\nvar (\n\tErrNoSides = newError(\"no sides\")\n)\n",
+        )
+        .write(
+            "shapes.go",
+            "package shapes\n\nvar (\n\tErrNoSides = newError(\"no sides\")\n\tErrTooMany = newError(\"too many\")\n)\n",
+        )
+        .edge_before("variable ErrNoSides", "calls", "function newError")
+        .edge_after("variable ErrTooMany", "calls", "function newError")
+}
+
+/// W7-15d0 (upstream #693): a call in a package-level closure, a cobra
+/// `RunE`, is the variable's; it links once the function appears.
+pub fn go_package_closure_call_reaches_a_function_that_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "cmd.go",
+            "package app\n\ntype Command struct {\n\tRunE func(args []string) error\n}\n\nvar rootCmd = &Command{\n\tRunE: func(args []string) error {\n\t\treturn run(args)\n\t},\n}\n",
+        )
+        .write("run.go", "package app\n\nfunc run(args []string) error { return nil }\n")
+        .edge_after("variable rootCmd", "calls", "function run @run.go")
+}
+
+/// W7-15d0 (upstream #693): a package-level composite literal instantiates
+/// its struct from the variable; the struct's package file deleted, the
+/// qualified literal links nothing, not the importer's own namesake.
+pub fn go_package_literal_struct_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "refresh/refresh.go",
+            "package refresh\n\ntype Options struct {\n\tName string\n}\n",
+        )
+        .file("app/options.go", "package app\n\ntype Options struct {\n\tName string\n}\n")
+        .file(
+            "app/config.go",
+            "package app\n\nimport \"example.com/app/refresh\"\n\nvar defaults = refresh.Options{Name: \"x\"}\n",
+        )
+        .edge_before("variable defaults", "instantiates", "struct Options @refresh/refresh.go")
+        .remove("refresh/refresh.go")
+        .no_edge_after("variable defaults", "instantiates", "struct Options @app/options.go")
+}
+
+/// W7-15d0 (upstream #2680): every member of a `const ( … )` group is a
+/// constant, so a function's read of a later member reaches it.
+pub fn go_const_group_member_read_by_a_function() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", "module example.com/limits\n\ngo 1.22\n")
+        .file(
+            "limits.go",
+            "package limits\n\nconst (\n\tBaseLimit = 10\n\tWideLimit = 50\n)\n\nfunc scale() int { return BaseLimit * 2 }\n",
+        )
+        .write(
+            "limits.go",
+            "package limits\n\nconst (\n\tBaseLimit = 10\n\tWideLimit = 50\n)\n\nfunc scale() int { return WideLimit * 2 }\n",
+        )
+        .edge_before("function scale", "references", "constant BaseLimit")
+        .edge_after("function scale", "references", "constant WideLimit")
+}
+
+const GO_SHOP_MAIN: &str =
+    "package main\n\nimport \"example.com/shop/util\"\n\nfunc main() { util.Go() }\n";
+const GO_UTIL_MAIN: &str =
+    "package main\n\nimport \"example.com/util\"\n\nfunc main() { util.Go() }\n";
+const GO_UTIL: &str = "package util\n\nfunc Go() {}\n";
+
+/// W7-15d1: `go.mod` is a control file. Its module path renamed, the
+/// import it named is outside the project, and the call through it links
+/// nothing, though no `.go` file changed.
+pub fn go_module_path_renamed_unlinks_a_cross_package_call() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("main.go", GO_SHOP_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .edge_before("function main", "calls", "function Go @util/util.go")
+        .write("go.mod", "module example.com/store\n\ngo 1.22\n")
+        .no_edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// W7-15d1: a nested module's `go.mod` appearing makes its directory the
+/// package an unchanged import names.
+pub fn go_nested_module_file_appears_and_links_its_importer() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("main.go", GO_UTIL_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .write("util/go.mod", "module example.com/util\n\ngo 1.22\n")
+        .edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// W7-15d1: the nested module's `go.mod` deleted, the import names no
+/// project package again.
+pub fn go_nested_module_file_deleted_unlinks_its_importer() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("util/go.mod", "module example.com/util\n\ngo 1.22\n")
+        .file("main.go", GO_UTIL_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .edge_before("function main", "calls", "function Go @util/util.go")
+        .remove("util/go.mod")
+        .no_edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// W7-15d1: the root `go.mod` deleted, the project has no module, so the
+/// import is outside it.
+pub fn go_root_module_file_deleted_unlinks_a_cross_package_call() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/shop\n\ngo 1.22\n")
+        .file("main.go", GO_SHOP_MAIN)
+        .file("util/util.go", GO_UTIL)
+        .edge_before("function main", "calls", "function Go @util/util.go")
+        .remove("go.mod")
+        .no_edge_after("function main", "calls", "function Go @util/util.go")
+}
+
+/// `discovery/refresh/refresh.go` of upstream's `go-func-field-dispatch.test.ts`:
+/// `Discovery.refresh` calls through `refreshf`, which `NewDiscovery` copies
+/// from `Options.RefreshF`.
+const GO_REFRESH: &str = "package refresh\n\nimport \"context\"\n\ntype Group struct{ Source string }\n\ntype Options struct {\n\tMech     string\n\tInterval int\n\tRefreshF func(ctx context.Context) ([]*Group, error)\n}\n\ntype Discovery struct {\n\tinterval int\n\trefreshf func(ctx context.Context) ([]*Group, error)\n}\n\nfunc NewDiscovery(opts Options) *Discovery {\n\treturn &Discovery{\n\t\tinterval: opts.Interval,\n\t\trefreshf: opts.RefreshF,\n\t}\n}\n\nfunc (d *Discovery) Run(ctx context.Context) {\n\td.refresh(ctx)\n}\n\nfunc (d *Discovery) refresh(ctx context.Context) ([]*Group, error) {\n\ttgs, err := d.refreshf(ctx)\n\treturn tgs, err\n}\n";
+
+/// The gce provider of upstream's sync case, before it wires its function.
+const GO_GCE_UNWIRED: &str = "package gce\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\nfunc refreshInstances(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc NewDiscovery() *refresh.Discovery {\n\treturn refresh.NewDiscovery(refresh.Options{Mech: \"gce\"})\n}\n";
+
+/// The same provider wiring `refreshInstances` in through `Options`.
+const GO_GCE_WIRED: &str = "package gce\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\nfunc refreshInstances(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc NewDiscovery() *refresh.Discovery {\n\treturn refresh.NewDiscovery(refresh.Options{Mech: \"gce\", RefreshF: refreshInstances})\n}\n";
+
+const GO_APP_MOD: &str = "module example.com/app\n\ngo 1.22\n";
+
+/// W7-15d (upstream `go-func-field-dispatch.test.ts`'s sync case): a file
+/// that only wires puts its function in the field, and the call through the
+/// copied field links to it.
+pub fn go_func_field_wiring_appears_in_a_file_that_only_wires() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/gce/gce.go", GO_GCE_UNWIRED)
+        .write("discovery/gce/gce.go", GO_GCE_WIRED)
+        .edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "function refreshInstances",
+        )
+}
+
+/// W7-15d (the same upstream case's second step): the wiring goes, and so
+/// does the link.
+pub fn go_func_field_wiring_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/gce/gce.go", GO_GCE_WIRED)
+        .edge_before(
+            "method Discovery::refresh",
+            "calls",
+            "function refreshInstances",
+        )
+        .write("discovery/gce/gce.go", GO_GCE_UNWIRED)
+        .no_edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "function refreshInstances",
+        )
+}
+
+/// W7-15d: the field stops holding a function, so a call through it is
+/// no call through a func field.
+pub fn go_func_field_type_stops_being_a_func() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file(
+            "jobs/jobs.go",
+            "package jobs\n\ntype Job struct {\n\tfn func() error\n}\n\nfunc (j *Job) Run() error { return j.fn() }\n",
+        )
+        .file(
+            "jobs/wire.go",
+            "package jobs\n\nfunc cleanup() error { return nil }\n\nfunc NewJob() *Job { return &Job{fn: cleanup} }\n",
+        )
+        .edge_before("method Job::Run", "calls", "function cleanup")
+        .write(
+            "jobs/jobs.go",
+            "package jobs\n\ntype Job struct {\n\tfn int\n}\n\nfunc (j *Job) Run() error { return j.fn() }\n",
+        )
+        .no_edge_after("method Job::Run", "calls", "function cleanup")
+}
+
+/// `discovery/aws/ec2.go` wiring its `refresh` method in.
+const GO_EC2_REFRESH: &str = "package aws\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\ntype EC2Discovery struct {\n\t*refresh.Discovery\n}\n\nfunc NewEC2Discovery() *EC2Discovery {\n\td := &EC2Discovery{}\n\td.Discovery = refresh.NewDiscovery(refresh.Options{RefreshF: d.refresh})\n\treturn d\n}\n\nfunc (d *EC2Discovery) refresh(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc (d *EC2Discovery) list(ctx context.Context) ([]*refresh.Group, error)    { return nil, nil }\n";
+
+/// The same provider wiring its `list` method instead.
+const GO_EC2_LIST: &str = "package aws\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\ntype EC2Discovery struct {\n\t*refresh.Discovery\n}\n\nfunc NewEC2Discovery() *EC2Discovery {\n\td := &EC2Discovery{}\n\td.Discovery = refresh.NewDiscovery(refresh.Options{RefreshF: d.list})\n\treturn d\n}\n\nfunc (d *EC2Discovery) refresh(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nfunc (d *EC2Discovery) list(ctx context.Context) ([]*refresh.Group, error)    { return nil, nil }\n";
+
+/// W7-15d: the value another file copies into the field changes, and the
+/// call through the copy follows it.
+pub fn go_func_field_copied_value_changes_in_another_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/aws/ec2.go", GO_EC2_REFRESH)
+        .edge_before(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+        .write("discovery/aws/ec2.go", GO_EC2_LIST)
+        .edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::list",
+        )
+        .no_edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+}
+
+/// W7-15d (after W7-15d0): a package-level variable's literal wires the
+/// field from a file that appears.
+pub fn go_func_field_package_level_wiring_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .write(
+            "discovery/static/static.go",
+            "package static\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/discovery/refresh\"\n)\n\nfunc list(ctx context.Context) ([]*refresh.Group, error) { return nil, nil }\n\nvar defaults = refresh.Options{Mech: \"static\", RefreshF: list}\n",
+        )
+        .edge_after("method Discovery::refresh", "calls", "function list")
+}
+
+/// W7-15d (after W7-15d1): the root `go.mod` renames the module, so the
+/// import a qualified literal is written through names no project package
+/// and the literal wires nothing.
+pub fn go_func_field_module_renamed_unlinks_a_qualified_literal() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", GO_APP_MOD)
+        .file("discovery/refresh/refresh.go", GO_REFRESH)
+        .file("discovery/aws/ec2.go", GO_EC2_REFRESH)
+        .edge_before(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+        .write("go.mod", "module example.com/other\n\ngo 1.22\n")
+        .no_edge_after(
+            "method Discovery::refresh",
+            "calls",
+            "method EC2Discovery::refresh",
+        )
+}
+
+/// W7-16a: a redux-thunk constant's body starts dispatching another thunk;
+/// the constant links to it (`redux-thunk`).
+pub fn ts_thunk_starts_dispatching_another_thunk() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "thunks.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const load = createAsyncThunk('a/load', async (_: void, { dispatch }) => {\n  return 1;\n});\n\nexport const save = createAsyncThunk('a/save', async () => 2);\n",
+        )
+        .write(
+            "thunks.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const load = createAsyncThunk('a/load', async (_: void, { dispatch }) => {\n  dispatch(save());\n});\n\nexport const save = createAsyncThunk('a/save', async () => 2);\n",
+        )
+        .edge_metadata_after(
+            ("constant load", "calls", "constant save"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+}
+
+/// W7-16d: a second thunk of the dispatched name appears in another file;
+/// the name has no one target, so the dispatch reaches neither (OD-B14).
+/// The call `inner()` the dispatch makes also resolves as a base edge, which
+/// stays, so the case reads the synthesized edge's metadata.
+pub fn ts_thunk_dispatch_target_gains_a_namesake_thunk() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "a.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const inner = createAsyncThunk('a/inner', async () => 1);\n",
+        )
+        .file(
+            "c.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const outer = createAsyncThunk('c/outer', async (_: void, { dispatch }) => {\n  await dispatch(inner());\n});\n",
+        )
+        .write(
+            "b.ts",
+            "import { createAsyncThunk } from '@reduxjs/toolkit';\n\nexport const inner = createAsyncThunk('b/inner', async () => 1);\n",
+        )
+        .edge_metadata_before(
+            ("constant outer", "calls", "constant inner @a.ts"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+        .no_edge_metadata_after(
+            ("constant outer", "calls", "constant inner @a.ts"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+        .no_edge_metadata_after(
+            ("constant outer", "calls", "constant inner @b.ts"),
+            "synthesizedBy",
+            "redux-thunk",
+        )
+}
+
+/// W7-16a: a Celery task loses its decorator, in its own file; the
+/// dispatching function of another file reaches it no more.
+pub fn python_celery_task_loses_its_decorator() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file(
+            "tasks.py",
+            "from celery import shared_task\n\n@shared_task\ndef send(to):\n    return to\n",
+        )
+        .file(
+            "views.py",
+            "from tasks import send\n\n\ndef signup(to):\n    send.delay(to)\n",
+        )
+        .write(
+            "tasks.py",
+            "from celery import shared_task\n\n# not a task\ndef send(to):\n    return to\n",
+        )
+        .edge_before("function signup", "calls", "function send")
+        .no_edge_after("function signup", "calls", "function send")
+}
+
+/// W7-16a: a Spring listener's parameter becomes another event; the
+/// publisher of the first one, in another file, reaches it no more.
+pub fn java_spring_listener_hears_another_event() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("app/Events.java", "package app;\nclass Shipped { }\nclass Cancelled { }\n")
+        .file(
+            "app/Service.java",
+            "package app;\nclass Service {\n    void ship() {\n        publisher.publishEvent(new Shipped());\n    }\n}\n",
+        )
+        .file(
+            "app/Listener.java",
+            "package app;\nclass Listener {\n    @EventListener\n    public void on(Shipped event) { }\n}\n",
+        )
+        .write(
+            "app/Listener.java",
+            "package app;\nclass Listener {\n    @EventListener\n    public void on(Cancelled event) { }\n}\n",
+        )
+        .edge_before("method app::Service::ship", "calls", "method app::Listener::on")
+        .no_edge_after("method app::Service::ship", "calls", "method app::Listener::on")
+}
+
+/// W7-16a: a MediatR handler's base list takes another request; the sender
+/// of the first, in another file, reaches its `Handle` no more.
+pub fn csharp_mediatr_handler_takes_another_request() -> Case {
+    Case::new(Change::EditHeritage, &[Language::CSharp])
+        .file(
+            "Requests.cs",
+            "namespace Shop;\npublic class Ping : IRequest<int> { }\npublic class Pong : IRequest<int> { }\n",
+        )
+        .file(
+            "PingHandler.cs",
+            "namespace Shop;\npublic class PingHandler : IRequestHandler<Ping, int> {\n    public Task<int> Handle(Ping request, CancellationToken ct) => Task.FromResult(1);\n}\n",
+        )
+        .file(
+            "Controller.cs",
+            "namespace Shop;\npublic class Controller {\n    public async Task Run() {\n        await _mediator.Send(new Ping());\n    }\n}\n",
+        )
+        .write(
+            "PingHandler.cs",
+            "namespace Shop;\npublic class PingHandler : IRequestHandler<Pong, int> {\n    public Task<int> Handle(Pong request, CancellationToken ct) => Task.FromResult(1);\n}\n",
+        )
+        .edge_before("method Shop::Controller::Run", "calls", "method Shop::PingHandler::Handle")
+        .no_edge_after(
+            "method Shop::Controller::Run",
+            "calls",
+            "method Shop::PingHandler::Handle",
+        )
+}
+
+/// W7-16a: a Sidekiq worker drops the mixin, in its own file; the enqueue
+/// of another file reaches its `perform` no more.
+pub fn ruby_sidekiq_worker_drops_its_mixin() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Ruby])
+        .file(
+            "app/workers/cleanup_worker.rb",
+            "class CleanupWorker\n  include Sidekiq::Worker\n  def perform(id)\n  end\nend\n",
+        )
+        .file(
+            "app/services/service.rb",
+            "class Service\n  def run\n    CleanupWorker.perform_async(1)\n  end\nend\n",
+        )
+        .write(
+            "app/workers/cleanup_worker.rb",
+            "class CleanupWorker\n  include Helpers\n  def perform(id)\n  end\nend\n",
+        )
+        .edge_before(
+            "method Service::run",
+            "calls",
+            "method CleanupWorker::perform",
+        )
+        .no_edge_after(
+            "method Service::run",
+            "calls",
+            "method CleanupWorker::perform",
+        )
+}
+
+/// W7-16d: another file writes `class Comments::NotifyWorker` with the
+/// mixin and a `perform`; the qualified name has no one worker, so the
+/// enqueue reaches neither (OD-B14).
+pub fn ruby_sidekiq_qualified_worker_is_reopened_with_a_perform() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Ruby])
+        .file(
+            "app/workers/comments/notify_worker.rb",
+            "module Comments\n  class NotifyWorker\n    include Sidekiq::Job\n    def perform(id)\n    end\n  end\nend\n",
+        )
+        .file(
+            "app/services/notifier.rb",
+            "class Notifier\n  def run\n    Comments::NotifyWorker.perform_async(1)\n  end\nend\n",
+        )
+        .write(
+            "app/workers/legacy/notify_worker.rb",
+            "class Comments::NotifyWorker\n  include Sidekiq::Job\n  def perform(id)\n  end\nend\n",
+        )
+        .edge_before(
+            "method Notifier::run",
+            "calls",
+            "method Comments::NotifyWorker::perform @app/workers/comments/notify_worker.rb",
+        )
+        .no_edge_after(
+            "method Notifier::run",
+            "calls",
+            "method Comments::NotifyWorker::perform @app/workers/comments/notify_worker.rb",
+        )
+        .no_edge_after(
+            "method Notifier::run",
+            "calls",
+            "method Comments::NotifyWorker::perform @app/workers/legacy/notify_worker.rb",
+        )
+}
+
+/// W7-16a: an event service provider's `$listen` map gains a listener, in a
+/// file of its own; the dispatcher of the event reaches its `handle`.
+pub fn php_laravel_listen_map_gains_a_listener() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file(
+            "app/Providers/EventServiceProvider.php",
+            "<?php\nnamespace App\\Providers;\nclass EventServiceProvider {\n    protected $listen = [\n        Saved::class => [],\n    ];\n}\n",
+        )
+        .file(
+            "app/Listeners/Notify.php",
+            "<?php\nnamespace App\\Listeners;\nclass Notify {\n    public function handle($event) {}\n}\n",
+        )
+        .file(
+            "app/Services/Service.php",
+            "<?php\nnamespace App\\Services;\nclass Service {\n    public function save() { event(new Saved()); }\n}\n",
+        )
+        .write(
+            "app/Providers/EventServiceProvider.php",
+            "<?php\nnamespace App\\Providers;\nclass EventServiceProvider {\n    protected $listen = [\n        Saved::class => [Notify::class],\n    ];\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "method App\\Services::Service::save",
+                "calls",
+                "method App\\Listeners::Notify::handle",
+            ),
+            "synthesizedBy",
+            "laravel-event",
+        )
+}
+
+/// W7-16b: a Pinia options store's `actions` gains a member, which calls a
+/// function of another file; the member is a node of its own that owns the
+/// call, and an unchanged file's call of its name reaches it.
+pub fn ts_pinia_options_store_gains_an_action() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "lib.ts",
+            "export function track(item: string) { return item; }\nexport function clearAll() { return []; }\n",
+        )
+        .file("other.ts", "export function wipe() { return reset(); }\n")
+        .file(
+            "store.ts",
+            "import { defineStore } from 'pinia';\nimport { track } from './lib';\nexport const useCartStore = defineStore('cart', {\n  actions: {\n    add(item: string) { track(item); },\n  },\n});\n",
+        )
+        .write(
+            "store.ts",
+            "import { defineStore } from 'pinia';\nimport { track, clearAll } from './lib';\nexport const useCartStore = defineStore('cart', {\n  actions: {\n    add(item: string) { track(item); },\n    reset() { clearAll(); },\n  },\n});\n",
+        )
+        .edge_before("function useCartStore::add", "calls", "function track")
+        .edge_after("function useCartStore::reset", "calls", "function clearAll")
+        .edge_after("function wipe", "calls", "function useCartStore::reset")
+}
+
+/// W7-16b: the api file's destructuring gains the RTK Query hook an
+/// unchanged component already imports and calls; the call reaches the hook.
+pub fn ts_rtk_api_gains_a_hook_binding() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({\n    getPosts: build.query({ query: () => '/posts' }),\n    getUser: build.query({ query: () => '/user' }),\n  }),\n});\nexport const { useGetPostsQuery } = api;\n",
+        )
+        .file(
+            "Profile.tsx",
+            "import { useGetUserQuery } from './api';\nexport function Profile() {\n  return useGetUserQuery();\n}\n",
+        )
+        .write(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({\n    getPosts: build.query({ query: () => '/posts' }),\n    getUser: build.query({ query: () => '/user' }),\n  }),\n});\nexport const { useGetPostsQuery, useGetUserQuery } = api;\n",
+        )
+        .named_before("function", "useGetPostsQuery")
+        .edge_after("function Profile", "calls", "function useGetUserQuery @api.ts")
+}
+
+/// W7-16b: a module's default export gains a second store word, so the file
+/// reads like a Vuex store; its `actions` member becomes a node that owns the
+/// call the file made before.
+pub fn js_vuex_module_becomes_a_store_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("api.js", "export function apiLogin(info) { return info; }\n")
+        .file(
+            "store/user.js",
+            "import { apiLogin } from '../api';\nexport default {\n  actions: {\n    login(context, info) { apiLogin(info); },\n  },\n};\n",
+        )
+        .write(
+            "store/user.js",
+            "import { apiLogin } from '../api';\nexport default {\n  namespaced: true,\n  actions: {\n    login(context, info) { apiLogin(info); },\n  },\n};\n",
+        )
+        .edge_before("file:store/user.js", "calls", "function apiLogin")
+        .edge_after("function login @store/user.js", "calls", "function apiLogin")
+}
+
+/// W7-16b: an RTK Query endpoint's key is renamed; the endpoint node follows
+/// with the call its handler makes.
+pub fn ts_rtk_endpoint_key_is_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::TypeScript])
+        .file("fetchers.ts", "export function fetchPosts() { return []; }\n")
+        .file(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nimport { fetchPosts } from './fetchers';\nexport const api = createApi({\n  endpoints: (build) => ({\n    getPosts: build.query({ queryFn: () => fetchPosts() }),\n  }),\n});\n",
+        )
+        .write(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nimport { fetchPosts } from './fetchers';\nexport const api = createApi({\n  endpoints: (build) => ({\n    listPosts: build.query({ queryFn: () => fetchPosts() }),\n  }),\n});\n",
+        )
+        .edge_before("function api::getPosts", "calls", "function fetchPosts")
+        .edge_after("function api::listPosts", "calls", "function fetchPosts")
+}
+
+/// W7-16b: the RTK api file gains a function named like an endpoint; the
+/// hook's endpoint has no one function of its name in the file, so the hook
+/// reaches neither (hard invariant 6).
+pub fn ts_rtk_api_gains_a_namesake_of_an_endpoint() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),\n});\nexport const { useGetPostsQuery } = api;\n",
+        )
+        .write(
+            "api.ts",
+            "import { createApi } from '@reduxjs/toolkit/query/react';\nexport const api = createApi({\n  endpoints: (build) => ({ getPosts: build.query({ query: () => '/posts' }) }),\n});\nexport const { useGetPostsQuery } = api;\nexport function getPosts() { return []; }\n",
+        )
+        .edge_metadata_before(
+            ("function useGetPostsQuery", "calls", "function api::getPosts"),
+            "synthesizedBy",
+            "rtk-query",
+        )
+        .no_edge_metadata_after(
+            ("function useGetPostsQuery", "calls", "function api::getPosts"),
+            "synthesizedBy",
+            "rtk-query",
+        )
+        .no_edge_metadata_after(
+            ("function useGetPostsQuery", "calls", "function getPosts"),
+            "synthesizedBy",
+            "rtk-query",
+        )
+}
+
+/// W7-16b: another file defines the Pinia factory a consumer binds; the
+/// name is no one store's, so the consumer's call reaches neither action.
+pub fn ts_pinia_factory_gains_a_namesake_in_another_file() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file(
+            "cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('cart', {\n  actions: { add(item: string) { this.items.push(item); } },\n});\n",
+        )
+        .file(
+            "checkout.ts",
+            "import { useCartStore } from './cart';\nexport function checkout() {\n  const cart = useCartStore();\n  cart.add('x');\n}\n",
+        )
+        .write(
+            "legacy/cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('legacy-cart', {\n  actions: { add(item: string) { this.items.push(item); } },\n});\n",
+        )
+        .edge_metadata_before(
+            ("function checkout", "calls", "function useCartStore::add @cart.ts"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+        .no_edge_metadata_after(
+            ("function checkout", "calls", "function useCartStore::add @cart.ts"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+        .no_edge_metadata_after(
+            (
+                "function checkout",
+                "calls",
+                "function useCartStore::add @legacy/cart.ts",
+            ),
+            "synthesizedBy",
+            "pinia-store",
+        )
+}
+
+/// W7-16b: a Pinia options store gains the action an unchanged consumer
+/// already calls; the call reaches it.
+pub fn ts_pinia_store_gains_the_action_its_consumer_calls() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('cart', {\n  actions: { add(item: string) { this.items.push(item); } },\n});\n",
+        )
+        .file(
+            "checkout.ts",
+            "import { useCartStore } from './cart';\nexport function checkout() {\n  const cart = useCartStore();\n  cart.add('x');\n  cart.clear();\n}\n",
+        )
+        .write(
+            "cart.ts",
+            "import { defineStore } from 'pinia';\nexport const useCartStore = defineStore('cart', {\n  actions: {\n    add(item: string) { this.items.push(item); },\n    clear() { this.items = []; },\n  },\n});\n",
+        )
+        .edge_metadata_before(
+            ("function checkout", "calls", "function useCartStore::add"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+        .edge_metadata_after(
+            ("function checkout", "calls", "function useCartStore::clear"),
+            "synthesizedBy",
+            "pinia-store",
+        )
+}
+
+/// W7-16b: a second store file of a Vuex namespace gains the action a
+/// namespaced dispatch names; the namespace has no one candidate, so the
+/// dispatch reaches neither (hard invariant 6).
+pub fn js_vuex_namespace_gains_a_second_store_file_of_the_action() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::JavaScript])
+        .file(
+            "store/modules/user.js",
+            "export default {\n  namespaced: true,\n  actions: { login() { return 1; } },\n};\n",
+        )
+        .file(
+            "app.js",
+            "export function bootstrap(store) {\n  store.dispatch('user/login');\n}\n",
+        )
+        .write(
+            "store/user/actions.js",
+            "export default {\n  namespaced: true,\n  actions: { login() { return 2; } },\n};\n",
+        )
+        .edge_metadata_before(
+            (
+                "function bootstrap",
+                "calls",
+                "function login @store/modules/user.js",
+            ),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+        .no_edge_metadata_after(
+            (
+                "function bootstrap",
+                "calls",
+                "function login @store/modules/user.js",
+            ),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+        .no_edge_metadata_after(
+            (
+                "function bootstrap",
+                "calls",
+                "function login @store/user/actions.js",
+            ),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+}
+
+/// W7-16b: a Vuex module gains the mutation its action already commits; the
+/// commit reaches it.
+pub fn js_vuex_module_gains_the_mutation_its_action_commits() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file(
+            "store/user.js",
+            "export default {\n  namespaced: true,\n  actions: { save({ commit }) { commit('SAVED'); } },\n};\n",
+        )
+        .write(
+            "store/user.js",
+            "export default {\n  namespaced: true,\n  mutations: { SAVED(state) { state.saved = true; } },\n  actions: { save({ commit }) { commit('SAVED'); } },\n};\n",
+        )
+        .named_before("function", "save")
+        .edge_metadata_after(
+            ("function save", "calls", "function SAVED"),
+            "synthesizedBy",
+            "vuex-dispatch",
+        )
+}
+
+/// W7-17a: a C table gains an entry; the dispatch in another file, unchanged,
+/// reaches it.
+pub fn c_fnptr_table_gains_an_entry() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", "struct ops { void (*run)(void); };\n")
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops table[] = { { one } };\n",
+        )
+        .file(
+            "go.c",
+            "#include \"ops.h\"\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops table[] = { { one }, { two } };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .edge_metadata_after(("function go", "calls", "function two"), "via", "ops.run")
+}
+
+/// W7-17a: a header's function-pointer typedef becomes a data typedef; the
+/// field it types is no function pointer, so the dispatch reaches nothing.
+pub fn c_fnptr_header_typedef_becomes_data() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "ops.h",
+            "typedef void (*handler_t)(void);\nstruct ops { handler_t run; };\n",
+        )
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nstatic struct ops table[] = { { one } };\n",
+        )
+        .file(
+            "go.c",
+            "#include \"ops.h\"\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "ops.h",
+            "typedef int handler_t;\nstruct ops { handler_t run; };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a: the macro that builds a table, defined in an included header,
+/// swaps its arguments; the function lands in the name's position.
+pub fn c_fnptr_header_table_macro_changes_its_expansion() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "cmd.h",
+            "struct cmd { const char *name; void (*fn)(void); };\n#define ENTRY(name, fn) { name, fn }\n",
+        )
+        .file(
+            "cmd.c",
+            "#include \"cmd.h\"\nvoid one(void) {}\nstatic struct cmd table[] = { ENTRY(\"one\", one) };\nvoid go(struct cmd *p) { p->fn(); }\n",
+        )
+        .write(
+            "cmd.h",
+            "struct cmd { const char *name; void (*fn)(void); };\n#define ENTRY(name, fn) { fn, name }\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a: a dispatch reads another field of the struct.
+pub fn c_fnptr_dispatch_reads_another_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "ops.c",
+            "struct ops { void (*run)(void); void (*stop)(void); };\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops table = { one, two };\n",
+        )
+        .file("go.c", "void go(struct ops *p) { p->run(); }\n")
+        .write("go.c", "void go(struct ops *p) { p->stop(); }\n")
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a (#1172): a C++ local function pointer is bound to another
+/// function; the call through it follows.
+pub fn cpp_local_fn_ptr_binds_another_function() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Cpp])
+        .file(
+            "launch.cpp",
+            "void f() {}\nvoid g() {}\nvoid run() { auto k = &f; k(); }\n",
+        )
+        .write(
+            "launch.cpp",
+            "void f() {}\nvoid g() {}\nvoid run() { auto k = &g; k(); }\n",
+        )
+        .edge_before("function run", "calls", "function f")
+        .edge_after("function run", "calls", "function g")
+        .no_edge_after("function run", "calls", "function f")
+}
+
+/// W7-17a: of two files defining `struct ops` with their fields in a
+/// different order, one is renamed past the other; each dispatch still
+/// reaches only its own table.
+pub fn c_fnptr_struct_definitions_change_their_order() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::C])
+        .file(
+            "a.c",
+            "struct ops { int n; void (*run)(void); };\nvoid a_run(void) {}\nstatic struct ops a_tab[] = { { 1, a_run } };\nvoid a_go(struct ops *p) { p->run(); }\n",
+        )
+        .file(
+            "b.c",
+            "struct ops { void (*run)(void); int n; };\nvoid b_run(void) {}\nstatic struct ops b_tab[] = { { b_run, 1 } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .rename("a.c", "z.c")
+        .edge_before("function a_go", "calls", "function a_run")
+        .edge_before("function b_go", "calls", "function b_run")
+        .edge_after("function a_go", "calls", "function a_run")
+        .edge_after("function b_go", "calls", "function b_run")
+        .no_edge_after("function a_go", "calls", "function b_run")
+        .no_edge_after("function b_go", "calls", "function a_run")
+}
+
+/// W7-17a: a table entry named by one function elsewhere gains a namesake
+/// in another file and is registered no more.
+pub fn c_fnptr_entry_gains_a_namesake() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::C])
+        .file(
+            "t.c",
+            "struct ops { void (*run)(void); };\nstatic struct ops tab = { handler };\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .file("x.c", "void handler(void) {}\n")
+        .write("y.c", "void handler(void) {}\n")
+        .edge_before("function go", "calls", "function handler")
+        .no_edge_after("function go", "calls", "function handler")
+}
+
+/// W7-17a: two files define the same `struct ops`, each with its table;
+/// one table gains an entry, and the other file's dispatch does not reach
+/// it.
+pub fn c_fnptr_identical_struct_table_gains_an_entry() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "a.c",
+            "struct ops { void (*run)(void); };\nvoid a_run(void) {}\nstatic struct ops a_tab[] = { { a_run } };\nvoid a_go(struct ops *p) { p->run(); }\n",
+        )
+        .file(
+            "b.c",
+            "struct ops { void (*run)(void); };\nvoid b_run(void) {}\nvoid b_two(void) {}\nstatic struct ops b_tab[] = { { b_run } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "b.c",
+            "struct ops { void (*run)(void); };\nvoid b_run(void) {}\nvoid b_two(void) {}\nstatic struct ops b_tab[] = { { b_run }, { b_two } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .edge_before("function a_go", "calls", "function a_run")
+        .edge_after("function b_go", "calls", "function b_two")
+        .no_edge_after("function a_go", "calls", "function b_two")
+}
+
+/// W7-17a: two files share a header's `struct ops`, so each dispatch
+/// reaches both tables; one file takes its own copy of the definition, and
+/// each reaches only its own.
+pub fn c_fnptr_shared_definition_splits() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", "struct ops { void (*run)(void); };\n")
+        .file(
+            "a.c",
+            "#include \"ops.h\"\nvoid a_run(void) {}\nstatic struct ops a_tab[] = { { a_run } };\nvoid a_go(struct ops *p) { p->run(); }\n",
+        )
+        .file(
+            "b.c",
+            "#include \"ops.h\"\nvoid b_run(void) {}\nstatic struct ops b_tab[] = { { b_run } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "b.c",
+            "struct ops { void (*run)(void); };\nvoid b_run(void) {}\nstatic struct ops b_tab[] = { { b_run } };\nvoid b_go(struct ops *p) { p->run(); }\n",
+        )
+        .edge_before("function a_go", "calls", "function b_run")
+        .edge_after("function a_go", "calls", "function a_run")
+        .edge_after("function b_go", "calls", "function b_run")
+        .no_edge_after("function a_go", "calls", "function b_run")
+        .no_edge_after("function b_go", "calls", "function a_run")
+}
+
+/// W7-17a: a header's struct gains an `#ifdef` field before its function
+/// pointer; the positional entry is registered no more, the designated one
+/// still is.
+pub fn c_fnptr_header_struct_gains_a_conditional_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", "struct ops {\n    void (*run)(void);\n};\n")
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops pos = { one };\nstatic struct ops named = { .run = two };\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write(
+            "ops.h",
+            "struct ops {\n#ifdef EXTRA\n    int extra;\n#endif\n    void (*run)(void);\n};\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17a: the reverse: the `#ifdef` field goes, and the positional entry
+/// is registered again.
+pub fn c_fnptr_header_struct_drops_its_conditional_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file(
+            "ops.h",
+            "struct ops {\n#ifdef EXTRA\n    int extra;\n#endif\n    void (*run)(void);\n};\n",
+        )
+        .file(
+            "tab.c",
+            "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\nstatic struct ops pos = { one };\nstatic struct ops named = { .run = two };\nvoid go(struct ops *p) { p->run(); }\n",
+        )
+        .write("ops.h", "struct ops {\n    void (*run)(void);\n};\n")
+        .edge_before("function go", "calls", "function two")
+        .edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the C file that dispatches and includes a `.def`, which the scan
+/// does not index, and the struct it registers into.
+const FNPTR_DEF_OPS_H: &str = "struct ops { void (*run)(void); };\n";
+const FNPTR_DEF_GO_C: &str = "#include \"ops.h\"\nvoid one(void) {}\nvoid two(void) {}\n#include \"tab.def\"\nvoid go(struct ops *p) { p->run(); }\n";
+const FNPTR_DEF_TAB: &str = "static struct ops table[] = { { one } };\n";
+
+/// W7-17b: only the `.def` the unchanged includer reads changes, and its
+/// table gains an entry.
+pub fn c_fnptr_non_indexed_include_gains_an_entry() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .write(
+            "tab.def",
+            "static struct ops table[] = { { one }, { two } };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .edge_metadata_after(("function go", "calls", "function two"), "via", "ops.run")
+}
+
+/// W7-17b: the `.def` an include names appears, though no file the index
+/// holds changes.
+pub fn c_fnptr_non_indexed_include_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .write("tab.def", FNPTR_DEF_TAB)
+        .edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the `.def` is deleted.
+pub fn c_fnptr_non_indexed_include_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .remove("tab.def")
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the root `.gitignore` comes to ignore the `.def`, which the
+/// stage then no longer reads.
+pub fn c_fnptr_non_indexed_include_becomes_gitignored() -> Case {
+    Case::new(Change::ControlFile, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .write(".gitignore", "*.def\n")
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-17b: the configuration comes to exclude the `.def`.
+pub fn c_fnptr_non_indexed_include_becomes_excluded() -> Case {
+    Case::new(Change::ControlFile, &[Language::C])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .write(
+            ".codegraph/config.toml",
+            "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"tab.def\"]\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .no_edge_after("function go", "calls", "function one")
+}
+
+/// W7-18d: a component whose `templateUrl` names a template the scan does
+/// not index, and the two handlers its class declares.
+const ANGULAR_X_COMPONENT: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', templateUrl: './x.component.html' })\nexport class XComponent {\n  one(): void {}\n  two(): void {}\n}\n";
+
+/// W7-18d: [`ANGULAR_X_COMPONENT`] with its `templateUrl` naming another
+/// template.
+const ANGULAR_X_COMPONENT_OTHER: &str = "import { Component } from '@angular/core';\n@Component({ selector: 'app-x', templateUrl: './other.component.html' })\nexport class XComponent {\n  one(): void {}\n  two(): void {}\n}\n";
+
+/// W7-18d: a template whose button runs `one`.
+const ANGULAR_TEMPLATE_ONE: &str = "<button (click)=\"one()\">One</button>\n";
+
+/// W7-18d: a template whose button runs `two`.
+const ANGULAR_TEMPLATE_TWO: &str = "<button (click)=\"two()\">Two</button>\n";
+
+/// W7-18d: only the template the stage read beside the index changes, the
+/// component is unchanged: its button comes to run the other handler.
+pub fn typescript_angular_template_file_runs_another_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .write("src/app/x/x.component.html", ANGULAR_TEMPLATE_TWO)
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+        .edge_metadata_after(
+            ("class XComponent", "calls", "method XComponent::two"),
+            "synthesizedBy",
+            "angular-event",
+        )
+}
+
+/// W7-18d: the template a `templateUrl` names appears, though no file the
+/// index holds changes.
+pub fn typescript_angular_template_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .write("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .edge_after("class XComponent", "calls", "method XComponent::one")
+}
+
+/// W7-18d: the template is deleted.
+pub fn typescript_angular_template_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .remove("src/app/x/x.component.html")
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+}
+
+/// W7-18d: the component's `templateUrl` comes to name another template,
+/// both unchanged.
+pub fn typescript_angular_template_url_names_another_template() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .file("src/app/x/other.component.html", ANGULAR_TEMPLATE_TWO)
+        .write("src/app/x/x.component.ts", ANGULAR_X_COMPONENT_OTHER)
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+}
+
+/// W7-18d: `codegraph.json` maps `.html` to JavaScript, so the template is
+/// an indexed file, read as the index holds it; it changes, the component
+/// is unchanged.
+pub fn typescript_angular_indexed_template_runs_another_handler() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            ".codegraph/codegraph.json",
+            "{\"extensions\":{\".html\":\"javascript\"}}\n",
+        )
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .write("src/app/x/x.component.html", ANGULAR_TEMPLATE_TWO)
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+}
+
+/// W7-16c: the root `go.mod` of a GoFrame app.
+const GOFRAME_GO_MOD: &str = "module example.com/app\n\nrequire github.com/gogf/gf/v2 v2.7.0\n";
+
+/// W7-16c: two `g.Meta` request types of a GoFrame api.
+const GOFRAME_DEPT_API: &str = "package system\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype DeptSearchReq struct {\n\tg.Meta `path:\"/dept/list\" method:\"get\"`\n}\ntype DeptSearchRes struct{}\n\ntype DeptAddReq struct {\n\tg.Meta `path:\"/dept/add\" method:\"post\"`\n}\ntype DeptAddRes struct{}\n";
+
+/// W7-16c: [`GOFRAME_DEPT_API`] with `POST /dept/add` moved to `/dept/create`.
+const GOFRAME_DEPT_API_CREATE: &str = "package system\n\nimport \"github.com/gogf/gf/v2/frame/g\"\n\ntype DeptSearchReq struct {\n\tg.Meta `path:\"/dept/list\" method:\"get\"`\n}\ntype DeptSearchRes struct{}\n\ntype DeptAddReq struct {\n\tg.Meta `path:\"/dept/create\" method:\"post\"`\n}\ntype DeptAddRes struct{}\n";
+
+/// W7-16c: the controller serving [`GOFRAME_DEPT_API`]'s routes.
+const GOFRAME_DEPT_CONTROLLER: &str = "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) List(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptSearchRes, err error) {\n\treturn\n}\n\nfunc (c *ctl) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n";
+
+/// W7-16c: a controller of `Add` only.
+const GOFRAME_ADD_CONTROLLER: &str = "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n";
+
+/// W7-16c: [`GOFRAME_ADD_CONTROLLER`] with `Add` taking the search request.
+const GOFRAME_ADD_TAKES_SEARCH: &str = "package controller\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl struct{}\n\nfunc (c *ctl) Add(ctx context.Context, req *system.DeptSearchReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n";
+
+/// W7-16c: `POST /dept/add`'s route by its request type.
+const GOFRAME_ADD_ROUTE: &str = "route api/system/dept.go::goframe-route:system.DeptAddReq";
+/// W7-16c: `GET /dept/list`'s route by its request type.
+const GOFRAME_SEARCH_ROUTE: &str = "route api/system/dept.go::goframe-route:system.DeptSearchReq";
+
+/// W7-16c: the root `go.mod` comes to require GoFrame: the request types
+/// become routes, joined to their controller methods.
+pub fn go_goframe_go_mod_comes_to_require_goframe() -> Case {
+    Case::new(Change::ControlFile, &[Language::Go])
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .write("go.mod", GOFRAME_GO_MOD)
+        .named_after("route", "POST /dept/add")
+        .edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_SEARCH_ROUTE, "calls", "method ctl::List")
+}
+
+/// W7-16c: the handler comes to take another request type; its route
+/// follows the parameter.
+pub fn go_goframe_handler_takes_another_request_type() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_ADD_CONTROLLER)
+        .write("internal/controller/dept.go", GOFRAME_ADD_TAKES_SEARCH)
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .no_edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_SEARCH_ROUTE, "calls", "method ctl::Add")
+}
+
+/// W7-16c: a `g.Meta` tag's path changes: the route is renamed, with a new
+/// id, and its edge follows.
+pub fn go_goframe_route_path_is_changed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .write("api/system/dept.go", GOFRAME_DEPT_API_CREATE)
+        .named_before("route", "POST /dept/add")
+        .named_after("route", "POST /dept/create")
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+}
+
+/// W7-16c: another controller directory gains a method taking the same
+/// request type, in the same addon root: the route has two handlers and
+/// links neither.
+pub fn go_goframe_another_controller_takes_the_request_type() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .write(
+            "internal/controller/v2/dept.go",
+            "package v2\n\nimport (\n\t\"context\"\n\n\t\"example.com/app/api/system\"\n)\n\ntype ctl2 struct{}\n\nfunc (c *ctl2) Add(ctx context.Context, req *system.DeptAddReq) (res *system.DeptAddRes, err error) {\n\treturn\n}\n",
+        )
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .no_edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .edge_after(GOFRAME_SEARCH_ROUTE, "calls", "method ctl::List")
+}
+
+/// W7-16c: the controller file is deleted: its routes stay, unlinked.
+pub fn go_goframe_controller_file_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Go])
+        .file("go.mod", GOFRAME_GO_MOD)
+        .file("api/system/dept.go", GOFRAME_DEPT_API)
+        .file("internal/controller/dept.go", GOFRAME_DEPT_CONTROLLER)
+        .remove("internal/controller/dept.go")
+        .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .named_after("route", "POST /dept/add")
+        .named_after("route", "GET /dept/list")
+}
+
+// W7-18a: the link passes. Each link is written in a file the edit leaves
+// alone; what it reaches changes in another file or a control file.
+
+const LINKS_NEXT_PACKAGE: &str = "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\"}}\n";
+const LINKS_NEXT_HOME_LINKS_ABOUT: &str = "import Link from 'next/link'\nexport default function Home() {\n  return <Link href=\"/about\">About</Link>\n}\n";
+const LINKS_NEXT_ABOUT_PAGE: &str = "export default function About() {\n  return null\n}\n";
+
+/// W7-18a: the page a `<Link href>` names appears in another file: the
+/// link pass draws the edge.
+pub fn tsx_next_link_target_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", LINKS_NEXT_PACKAGE)
+        .file("app/page.tsx", LINKS_NEXT_HOME_LINKS_ABOUT)
+        .write("app/about/page.tsx", LINKS_NEXT_ABOUT_PAGE)
+        .edge_after(
+            "function Home",
+            "navigates",
+            "route app/about/page.tsx::route:/about",
+        )
+        .edge_metadata_after(
+            (
+                "function Home",
+                "navigates",
+                "route app/about/page.tsx::route:/about",
+            ),
+            "synthesizedBy",
+            "next-link",
+        )
+}
+
+/// W7-18a: the page a `<Link href>` names is deleted: the link reaches the
+/// dynamic page that now serves its path.
+pub fn tsx_next_link_target_page_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Tsx])
+        .file("package.json", LINKS_NEXT_PACKAGE)
+        .file("app/page.tsx", LINKS_NEXT_HOME_LINKS_ABOUT)
+        .file("app/about/page.tsx", LINKS_NEXT_ABOUT_PAGE)
+        .file(
+            "app/[slug]/page.tsx",
+            "export default function Doc() {\n  return null\n}\n",
+        )
+        .remove("app/about/page.tsx")
+        .edge_before(
+            "function Home",
+            "navigates",
+            "route app/about/page.tsx::route:/about",
+        )
+        .edge_after(
+            "function Home",
+            "navigates",
+            "route app/[slug]/page.tsx::route:/:slug",
+        )
+}
+
+const LINKS_REACT_ROUTER_PACKAGE: &str = "{\"name\":\"app\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\",\"styled-components\":\"*\"}}\n";
+
+/// W7-18a: the route file is edited to serve the path a `<Link to>` in
+/// another file names.
+pub fn tsx_react_router_route_file_edit_serves_a_links_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/old\" element={<Page />} />\n    </Routes>\n  )\n}\nfunction Page() {\n  return null\n}\n",
+        )
+        .file(
+            "src/Nav.tsx",
+            "import { Link } from 'react-router-dom'\nexport function Nav() {\n  return <Link to=\"/new\">New</Link>\n}\n",
+        )
+        .write(
+            "src/App.tsx",
+            "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/new\" element={<Page />} />\n    </Routes>\n  )\n}\nfunction Page() {\n  return null\n}\n",
+        )
+        .named_before("route", "/old")
+        .edge_after(
+            "function Nav",
+            "navigates",
+            "route src/App.tsx::route:/new",
+        )
+}
+
+const LINKS_VUE_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n";
+const LINKS_VUE_VIEW: &str =
+    "<template>\n  <div>view</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n";
+
+/// W7-18a: a route in the router config is renamed to the name a
+/// `<router-link :to="{ name }">` in another file names.
+pub fn vue_router_route_is_renamed_to_a_links_name() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Vue, Language::JavaScript])
+        .file("package.json", LINKS_VUE_PACKAGE)
+        .file(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"home\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"about\", path: \"/about\", component: () => import(\"@/views/About\") }\n  ]\n})\nexport default router\n",
+        )
+        .file("src/views/Home.vue", LINKS_VUE_VIEW)
+        .file("src/views/About.vue", LINKS_VUE_VIEW)
+        .file(
+            "src/components/Menu.vue",
+            "<template>\n  <nav>\n    <router-link :to=\"{ name: 'start' }\">Start</router-link>\n  </nav>\n</template>\n<script setup>\nconst y = 1\n</script>\n",
+        )
+        .write(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"start\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"about\", path: \"/about\", component: () => import(\"@/views/About\") }\n  ]\n})\nexport default router\n",
+        )
+        .edge_after(
+            "component src/components/Menu.vue::Menu",
+            "navigates",
+            "route src/router/index.js::route:/",
+        )
+        .edge_metadata_after(
+            (
+                "component src/components/Menu.vue::Menu",
+                "navigates",
+                "route src/router/index.js::route:/",
+            ),
+            "by",
+            "name",
+        )
+}
+
+/// W7-18a: the page an `<a href>` in the layout names appears.
+pub fn svelte_sveltekit_link_target_page_appears() -> Case {
+    sveltekit_app(Case::new(Change::AddImportTarget, &[Language::Svelte]))
+        .file(
+            "src/routes/+layout.svelte",
+            "<nav>\n  <a href=\"/faq\">FAQ</a>\n</nav>\n<slot />\n",
+        )
+        .write("src/routes/faq/+page.svelte", SVELTEKIT_PAGE)
+        .edge_after(
+            "component src/routes/+layout.svelte::+layout",
+            "navigates",
+            "route src/routes/faq/+page.svelte::route:/faq",
+        )
+        .edge_metadata_after(
+            (
+                "component src/routes/+layout.svelte::+layout",
+                "navigates",
+                "route src/routes/faq/+page.svelte::route:/faq",
+            ),
+            "synthesizedBy",
+            "sveltekit-link",
+        )
+}
+
+const SVELTEKIT_LOADER: &str =
+    "export function load({ locals }) {\n  return { user: locals.user }\n}\n";
+
+/// W7-18b: a server loader appears beside a page, which is unchanged: the
+/// page calls its `load`.
+pub fn svelte_sveltekit_page_server_appears() -> Case {
+    sveltekit_app(Case::new(
+        Change::AddImportTarget,
+        &[Language::Svelte, Language::TypeScript],
+    ))
+    .write("src/routes/settings/+page.server.ts", SVELTEKIT_LOADER)
+    .edge_after(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "function load",
+    )
+    .edge_metadata_after(
+        (
+            "component src/routes/settings/+page.svelte::+page",
+            "calls",
+            "function load",
+        ),
+        "synthesizedBy",
+        "sveltekit-load",
+    )
+}
+
+/// W7-18b: a page's server loader is deleted and its universal loader
+/// kept: the page, unchanged, calls only the universal `load`.
+pub fn svelte_sveltekit_page_server_deleted() -> Case {
+    sveltekit_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::Svelte, Language::TypeScript],
+    ))
+    .file(
+        "src/routes/settings/+page.server.ts",
+        "export const actions = {\n  save: async ({ request }) => {\n    return { saved: true }\n  }\n}\n",
+    )
+    .file("src/routes/settings/+page.ts", SVELTEKIT_LOADER)
+    .remove("src/routes/settings/+page.server.ts")
+    .edge_before(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "constant actions",
+    )
+    .edge_before(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "function actions::save",
+    )
+    .edge_after(
+        "component src/routes/settings/+page.svelte::+page",
+        "calls",
+        "function load",
+    )
+}
+
+/// W7-18b: a page appears beside a loader no page used: its route calls
+/// its component, and the component the loader's `load`.
+pub fn svelte_sveltekit_page_appears_beside_its_loader() -> Case {
+    sveltekit_app(Case::new(
+        Change::AddImportTarget,
+        &[Language::Svelte, Language::TypeScript],
+    ))
+    .file("src/routes/faq/+page.ts", SVELTEKIT_LOADER)
+    .write("src/routes/faq/+page.svelte", SVELTEKIT_PAGE)
+    .edge_after(
+        "route src/routes/faq/+page.svelte::route:/faq",
+        "calls",
+        "component src/routes/faq/+page.svelte::+page",
+    )
+    .edge_metadata_after(
+        (
+            "route src/routes/faq/+page.svelte::route:/faq",
+            "calls",
+            "component src/routes/faq/+page.svelte::+page",
+        ),
+        "synthesizedBy",
+        "sveltekit-page",
+    )
+    .edge_after(
+        "component src/routes/faq/+page.svelte::+page",
+        "calls",
+        "function load",
+    )
+}
+
+/// W7-18a: the route file of the pattern a TanStack `<Link to>` names
+/// appears.
+pub fn tsx_tanstack_link_route_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n",
+        )
+        .file(
+            "src/routes/index.tsx",
+            "import { createFileRoute, Link } from '@tanstack/react-router'\nexport const Route = createFileRoute('/')({ component: IndexComponent })\nfunction IndexComponent() {\n  return <Link to=\"/about\">About</Link>\n}\n",
+        )
+        .write(
+            "src/routes/about.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/about')({ component: AboutComponent })\nfunction AboutComponent() {\n  return null\n}\n",
+        )
+        .edge_after(
+            "function IndexComponent",
+            "navigates",
+            "route src/routes/about.tsx::route:/about",
+        )
+}
+
+const LINKS_REACT_ROUTER_FEATURES_APP: &str = "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/features\" element={<Features />} />\n    </Routes>\n  )\n}\nfunction Features() {\n  return null\n}\n";
+
+/// W7-18a: `HeaderLink.tsx`'s default export stops being a styled link;
+/// the `<HeaderLink to>` in `Header.tsx`, unchanged, no longer navigates.
+pub fn tsx_header_link_default_export_stops_wrapping_a_link() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file("src/App.tsx", LINKS_REACT_ROUTER_FEATURES_APP)
+        .file(
+            "src/HeaderLink.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nexport default styled(Link)`\n  color: red;\n`\n",
+        )
+        .file(
+            "src/Header.tsx",
+            "import HeaderLink from './HeaderLink'\nexport function Header() {\n  return <HeaderLink to=\"/features\">Features</HeaderLink>\n}\n",
+        )
+        .write(
+            "src/HeaderLink.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nimport { Button } from './Button'\nexport default styled(Button)`\n  color: red;\n`\n",
+        )
+        .edge_before(
+            "function Header",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+        .no_edge_after(
+            "function Header",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+}
+
+const LINKS_REACT_ROUTER_AB_APP: &str = "import { Routes, Route } from 'react-router-dom'\nexport function App() {\n  return (\n    <Routes>\n      <Route path=\"/a\" element={<Page />} />\n      <Route path=\"/b\" element={<Page />} />\n    </Routes>\n  )\n}\nfunction Page() {\n  return null\n}\n";
+const LINKS_ROUTE_CONFIG_A: &str =
+    "export const paths = {\n  home: { getHref: () => '/a' },\n} as const;\n";
+const LINKS_ROUTE_CONFIG_B: &str =
+    "export const paths = {\n  home: { getHref: () => '/b' },\n} as const;\n";
+
+/// W7-18a: the route-config helper a `<Link to={paths.home.getHref()}>`
+/// calls comes to return another path (#2187's link half).
+pub fn tsx_route_config_get_href_returns_another_path() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}\n",
+        )
+        .file("src/App.tsx", LINKS_REACT_ROUTER_AB_APP)
+        .file("src/config/paths.ts", LINKS_ROUTE_CONFIG_A)
+        .file(
+            "src/Nav.tsx",
+            "import { Link } from 'react-router-dom'\nimport { paths } from '@/config/paths'\nexport function Nav() {\n  return <Link to={paths.home.getHref()}>Home</Link>\n}\n",
+        )
+        .write("src/config/paths.ts", LINKS_ROUTE_CONFIG_B)
+        .edge_before("function Nav", "navigates", "route src/App.tsx::route:/a")
+        .edge_after("function Nav", "navigates", "route src/App.tsx::route:/b")
+        .no_edge_after("function Nav", "navigates", "route src/App.tsx::route:/a")
+}
+
+/// W7-18a: `tsconfig.json`'s alias comes to point at another directory;
+/// the link that imports the route config through it, unchanged, reads the
+/// other config.
+pub fn tsx_tsconfig_alias_of_a_links_route_config_points_elsewhere() -> Case {
+    Case::new(Change::ControlFile, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", LINKS_REACT_ROUTER_PACKAGE)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./src/config/*\"]}}}\n",
+        )
+        .file("src/App.tsx", LINKS_REACT_ROUTER_AB_APP)
+        .file("src/config/paths.ts", LINKS_ROUTE_CONFIG_A)
+        .file("src/alt/paths.ts", LINKS_ROUTE_CONFIG_B)
+        .file(
+            "src/Nav.tsx",
+            "import { Link } from 'react-router-dom'\nimport { paths } from '@config/paths'\nexport function Nav() {\n  return <Link to={paths.home.getHref()}>Home</Link>\n}\n",
+        )
+        .write(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@config/*\":[\"./src/alt/*\"]}}}\n",
+        )
+        .edge_before("function Nav", "navigates", "route src/App.tsx::route:/a")
+        .edge_after("function Nav", "navigates", "route src/App.tsx::route:/b")
+        .no_edge_after("function Nav", "navigates", "route src/App.tsx::route:/a")
+}
+
+/// W7-18a: a workspace package's styled link comes to wrap another
+/// component; the app's `<AppLink to>`, unchanged, no longer navigates.
+pub fn tsx_workspace_package_wrapper_wraps_another_component() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"packages/*\"],\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\",\"styled-components\":\"*\"}}\n",
+        )
+        .file(
+            "packages/ui/package.json",
+            "{\"name\":\"@acme/ui\",\"dependencies\":{\"react-router-dom\":\"6\"}}\n",
+        )
+        .file(
+            "packages/ui/index.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nexport const AppLink = styled(Link)`\n  color: red;\n`\n",
+        )
+        .file("src/App.tsx", LINKS_REACT_ROUTER_FEATURES_APP)
+        .file(
+            "src/Nav.tsx",
+            "import { AppLink } from '@acme/ui'\nexport function Nav() {\n  return <AppLink to=\"/features\">Features</AppLink>\n}\n",
+        )
+        .write(
+            "packages/ui/index.tsx",
+            "import { Link } from 'react-router-dom'\nimport styled from 'styled-components'\nimport { Button } from './Button'\nexport const AppLink = styled(Button)`\n  color: red;\n`\n",
+        )
+        .edge_before(
+            "function Nav",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+        .no_edge_after(
+            "function Nav",
+            "navigates",
+            "route src/App.tsx::route:/features",
+        )
+}
+
+/// An Expo app with a `/welcome` and a `/home` screen.
+fn expo_app(case: Case) -> Case {
+    case.file(
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react\":\"18\"}}\n",
+    )
+    .file(
+        "src/app/_layout.tsx",
+        "export default function Layout() { return null }\n",
+    )
+    .file(
+        "src/app/welcome.tsx",
+        "export default function Welcome() { return null }\n",
+    )
+    .file(
+        "src/app/home.tsx",
+        "export default function Home() { return null }\n",
+    )
+}
+
+const LINKS_EXPO_PICK_WELCOME: &str = "export function pick() {\n  return '/welcome'\n}\n";
+const LINKS_EXPO_FINISH_WITH_PICK: &str = "import { router } from 'expo-router'\nimport { pick } from './route'\nexport function finish() {\n  router.replace(pick())\n}\n";
+
+/// W7-18a: the helper a push consumes comes to return another screen.
+pub fn typescript_expo_helper_returns_another_screen() -> Case {
+    expo_app(Case::new(
+        Change::BodyEdit,
+        &[Language::TypeScript, Language::Tsx],
+    ))
+    .file("src/services/route.ts", LINKS_EXPO_PICK_WELCOME)
+    .file("src/services/login.ts", LINKS_EXPO_FINISH_WITH_PICK)
+    .write(
+        "src/services/route.ts",
+        "export function pick() {\n  return '/home'\n}\n",
+    )
+    .edge_before(
+        "function pick",
+        "navigates",
+        "route src/app/welcome.tsx::route:/welcome",
+    )
+    .edge_after(
+        "function pick",
+        "navigates",
+        "route src/app/home.tsx::route:/home",
+    )
+    .no_edge_after(
+        "function pick",
+        "navigates",
+        "route src/app/welcome.tsx::route:/welcome",
+    )
+}
+
+/// W7-18a: another file comes to push the helper's return value: the
+/// helper, unchanged, navigates to its screen.
+pub fn typescript_expo_push_comes_to_consume_a_helper() -> Case {
+    expo_app(Case::new(
+        Change::BodyEdit,
+        &[Language::TypeScript, Language::Tsx],
+    ))
+    .file("src/services/route.ts", LINKS_EXPO_PICK_WELCOME)
+    .file(
+        "src/services/login.ts",
+        "import { router } from 'expo-router'\nimport { pick } from './route'\nexport function finish() {\n  router.replace('/home')\n}\n",
+    )
+    .write("src/services/login.ts", LINKS_EXPO_FINISH_WITH_PICK)
+    .edge_after(
+        "function pick",
+        "navigates",
+        "route src/app/welcome.tsx::route:/welcome",
+    )
+    .edge_metadata_after(
+        (
+            "function pick",
+            "navigates",
+            "route src/app/welcome.tsx::route:/welcome",
+        ),
+        "registeredAt",
+        "src/services/login.ts:4",
+    )
+}
+
+/// W7-18c: the member a template's handler destructures from a composable
+/// is renamed in the composable's file; the component, unchanged, binds
+/// nothing there any more.
+pub fn vue_composable_member_is_renamed() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Vue, Language::TypeScript],
+    )
+    .file(
+        "composables/useSidebar.ts",
+        "export function useSidebar() {\n  function close() {\n    return false;\n  }\n  return { close };\n}\n",
+    )
+    .file(
+        "components/AppSidebar.vue",
+        "<template>\n  <button @click=\"closeSidebar\">x</button>\n</template>\n\n<script setup lang=\"ts\">\nimport { useSidebar } from '../composables/useSidebar';\nconst { close: closeSidebar } = useSidebar();\n</script>\n",
+    )
+    .write(
+        "composables/useSidebar.ts",
+        "export function useSidebar() {\n  function shut() {\n    return false;\n  }\n  return { close: shut };\n}\n",
+    )
+    .edge_before(
+        "component components/AppSidebar.vue::AppSidebar",
+        "calls",
+        "function useSidebar::close",
+    )
+}
+
+/// W7-18c: the component a template's kebab-case tag names appears in
+/// another file; the template, unchanged, renders it.
+pub fn vue_kebab_component_appears_elsewhere() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Vue])
+        .file(
+            "components/AppHeader.vue",
+            "<template>\n  <header><el-button>go</el-button></header>\n</template>\n",
+        )
+        .write(
+            "components/ElButton.vue",
+            "<template>\n  <button><slot /></button>\n</template>\n",
+        )
+        .edge_after(
+            "component components/AppHeader.vue::AppHeader",
+            "calls",
+            "component components/ElButton.vue::ElButton",
+        )
+        .edge_metadata_after(
+            (
+                "component components/AppHeader.vue::AppHeader",
+                "calls",
+                "component components/ElButton.vue::ElButton",
+            ),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-18c: `package.json` comes to declare the package a template's tag is
+/// imported from; the tag renders that package's component, no longer the
+/// project's namesake.
+pub fn vue_package_json_declares_an_imported_tags_package() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::Vue],
+    )
+    .file("package.json", "{\"dependencies\":{\"vue\":\"^3.4.0\"}}\n")
+    .file(
+        "src/components/ui/Card.vue",
+        "<template>\n  <div><slot /></div>\n</template>\n",
+    )
+    .file(
+        "src/views/Dashboard.vue",
+        "<script setup lang=\"ts\">\nimport { Card } from 'ant-design-vue';\n</script>\n\n<template>\n  <Card title=\"Usage\">x</Card>\n</template>\n",
+    )
+    .write(
+        "package.json",
+        "{\"dependencies\":{\"vue\":\"^3.4.0\",\"ant-design-vue\":\"^4.0.0\"}}\n",
+    )
+    .edge_before(
+        "component src/views/Dashboard.vue::Dashboard",
+        "calls",
+        "component src/components/ui/Card.vue::Card",
+    )
+    .no_edge_after(
+        "component src/views/Dashboard.vue::Dashboard",
+        "calls",
+        "component src/components/ui/Card.vue::Card",
+    )
+}
+
+// --- W7-20: cross-tier channels and test requests (upstream
+// `tier-synthesizer.ts` at e8ddc4e2). The passes read indexed text, nodes,
+// route names and JavaScript's control inputs; no lane, marker or control
+// kind of their own. ---
+
+/// An Express app serving `POST /api/users` and `GET /api/orders`.
+const TIER_APP: &str = "import express from 'express';\nconst app = express();\napp.post('/api/users', createUser);\napp.get('/api/orders', listOrders);\nfunction createUser(req, res) {}\nfunction listOrders(req, res) {}\n";
+const TIER_FORM: &str =
+    "export function submit() {\n  return fetch('/api/users', { method: 'POST' });\n}\n";
+const TIER_USERS_ROUTE: &str = "route apps/api/app.ts::POST:/api/users";
+
+/// W7-20: the client's path changes: its call reaches the other route.
+pub fn typescript_tier_client_path_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .write(
+            "apps/web/form.ts",
+            "export function submit() {\n  return fetch('/api/orders');\n}\n",
+        )
+        .edge_metadata_before(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .edge_metadata_after(
+            (
+                "function submit",
+                "calls",
+                "route apps/api/app.ts::GET:/api/orders",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the route's path changes under an unchanged client: the call
+/// reaches nothing.
+pub fn typescript_tier_route_path_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .write(
+            "apps/api/app.ts",
+            "import express from 'express';\nconst app = express();\napp.post('/api/people', createUser);\napp.get('/api/orders', listOrders);\nfunction createUser(req, res) {}\nfunction listOrders(req, res) {}\n",
+        )
+        .edge_metadata_before(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .named_after("route", "POST /api/people")
+        .no_edge_metadata_after(
+            ("function submit", "calls", "route apps/api/app.ts::POST:/api/people"),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_MOUNTED_APP: &str = "import express from 'express'\nconst app = express()\nconst v1 = require('./v1')\napp.use('/api/v1', authenticate, v1)\nexport default app\n";
+const TIER_ORDERS_ROUTE: &str = "route apps/api/src/orders.routes.ts::GET:/";
+
+/// W7-20: the mount's prefix changes (upstream `ui-steps-cross-tier`'s
+/// tree): the mounted route is renamed before the stage runs, and the
+/// client's call, in an unchanged file, reaches it no more.
+pub fn typescript_tier_mount_prefix_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/src/app.ts", TIER_MOUNTED_APP)
+        .file(
+            "apps/api/src/v1/index.ts",
+            "import { Router } from 'express'\nimport ordersRouter from '../orders.routes'\nconst router = Router()\nrouter.use('/orders', ordersRouter)\nexport default router\n",
+        )
+        .file(
+            "apps/api/src/orders.routes.ts",
+            "import { Router } from 'express'\nconst router = Router()\nrouter.get('/', listAllOrders)\nexport async function listAllOrders(req, res) {\n  res.json([])\n}\nexport default router\n",
+        )
+        .file(
+            "apps/web/orders.ts",
+            "export async function loadOrders() {\n  const res = await fetch('/api/v1/orders')\n  return res.json()\n}\n",
+        )
+        .write(
+            "apps/api/src/app.ts",
+            "import express from 'express'\nconst app = express()\nconst v1 = require('./v1')\napp.use('/api/v2', authenticate, v1)\nexport default app\n",
+        )
+        .named_before("route", "GET /api/v1/orders")
+        .named_after("route", "GET /api/v2/orders")
+        .edge_metadata_before(
+            ("function loadOrders", "calls", TIER_ORDERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function loadOrders", "calls", TIER_ORDERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_NEST_MAIN: &str = "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  await app.listen(3000);\n}\nbootstrap();\n";
+const TIER_NEST_MAIN_PREFIXED: &str = "import { NestFactory } from '@nestjs/core';\nimport { AppModule } from './app.module';\n\nasync function bootstrap() {\n  const app = await NestFactory.create(AppModule);\n  app.setGlobalPrefix('api');\n  app.enableVersioning({ defaultVersion: '1' });\n  await app.listen(3000);\n}\nbootstrap();\n";
+const TIER_NEST_MODULE: &str = "import { Module } from '@nestjs/common';\nimport { UsersController } from './users/users.controller';\n\n@Module({ controllers: [UsersController] })\nexport class AppModule {}\n";
+const TIER_NEST_CLIENT: &str =
+    "export function fetchUser() {\n  return fetch('/api/v1/users/1');\n}\n";
+const TIER_NEST_ROUTE: &str = "route src/users/users.controller.ts::GET:/users/:id";
+
+/// W7-20: the NestJS bootstrap comes to set a global prefix: a client's
+/// request for the prefixed path, in an unchanged file, reaches the
+/// renamed route.
+pub fn typescript_tier_nestjs_global_prefix_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/main.ts", TIER_NEST_MAIN)
+        .file("src/app.module.ts", TIER_NEST_MODULE)
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .file("src/client/users.ts", TIER_NEST_CLIENT)
+        .write("src/main.ts", TIER_NEST_MAIN_PREFIXED)
+        .named_after("route", "GET /api/v1/users/:id")
+        .edge_metadata_after(
+            ("function fetchUser", "calls", TIER_NEST_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the global prefix goes: the client's request reaches nothing.
+pub fn typescript_tier_nestjs_global_prefix_goes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", NEST_PACKAGE)
+        .file("src/main.ts", TIER_NEST_MAIN_PREFIXED)
+        .file("src/app.module.ts", TIER_NEST_MODULE)
+        .file("src/users/users.controller.ts", NEST_USERS_CONTROLLER)
+        .file("src/client/users.ts", TIER_NEST_CLIENT)
+        .write("src/main.ts", TIER_NEST_MAIN)
+        .edge_metadata_before(
+            ("function fetchUser", "calls", TIER_NEST_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .named_after("route", "GET /users/:id")
+        .no_edge_metadata_after(
+            ("function fetchUser", "calls", TIER_NEST_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_ADMIN_FILE: &str = "apps/admin/app.ts";
+const TIER_ADMIN_APP: &str = "import express from 'express';\nconst app = express();\napp.post('/api/users', createAdmin);\nfunction createAdmin(req, res) {}\n";
+
+/// W7-20: a second app serves the same route: two routes serve the call
+/// alike, and a tie draws nothing.
+pub fn typescript_tier_second_route_ties_the_call() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .write(TIER_ADMIN_FILE, TIER_ADMIN_APP)
+        .edge_metadata_before(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            (
+                "function submit",
+                "calls",
+                "route apps/admin/app.ts::POST:/api/users",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the second app goes: the call reaches its route again.
+pub fn typescript_tier_second_route_goes() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_APP)
+        .file("apps/web/form.ts", TIER_FORM)
+        .file(TIER_ADMIN_FILE, TIER_ADMIN_APP)
+        .remove(TIER_ADMIN_FILE)
+        .edge_metadata_after(
+            ("function submit", "calls", TIER_USERS_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// An Express app serving `GET /api/users/:id`, a client instance with a
+/// base URL, and a card calling through it.
+const TIER_USER_APP: &str = "import express from 'express';\nconst app = express();\napp.get('/api/users/:id', getUser);\nfunction getUser(req, res) {}\n";
+const TIER_API_INSTANCE: &str =
+    "import axios from 'axios';\nexport const api = axios.create({ baseURL: '/api' });\n";
+const TIER_CARD: &str = "import { api } from './lib/api';\nexport function load(id: string) {\n  return api.get(`/users/${id}`);\n}\n";
+const TIER_USER_ROUTE: &str = "route apps/api/app.ts::GET:/api/users/:id";
+
+/// W7-20: the imported instance's base URL changes: the call, in an
+/// unchanged file, reaches its route no more.
+pub fn typescript_tier_imported_base_url_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_USER_APP)
+        .file("apps/web/lib/api.ts", TIER_API_INSTANCE)
+        .file("apps/web/card.ts", TIER_CARD)
+        .write(
+            "apps/web/lib/api.ts",
+            "import axios from 'axios';\nexport const api = axios.create({ baseURL: '/v2' });\n",
+        )
+        .edge_metadata_before(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the instance's module is deleted: `api` is a client by its name
+/// alone, with no base URL, and the call reaches nothing.
+pub fn typescript_tier_imported_instance_module_is_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("apps/api/app.ts", TIER_USER_APP)
+        .file("apps/web/lib/api.ts", TIER_API_INSTANCE)
+        .file("apps/web/card.ts", TIER_CARD)
+        .remove("apps/web/lib/api.ts")
+        .edge_metadata_before(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+/// W7-20: the `tsconfig.json` alias the card imports its instance through
+/// comes to point at a module that makes none: `api` is a client by its
+/// name alone, and the call reaches nothing.
+pub fn typescript_tier_import_alias_points_elsewhere() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"apps/web/lib/*\"]}}}\n",
+        )
+        .file("apps/api/app.ts", TIER_USER_APP)
+        .file("apps/web/lib/api.ts", TIER_API_INSTANCE)
+        .file(
+            "apps/web/other/api.ts",
+            "export const api = {\n  get(path: string) {\n    return path;\n  },\n};\n",
+        )
+        .file(
+            "apps/web/card.ts",
+            "import { api } from '@lib/api';\nexport function load(id: string) {\n  return api.get(`/users/${id}`);\n}\n",
+        )
+        .write(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"apps/web/other/*\"]}}}\n",
+        )
+        .edge_metadata_before(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function load", "calls", TIER_USER_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_PAGES_JS: &str =
+    "export async function loadPages() {\n  return await fetch('/api/pages');\n}\n";
+const TIER_LARAVEL_PAGES_ROUTE: &str = "route routes/api.php::route:/pages";
+
+/// W7-20: `withRouting` comes to mount `routes/api.php` under an
+/// `apiPrefix`: a front end's `fetch('/api/pages')`, in an unchanged file,
+/// reaches the renamed route no more.
+pub fn php_tier_laravel_api_prefix_moves_the_route() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php, Language::JavaScript])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", LARAVEL_API_ROUTES)
+        .file(LARAVEL_PAGES_FILE, LARAVEL_PAGES)
+        .file(LARAVEL_APP_FILE, LARAVEL_APP_WEB)
+        .file("resources/js/pages.js", TIER_PAGES_JS)
+        .write(LARAVEL_APP_FILE, LARAVEL_APP_API_PREFIX)
+        .named_after("route", "GET /v2/pages")
+        .edge_metadata_before(
+            ("function loadPages", "calls", TIER_LARAVEL_PAGES_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            ("function loadPages", "calls", TIER_LARAVEL_PAGES_ROUTE),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_LOGIN_TEST: &str = "<?php\nclass LoginTest extends TestCase {\n    public function testLoginViaHelper() { $this->postAs('api/me', []); }\n}\n";
+const TIER_LOGIN_EDGE: (&str, &str, &str) = (
+    "method LoginTest::testLoginViaHelper",
+    "calls",
+    "route routes/api.php::route:/me",
+);
+
+/// W7-20: the project's request helper stops making a request: the test
+/// calling it, in an unchanged file, reaches the route no more.
+pub fn php_tier_request_helper_stops_requesting() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Php])
+        .file("artisan", LARAVEL_ARTISAN)
+        .file("routes/api.php", "<?php\n\nRoute::post('me', 'AuthController@login');\n")
+        .file(
+            "app/Http/Controllers/AuthController.php",
+            "<?php\n\nclass AuthController\n{\n    public function login() { return 1; }\n}\n",
+        )
+        .file(
+            "tests/TestCase.php",
+            "<?php\nabstract class TestCase {\n    protected function postAs(string $url, array $data) {\n        return $this->postJson($url, $data);\n    }\n}\n",
+        )
+        .file("tests/Feature/LoginTest.php", TIER_LOGIN_TEST)
+        .write(
+            "tests/TestCase.php",
+            "<?php\nabstract class TestCase {\n    protected function postAs(string $url, array $data) {\n        return [$url, $data];\n    }\n}\n",
+        )
+        .edge_metadata_before(TIER_LOGIN_EDGE, "synthesizedBy", "test-request")
+        .no_edge_metadata_after(TIER_LOGIN_EDGE, "synthesizedBy", "test-request")
+}
+
+/// W7-20: the client moves into a test directory: a test is never a
+/// client.
+pub fn javascript_tier_client_moves_under_tests() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", EXPRESS_PACKAGE)
+        .file(
+            "server/app.js",
+            "const express = require('express');\nconst app = express();\napp.get('/api/users', listUsers);\nfunction listUsers(req, res) {}\n",
+        )
+        .file(
+            "src/client.js",
+            "export function loadUsers() {\n  return fetch('/api/users');\n}\n",
+        )
+        .rename("src/client.js", "src/__tests__/client.js")
+        .edge_metadata_before(
+            (
+                "function loadUsers @src/client.js",
+                "calls",
+                "route server/app.js::GET:/api/users",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+        .no_edge_metadata_after(
+            (
+                "function loadUsers @src/__tests__/client.js",
+                "calls",
+                "route server/app.js::GET:/api/users",
+            ),
+            "synthesizedBy",
+            "http-client",
+        )
+}
+
+const TIER_QUEUE_PACKAGE: &str = "{\"name\":\"api\",\"dependencies\":{\"@nestjs/core\":\"^11.0.0\",\"@nestjs/common\":\"^11.0.0\",\"@nestjs/bull\":\"^10.0.0\",\"bullmq\":\"^5.0.0\"}}\n";
+const TIER_WELCOME_EMAIL: (&str, &str, &str) = (
+    "function createUser",
+    "calls",
+    "method EmailProcessor::sendWelcome",
+);
+
+/// W7-20: the queue the producer's binding names changes: its job, put on
+/// in an unchanged file, reaches the other queue's consumer.
+pub fn typescript_tier_queue_binding_names_another_queue() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", TIER_QUEUE_PACKAGE)
+        .file(
+            "src/queue.ts",
+            "import { Queue } from 'bullmq';\nexport const q = new Queue('email');\n",
+        )
+        .file(
+            "src/email.processor.ts",
+            "import { Processor, Process } from '@nestjs/bull';\n@Processor('email')\nexport class EmailProcessor {\n  @Process('welcome')\n  async sendWelcome(job) {\n    return job;\n  }\n}\n",
+        )
+        .file(
+            "src/sms.processor.ts",
+            "import { Processor, Process } from '@nestjs/bull';\n@Processor('sms')\nexport class SmsProcessor {\n  @Process('welcome')\n  async textWelcome(job) {\n    return job;\n  }\n}\n",
+        )
+        .file(
+            "src/users.ts",
+            "import { q } from './queue';\nexport async function createUser() {\n  await q.add('welcome', {});\n}\n",
+        )
+        .write(
+            "src/queue.ts",
+            "import { Queue } from 'bullmq';\nexport const q = new Queue('sms');\n",
+        )
+        .edge_metadata_before(TIER_WELCOME_EMAIL, "queue", "email")
+        .edge_metadata_after(
+            (
+                "function createUser",
+                "calls",
+                "method SmsProcessor::textWelcome",
+            ),
+            "queue",
+            "sms",
+        )
+        .no_edge_metadata_after(TIER_WELCOME_EMAIL, "synthesizedBy", "queue-job")
+}
+
+const TIER_CHAT: &str = "import { io } from 'socket.io-client'\nconst socket = io()\nexport function Chat() {\n  function send(text) {\n    socket.emit('message', text)\n  }\n  return null\n}\n";
+const TIER_CHAT_SEND: (&str, &str, &str) = (
+    "function Chat::send",
+    "calls",
+    "method ChatGateway::handleMessage",
+);
+
+/// W7-20: the chat file comes to hold a socket server
+/// (`io.on('connection')`): its `socket.emit`, now a server's, reaches the
+/// gateway's handler no more.
+pub fn tsx_tier_chat_becomes_a_socket_server() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx, Language::TypeScript])
+        .file("apps/web/chat.tsx", TIER_CHAT)
+        .file(
+            "apps/api/chat.gateway.ts",
+            "import { WebSocketGateway, SubscribeMessage } from '@nestjs/websockets'\n@WebSocketGateway()\nexport class ChatGateway {\n  @SubscribeMessage('message')\n  handleMessage(client, payload) {\n    return payload\n  }\n}\n",
+        )
+        .write(
+            "apps/web/chat.tsx",
+            "import { io } from 'socket.io-client'\nconst socket = io()\nio.on('connection', () => {})\nexport function Chat() {\n  function send(text) {\n    socket.emit('message', text)\n  }\n  return null\n}\n",
+        )
+        .edge_metadata_before(TIER_CHAT_SEND, "tier", "client→server")
+        .no_edge_metadata_after(TIER_CHAT_SEND, "synthesizedBy", "event-bus")
+}
+
+const TIER_CREATED: (&str, &str, &str) = (
+    "method UsersService::create",
+    "calls",
+    "method NotificationsListener::handleUserCreated",
+);
+
+/// W7-20: the listener loses its `@OnEvent`: the pair the tier pass drew
+/// first, and the merge kept as `event-bus`, is the emitter pass's
+/// `event-emitter` edge.
+pub fn typescript_tier_on_event_goes_and_the_emitter_pass_keeps_the_pair() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/users.service.ts",
+            "import { EventEmitter2 } from '@nestjs/event-emitter'\nexport class UsersService {\n  constructor(private readonly eventEmitter: EventEmitter2) {}\n  create(dto) {\n    this.eventEmitter.emit('user.created', dto)\n    return dto\n  }\n}\n",
+        )
+        .file(
+            "src/listener.ts",
+            "import { OnEvent } from '@nestjs/event-emitter'\nexport class NotificationsListener {\n  @OnEvent('user.created')\n  handleUserCreated(user) {\n    return user\n  }\n}\n",
+        )
+        .file(
+            "src/wire.ts",
+            "export function wire(emitter) {\n  emitter.on('user.created', handleUserCreated)\n}\n",
+        )
+        .write(
+            "src/listener.ts",
+            "import { OnEvent } from '@nestjs/event-emitter'\nexport class NotificationsListener {\n  handleUserCreated(user) {\n    return user\n  }\n}\n",
+        )
+        .edge_metadata_before(TIER_CREATED, "synthesizedBy", "event-bus")
+        .edge_metadata_after(TIER_CREATED, "synthesizedBy", "event-emitter")
+}
+
+const TIER_OWNER_TEST_FILE: &str = "src/test/java/demo/OwnerControllerTests.java";
+
+/// W7-20: a Spring test comes to import the MockMvc builders: its bare
+/// `get("/owners")` is a request, and reaches its route.
+pub fn java_tier_spring_test_imports_its_request_builders() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Java])
+        .file("pom.xml", SPRING_POM)
+        .file(
+            "src/main/java/demo/OwnerController.java",
+            "package demo;\n\n@Controller\nclass OwnerController {\n    @GetMapping(\"/owners\")\n    public String processFindForm() {\n        return \"owners/list\";\n    }\n}\n",
+        )
+        .file(
+            TIER_OWNER_TEST_FILE,
+            "package demo;\n\nclass OwnerControllerTests {\n    void testFindByPage() throws Exception {\n        mockMvc.perform(get(\"/owners\"));\n    }\n}\n",
+        )
+        .write(
+            TIER_OWNER_TEST_FILE,
+            "package demo;\n\nimport static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;\n\nclass OwnerControllerTests {\n    void testFindByPage() throws Exception {\n        mockMvc.perform(get(\"/owners\"));\n    }\n}\n",
+        )
+        .edge_metadata_after(
+            (
+                "method demo::OwnerControllerTests::testFindByPage",
+                "calls",
+                "route src/main/java/demo/OwnerController.java::route:/owners",
+            ),
+            "synthesizedBy",
+            "test-request",
+        )
+}
+
+/// The configuration keeps `src/api.ts` out of the index; an indexed
+/// `src/api/index.ts` beside it is `./api`'s next candidate.
+const TIER_EXCLUDE_API: &str =
+    "[app]\nname = \"matrix\"\n\n[indexing]\nexclude = [\"src/api.ts\"]\n";
+const TIER_TWO_USER_APPS: &str = "import express from 'express';\nconst app = express();\napp.get('/api/users/:id', getUser);\napp.get('/legacy/users/:id', getLegacyUser);\nfunction getUser(req, res) {}\nfunction getLegacyUser(req, res) {}\n";
+const TIER_LEGACY_INSTANCE: &str =
+    "import axios from 'axios';\nexport const api = axios.create({ baseURL: '/legacy' });\n";
+const TIER_DOT_API_CLIENT: &str = "import { api } from './api';\nexport function load(id: string) {\n  return api.get(`/users/${id}`);\n}\n";
+const TIER_LOAD_API: (&str, &str, &str) = (
+    "function load",
+    "calls",
+    "route server/app.ts::GET:/api/users/:id",
+);
+const TIER_LOAD_LEGACY: (&str, &str, &str) = (
+    "function load",
+    "calls",
+    "route server/app.ts::GET:/legacy/users/:id",
+);
+
+/// W7-20 (KEEP-RUST): an excluded `src/api.ts` appears beside the indexed
+/// `src/api/index.ts` an unchanged client imports as `./api`. The index
+/// does not change; the tier pass resolves the import among the indexed
+/// files, so the client keeps `src/api/index.ts`'s instance (upstream reads
+/// the excluded file from disk). A known gap all the same: base import
+/// resolution probes the disk for the excluded candidate, so a fresh index
+/// leaves `./api` unresolved where the sync keeps its old resolution.
+pub fn typescript_tier_excluded_import_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(".codegraph/config.toml", TIER_EXCLUDE_API)
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.ts", TIER_TWO_USER_APPS)
+        .file("src/api/index.ts", TIER_API_INSTANCE)
+        .file("src/client.ts", TIER_DOT_API_CLIENT)
+        .write("src/api.ts", TIER_LEGACY_INSTANCE)
+        .edge_metadata_before(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .edge_metadata_after(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .no_edge_metadata_after(TIER_LOAD_LEGACY, "synthesizedBy", "http-client")
+}
+
+/// W7-20 (KEEP-RUST): the excluded `src/api.ts` goes: the tier pass keeps
+/// `src/api/index.ts`'s instance for the client, as a fresh index does. A
+/// known gap for base import resolution, as when it appears.
+pub fn typescript_tier_excluded_import_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file(".codegraph/config.toml", TIER_EXCLUDE_API)
+        .file("package.json", EXPRESS_PACKAGE)
+        .file("server/app.ts", TIER_TWO_USER_APPS)
+        .file("src/api/index.ts", TIER_API_INSTANCE)
+        .file("src/api.ts", TIER_LEGACY_INSTANCE)
+        .file("src/client.ts", TIER_DOT_API_CLIENT)
+        .remove("src/api.ts")
+        .edge_metadata_before(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .edge_metadata_after(TIER_LOAD_API, "synthesizedBy", "http-client")
+        .no_edge_metadata_after(TIER_LOAD_LEGACY, "synthesizedBy", "http-client")
+}
+
+// ----- React Native, Expo modules, Fabric and Swift-ObjC bridges (W7-21) ---
+
+/// A root `package.json` that names `react-native`, which the React Native
+/// bridge is detected by.
+const RN_PACKAGE: &str = "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n";
+
+/// Two Swift modules with one method each, the shims that export them
+/// (`RCT_EXTERN_MODULE`; upstream reads one module from each file), a file
+/// that binds `captureView` to the first module, and a hook that calls the
+/// method through that binding.
+const RN_CAPTURE_SWIFT_FILE: &str = "ios/CaptureView.swift";
+const RN_CAPTURE_SWIFT: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func finalizeCaptureSession() {}\n}\n\n@objc(CaptureViewV2)\nclass CaptureViewV2: NSObject {\n  @objc func finalizeCaptureSession() {}\n}\n";
+const RN_CAPTURE_SHIM_FILE: &str = "ios/CaptureView.m";
+const RN_CAPTURE_SHIM: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(finalizeCaptureSession)\n@end\n";
+const RN_CAPTURE_V2_SHIM_FILE: &str = "ios/CaptureViewV2.m";
+const RN_CAPTURE_V2_SHIM: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureViewV2, NSObject)\nRCT_EXTERN_METHOD(finalizeCaptureSession)\n@end\n";
+const RN_ALIAS_FILE: &str = "src/a.ts";
+const RN_ALIAS: &str = "import { NativeModules } from 'react-native';\n\nexport const captureView = NativeModules.CaptureView;\n";
+const RN_ALIAS_V2: &str = "import { NativeModules } from 'react-native';\n\nexport const captureView = NativeModules.CaptureViewV2;\n";
+const RN_ALIAS_RIVAL_FILE: &str = "src/b.ts";
+const RN_ALIAS_RIVAL: &str =
+    "import { NativeModules } from 'react-native';\n\nconst captureView = NativeModules.Other;\n";
+const RN_HOOKS_FILE: &str = "src/hooks/use-review-handlers.ts";
+const RN_HOOKS: &str = "import { captureView } from '../a';\n\nexport function finish() {\n  captureView.finalizeCaptureSession();\n}\n";
+const RN_FINISH: &str = "function finish";
+const RN_CAPTURE_FINALIZE: &str = "method CaptureView::finalizeCaptureSession";
+const RN_CAPTURE_V2_FINALIZE: &str = "method CaptureViewV2::finalizeCaptureSession";
+const RN_ALIAS_CONSTANT: &str = "constant captureView @src/a.ts";
+
+/// The alias tree whose binding file is `alias`.
+fn rn_alias_case(change: Change, alias: &'static str) -> Case {
+    Case::new(
+        change,
+        &[Language::TypeScript, Language::Swift, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, RN_CAPTURE_SWIFT)
+    .file(RN_CAPTURE_SHIM_FILE, RN_CAPTURE_SHIM)
+    .file(RN_CAPTURE_V2_SHIM_FILE, RN_CAPTURE_V2_SHIM)
+    .file(RN_ALIAS_FILE, alias)
+    .file(RN_HOOKS_FILE, RN_HOOKS)
+}
+
+/// W7-21 (Q5 case 4): another file binds the same name to another module,
+/// so the name names no module anywhere in the project: the hook's call,
+/// which the alias took to the Swift method at 0.95, falls to the imported
+/// constant, as a fresh index has it (the 0.6 fallback finds two Swift
+/// methods and answers nothing).
+pub fn react_native_alias_becomes_ambiguous() -> Case {
+    rn_alias_case(Change::AddCompetitor, RN_ALIAS)
+        .write(RN_ALIAS_RIVAL_FILE, RN_ALIAS_RIVAL)
+        .edge_metadata_before(
+            (RN_FINISH, "calls", RN_CAPTURE_FINALIZE),
+            "bridge",
+            "react-native",
+        )
+        .edge_after(RN_FINISH, "calls", RN_ALIAS_CONSTANT)
+        .no_edge_after(RN_FINISH, "calls", RN_CAPTURE_FINALIZE)
+}
+
+/// W7-21: the rival binding goes: the alias names its module again, and the
+/// call is the bridge's.
+pub fn react_native_alias_stops_being_ambiguous() -> Case {
+    rn_alias_case(Change::AddCompetitor, RN_ALIAS)
+        .file(RN_ALIAS_RIVAL_FILE, RN_ALIAS_RIVAL)
+        .remove(RN_ALIAS_RIVAL_FILE)
+        .edge_before(RN_FINISH, "calls", RN_ALIAS_CONSTANT)
+        .edge_metadata_after(
+            (RN_FINISH, "calls", RN_CAPTURE_FINALIZE),
+            "bridge",
+            "react-native",
+        )
+}
+
+/// W7-21 (Q5 case 5): the alias comes to bind the other module: the hook's
+/// call, an unchanged file's, follows it to the other Swift class.
+pub fn react_native_alias_is_retargeted() -> Case {
+    rn_alias_case(Change::ReexportEdit, RN_ALIAS)
+        .write(RN_ALIAS_FILE, RN_ALIAS_V2)
+        .edge_before(RN_FINISH, "calls", RN_CAPTURE_FINALIZE)
+        .edge_metadata_after(
+            (RN_FINISH, "calls", RN_CAPTURE_V2_FINALIZE),
+            "module",
+            "CaptureViewV2",
+        )
+        .no_edge_after(RN_FINISH, "calls", RN_CAPTURE_FINALIZE)
+}
+
+/// W7-21: the alias goes back to the first module.
+pub fn react_native_alias_is_retargeted_back() -> Case {
+    rn_alias_case(Change::ReexportEdit, RN_ALIAS_V2)
+        .write(RN_ALIAS_FILE, RN_ALIAS)
+        .edge_before(RN_FINISH, "calls", RN_CAPTURE_V2_FINALIZE)
+        .edge_metadata_after(
+            (RN_FINISH, "calls", RN_CAPTURE_FINALIZE),
+            "module",
+            "CaptureView",
+        )
+        .no_edge_after(RN_FINISH, "calls", RN_CAPTURE_V2_FINALIZE)
+}
+
+/// A Swift module whose shim exports one method by `RCT_EXTERN_METHOD`, a
+/// second Swift class with a method of the same name, and a JS call through
+/// `NativeModules`.
+const RN_SETTINGS_SWIFT: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n\n@objc(CaptureViewImpl)\nclass CaptureViewImpl: NSObject {\n  @objc func syncSettings() {}\n}\n";
+const RN_SETTINGS_SHIM: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n";
+const RN_SETTINGS_SHIM_EMPTY: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\n@end\n";
+const RN_SETTINGS_SHIM_REMAP: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_REMAP_MODULE(CaptureView, CaptureViewImpl, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n";
+const RN_SAVE_FILE: &str = "src/save.ts";
+const RN_SAVE: &str = "import { NativeModules } from 'react-native';\n\nexport function save() {\n  NativeModules.CaptureView.syncSettings();\n}\n";
+const RN_SAVE_FN: &str = "function save";
+const RN_SYNC_SETTINGS: &str = "method CaptureView::syncSettings";
+const RN_SYNC_SETTINGS_IMPL: &str = "method CaptureViewImpl::syncSettings";
+
+/// The `RCT_EXTERN` tree with the shim `shim`.
+fn rn_settings_case(change: Change, shim: &'static str) -> Case {
+    Case::new(
+        change,
+        &[Language::TypeScript, Language::Swift, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, RN_SETTINGS_SWIFT)
+    .file(RN_CAPTURE_SHIM_FILE, shim)
+    .file(RN_SAVE_FILE, RN_SAVE)
+}
+
+/// W7-21 (Q5 case 6): the shim stops exporting the method, which is no
+/// node: the module the call names lacks the method, so the bridge answers
+/// nothing, as a fresh index has it.
+pub fn react_native_extern_shim_drops_its_method() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM_EMPTY)
+        .edge_metadata_before(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "bridge",
+            "react-native",
+        )
+        .no_edge_after(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+}
+
+/// W7-21: the shim comes to export the method: the waiting call links.
+pub fn react_native_extern_shim_gains_its_method() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM_EMPTY)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "bridge",
+            "react-native",
+        )
+}
+
+/// W7-21 (Q5 case 6): the shim becomes `RCT_EXTERN_REMAP_MODULE`, the same
+/// JS module implemented by another class: the call moves to that class's
+/// method.
+pub fn react_native_extern_shim_becomes_a_remap_module() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM_REMAP)
+        .edge_before(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS_IMPL),
+            "module",
+            "CaptureView",
+        )
+        .no_edge_after(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+}
+
+/// W7-21: the shim goes back to `RCT_EXTERN_MODULE`.
+pub fn react_native_extern_shim_stops_being_a_remap_module() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM_REMAP)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+        .edge_before(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS_IMPL)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "module",
+            "CaptureView",
+        )
+        .no_edge_after(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS_IMPL)
+}
+
+/// The class the shim names, holding the exported method, and the same
+/// method under a class of another name: renaming the class keeps the
+/// method's name, line and exposure, so its node keeps its id, and only its
+/// qualified name moves.
+const RN_MOVE_SWIFT_IN: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n";
+const RN_MOVE_SWIFT_OUT: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureViewOld: NSObject {\n  @objc func syncSettings() {}\n}\n";
+
+/// The tree whose Swift file is `swift`.
+fn rn_move_case(swift: &'static str) -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::TypeScript, Language::Swift, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, swift)
+    .file(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+    .file(RN_SAVE_FILE, RN_SAVE)
+}
+
+/// W7-21 (round 1 of the gate): the class around the exported method is
+/// renamed away from the class the shim names: the method leaves the
+/// module, and the call, an unchanged file's, links to nothing.
+pub fn react_native_extern_method_moves_out_of_its_class() -> Case {
+    rn_move_case(RN_MOVE_SWIFT_IN)
+        .write(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_OUT)
+        .edge_before(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+        .no_edge_after(RN_SAVE_FN, "calls", "method CaptureViewOld::syncSettings")
+}
+
+/// W7-21: the class is renamed to the one the shim names: the call, waiting
+/// unresolved in an unchanged file, links.
+pub fn react_native_extern_method_moves_into_its_class() -> Case {
+    rn_move_case(RN_MOVE_SWIFT_OUT)
+        .write(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_IN)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "bridge",
+            "react-native",
+        )
+}
+
+/// An `RCT_REMAP_METHOD` whose native selector no Objective-C method has
+/// yet, and the file that comes to declare one.
+const RN_PLAYER_FILE: &str = "ios/Player.m";
+const RN_PLAYER: &str = "#import <React/RCTBridgeModule.h>\n\n@implementation Player\n\nRCT_EXPORT_MODULE(Player)\n\nRCT_REMAP_METHOD(pause, pauseInferenceNow:(BOOL)flag)\n{\n}\n\n@end\n";
+const RN_ENGINE_FILE: &str = "ios/Engine.m";
+const RN_ENGINE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Engine\n- (void)pauseInferenceNow:(BOOL)flag {\n}\n@end\n";
+const RN_STOP_FILE: &str = "src/stop.ts";
+const RN_STOP: &str = "import { NativeModules } from 'react-native';\n\nexport function stop() {\n  NativeModules.Player.pause(true);\n}\n";
+const RN_PAUSE_NOW: &str = "method Engine::pauseInferenceNow:";
+
+/// W7-21 (Q5 case 7): the Objective-C method the remap names appears in
+/// another file: `pause`, the call's tail, is not its name, and the call
+/// links to it.
+pub fn react_native_remap_target_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_PLAYER_FILE, RN_PLAYER)
+    .file(RN_STOP_FILE, RN_STOP)
+    .write(RN_ENGINE_FILE, RN_ENGINE)
+    .named_before("method", "pause")
+    .edge_metadata_after(("function stop", "calls", RN_PAUSE_NOW), "module", "Player")
+}
+
+/// W7-21: the method's file is deleted: the call waits again.
+pub fn react_native_remap_target_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_PLAYER_FILE, RN_PLAYER)
+    .file(RN_STOP_FILE, RN_STOP)
+    .file(RN_ENGINE_FILE, RN_ENGINE)
+    .remove(RN_ENGINE_FILE)
+    .edge_metadata_before(("function stop", "calls", RN_PAUSE_NOW), "module", "Player")
+    .named_after("method", "pause")
+}
+
+/// A Java module exporting `add` by `@ReactMethod`, written on the method's
+/// own line so the method keeps its line without it, and a JS call.
+const RN_CALC_JAVA_FILE: &str = "android/app/src/main/java/com/app/CalcModule.java";
+const RN_CALC_JAVA: &str = "package com.app;\n\nimport com.facebook.react.bridge.ReactContextBaseJavaModule;\nimport com.facebook.react.bridge.ReactMethod;\n\npublic class CalcModule extends ReactContextBaseJavaModule {\n  @Override\n  public String getName() {\n    return \"Calc\";\n  }\n\n  @ReactMethod public void add(int a, int b) {\n  }\n}\n";
+const RN_CALC_JAVA_PLAIN: &str = "package com.app;\n\nimport com.facebook.react.bridge.ReactContextBaseJavaModule;\nimport com.facebook.react.bridge.ReactMethod;\n\npublic class CalcModule extends ReactContextBaseJavaModule {\n  @Override\n  public String getName() {\n    return \"Calc\";\n  }\n\n  public void add(int a, int b) {\n  }\n}\n";
+const RN_SUM_FILE: &str = "src/sum.ts";
+const RN_SUM: &str = "import { NativeModules } from 'react-native';\n\nexport function sum() {\n  NativeModules.Calc.add(1, 2);\n}\n";
+const RN_CALC_ADD_JAVA: &str = "method com.app::CalcModule::add";
+
+/// The JVM tree whose module is `java`.
+fn rn_jvm_case(java: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Java])
+        .file("package.json", RN_PACKAGE)
+        .file(RN_CALC_JAVA_FILE, java)
+        .file(RN_SUM_FILE, RN_SUM)
+}
+
+/// W7-21: the Java method loses `@ReactMethod`: the module no longer
+/// exports it, and the JS call links to nothing.
+pub fn react_native_jvm_method_loses_its_annotation() -> Case {
+    rn_jvm_case(RN_CALC_JAVA)
+        .write(RN_CALC_JAVA_FILE, RN_CALC_JAVA_PLAIN)
+        .edge_metadata_before(
+            ("function sum", "calls", RN_CALC_ADD_JAVA),
+            "module",
+            "Calc",
+        )
+        .no_edge_after("function sum", "calls", RN_CALC_ADD_JAVA)
+}
+
+/// W7-21: the Java method gains `@ReactMethod`: the waiting call links.
+pub fn react_native_jvm_method_gains_its_annotation() -> Case {
+    rn_jvm_case(RN_CALC_JAVA_PLAIN)
+        .write(RN_CALC_JAVA_FILE, RN_CALC_JAVA)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_JAVA),
+            "module",
+            "Calc",
+        )
+}
+
+/// A TurboModule spec that names `Calc` and declares `add`, the
+/// Objective-C++ class implementing it, and the same JS call.
+const RN_SPEC_FILE: &str = "src/NativeCalc.ts";
+const RN_SPEC: &str = "import type { TurboModule } from 'react-native';\nimport { TurboModuleRegistry } from 'react-native';\n\nexport interface Spec extends TurboModule {\n  add(a: number, b: number): number;\n}\n\nexport default TurboModuleRegistry.getEnforcing<Spec>('Calc');\n";
+const RN_SPEC_EMPTY: &str = "import type { TurboModule } from 'react-native';\nimport { TurboModuleRegistry } from 'react-native';\n\nexport interface Spec extends TurboModule {\n}\n\nexport default TurboModuleRegistry.getEnforcing<Spec>('Calc');\n";
+const RN_CALC_MM_FILE: &str = "ios/Calc.mm";
+const RN_CALC_MM: &str = "#import <Foundation/Foundation.h>\n\n@implementation Calc\n- (NSNumber *)add:(double)a b:(double)b {\n  return nil;\n}\n@end\n";
+const RN_CALC_ADD_OBJC: &str = "method Calc::add:b:";
+
+/// The TurboModule tree whose spec is `spec`.
+fn rn_spec_case(spec: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::ObjC])
+        .file("package.json", RN_PACKAGE)
+        .file(RN_SPEC_FILE, spec)
+        .file(RN_CALC_MM_FILE, RN_CALC_MM)
+        .file(RN_SUM_FILE, RN_SUM)
+}
+
+/// W7-21: the spec drops `add`: the module has no `add`, and the call links
+/// to nothing.
+pub fn react_native_turbo_spec_drops_a_method() -> Case {
+    rn_spec_case(RN_SPEC)
+        .write(RN_SPEC_FILE, RN_SPEC_EMPTY)
+        .edge_metadata_before(
+            ("function sum", "calls", RN_CALC_ADD_OBJC),
+            "module",
+            "Calc",
+        )
+        .no_edge_after("function sum", "calls", RN_CALC_ADD_OBJC)
+}
+
+/// W7-21: the spec comes to declare `add`: the call links to the
+/// Objective-C++ method.
+pub fn react_native_turbo_spec_gains_a_method() -> Case {
+    rn_spec_case(RN_SPEC_EMPTY)
+        .write(RN_SPEC_FILE, RN_SPEC)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_OBJC),
+            "module",
+            "Calc",
+        )
+}
+
+/// A Swift call whose name bridges to `fetchEntryForKey:`, before and after
+/// `Cache.m` declares it, and a second declaration in a path that sorts
+/// first.
+const SWIFT_OBJC_CACHE_FILE: &str = "Sources/Cache.m";
+const SWIFT_OBJC_CACHE_EMPTY: &str =
+    "#import <Foundation/Foundation.h>\n\n@implementation Cache\n- (void)clear {\n}\n@end\n";
+const SWIFT_OBJC_CACHE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Cache\n- (void)clear {\n}\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n@end\n";
+const SWIFT_OBJC_STORE_FILE: &str = "Lib/Store.m";
+const SWIFT_OBJC_STORE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Store\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n@end\n";
+const SWIFT_OBJC_CALLER_FILE: &str = "Sources/Caller.swift";
+const SWIFT_OBJC_CALLER: &str =
+    "import Foundation\n\nfunc load(cache: Cache) {\n  _ = cache.fetchEntry(forKey: \"x\")\n}\n";
+const SWIFT_OBJC_LOAD: &str = "function load";
+const SWIFT_OBJC_FETCH: &str = "method Cache::fetchEntryForKey:";
+
+/// The Swift-ObjC tree whose `Cache.m` is `cache`.
+fn swift_objc_case(change: Change, cache: &'static str) -> Case {
+    Case::new(change, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_CACHE_FILE, cache)
+        .file(SWIFT_OBJC_CALLER_FILE, SWIFT_OBJC_CALLER)
+}
+
+/// W7-21 (Q5 case 8): `Cache.m` comes to declare `fetchEntryForKey:`: the
+/// Swift call `cache.fetchEntry`, waiting under a tail that is not the new
+/// name, links to it at 0.6.
+pub fn swift_objc_bridge_target_appears() -> Case {
+    swift_objc_case(Change::BodyEdit, SWIFT_OBJC_CACHE_EMPTY)
+        .write(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21: the method goes: the Swift call waits again.
+pub fn swift_objc_bridge_target_goes() -> Case {
+    swift_objc_case(Change::BodyEdit, SWIFT_OBJC_CACHE)
+        .write(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE_EMPTY)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21 (Q5 case 10, KEEP-RUST): a second `fetchEntryForKey:` appears in
+/// a path that sorts first: the name bridges to two methods, and the call
+/// links to neither.
+pub fn swift_objc_bridge_target_gains_a_namesake() -> Case {
+    swift_objc_case(Change::AddCompetitor, SWIFT_OBJC_CACHE)
+        .write(SWIFT_OBJC_STORE_FILE, SWIFT_OBJC_STORE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", "method Store::fetchEntryForKey:")
+}
+
+/// W7-21: the namesake goes: the call links to the one left.
+pub fn swift_objc_bridge_target_loses_its_namesake() -> Case {
+    swift_objc_case(Change::AddCompetitor, SWIFT_OBJC_CACHE)
+        .file(SWIFT_OBJC_STORE_FILE, SWIFT_OBJC_STORE)
+        .remove(SWIFT_OBJC_STORE_FILE)
+        .edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// A Swift method an Objective-C message bridges to once it is exposed:
+/// `@objc` written on its own line or on the line above, which a Swift node
+/// starts at, so the node keeps its line either way.
+const SWIFT_OBJC_CHART_FILE: &str = "Sources/Chart.swift";
+const SWIFT_OBJC_CHART_PLAIN: &str = "import Foundation\n\nclass Chart: NSObject {\n  func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n";
+const SWIFT_OBJC_CHART_SAME_LINE: &str = "import Foundation\n\nclass Chart: NSObject {\n  @objc func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n";
+const SWIFT_OBJC_CHART_LINE_ABOVE: &str = "import Foundation\n\nclass Chart: NSObject {\n  @objc\n  func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n";
+const SWIFT_OBJC_ANIMATOR_FILE: &str = "Sources/Animator.m";
+const SWIFT_OBJC_ANIMATOR: &str = "#import <Foundation/Foundation.h>\n\n@implementation Animator\n- (void)run:(Chart *)chart {\n  [chart animateWithXAxisDuration:1.0 yAxisDuration:2.0];\n}\n@end\n";
+const SWIFT_OBJC_RUN: &str = "method Animator::run:";
+const SWIFT_OBJC_ANIMATE: &str = "method Chart::animate";
+
+/// The exposure tree whose Swift file is `chart`.
+fn swift_objc_exposure_case(chart: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_CHART_FILE, chart)
+        .file(SWIFT_OBJC_ANIMATOR_FILE, SWIFT_OBJC_ANIMATOR)
+}
+
+/// W7-21 (Q5 case 9): the Swift method gains `@objc` on its own line: the
+/// Objective-C message, waiting unresolved in an unchanged file, links.
+pub fn swift_objc_method_is_exposed_on_its_line() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_PLAIN)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_SAME_LINE)
+        .edge_metadata_after(
+            (SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21: the method loses `@objc` from its line: the message waits again.
+pub fn swift_objc_method_is_hidden_on_its_line() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_SAME_LINE)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_PLAIN)
+        .edge_before(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+        .no_edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+}
+
+/// W7-21 (Q5 case 9): `@objc` appears on a line of its own above the
+/// method: the message links.
+pub fn swift_objc_method_is_exposed_on_the_line_above() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_PLAIN)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_LINE_ABOVE)
+        .edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+}
+
+/// W7-21: the line above goes: the message waits again.
+pub fn swift_objc_method_is_hidden_on_the_line_above() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_LINE_ABOVE)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_PLAIN)
+        .edge_before(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+        .no_edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+}
+
+/// A root `package.json` that names `expo-modules-core`, which the Expo
+/// modules resolvers are detected by.
+const EXPO_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"expo-modules-core\":\"^1.0.0\"}}\n";
+
+/// Two Expo modules with one function each, a file that binds the default
+/// export to the first by name, and a component that calls the function
+/// through the default import.
+const EXPO_CAMERA_SWIFT_FILE: &str = "ios/CameraModule.swift";
+const EXPO_CAMERA_SWIFT: &str = "import ExpoModulesCore\n\npublic class CameraModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoCamera\")\n    AsyncFunction(\"takePictureAsync\") {\n    }\n  }\n}\n";
+const EXPO_CAMERA2_SWIFT_FILE: &str = "ios/Camera2Module.swift";
+const EXPO_CAMERA2_SWIFT: &str = "import ExpoModulesCore\n\npublic class Camera2Module: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoCamera2\")\n    AsyncFunction(\"takePictureAsync\") {\n    }\n  }\n}\n";
+const EXPO_CAMERA_KOTLIN_FILE: &str = "android/src/main/java/expo/modules/camera/CameraModule.kt";
+const EXPO_CAMERA_KOTLIN: &str = "package expo.modules.camera\n\nimport expo.modules.kotlin.modules.Module\nimport expo.modules.kotlin.modules.ModuleDefinition\n\nclass CameraModule : Module() {\n  override fun definition() = ModuleDefinition {\n    Name(\"ExpoCamera\")\n    AsyncFunction(\"takePictureAsync\") {\n    }\n  }\n}\n";
+const EXPO_MANAGER_FILE: &str = "src/ExpoCameraManager.ts";
+const EXPO_MANAGER: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<CameraNativeModule>('ExpoCamera');\n";
+const EXPO_MANAGER_CAMERA2: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<CameraNativeModule>('ExpoCamera2');\n";
+const EXPO_VIEW_FILE: &str = "src/CameraView.tsx";
+const EXPO_VIEW: &str = "import CameraManager from './ExpoCameraManager';\n\nexport function takePhoto() {\n  CameraManager.takePictureAsync();\n}\n";
+const EXPO_TAKE_PHOTO: &str = "function takePhoto";
+const EXPO_TAKE_SWIFT: &str = "method ios/CameraModule.swift::ExpoCamera.takePictureAsync";
+const EXPO_TAKE_SWIFT2: &str = "method ios/Camera2Module.swift::ExpoCamera2.takePictureAsync";
+const EXPO_TAKE_KOTLIN: &str =
+    "method android/src/main/java/expo/modules/camera/CameraModule.kt::ExpoCamera.takePictureAsync";
+
+/// The two-module Expo tree whose binding file is `manager`.
+fn expo_module_case(manager: &'static str) -> Case {
+    Case::new(
+        Change::ReexportEdit,
+        &[Language::TypeScript, Language::Tsx, Language::Swift],
+    )
+    .file("package.json", EXPO_PACKAGE)
+    .file(EXPO_CAMERA_SWIFT_FILE, EXPO_CAMERA_SWIFT)
+    .file(EXPO_CAMERA2_SWIFT_FILE, EXPO_CAMERA2_SWIFT)
+    .file(EXPO_MANAGER_FILE, manager)
+    .file(EXPO_VIEW_FILE, EXPO_VIEW)
+}
+
+/// W7-21 (Q5 case 11): the binding file comes to name the other module:
+/// the component's call, an unchanged file's, follows it.
+pub fn expo_binding_names_another_module() -> Case {
+    expo_module_case(EXPO_MANAGER)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER_CAMERA2)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+        .edge_metadata_after(
+            (EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT2),
+            "framework",
+            "expo-modules-js",
+        )
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+}
+
+/// W7-21: the binding goes back to the first module.
+pub fn expo_binding_names_its_module_again() -> Case {
+    expo_module_case(EXPO_MANAGER_CAMERA2)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT2)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT2)
+}
+
+/// A binding that names no module the project implements, so its type
+/// argument answers, and two interfaces that declare the function.
+const EXPO_TYPES_FILE: &str = "src/Camera.types.ts";
+const EXPO_TYPES: &str = "export interface CameraNativeModule {\n  takePictureAsync(): Promise<void>;\n}\n\nexport interface LegacyNativeModule {\n  takePictureAsync(): Promise<void>;\n}\n";
+const EXPO_MANAGER_TYPED: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<CameraNativeModule>('Missing');\n";
+const EXPO_MANAGER_TYPED_LEGACY: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<LegacyNativeModule>('Missing');\n";
+const EXPO_TAKE_TYPED: &str = "method CameraNativeModule::takePictureAsync";
+const EXPO_TAKE_TYPED_LEGACY: &str = "method LegacyNativeModule::takePictureAsync";
+
+/// The type-fallback tree whose binding file is `manager`.
+fn expo_type_case(manager: &'static str) -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", EXPO_PACKAGE)
+        .file(EXPO_TYPES_FILE, EXPO_TYPES)
+        .file(EXPO_MANAGER_FILE, manager)
+        .file(EXPO_VIEW_FILE, EXPO_VIEW)
+}
+
+/// W7-21 (Q5 case 11): the binding's type argument changes: the call, an
+/// unchanged file's, follows it to the other interface's function.
+pub fn expo_binding_type_argument_changes() -> Case {
+    expo_type_case(EXPO_MANAGER_TYPED)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER_TYPED_LEGACY)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED)
+        .edge_metadata_after(
+            (EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED_LEGACY),
+            "framework",
+            "expo-modules-js",
+        )
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED)
+}
+
+/// W7-21: the type argument changes back.
+pub fn expo_binding_type_argument_changes_back() -> Case {
+    expo_type_case(EXPO_MANAGER_TYPED_LEGACY)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER_TYPED)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED_LEGACY)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED)
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED_LEGACY)
+}
+
+/// The one-module Expo tree, with a Swift implementation only.
+fn expo_kotlin_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[
+            Language::TypeScript,
+            Language::Tsx,
+            Language::Swift,
+            Language::Kotlin,
+        ],
+    )
+    .file("package.json", EXPO_PACKAGE)
+    .file(EXPO_CAMERA_SWIFT_FILE, EXPO_CAMERA_SWIFT)
+    .file(EXPO_MANAGER_FILE, EXPO_MANAGER)
+    .file(EXPO_VIEW_FILE, EXPO_VIEW)
+}
+
+/// W7-21 (Q5 case 12): the module's Kotlin implementation appears: the call
+/// keeps the Swift function as its target and gains the Kotlin one beside
+/// it, and the two platforms pair.
+pub fn expo_module_gains_its_kotlin_implementation() -> Case {
+    expo_kotlin_case()
+        .write(EXPO_CAMERA_KOTLIN_FILE, EXPO_CAMERA_KOTLIN)
+        .edge_throughout(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_KOTLIN)
+        .edge_metadata_after(
+            (EXPO_TAKE_SWIFT, "calls", EXPO_TAKE_KOTLIN),
+            "synthesizedBy",
+            "expo-cross-platform",
+        )
+}
+
+/// W7-21: the Kotlin implementation is deleted: the call keeps the Swift
+/// one.
+pub fn expo_module_loses_its_kotlin_implementation() -> Case {
+    expo_kotlin_case()
+        .file(EXPO_CAMERA_KOTLIN_FILE, EXPO_CAMERA_KOTLIN)
+        .remove(EXPO_CAMERA_KOTLIN_FILE)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_KOTLIN)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+}
+
+/// A Fabric component spec outside every workspace root and its native
+/// view, with no root `package.json`: only a manifest under one of the
+/// four roots Fabric lists can show React Native, and no indexed file is
+/// under it.
+const FABRIC_SPEC_FILE: &str = "src/MyViewNativeComponent.ts";
+const FABRIC_SPEC: &str = "import type { ViewProps } from 'react-native';\nimport codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\n\nexport interface NativeProps extends ViewProps {\n  color?: string;\n}\n\nexport default codegenNativeComponent<NativeProps>('MyView');\n";
+const FABRIC_VIEW_FILE: &str = "ios/MyViewComponentView.mm";
+const FABRIC_VIEW: &str = "#import <UIKit/UIKit.h>\n\n@implementation MyViewComponentView\n- (void)prepareForRecycle {\n}\n@end\n";
+const FABRIC_MANIFEST_FILE: &str = "packages/native/package.json";
+const FABRIC_MANIFEST: &str =
+    "{\"name\":\"native\",\"peerDependencies\":{\"react-native\":\"*\"}}\n";
+const FABRIC_MANIFEST_PLAIN: &str =
+    "{\"name\":\"native\",\"peerDependencies\":{\"react\":\"*\"}}\n";
+const FABRIC_COMPONENT: &str = "component src/MyViewNativeComponent.ts::MyView";
+const FABRIC_NATIVE_VIEW: &str = "class MyViewComponentView";
+
+/// The Fabric tree.
+fn fabric_case() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::ObjC])
+        .file(FABRIC_SPEC_FILE, FABRIC_SPEC)
+        .file(FABRIC_VIEW_FILE, FABRIC_VIEW)
+}
+
+/// W7-21 (Q5 case 3): a workspace package's manifest that names
+/// `react-native` appears under `packages/`: Fabric is detected, the spec's
+/// component appears and pairs with its native view.
+pub fn fabric_workspace_manifest_appears() -> Case {
+    fabric_case()
+        .write(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST)
+        .detected_before("fabric-view", false)
+        .detected_after("fabric-view", true)
+        .edge_metadata_after(
+            (FABRIC_COMPONENT, "calls", FABRIC_NATIVE_VIEW),
+            "synthesizedBy",
+            "fabric-native-impl",
+        )
+}
+
+/// W7-21: the manifest is deleted, leaving its directory empty: Fabric is
+/// not detected, and the component goes.
+pub fn fabric_workspace_manifest_is_deleted() -> Case {
+    fabric_case()
+        .file(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST)
+        .remove(FABRIC_MANIFEST_FILE)
+        .detected_before("fabric-view", true)
+        .edge_before(FABRIC_COMPONENT, "calls", FABRIC_NATIVE_VIEW)
+        .detected_after("fabric-view", false)
+}
+
+/// W7-21: the manifest comes to name `react-native` in place: Fabric is
+/// detected.
+pub fn fabric_workspace_manifest_comes_to_name_react_native() -> Case {
+    fabric_case()
+        .file(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST_PLAIN)
+        .write(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST)
+        .detected_before("fabric-view", false)
+        .detected_after("fabric-view", true)
+        .edge_after(FABRIC_COMPONENT, "calls", FABRIC_NATIVE_VIEW)
+}
+
+/// A JS caller that comes to call through the bridge while every native
+/// file stays as it was: a sync resolves the new call from the rows the
+/// unchanged files' facts were recorded in, where a fresh index reads their
+/// text.
+const RN_SUM_EMPTY: &str =
+    "import { NativeModules } from 'react-native';\n\nexport function sum() {\n  return 0;\n}\n";
+const RN_CALC_EXPORT: &str = "#import <React/RCTBridgeModule.h>\n\n@implementation CalcModule\n\nRCT_EXPORT_MODULE(Calc)\n\nRCT_EXPORT_METHOD(add:(double)a b:(double)b)\n{\n}\n\n@end\n";
+const RN_CALC_KOTLIN_FILE: &str = "android/app/src/main/java/com/app/CalcModule.kt";
+const RN_CALC_KOTLIN: &str = "package com.app\n\nimport com.facebook.react.bridge.ReactApplicationContext\nimport com.facebook.react.bridge.ReactContextBaseJavaModule\nimport com.facebook.react.bridge.ReactMethod\n\nclass CalcModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {\n  override fun getName() = \"Calc\"\n\n  @ReactMethod\n  fun add(a: Int, b: Int) {\n  }\n}\n";
+
+/// The tree of `files` whose JS caller `src/sum.ts` comes to call
+/// `NativeModules.Calc.add`.
+fn rn_call_appears(languages: &[Language], files: &[(&'static str, &'static str)]) -> Case {
+    files
+        .iter()
+        .fold(
+            Case::new(Change::BodyEdit, languages).file("package.json", RN_PACKAGE),
+            |case, (path, text)| case.file(path, text),
+        )
+        .file(RN_SUM_FILE, RN_SUM_EMPTY)
+        .write(RN_SUM_FILE, RN_SUM)
+}
+
+/// W7-21: the call appears beside an unchanged Objective-C export module.
+pub fn react_native_call_appears_beside_an_unchanged_export() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::ObjC],
+        &[("ios/CalcModule.m", RN_CALC_EXPORT)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", "method ios/CalcModule.m::Calc.add"),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged Objective-C++ export module.
+pub fn react_native_call_appears_beside_an_unchanged_objcpp_export() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::ObjC],
+        &[("ios/CalcModule.mm", RN_CALC_EXPORT)],
+    )
+    .edge_metadata_after(
+        (
+            "function sum",
+            "calls",
+            "method ios/CalcModule.mm::Calc.add",
+        ),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged Java module.
+pub fn react_native_call_appears_beside_an_unchanged_java_module() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::Java],
+        &[(RN_CALC_JAVA_FILE, RN_CALC_JAVA)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", RN_CALC_ADD_JAVA),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged Kotlin module.
+pub fn react_native_call_appears_beside_an_unchanged_kotlin_module() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::Kotlin],
+        &[(RN_CALC_KOTLIN_FILE, RN_CALC_KOTLIN)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", "method com.app::CalcModule::add"),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged TurboModule spec and its
+/// Objective-C++ implementation.
+pub fn react_native_call_appears_beside_an_unchanged_spec() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::ObjC],
+        &[(RN_SPEC_FILE, RN_SPEC), (RN_CALC_MM_FILE, RN_CALC_MM)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", RN_CALC_ADD_OBJC),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged `RCT_EXTERN` shim of a Swift
+/// module.
+pub fn react_native_call_appears_beside_an_unchanged_shim() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Swift, Language::ObjC])
+        .file("package.json", RN_PACKAGE)
+        .file(RN_CAPTURE_SWIFT_FILE, RN_SETTINGS_SWIFT)
+        .file(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+        .file(
+            RN_SAVE_FILE,
+            "import { NativeModules } from 'react-native';\n\nexport function save() {\n  return 0;\n}\n",
+        )
+        .write(RN_SAVE_FILE, RN_SAVE)
+        .edge_metadata_after((RN_SAVE_FN, "calls", RN_SYNC_SETTINGS), "bridge", "react-native")
+}
+
+/// W7-21: the hook comes to call through an alias another, unchanged file
+/// declares.
+pub fn react_native_call_appears_through_an_unchanged_alias() -> Case {
+    rn_alias_case(Change::BodyEdit, RN_ALIAS)
+        .file(
+            "src/hooks/use-later.ts",
+            "import { captureView } from '../a';\n\nexport function later() {\n  return 0;\n}\n",
+        )
+        .write(
+            "src/hooks/use-later.ts",
+            "import { captureView } from '../a';\n\nexport function later() {\n  captureView.finalizeCaptureSession();\n}\n",
+        )
+        .edge_metadata_after(("function later", "calls", RN_CAPTURE_FINALIZE), "module", "CaptureView")
+}
+
+/// W7-21: the component comes to call through a binding an unchanged file
+/// exports.
+pub fn expo_call_appears_beside_an_unchanged_binding() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx, Language::Swift])
+        .file("package.json", EXPO_PACKAGE)
+        .file(EXPO_CAMERA_SWIFT_FILE, EXPO_CAMERA_SWIFT)
+        .file(EXPO_MANAGER_FILE, EXPO_MANAGER)
+        .file(
+            EXPO_VIEW_FILE,
+            "import CameraManager from './ExpoCameraManager';\n\nexport function takePhoto() {\n  return CameraManager;\n}\n",
+        )
+        .write(EXPO_VIEW_FILE, EXPO_VIEW)
+        .edge_metadata_after(
+            (EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT),
+            "framework",
+            "expo-modules-js",
+        )
+}
+
+/// W7-21: the Objective-C++ class implementing a TurboModule spec appears:
+/// `add:b:` is not the call's tail `add`, and the call links to it.
+pub fn react_native_turbo_implementation_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_SPEC_FILE, RN_SPEC)
+    .file(RN_SUM_FILE, RN_SUM)
+    .write(RN_CALC_MM_FILE, RN_CALC_MM)
+    .edge_metadata_after(
+        ("function sum", "calls", RN_CALC_ADD_OBJC),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the implementation is deleted: the call waits again.
+pub fn react_native_turbo_implementation_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_SPEC_FILE, RN_SPEC)
+    .file(RN_SUM_FILE, RN_SUM)
+    .file(RN_CALC_MM_FILE, RN_CALC_MM)
+    .remove(RN_CALC_MM_FILE)
+    .edge_metadata_before(
+        ("function sum", "calls", RN_CALC_ADD_OBJC),
+        "module",
+        "Calc",
+    )
+    .named_after("method", "add")
+}
+
+/// More unresolved `….syncSettings` calls than one tail retries in a sync:
+/// CFML calls, which no bridge reads.
+static UNTYPED_SYNC_SETTINGS_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.syncSettings({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// W7-21 (owner change 4): the class is renamed to the one the shim names
+/// beside more parked `….syncSettings` calls than one tail retries: the
+/// Swift rows move the call, an unchanged file's, uncapped.
+pub fn react_native_extern_method_moves_into_its_class_past_the_tail_ceiling() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[
+            Language::TypeScript,
+            Language::Swift,
+            Language::ObjC,
+            Language::Cfml,
+        ],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_OUT)
+    .file(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+    .file(RN_SAVE_FILE, RN_SAVE)
+    .file("noise/Noise.cfc", UNTYPED_SYNC_SETTINGS_CALLS.as_str())
+    .write(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_IN)
+    .edge_metadata_after(
+        (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+        "bridge",
+        "react-native",
+    )
+}
+
+/// A top-level Swift function an Objective-C message bridges to once
+/// `@objc` exposes it: a function is the bridge's as a method is.
+const SWIFT_OBJC_EASING_FILE: &str = "Sources/Easing.swift";
+const SWIFT_OBJC_EASING_PLAIN: &str =
+    "import Foundation\n\nfunc animate(xAxisDuration: Double, yAxisDuration: Double) {}\n";
+const SWIFT_OBJC_EASING_EXPOSED: &str =
+    "import Foundation\n\n@objc func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n";
+const SWIFT_OBJC_EASE: &str = "function animate";
+
+/// The function tree whose Swift file is `easing`.
+fn swift_objc_function_case(easing: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_EASING_FILE, easing)
+        .file(SWIFT_OBJC_ANIMATOR_FILE, SWIFT_OBJC_ANIMATOR)
+}
+
+/// W7-21: a top-level Swift function gains `@objc` on its line: the
+/// Objective-C message, waiting unresolved in an unchanged file, links.
+pub fn swift_objc_function_is_exposed_on_its_line() -> Case {
+    swift_objc_function_case(SWIFT_OBJC_EASING_PLAIN)
+        .write(SWIFT_OBJC_EASING_FILE, SWIFT_OBJC_EASING_EXPOSED)
+        .edge_metadata_after(
+            (SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_EASE),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21: the function loses `@objc`: the message waits again.
+pub fn swift_objc_function_is_hidden_on_its_line() -> Case {
+    swift_objc_function_case(SWIFT_OBJC_EASING_EXPOSED)
+        .write(SWIFT_OBJC_EASING_FILE, SWIFT_OBJC_EASING_PLAIN)
+        .edge_before(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_EASE)
+        .no_edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_EASE)
+}
+
+/// More unresolved `….add` calls than one tail retries in a sync: CFML
+/// calls, which no bridge reads.
+static UNTYPED_ADD_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.add({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// A Kotlin and a Java TurboModule implementation, before and after they
+/// declare the spec's `add` (no `@ReactMethod`: the spec's method reaches
+/// it by name). The class is there before: a file that appears sends the
+/// JavaScript files down another lane whole.
+const RN_CALC_KT_FILE: &str = "android/app/src/main/java/com/app/CalcModule.kt";
+const RN_CALC_KT_EMPTY: &str = "package com.app\n\nclass CalcModule(context: ReactApplicationContext) : NativeCalcSpec(context) {\n  fun other() {}\n}\n";
+const RN_CALC_KT: &str = "package com.app\n\nclass CalcModule(context: ReactApplicationContext) : NativeCalcSpec(context) {\n  fun other() {}\n  override fun add(a: Double, b: Double): Double = a + b\n}\n";
+const RN_CALC_ADD_KOTLIN: &str = "method com.app::CalcModule::add";
+const RN_CALC_JAVA_TURBO_EMPTY: &str = "package com.app;\n\npublic class CalcModule extends NativeCalcSpec {\n  public void other() {\n  }\n}\n";
+const RN_CALC_JAVA_TURBO: &str = "package com.app;\n\npublic class CalcModule extends NativeCalcSpec {\n  public void other() {\n  }\n\n  @Override\n  public double add(double a, double b) {\n    return a + b;\n  }\n}\n";
+/// The TurboModule tree beside more parked `….add` calls than one tail
+/// retries.
+fn rn_turbo_ceiling_case(languages: &[Language]) -> Case {
+    Case::new(Change::BodyEdit, languages)
+        .file("package.json", RN_PACKAGE)
+        .file(RN_SPEC_FILE, RN_SPEC)
+        .file(RN_SUM_FILE, RN_SUM)
+        .file("noise/Noise.cfc", UNTYPED_ADD_CALLS.as_str())
+}
+
+/// W7-21: a Kotlin implementation comes to declare the spec's method beside
+/// more parked `….add` calls than one tail retries: the lane's JVM method
+/// seeds link the waiting call, uncapped.
+pub fn react_native_turbo_kotlin_implementation_gains_its_method_past_the_tail_ceiling() -> Case {
+    rn_turbo_ceiling_case(&[Language::TypeScript, Language::Kotlin, Language::Cfml])
+        .file(RN_CALC_KT_FILE, RN_CALC_KT_EMPTY)
+        .write(RN_CALC_KT_FILE, RN_CALC_KT)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_KOTLIN),
+            "module",
+            "Calc",
+        )
+}
+
+/// W7-21: a Java implementation likewise.
+pub fn react_native_turbo_java_implementation_gains_its_method_past_the_tail_ceiling() -> Case {
+    rn_turbo_ceiling_case(&[Language::TypeScript, Language::Java, Language::Cfml])
+        .file(RN_CALC_JAVA_FILE, RN_CALC_JAVA_TURBO_EMPTY)
+        .write(RN_CALC_JAVA_FILE, RN_CALC_JAVA_TURBO)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_JAVA),
+            "module",
+            "Calc",
+        )
+}
+
+/// Two files binding one local name to two Expo modules, before and after
+/// each calls through it.
+const EXPO_X_MODULE_FILE: &str = "ios/XModule.swift";
+const EXPO_X_MODULE: &str = "import ExpoModulesCore\n\npublic class XModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoX\")\n    Function(\"go\") {\n    }\n  }\n}\n";
+const EXPO_Y_MODULE_FILE: &str = "ios/YModule.swift";
+const EXPO_Y_MODULE: &str = "import ExpoModulesCore\n\npublic class YModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoY\")\n    Function(\"go\") {\n    }\n  }\n}\n";
+const EXPO_X_FILE: &str = "src/x.ts";
+const EXPO_X_QUIET: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoX');\nexport function runX() {\n}\n";
+const EXPO_X_CALLING: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoX');\nexport function runX() {\n  M.go();\n}\n";
+const EXPO_Y_FILE: &str = "src/y.ts";
+const EXPO_Y_QUIET: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoY');\nexport function runY() {\n}\n";
+const EXPO_Y_CALLING: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoY');\nexport function runY() {\n  M.go();\n}\n";
+
+/// W7-21: two files binding one local name to two modules come to call
+/// through it in one sync, which resolves both in one pass: each call
+/// reaches its own file's module (upstream's per-file `bindingMemo`).
+pub fn expo_one_binding_name_in_two_files_reaches_each_files_module() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Swift])
+        .file("package.json", EXPO_PACKAGE)
+        .file(EXPO_X_MODULE_FILE, EXPO_X_MODULE)
+        .file(EXPO_Y_MODULE_FILE, EXPO_Y_MODULE)
+        .file(EXPO_X_FILE, EXPO_X_QUIET)
+        .file(EXPO_Y_FILE, EXPO_Y_QUIET)
+        .write(EXPO_X_FILE, EXPO_X_CALLING)
+        .write(EXPO_Y_FILE, EXPO_Y_CALLING)
+        .edge_metadata_after(
+            (
+                "function runX",
+                "calls",
+                "method ios/XModule.swift::ExpoX.go",
+            ),
+            "framework",
+            "expo-modules-js",
+        )
+        .edge_metadata_after(
+            (
+                "function runY",
+                "calls",
+                "method ios/YModule.swift::ExpoY.go",
+            ),
+            "framework",
+            "expo-modules-js",
+        )
+}
+
+/// An Objective-C message to `self` whose selector's base name an `@objc`
+/// Swift method answers through the bridge at 0.6, beside a method of the
+/// selector out of the sender's hierarchy, and the sender's superclass,
+/// which comes to declare the selector itself: the name match then scores
+/// 0.4 (two candidates of the name), and a bridge fills in only where no
+/// candidate in the message's language is (KEEP-RUST, W7-21).
+const BRIDGE_BASE_HEADER_FILE: &str = "Base.h";
+const BRIDGE_BASE_HEADER: &str =
+    "#import <Foundation/Foundation.h>\n\n@interface Base : NSObject\n@end\n";
+const BRIDGE_BASE_FILE: &str = "Base.m";
+const BRIDGE_BASE_EMPTY: &str =
+    "#import \"Base.h\"\n\n@implementation Base\n- (void)clear {\n}\n@end\n";
+const BRIDGE_BASE: &str = "#import \"Base.h\"\n\n@implementation Base\n- (id)objectAtIndex:(NSUInteger)index {\n  return nil;\n}\n@end\n";
+const BRIDGE_SENDER_FILE: &str = "Foo.m";
+const BRIDGE_SENDER: &str = "#import \"Base.h\"\n\n@interface Foo : Base\n@end\n\n@implementation Foo\n- (id)first {\n  return [self objectAtIndex:0];\n}\n@end\n";
+const BRIDGE_OUTSIDER_FILE: &str = "Bar.m";
+const BRIDGE_OUTSIDER: &str = "#import <Foundation/Foundation.h>\n\n@implementation Bar\n- (id)objectAtIndex:(NSUInteger)index {\n  return nil;\n}\n@end\n";
+const BRIDGE_SWIFT_FILE: &str = "Map.swift";
+const BRIDGE_SWIFT: &str = "import Foundation\n\nclass Map: NSObject {\n  @objc public func object(forKey key: AnyObject) -> AnyObject? {\n    return nil\n  }\n}\n";
+const BRIDGE_FIRST: &str = "method Foo::first";
+const BRIDGE_BASE_METHOD: &str = "method Base::objectAtIndex:";
+const BRIDGE_SWIFT_METHOD: &str = "method Map::object";
+
+/// The superclass tree whose `Base.m` is `base`.
+fn swift_objc_namesake_case(base: &'static str) -> Case {
+    Case::new(Change::AddCompetitor, &[Language::ObjC, Language::Swift])
+        .file(BRIDGE_BASE_HEADER_FILE, BRIDGE_BASE_HEADER)
+        .file(BRIDGE_BASE_FILE, base)
+        .file(BRIDGE_SENDER_FILE, BRIDGE_SENDER)
+        .file(BRIDGE_OUTSIDER_FILE, BRIDGE_OUTSIDER)
+        .file(BRIDGE_SWIFT_FILE, BRIDGE_SWIFT)
+}
+
+/// W7-21 (KEEP-RUST): the sender's superclass comes to declare the
+/// selector: the unchanged message, which the bridge took to the Swift
+/// method, reaches the superclass's method.
+pub fn swift_objc_bridge_gives_way_to_a_namesake_in_the_messages_language() -> Case {
+    swift_objc_namesake_case(BRIDGE_BASE_EMPTY)
+        .write(BRIDGE_BASE_FILE, BRIDGE_BASE)
+        .edge_metadata_before(
+            (BRIDGE_FIRST, "calls", BRIDGE_SWIFT_METHOD),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(BRIDGE_FIRST, "calls", BRIDGE_BASE_METHOD)
+        .no_edge_after(BRIDGE_FIRST, "calls", BRIDGE_SWIFT_METHOD)
+}
+
+/// W7-21 (KEEP-RUST): the superclass's method goes: the message crosses
+/// the bridge again.
+pub fn swift_objc_bridge_answers_again_when_its_namesake_goes() -> Case {
+    swift_objc_namesake_case(BRIDGE_BASE)
+        .write(BRIDGE_BASE_FILE, BRIDGE_BASE_EMPTY)
+        .edge_before(BRIDGE_FIRST, "calls", BRIDGE_BASE_METHOD)
+        .edge_metadata_after(
+            (BRIDGE_FIRST, "calls", BRIDGE_SWIFT_METHOD),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// A bare TypeScript call a Java `@ReactMethod` of its name answers through
+/// the bridge at 0.6, and a TypeScript function of the name that another
+/// file comes to declare: the name match then scores 0.4 (the Java
+/// namesake makes two candidates), and a bridge fills in only where no
+/// candidate in the call's language is (KEEP-RUST, W7-21).
+const RN_FEATURE_CALLER_FILE: &str = "src/use.ts";
+const RN_FEATURE_CALLER: &str =
+    "export function useFeature(f: string) {\n  return hasFeature(f);\n}\n";
+const RN_FEATURE_FILE: &str = "src/feature.ts";
+const RN_FEATURE: &str = "export async function hasFeature(f: string) {\n  return f;\n}\n";
+const RN_FX_JAVA_FILE: &str = "android/src/main/java/com/fx/FxModule.java";
+const RN_FX_JAVA: &str = "package com.fx;\n\npublic class FxModule extends ReactContextBaseJavaModule {\n  @Override\n  public String getName() {\n    return \"Fx\";\n  }\n\n  @ReactMethod\n  public void hasFeature(String f, Promise p) {\n  }\n}\n";
+const RN_USE_FEATURE: &str = "function useFeature";
+const RN_HAS_FEATURE: &str = "function hasFeature";
+const RN_HAS_FEATURE_JAVA: &str = "method com.fx::FxModule::hasFeature";
+
+/// The React Native tree with its caller and Java module.
+fn rn_namesake_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::TypeScript, Language::Java],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_FEATURE_CALLER_FILE, RN_FEATURE_CALLER)
+    .file(RN_FX_JAVA_FILE, RN_FX_JAVA)
+}
+
+/// W7-21 (KEEP-RUST): another file comes to declare the TypeScript
+/// function: the unchanged call, which the bridge took to the Java method,
+/// reaches it.
+pub fn react_native_bridge_gives_way_to_a_namesake_in_the_calls_language() -> Case {
+    rn_namesake_case()
+        .write(RN_FEATURE_FILE, RN_FEATURE)
+        .edge_metadata_before(
+            (RN_USE_FEATURE, "calls", RN_HAS_FEATURE_JAVA),
+            "framework",
+            "react-native-bridge",
+        )
+        .edge_after(RN_USE_FEATURE, "calls", RN_HAS_FEATURE)
+        .no_edge_after(RN_USE_FEATURE, "calls", RN_HAS_FEATURE_JAVA)
+}
+
+/// W7-21 (KEEP-RUST): the TypeScript function's file is deleted: the call
+/// crosses the bridge again.
+pub fn react_native_bridge_answers_again_when_its_namesake_goes() -> Case {
+    rn_namesake_case()
+        .file(RN_FEATURE_FILE, RN_FEATURE)
+        .remove(RN_FEATURE_FILE)
+        .edge_before(RN_USE_FEATURE, "calls", RN_HAS_FEATURE)
+        .edge_metadata_after(
+            (RN_USE_FEATURE, "calls", RN_HAS_FEATURE_JAVA),
+            "framework",
+            "react-native-bridge",
+        )
+}
+
+/// An Objective-C view class with a property, a subclass and a use of the
+/// property, and a Paper view manager that comes and goes, minting an
+/// exported component named for the class and a prop named for the
+/// property: name matching offers neither (KEEP-RUST, W7-21), so the
+/// class's and the property's references hold throughout, while the
+/// component reaches the class it is named for (`fabric-native-impl`).
+const PAPER_HEADER_FILE: &str = "apple/RNSVGNode.h";
+const PAPER_HEADER: &str = "#import <UIKit/UIKit.h>\n\n@interface RNSVGNode : UIView\n@property (nonatomic, copy) RCTDirectEventBlock onSvgLayout;\n@end\n";
+const PAPER_VIEW_FILE: &str = "apple/RNSVGNode.mm";
+const PAPER_VIEW: &str = "#import \"RNSVGNode.h\"\n\n@implementation RNSVGNode\n- (void)layout\n{\n  self.onSvgLayout(@{});\n}\n@end\n";
+const PAPER_SUBCLASS_FILE: &str = "apple/Elements/RNSVGDefs.h";
+const PAPER_SUBCLASS: &str = "#import \"RNSVGNode.h\"\n\n@interface RNSVGDefs : RNSVGNode\n@end\n";
+const PAPER_MANAGER_FILE: &str = "apple/ViewManagers/RNSVGNodeManager.mm";
+const PAPER_MANAGER: &str = "#import \"RNSVGNode.h\"\n\n@implementation RNSVGNodeManager\nRCT_EXPORT_MODULE()\n- (UIView *)view\n{\n  return [RNSVGNode new];\n}\nRCT_EXPORT_VIEW_PROPERTY(onSvgLayout, RCTDirectEventBlock)\n@end\n";
+const PAPER_CLASS: &str = "class RNSVGNode @apple/RNSVGNode.h";
+const PAPER_PROPERTY: &str = "property RNSVGNode::onSvgLayout";
+const PAPER_COMPONENT: &str = "component apple/ViewManagers/RNSVGNodeManager.mm::RNSVGNode";
+
+/// The Paper tree, without its manager.
+fn paper_case() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::ObjC])
+        .file("package.json", RN_PACKAGE)
+        .file(PAPER_HEADER_FILE, PAPER_HEADER)
+        .file(PAPER_VIEW_FILE, PAPER_VIEW)
+        .file(PAPER_SUBCLASS_FILE, PAPER_SUBCLASS)
+}
+
+/// W7-21 (KEEP-RUST): the manager appears: the subclass's supertype and
+/// the property's use stay where they were, the manager's `[RNSVGNode new]`
+/// reaches the class, and the component reaches it too.
+pub fn paper_view_manager_appears_beside_its_view_class() -> Case {
+    paper_case()
+        .write(PAPER_MANAGER_FILE, PAPER_MANAGER)
+        .edge_throughout("class RNSVGDefs", "extends", PAPER_CLASS)
+        .edge_throughout("method RNSVGNode::layout", "calls", PAPER_PROPERTY)
+        .edge_after("method RNSVGNodeManager::view", "references", PAPER_CLASS)
+        .edge_metadata_after(
+            (PAPER_COMPONENT, "calls", PAPER_CLASS),
+            "synthesizedBy",
+            "fabric-native-impl",
+        )
+}
+
+/// W7-21 (KEEP-RUST): the manager is deleted: the supertype and the
+/// property's use stay where they were.
+pub fn paper_view_manager_is_deleted() -> Case {
+    paper_case()
+        .file(PAPER_MANAGER_FILE, PAPER_MANAGER)
+        .remove(PAPER_MANAGER_FILE)
+        .edge_before("method RNSVGNodeManager::view", "references", PAPER_CLASS)
+        .edge_metadata_before(
+            (PAPER_COMPONENT, "calls", PAPER_CLASS),
+            "synthesizedBy",
+            "fabric-native-impl",
+        )
+        .edge_throughout("class RNSVGDefs", "extends", PAPER_CLASS)
+        .edge_throughout("method RNSVGNode::layout", "calls", PAPER_PROPERTY)
+}
+
+/// A bare TypeScript call the React Native bridge answers by name at 0.6
+/// with the Objective-C method an `RCT_REMAP_METHOD` export maps it to,
+/// which is named otherwise, and a TypeScript function of the call's name
+/// that another file comes to declare: no edge reaches a node of the
+/// call's name, so the bridge lane's rival seed moves the call (KEEP-RUST,
+/// W7-21).
+const RN_REMAP_CALLER_FILE: &str = "src/halt.ts";
+const RN_REMAP_CALLER: &str = "export function halt() {\n  pause(true);\n}\n";
+const RN_REMAP_RIVAL_FILE: &str = "src/media.ts";
+const RN_REMAP_RIVAL: &str = "export function pause(flag: boolean) {\n  return flag;\n}\n";
+const RN_HALT: &str = "function halt";
+const RN_PAUSE_FUNCTION: &str = "function pause";
+
+/// The remapping tree with its bare caller.
+fn rn_remap_namesake_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_PLAYER_FILE, RN_PLAYER)
+    .file(RN_ENGINE_FILE, RN_ENGINE)
+    .file(RN_REMAP_CALLER_FILE, RN_REMAP_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the TypeScript function appears: the unchanged call,
+/// which the bridge took to the remapped Objective-C method, reaches it.
+pub fn react_native_remapped_bridge_gives_way_to_a_namesake_of_the_call() -> Case {
+    rn_remap_namesake_case()
+        .write(RN_REMAP_RIVAL_FILE, RN_REMAP_RIVAL)
+        .edge_metadata_before(
+            (RN_HALT, "calls", RN_PAUSE_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+        .edge_after(RN_HALT, "calls", RN_PAUSE_FUNCTION)
+        .no_edge_after(RN_HALT, "calls", RN_PAUSE_NOW)
+}
+
+/// W7-21 (KEEP-RUST): the TypeScript function's file is deleted: the call
+/// crosses the bridge again.
+pub fn react_native_remapped_bridge_answers_again_when_its_namesake_goes() -> Case {
+    rn_remap_namesake_case()
+        .file(RN_REMAP_RIVAL_FILE, RN_REMAP_RIVAL)
+        .remove(RN_REMAP_RIVAL_FILE)
+        .edge_before(RN_HALT, "calls", RN_PAUSE_FUNCTION)
+        .edge_metadata_after(
+            (RN_HALT, "calls", RN_PAUSE_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+}
+
+/// A bare Swift call the bridge answers at 0.6 with the Objective-C method
+/// a base name of whose selector it names, beside an Objective-C method of
+/// the call's name (a match across languages, scoring 0.5), and a Swift
+/// function of the call's name that another file comes to declare: the
+/// name match then scores 0.4 (two candidates), and no edge reaches a node
+/// of the call's name, so the bridge lane's rival seed moves the call
+/// (KEEP-RUST, W7-21).
+const SWIFT_RIVAL_LEDGER_FILE: &str = "Sources/Ledger.m";
+const SWIFT_RIVAL_LEDGER: &str = "#import <Foundation/Foundation.h>\n\n@implementation Ledger\n- (id)fetchEntry {\n  return nil;\n}\n@end\n";
+const SWIFT_RIVAL_CALLER_FILE: &str = "Sources/Load.swift";
+const SWIFT_RIVAL_CALLER: &str =
+    "import Foundation\n\nfunc load() {\n  _ = fetchEntry(forKey: \"x\")\n}\n";
+const SWIFT_RIVAL_FILE: &str = "Sources/Lookup.swift";
+const SWIFT_RIVAL: &str =
+    "import Foundation\n\nfunc fetchEntry(forKey key: String) -> Any? {\n  return nil\n}\n";
+const SWIFT_RIVAL_FUNCTION: &str = "function fetchEntry";
+
+/// The tree of the bare Swift call.
+fn swift_rival_case() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+        .file(SWIFT_RIVAL_LEDGER_FILE, SWIFT_RIVAL_LEDGER)
+        .file(SWIFT_RIVAL_CALLER_FILE, SWIFT_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the Swift function appears: the unchanged call, which
+/// the bridge took to the Objective-C method, reaches it.
+pub fn swift_objc_bridge_gives_way_to_a_swift_namesake_of_the_call() -> Case {
+    swift_rival_case()
+        .write(SWIFT_RIVAL_FILE, SWIFT_RIVAL)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_RIVAL_FUNCTION)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// W7-21 (KEEP-RUST): the Swift function's file is deleted: the call
+/// crosses the bridge again.
+pub fn swift_objc_bridge_answers_again_when_the_swift_namesake_goes() -> Case {
+    swift_rival_case()
+        .file(SWIFT_RIVAL_FILE, SWIFT_RIVAL)
+        .remove(SWIFT_RIVAL_FILE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", SWIFT_RIVAL_FUNCTION)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// A Swift call on an untyped receiver the bridge answers at 0.6 with the
+/// Objective-C method a base name of whose selector it names, beside a
+/// vendored C++ `Cache::fetchEntry`: one method of the call's name scores
+/// 0.5 across languages, below the bridge's answer, and with a second one,
+/// which another file comes to declare, the receiver's word picks one at
+/// 0.65 (instance-method), above it. C++ is no language of the call's, and
+/// no edge reaches a node of the call's name, so the bridge lane's rival
+/// seed moves the call, as it does for a declaration of any language
+/// (KEEP-RUST, W7-21).
+const CPP_RIVAL_CALLER_FILE: &str = "Sources/App/Load.swift";
+const CPP_RIVAL_CALLER: &str =
+    "import Foundation\n\nfunc load() {\n  _ = cache.fetchEntry(forKey: \"x\")\n}\n";
+const CPP_RIVAL_VENDORED_FILE: &str = "Vendor/Old/OldCache.cpp";
+const CPP_RIVAL_FILE: &str = "Sources/App/Cache.cpp";
+const CPP_RIVAL: &str = "class Cache {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Cache::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_RIVAL_METHOD: &str = "method Cache::fetchEntry @Sources/App/Cache.cpp";
+
+/// The tree of the Swift call beside the vendored C++ method.
+fn cpp_rival_case(change: Change) -> Case {
+    Case::new(change, &[Language::Swift, Language::ObjC, Language::Cpp])
+        .file(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+        .file(CPP_RIVAL_VENDORED_FILE, CPP_RIVAL)
+        .file(CPP_RIVAL_CALLER_FILE, CPP_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the second C++ method appears: the unchanged call,
+/// which the bridge took to the Objective-C method, reaches it.
+pub fn swift_objc_bridge_gives_way_to_a_cpp_namesake_of_the_call() -> Case {
+    cpp_rival_case(Change::AddCompetitor)
+        .write(CPP_RIVAL_FILE, CPP_RIVAL)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(SWIFT_OBJC_LOAD, "calls", CPP_RIVAL_METHOD)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// W7-21 (KEEP-RUST): the second C++ method's file is deleted: the call
+/// crosses the bridge again.
+pub fn swift_objc_bridge_answers_again_when_the_cpp_namesake_goes() -> Case {
+    cpp_rival_case(Change::AddCompetitor)
+        .file(CPP_RIVAL_FILE, CPP_RIVAL)
+        .remove(CPP_RIVAL_FILE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", CPP_RIVAL_METHOD)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// The same call beside two vendored C++ methods of its name whose classes
+/// share no word with the receiver, both far from it: they score 0.4, below
+/// the bridge's answer, until one class is renamed `Cache` in place. Its
+/// method keeps its name, line and id, and only its qualified name moves,
+/// so a seed counting names would miss it (KEEP-RUST, W7-21).
+const CPP_OWNER_LEDGER_FILE: &str = "Vendor/Old/Ledger.cpp";
+const CPP_OWNER_LEDGER: &str = "class Ledger {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Ledger::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_OWNER_FILE: &str = "Vendor/New/Store.cpp";
+const CPP_OWNER_STORE: &str = "class Store {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Store::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_OWNER_CACHE: &str = "class Cache {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Cache::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_OWNER_METHOD: &str = "method Cache::fetchEntry @Vendor/New/Store.cpp";
+
+/// The tree of the Swift call beside the two vendored methods, the second
+/// of a class `owner`.
+fn cpp_owner_case(owner: &'static str) -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Swift, Language::ObjC, Language::Cpp],
+    )
+    .file(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+    .file(CPP_OWNER_LEDGER_FILE, CPP_OWNER_LEDGER)
+    .file(CPP_OWNER_FILE, owner)
+    .file(CPP_RIVAL_CALLER_FILE, CPP_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the class is renamed `Cache`: the unchanged call,
+/// which the bridge took to the Objective-C method, reaches its method.
+pub fn swift_objc_bridge_gives_way_when_a_cpp_namesakes_class_is_renamed() -> Case {
+    cpp_owner_case(CPP_OWNER_STORE)
+        .write(CPP_OWNER_FILE, CPP_OWNER_CACHE)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(SWIFT_OBJC_LOAD, "calls", CPP_OWNER_METHOD)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// W7-21 (KEEP-RUST): the class is renamed back: the call crosses the
+/// bridge again.
+pub fn swift_objc_bridge_answers_again_when_the_cpp_class_is_renamed_back() -> Case {
+    cpp_owner_case(CPP_OWNER_CACHE)
+        .write(CPP_OWNER_FILE, CPP_OWNER_STORE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", CPP_OWNER_METHOD)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// A TypeScript member call the React Native bridge answers by name at 0.6
+/// with the Objective-C method an `RCT_REMAP_METHOD` export maps it to, and
+/// an ArkTS class `Player` another file comes to declare with a method of
+/// the call's name: beside the export's own `rn-export` node of that name,
+/// the receiver's word picks the ArkTS method at 0.65 (instance-method),
+/// above the bridge's answer. ArkTS is no language of the call's, and no
+/// edge reaches a node of the call's name, so the bridge lane's rival seed
+/// moves the call, as it does for a declaration of any language (KEEP-RUST,
+/// W7-21).
+const ARKTS_RIVAL_DECK_FILE: &str = "ios/Deck.m";
+const ARKTS_RIVAL_DECK: &str = "#import <React/RCTBridgeModule.h>\n\n@implementation Deck\n\nRCT_EXPORT_MODULE(Deck)\n\nRCT_REMAP_METHOD(rewind, rewindInferenceNow:(BOOL)flag)\n{\n}\n\n@end\n";
+const ARKTS_RIVAL_ENGINE_FILE: &str = "ios/Engine.m";
+const ARKTS_RIVAL_ENGINE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Engine\n- (void)rewindInferenceNow:(BOOL)flag {\n}\n@end\n";
+const ARKTS_RIVAL_CALLER_FILE: &str = "src/app/halt.ts";
+const ARKTS_RIVAL_CALLER: &str = "export function halt() {\n  player.rewind(true);\n}\n";
+const ARKTS_RIVAL_FILE: &str = "src/app/Player.ets";
+const ARKTS_RIVAL: &str =
+    "export class Player {\n  rewind(flag: boolean) {\n    return flag;\n  }\n}\n";
+const ARKTS_REWIND_NOW: &str = "method Engine::rewindInferenceNow:";
+const ARKTS_REWIND: &str = "method Player::rewind";
+
+/// The tree of the TypeScript call, its module and its native method.
+fn arkts_rival_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::TypeScript, Language::ObjC, Language::ArkTs],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(ARKTS_RIVAL_DECK_FILE, ARKTS_RIVAL_DECK)
+    .file(ARKTS_RIVAL_ENGINE_FILE, ARKTS_RIVAL_ENGINE)
+    .file(ARKTS_RIVAL_CALLER_FILE, ARKTS_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the ArkTS class appears: the unchanged call, which
+/// the bridge took to the remapped Objective-C method, reaches its method.
+pub fn react_native_bridge_gives_way_to_an_arkts_namesake_of_the_call() -> Case {
+    arkts_rival_case()
+        .write(ARKTS_RIVAL_FILE, ARKTS_RIVAL)
+        .edge_metadata_before(
+            (RN_HALT, "calls", ARKTS_REWIND_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+        .edge_after(RN_HALT, "calls", ARKTS_REWIND)
+        .no_edge_after(RN_HALT, "calls", ARKTS_REWIND_NOW)
+}
+
+/// W7-21 (KEEP-RUST): the ArkTS file is deleted: the call crosses the
+/// bridge again.
+pub fn react_native_bridge_answers_again_when_the_arkts_namesake_goes() -> Case {
+    arkts_rival_case()
+        .file(ARKTS_RIVAL_FILE, ARKTS_RIVAL)
+        .remove(ARKTS_RIVAL_FILE)
+        .edge_before(RN_HALT, "calls", ARKTS_REWIND)
+        .edge_metadata_after(
+            (RN_HALT, "calls", ARKTS_REWIND_NOW),
+            "framework",
+            "react-native-bridge",
+        )
 }

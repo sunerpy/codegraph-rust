@@ -270,6 +270,33 @@ The exit status is 0 when the graphs are identical and 1 when they differ. It is
 to stdout in that case. `--graph-diff` runs on its own; other options are
 ignored.
 
+### Go standard-library method table
+
+`--gen-go-std-methods --go-src <DIR>` regenerates the rows of
+`crates/codegraph-resolve/src/go_std_methods.rs`, the methods of the
+standard-library types Go code embeds (upstream's `go-stdlib-methods.ts`), from
+a Go source tree. For each type a row lists, it reads that package's non-test
+`.go` files with this repository's Go grammar and lists the type's methods as
+`name:params/results`: an interface's own and those of the interfaces it embeds,
+a named type's and those its embedded fields promote, an alias's target's.
+Exported names are kept, and an unexported one only where a listed interface
+requires it. Add or drop a type by editing a row, then regenerate.
+
+```bash
+target/release/bench --gen-go-std-methods --go-src /path/to/go --check
+```
+
+Without a mode it prints the rows; `--check` exits 1 when they differ from the
+committed ones and prints each differing row; `--write` rewrites them. It also
+exits 1 when a listed type is missing or a kept method's signature does not
+read, as upstream's generator does, and 2 when `--go-src` is not a Go source
+tree. The
+committed rows come from Go 1.27.3: `go1.27.3.src.tar.gz` from `go.dev/dl`,
+checked against the sha256 that `go.dev/dl/?mode=json&include=all` publishes
+(`6e7749035cf360f06b2575d162ea79df9fda8ef671889e5c375f8e50777f26bb`) and
+unpacked, its `go` directory being `<DIR>`. CI does not download Go's source; run
+`--check` locally after changing the generator or the table.
+
 ## Evidence requirements
 
 A publishable result must include:
