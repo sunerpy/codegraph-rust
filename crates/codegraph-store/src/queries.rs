@@ -2136,6 +2136,70 @@ impl Store {
             .collect()
     }
 
+    /// The resolved imports a sync that adds files reads again (W7-27, the
+    /// resolved counterpart of [`Self::retryable_failed_imports`]): an added
+    /// file can come ahead of a resolved import's answer, which no edge into
+    /// a changed file and no touched name reaches. The rows of
+    /// `resolved_refs` the parked lookup would take from `unresolved_refs`
+    /// for `path_keys`, by their tail or their whole name, with no per-key
+    /// ceiling: a key left out would leave an import a fresh index answers
+    /// another way. One scan of `resolved_refs`, which no index holds by
+    /// name; in id order.
+    pub fn resolved_imports_naming(
+        &self,
+        path_keys: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if path_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path_keys: HashSet<&str> = path_keys.iter().map(String::as_str).collect();
+        // Each row's id, name and kind first, read without copying, the
+        // rest of a row only for the ones chosen, as the parked lookup does.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, reference_name, reference_kind FROM resolved_refs \
+             WHERE reference_kind = 'imports' \
+             OR (reference_kind = 'references' AND instr(reference_name, '/') > 0) ORDER BY id",
+        )?;
+        let mut chosen = Vec::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let name = text_column(row, 1)?;
+            let tail = reference_name_tail_of(name, edge_kind_of(text_column(row, 2)?)?);
+            if path_keys.contains(tail) || path_keys.contains(name) {
+                chosen.push(id);
+            }
+        }
+        drop(rows);
+        let mut by_id = self
+            .conn
+            .prepare_cached("SELECT * FROM resolved_refs WHERE id = ?1")?;
+        chosen
+            .into_iter()
+            .map(|id| by_id.query_row([id], row_to_unresolved_ref))
+            .collect()
+    }
+
+    /// The targets of the edges of `kind` written at a reference site
+    /// (`source`, `line`, `col`), other than synthesized ones, sorted: what
+    /// a resolved reference there answered (W7-27).
+    pub fn edge_targets_at_site(
+        &self,
+        source: &str,
+        line: i64,
+        col: i64,
+        kind: EdgeKind,
+    ) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT e.target FROM edges e WHERE e.source = ?1 AND e.line = ?2 \
+             AND e.col = ?3 AND e.kind = ?4 AND NOT ({SYNTHESIZED_E}) ORDER BY e.target"
+        ))?;
+        let rows = stmt.query_map(params![source, line, col, kind.as_str()], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect()
+    }
+
     /// The JavaScript-family files whose import of `file` holds a binding that
     /// does not resolve into it (upstream #2450): another file X with an
     /// `imports` edge into `file`'s file node, X's `import` node around that

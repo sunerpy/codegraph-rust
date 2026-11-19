@@ -22,6 +22,52 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use crate::import_resolver::resolve_via_import;
 use crate::types::{RefView, ResolutionContext};
 
+/// The files whose C or C++ `#include` spells the name or the stem of one of
+/// `paths`, with every file including those, directly or through other
+/// includes (W7-27): a file that comes or goes at such a path, or gains or
+/// loses its nodes across `max_file_size`, can change which file that
+/// include takes or what it reads, and with it whether a call in any of
+/// those translation units is a macro expansion (`c_macro_visibility`).
+/// Empty when the index holds no function-like macro, since the walk then
+/// decides no call. Sorted.
+pub(crate) fn include_walk_dependents(
+    paths: &[String],
+    context: &dyn ResolutionContext,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if paths.is_empty()
+        || !context
+            .get_nodes_by_kind_shared(NodeKind::Constant)
+            .iter()
+            .any(|node| crate::c_macro_visibility::is_define_constant(node))
+    {
+        return out;
+    }
+    // The walk enters a file only through an include spelling its name or
+    // its stem (the includer's own directory, the import resolver's
+    // extension candidates, or the one indexed file of that name), so the
+    // files whose include spells a member's name or stem, followed upward,
+    // hold every translation unit that can reach one of `paths`. No
+    // include's resolution is checked: one the walk finds only by its name
+    // resolves no include edge (production lists no include directories).
+    let mut graph = CppIncluders::default();
+    let mut queue: Vec<String> = paths.to_vec();
+    while let Some(member) = queue.pop() {
+        let spellings: BTreeSet<String> = [file_name(&member), file_stem(&member)]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for spelled in &spellings {
+            for include in graph.includes_named(spelled, context) {
+                if out.insert(include.file.clone()) {
+                    queue.push(include.file);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// One `#include` directive, as its import node records it.
 #[derive(Clone)]
 struct Include {

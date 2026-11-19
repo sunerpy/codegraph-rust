@@ -1670,6 +1670,18 @@ impl ReferenceResolver {
     /// qualified name or set of references, to come back as wanted: upstream
     /// renames it in place and keeps its references, so a consumer's edit
     /// could leave them stale where a fresh index has the new ones.
+    /// The files a sync re-resolves whole because the files at `paths` came,
+    /// went, or gained or lost their nodes across `max_file_size` (W7-27): a
+    /// C or C++ translation unit's include walk takes the first indexed
+    /// candidate of each include and reads it, and decides by what it read
+    /// whether a call is a macro expansion. The files whose `#include`
+    /// spells one of those files' names or stems, with every file including
+    /// them; none when the index holds no function-like macro. Sorted.
+    pub fn include_walk_dependents(&self, store: &Store, paths: &[String]) -> BTreeSet<String> {
+        let context = self.store_context(store);
+        crate::cpp_includers::include_walk_dependents(paths, &context)
+    }
+
     pub fn plan_cross_file_nodes(&self, store: &Store) -> anyhow::Result<CrossFilePlan> {
         let mut passes = Vec::new();
         {

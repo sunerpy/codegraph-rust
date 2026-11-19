@@ -23410,6 +23410,387 @@ pub fn php_excluded_include_candidate_goes() -> Case {
         .edge_after("file:index.php", "imports", "file:inc/db.inc.php")
 }
 
+// ----- what an added, removed or resized file moves (W7-27b) --------------
+
+/// `./api` from `src/main.ts`, with `src/api.ts` ahead of `src/api/index.ts`
+/// in its candidates.
+const TS_API_MAIN: &str =
+    "import { helper } from './api';\n\nexport function main(): number {\n  return helper();\n}\n";
+const TS_API_INDEX: &str = "export function helper(): number {\n  return 1;\n}\n";
+const TS_API_FILE: &str = "export function helper(): number {\n  return 2;\n}\n";
+
+/// W7-27b: an indexed `src/api.ts` appears ahead of the indexed
+/// `src/api/index.ts` an unchanged module imports as `./api`: the import, its
+/// binding and the call through it move to `src/api.ts`, its first
+/// candidate, which no edge into a changed file and no touched name reaches.
+pub fn typescript_indexed_import_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("src/main.ts", TS_API_MAIN)
+        .file("src/api/index.ts", TS_API_INDEX)
+        .write("src/api.ts", TS_API_FILE)
+        .edge_before(
+            "function main",
+            "calls",
+            "function helper @src/api/index.ts",
+        )
+        .edge_after("function main", "calls", "function helper @src/api.ts")
+        .no_edge_after(
+            "function main",
+            "calls",
+            "function helper @src/api/index.ts",
+        )
+}
+
+/// W7-27b (regression): the indexed `src/api.ts` goes: the import moves back
+/// to `src/api/index.ts`.
+pub fn typescript_indexed_import_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("src/main.ts", TS_API_MAIN)
+        .file("src/api.ts", TS_API_FILE)
+        .file("src/api/index.ts", TS_API_INDEX)
+        .remove("src/api.ts")
+        .edge_before("function main", "calls", "function helper @src/api.ts")
+        .edge_after(
+            "function main",
+            "calls",
+            "function helper @src/api/index.ts",
+        )
+}
+
+/// A `src/api.ts` that does not declare `helper`.
+const TS_API_WITHOUT_HELPER: &str = "export function other(): number {\n  return 2;\n}\n";
+
+/// W7-27b: an indexed `src/api.ts` that does not declare `helper` appears
+/// ahead of `src/api/index.ts`: `./api` is `src/api.ts` now, so the binding
+/// leaves the import, and the call reaches `helper` by its name.
+pub fn typescript_indexed_import_candidate_without_the_binding_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("src/main.ts", TS_API_MAIN)
+        .file("src/api/index.ts", TS_API_INDEX)
+        .write("src/api.ts", TS_API_WITHOUT_HELPER)
+        .edge_before("file:src/main.ts", "imports", "file:src/api/index.ts")
+        .edge_after("file:src/main.ts", "imports", "file:src/api.ts")
+}
+
+/// W7-27b (regression): that `src/api.ts` goes: the import and its binding
+/// are `src/api/index.ts`'s again.
+pub fn typescript_indexed_import_candidate_without_the_binding_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file("src/main.ts", TS_API_MAIN)
+        .file("src/api.ts", TS_API_WITHOUT_HELPER)
+        .file("src/api/index.ts", TS_API_INDEX)
+        .remove("src/api.ts")
+        .edge_before("file:src/main.ts", "imports", "file:src/api.ts")
+        .edge_after("file:src/main.ts", "imports", "file:src/api/index.ts")
+}
+
+/// W7-27b (regression): an indexed `pkg/util.py` appears ahead of the
+/// indexed package `pkg/util/__init__.py` an unchanged module imports as
+/// `.util`: the module reference never resolves, so #2392's retry wakes it.
+pub fn python_indexed_import_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Python])
+        .file("pkg/main.py", PY_UTIL_MAIN)
+        .file("pkg/util/__init__.py", PY_UTIL_PACKAGE)
+        .write("pkg/util.py", PY_UTIL_MODULE)
+        .edge_before(
+            "function main",
+            "calls",
+            "function helper @pkg/util/__init__.py",
+        )
+        .edge_after("function main", "calls", "function helper @pkg/util.py")
+}
+
+/// W7-27b (regression): the indexed `pkg/util.py` goes: the import moves
+/// back to the package.
+pub fn python_indexed_import_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file("pkg/main.py", PY_UTIL_MAIN)
+        .file("pkg/util.py", PY_UTIL_MODULE)
+        .file("pkg/util/__init__.py", PY_UTIL_PACKAGE)
+        .remove("pkg/util.py")
+        .edge_before("function main", "calls", "function helper @pkg/util.py")
+        .edge_after(
+            "function main",
+            "calls",
+            "function helper @pkg/util/__init__.py",
+        )
+}
+
+/// W7-27b (regression): an indexed `src/util.rs` appears ahead of the
+/// indexed `src/util/mod.rs` an unchanged crate root's `use
+/// crate::util::helper` reaches: the use resolves to the leaf, whose name the
+/// new file touches.
+pub fn rust_indexed_module_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file("src/lib.rs", RUST_UTIL_LIB)
+        .file("src/util/mod.rs", RUST_UTIL_MOD)
+        .write("src/util.rs", RUST_UTIL_FILE)
+        .edge_before("function run", "calls", "function helper @src/util/mod.rs")
+        .edge_after("function run", "calls", "function helper @src/util.rs")
+}
+
+/// W7-27b (regression): the indexed `src/util.rs` goes: the use moves back
+/// to `src/util/mod.rs`.
+pub fn rust_indexed_module_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file("src/lib.rs", RUST_UTIL_LIB)
+        .file("src/util.rs", RUST_UTIL_FILE)
+        .file("src/util/mod.rs", RUST_UTIL_MOD)
+        .remove("src/util.rs")
+        .edge_before("function run", "calls", "function helper @src/util.rs")
+        .edge_after("function run", "calls", "function helper @src/util/mod.rs")
+}
+
+/// W7-27b: an indexed `inc/db.inc`, the path an unchanged `require
+/// 'inc/db.inc'` names, appears beside the indexed `inc/db.inc.php`: the
+/// include moves to `inc/db.inc`.
+pub fn php_indexed_include_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("index.php", PHP_DB_INC_INDEX)
+        .file("inc/db.inc.php", PHP_DB_INC_PHP)
+        .write("inc/db.inc", PHP_DB_INC)
+        .edge_before("file:index.php", "imports", "file:inc/db.inc.php")
+        .edge_after("file:index.php", "imports", "file:inc/db.inc")
+}
+
+/// W7-27b (regression): the indexed `inc/db.inc` goes: the include moves
+/// back to `inc/db.inc.php`.
+pub fn php_indexed_include_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("index.php", PHP_DB_INC_INDEX)
+        .file("inc/db.inc", PHP_DB_INC)
+        .file("inc/db.inc.php", PHP_DB_INC_PHP)
+        .remove("inc/db.inc")
+        .edge_before("file:index.php", "imports", "file:inc/db.inc")
+        .edge_after("file:index.php", "imports", "file:inc/db.inc.php")
+}
+
+/// A `require` whose path names no folder: only its whole name, `db.inc`, is
+/// a key of the file it names.
+const PHP_BARE_INDEX: &str =
+    "<?php\nrequire 'db.inc';\n\nfunction boot() {\n    return connect();\n}\n";
+
+/// W7-27b: an indexed `db.inc` appears beside the indexed `db.inc.php` an
+/// unchanged `require 'db.inc'` takes: the include moves to `db.inc`, a file
+/// only the whole name finds.
+pub fn php_indexed_include_of_a_bare_name_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Php])
+        .file("index.php", PHP_BARE_INDEX)
+        .file("db.inc.php", PHP_DB_INC_PHP)
+        .write("db.inc", PHP_DB_INC)
+        .edge_before("file:index.php", "imports", "file:db.inc.php")
+        .edge_after("file:index.php", "imports", "file:db.inc")
+}
+
+/// W7-27b (regression): the indexed `db.inc` goes: the include moves back to
+/// `db.inc.php`.
+pub fn php_indexed_include_of_a_bare_name_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Php])
+        .file("index.php", PHP_BARE_INDEX)
+        .file("db.inc", PHP_DB_INC)
+        .file("db.inc.php", PHP_DB_INC_PHP)
+        .remove("db.inc")
+        .edge_before("file:index.php", "imports", "file:db.inc")
+        .edge_after("file:index.php", "imports", "file:db.inc.php")
+}
+
+/// A header beside the C file that includes `"trace.h"`, which defines no
+/// `TRACE`: the call's translation unit takes it ahead of the indexed
+/// `include/trace.h` whose macro hides the call.
+const C_TRACE_LOCAL: &str = "int trace_level(void);\n";
+
+/// W7-27b: an indexed `src/trace.h` without the macro appears beside an
+/// unchanged C file that includes `"trace.h"`: the translation unit takes it
+/// ahead of `include/trace.h`, whose function-like `TRACE` hid the call, and
+/// the call reaches its function.
+pub fn c_indexed_include_candidate_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file("src/main.c", C_TRACE_MAIN)
+        .file("include/trace.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("src/trace.h", C_TRACE_LOCAL)
+        .edge_after("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27b: the indexed `src/trace.h` goes: the translation unit takes
+/// `include/trace.h` again, and its macro hides the call, though no name
+/// the removal touches is the call's.
+pub fn c_indexed_include_candidate_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file("src/main.c", C_TRACE_MAIN)
+        .file("src/trace.h", C_TRACE_LOCAL)
+        .file("include/trace.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .remove("src/trace.h")
+        .edge_before("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// `src/main.c` reaches `"trace.h"` through `src/wrap.h`.
+const C_WRAP_MAIN: &str = "#include \"wrap.h\"\n\nint main(void) {\n    return TRACE(1);\n}\n";
+const C_WRAP: &str = "#include \"trace.h\"\n";
+
+/// W7-27b: an indexed `src/trace.h` without the macro appears beside
+/// `src/wrap.h`, which `src/main.c` includes: the include in `wrap.h` takes
+/// it ahead of `include/trace.h`, and the call in `main.c`, whose own
+/// include did not move, reaches its function.
+pub fn c_indexed_include_candidate_appears_through_a_header() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file("src/main.c", C_WRAP_MAIN)
+        .file("src/wrap.h", C_WRAP)
+        .file("include/trace.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("src/trace.h", C_TRACE_LOCAL)
+        .edge_after("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27b: that `src/trace.h` goes: `wrap.h` includes `include/trace.h`
+/// again, and its macro hides the call in `main.c`.
+pub fn c_indexed_include_candidate_goes_through_a_header() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file("src/main.c", C_WRAP_MAIN)
+        .file("src/wrap.h", C_WRAP)
+        .file("src/trace.h", C_TRACE_LOCAL)
+        .file("include/trace.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .remove("src/trace.h")
+        .edge_before("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// `src/main.c` reaches `"trace.h"` through `"wrap.h"`, which is
+/// `include/wrap.h`: no include resolves to it, so the translation unit's
+/// walk finds it by its name, as it finds the macro's header,
+/// `lib/trace.h`.
+const C_FAR_WRAP: &str = "#include \"trace.h\"\n";
+
+/// W7-27b: an indexed `include/trace.h` without the macro appears beside
+/// `include/wrap.h`, which `src/main.c` reaches only by its name: the include
+/// in `wrap.h` takes it ahead of `lib/trace.h`, and the call in `main.c`
+/// reaches its function. A closure that kept only the includes resolving to
+/// a file would miss `main.c`.
+pub fn c_indexed_include_candidate_appears_through_a_header_found_by_name() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file("src/main.c", C_WRAP_MAIN)
+        .file("include/wrap.h", C_FAR_WRAP)
+        .file("lib/trace.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("include/trace.h", C_TRACE_LOCAL)
+        .edge_after("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27b: that `include/trace.h` goes: `wrap.h` takes `lib/trace.h` again,
+/// and its macro hides the call in `main.c`.
+pub fn c_indexed_include_candidate_goes_through_a_header_found_by_name() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file("src/main.c", C_WRAP_MAIN)
+        .file("include/wrap.h", C_FAR_WRAP)
+        .file("include/trace.h", C_TRACE_LOCAL)
+        .file("lib/trace.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .remove("include/trace.h")
+        .edge_before("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// An index root configuration whose `max_file_size` keeps a header holding
+/// [`C_SHIM_OVER_LIMIT`] out of extraction and every other file of the cases
+/// below in: the header stays tracked, recorded without any node, and a
+/// translation unit's walk reads nothing of it.
+const C_SIZE_LIMIT_CONFIG: &str = "[app]\nname = \"matrix\"\n\n[indexing]\nmax_file_size = 120\n";
+/// `src/shim.h` includes the macro's header.
+const C_SHIM: &str = "#include \"macros.h\"\n";
+/// [`C_SHIM`] behind a comment that puts it over that limit.
+const C_SHIM_OVER_LIMIT: &str = "// A header over the index root's max_file_size is recorded without any node, its file node included, until it shrinks back.\n#include \"macros.h\"\n";
+const C_SHIM_MAIN: &str = "#include \"shim.h\"\n\nint main(void) {\n    return TRACE(1);\n}\n";
+const C_MID_MAIN: &str = "#include \"mid.h\"\n\nint main(void) {\n    return TRACE(1);\n}\n";
+const C_MID: &str = "#include \"shim.h\"\n";
+
+/// W7-27b: `src/shim.h`, which `src/main.c` includes, shrinks back under
+/// `max_file_size`: the walk reads it again, and through it `macros.h`,
+/// whose function-like `TRACE` hides the call. The header stays tracked, so
+/// no file came; its file node did.
+pub fn c_header_shrinks_under_the_size_limit() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file(".codegraph/config.toml", C_SIZE_LIMIT_CONFIG)
+        .file("src/main.c", C_SHIM_MAIN)
+        .file("src/shim.h", C_SHIM_OVER_LIMIT)
+        .file("src/macros.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("src/shim.h", C_SHIM)
+        .edge_before("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27b: `src/shim.h` grows over the limit: the walk reads nothing of it,
+/// so `macros.h` is out of the translation unit and the call reaches its
+/// function.
+pub fn c_header_grows_over_the_size_limit() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file(".codegraph/config.toml", C_SIZE_LIMIT_CONFIG)
+        .file("src/main.c", C_SHIM_MAIN)
+        .file("src/shim.h", C_SHIM)
+        .file("src/macros.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("src/shim.h", C_SHIM_OVER_LIMIT)
+        .edge_after("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27b: as [`c_header_shrinks_under_the_size_limit`], with `src/main.c`
+/// reaching `shim.h` through `src/mid.h`.
+pub fn c_header_shrinks_under_the_size_limit_through_a_header() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::C])
+        .file(".codegraph/config.toml", C_SIZE_LIMIT_CONFIG)
+        .file("src/main.c", C_MID_MAIN)
+        .file("src/mid.h", C_MID)
+        .file("src/shim.h", C_SHIM_OVER_LIMIT)
+        .file("src/macros.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("src/shim.h", C_SHIM)
+        .edge_before("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// W7-27b: as [`c_header_grows_over_the_size_limit`], through `src/mid.h`.
+pub fn c_header_grows_over_the_size_limit_through_a_header() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::C])
+        .file(".codegraph/config.toml", C_SIZE_LIMIT_CONFIG)
+        .file("src/main.c", C_MID_MAIN)
+        .file("src/mid.h", C_MID)
+        .file("src/shim.h", C_SHIM)
+        .file("src/macros.h", C_TRACE_MACRO)
+        .file("lib/trace.c", C_TRACE_DEFINITION)
+        .write("src/shim.h", C_SHIM_OVER_LIMIT)
+        .edge_after("function main", "calls", "function TRACE @lib/trace.c")
+}
+
+/// An index root configuration whose `max_file_size` keeps a file holding
+/// [`TS_API_OVER_LIMIT`] out of extraction and every other file of the cases
+/// below in: the file stays tracked, recorded without any node.
+const TS_SIZE_LIMIT_CONFIG: &str = "[app]\nname = \"matrix\"\n\n[indexing]\nmax_file_size = 120\n";
+/// [`TS_API_FILE`] behind a comment that puts it over that limit.
+const TS_API_OVER_LIMIT: &str = "// A file over the index root's max_file_size is recorded without any node until it shrinks back.\nexport function helper(): number {\n  return 2;\n}\n";
+
+/// W7-27b: `src/api.ts`, over `max_file_size`, is `./api`'s first candidate
+/// but has no file node, so the import waits; it shrinks back under the
+/// limit, a tracked file whose file node comes back, and the import takes it.
+pub fn typescript_import_candidate_shrinks_under_the_size_limit() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(".codegraph/config.toml", TS_SIZE_LIMIT_CONFIG)
+        .file("src/main.ts", TS_API_MAIN)
+        .file("src/api/index.ts", TS_API_INDEX)
+        .file("src/api.ts", TS_API_OVER_LIMIT)
+        .write("src/api.ts", TS_API_FILE)
+        .edge_after("file:src/main.ts", "imports", "file:src/api.ts")
+}
+
+/// W7-27b (regression): `src/api.ts` grows over the limit: its file node
+/// goes, and the import waits, as a fresh index leaves it.
+pub fn typescript_import_candidate_grows_over_the_size_limit() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file(".codegraph/config.toml", TS_SIZE_LIMIT_CONFIG)
+        .file("src/main.ts", TS_API_MAIN)
+        .file("src/api/index.ts", TS_API_INDEX)
+        .file("src/api.ts", TS_API_FILE)
+        .write("src/api.ts", TS_API_OVER_LIMIT)
+        .edge_before("file:src/main.ts", "imports", "file:src/api.ts")
+}
+
 // ----- React Native, Expo modules, Fabric and Swift-ObjC bridges (W7-21) ---
 
 /// A root `package.json` that names `react-native`, which the React Native

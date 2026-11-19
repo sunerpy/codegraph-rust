@@ -1578,6 +1578,78 @@ fn sync_paths_with_store(
                 dependent_fallbacks.insert(parked.file_path);
             }
         }
+        // W7-27 — the resolved counterpart: such a file can come ahead of a
+        // resolved import's answer, which no edge into a changed file and no
+        // touched name reaches. Each resolved import those keys can name, in
+        // a file this sync did not re-extract, is resolved again over the
+        // store the sync has written; when its answer is not the target its
+        // edge holds, its file goes whole, since the statement's bindings
+        // and the calls through them follow that answer.
+        if !path_keys.is_empty() {
+            let context = codegraph_resolve::StoreResolutionContext::new(
+                store,
+                project_root.to_string_lossy(),
+            )
+            .with_max_file_size(scope.options.max_file_size);
+            for resolved in store.resolved_imports_naming(&path_keys)? {
+                if reindexed.contains(&resolved.file_path)
+                    || dependent_fallbacks.contains(&resolved.file_path)
+                {
+                    continue;
+                }
+                let view = codegraph_resolve::RefView {
+                    row_id: resolved.id,
+                    from_node_id: resolved.from_node_id.clone(),
+                    reference_name: resolved.reference_name.clone(),
+                    reference_kind: resolved.reference_kind,
+                    line: resolved.line,
+                    column: resolved.col,
+                    file_path: resolved.file_path.clone(),
+                    language: resolved.language,
+                    is_function_ref: resolved.is_function_ref,
+                    reference_subkind: resolved.reference_subkind,
+                };
+                let now: Vec<String> =
+                    codegraph_resolve::import_resolver::resolve_via_import(&view, &context)
+                        .map(|answer| answer.target_node_id)
+                        .into_iter()
+                        .collect();
+                let held = store.edge_targets_at_site(
+                    &resolved.from_node_id,
+                    resolved.line,
+                    resolved.col,
+                    resolved.reference_kind,
+                )?;
+                if now != held {
+                    dependent_sites.remove(&resolved.file_path);
+                    dependent_fallbacks.insert(resolved.file_path);
+                }
+            }
+        }
+        // W7-27 — and a C or C++ translation unit's include walk takes the
+        // first indexed candidate of each include and reads it, so a file
+        // that comes or goes beside an include, or a header that gains or
+        // loses its nodes across `max_file_size` (its includes and defines
+        // with them), can change whether a call in a file reaching it is a
+        // macro expansion, which no name touches: the files whose include
+        // spells such a file's name or stem, with every file whose include
+        // spells one of those in turn, go whole (none when the index holds
+        // no function-like macro).
+        let came_or_went: Vec<String> = changed_names
+            .added_files
+            .iter()
+            .chain(&changed_names.removed_files)
+            .chain(&changed_names.file_nodes_changed)
+            .cloned()
+            .collect();
+        if !came_or_went.is_empty() {
+            for file in resolver.include_walk_dependents(store, &came_or_went) {
+                if !reindexed.contains(&file) {
+                    dependent_sites.remove(&file);
+                    dependent_fallbacks.insert(file);
+                }
+            }
+        }
         // W5-06 — a control input that moved re-resolves every file of its
         // kind whole.
         for file in crate::control_inputs::files_of(store, &control.changed)? {
@@ -1748,12 +1820,16 @@ fn sync_paths_with_store(
                 )
                 .with_max_file_size(scope.options.max_file_size);
                 let crates = codegraph_resolve::ResolutionContext::cargo_workspace_crates(&context);
+                let resized = changed_names
+                    .file_nodes_changed
+                    .iter()
+                    .filter(|path| crate::rust_crate_roots::may_be_module_target(path));
                 crate::rust_crate_roots::names_reaching(
                     changed_names
                         .added_files
                         .iter()
                         .chain(&changed_names.removed_files)
-                        .chain(&changed_names.file_nodes_changed),
+                        .chain(resized),
                     &crates,
                 )
                 .into_iter()
@@ -2333,11 +2409,11 @@ fn sync_one(
             .namespaces
             .before_change(store, relative)?;
     }
-    // Whether a tracked file the Rust module rule may target has its file
-    // node, before and after: crossing `max_file_size` changes that
-    // without adding or removing the file (W7-19h).
-    let file_node = (!added && crate::rust_crate_roots::may_be_module_target(relative))
-        .then(|| codegraph_core::node_id::file_node_id(relative));
+    // Whether a tracked file has its file node, before and after: crossing
+    // `max_file_size` changes that without adding or removing the file. The
+    // Rust module rule reads it (W7-19h), and so do the import retries, for
+    // which such a file is one an import may now take or lose (W7-27).
+    let file_node = (!added).then(|| codegraph_core::node_id::file_node_id(relative));
     let had_file_node = match &file_node {
         Some(id) => store.node_by_id(id)?.is_some(),
         None => false,
@@ -3093,10 +3169,11 @@ struct ChangedNames {
     js_surfaces: BTreeMap<String, crate::module_surfaces::SurfaceChange>,
     /// The files this sync removed.
     removed_files: BTreeSet<String>,
-    /// The tracked files the Rust module rule may target whose file node
-    /// came or went as the sync re-extracted them: a file over
-    /// `max_file_size` is recorded without nodes, so crossing the limit
-    /// adds or removes its file node while the file stays tracked (W7-19h).
+    /// The tracked files whose file node came or went as the sync
+    /// re-extracted them: a file over `max_file_size` is recorded without
+    /// nodes, so crossing the limit adds or removes its file node while the
+    /// file stays tracked. The Rust module rule reads them (W7-19h), and the
+    /// import retries take them as they take an added file (W7-27).
     file_nodes_changed: BTreeSet<String>,
     /// Whether this sync already withdrew the surface version marker, as it
     /// does before its first mutation and restores once everything persisted.
@@ -3284,11 +3361,12 @@ impl ChangedNames {
         Ok(())
     }
 
-    /// What an import of an added file can be written as, and the namespaces
-    /// and modules the changed files declare (upstream #2392).
+    /// What an import of an added file, or of a tracked one whose file node
+    /// came or went (W7-27), can be written as, and the namespaces and
+    /// modules the changed files declare (upstream #2392).
     fn import_retry_keys(&self) -> (Vec<String>, Vec<String>) {
         let mut path_keys = BTreeSet::new();
-        for file in &self.added_files {
+        for file in self.added_files.iter().chain(&self.file_nodes_changed) {
             path_keys.extend(codegraph_store::import_path_keys(file));
         }
         let mut names: Vec<String> = self.module_names.iter().cloned().collect();
@@ -11653,5 +11731,108 @@ pub(crate) mod tests {
         names.note_restorable("src/a.js", &before, &touched);
         names.note_restorable("src/a.js", &before, &touched);
         assert!(names.restored.abandoned, "a file kept twice");
+    }
+
+    // ----- what an added, removed or resized file moves (W7-27b) -----------
+
+    const W727_MAIN: (&str, &str) = (
+        "src/main.ts",
+        "import { helper } from './api';\n\nexport function main(): number {\n  return helper();\n}\n",
+    );
+    const W727_API: (&str, &str) = (
+        "src/api.ts",
+        "export function helper(): number {\n  return 2;\n}\n",
+    );
+    const W727_INDEX: (&str, &str) = (
+        "src/api/index.ts",
+        "export function helper(): number {\n  return 1;\n}\n",
+    );
+
+    /// W7-27b: a sync that adds `src/api.ts` ahead of the indexed
+    /// `src/api/index.ts` and fails after its mutations leaves the import
+    /// where it was, and the next sync sees no added file. That sync still
+    /// moves the import: the JavaScript-family marker the failed one withdrew
+    /// makes it reconcile every JavaScript-family file.
+    #[test]
+    fn an_import_candidate_a_failed_sync_added_moves_the_import_next_time() {
+        let (dir, db) = fully_indexed("added-candidate-fail", &[W727_MAIN, W727_INDEX]);
+        write_files(dir.path(), &[W727_API]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [W727_API.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the failed sync withdrew it");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "added-candidate-fail-fresh",
+                &[W727_MAIN, W727_INDEX, W727_API]
+            )
+        );
+    }
+
+    /// W7-27b: an added file that comes after a resolved import's answer
+    /// (`src/api.d.ts` beside the indexed `src/api.ts` that `./api` takes)
+    /// leaves the answer, so the importing file is not resolved again whole.
+    /// The later candidate is a TypeScript file in a folder the index already
+    /// has: one in a new folder moves the JavaScript control inputs (the
+    /// manifests a framework's detection probes below every file), and a
+    /// `.tsx` file can bring a framework in, either of which re-resolves
+    /// every JavaScript-family file.
+    #[test]
+    fn an_added_later_import_candidate_sends_no_importer_whole() {
+        const LATER: (&str, &str) = ("src/api.d.ts", "export declare function other(): number;\n");
+        let (dir, db) = fully_indexed("later-candidate", &[W727_MAIN, W727_API]);
+        take_dependent_refreshes();
+        write_files(dir.path(), &[LATER]);
+        sync_changed_paths(dir.path(), &db, [LATER.0]).unwrap();
+        let refreshes = take_dependent_refreshes();
+        assert!(
+            !refreshes
+                .iter()
+                .any(|refresh| refresh.file == W727_MAIN.0 && refresh.whole),
+            "{refreshes:?}"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("later-candidate-fresh", &[W727_MAIN, W727_API, LATER])
+        );
+    }
+
+    /// W7-27b: a header that comes beside an include another header makes
+    /// sends the translation units through that header down the whole-file
+    /// lane, since the walk may now take it, only when the index holds a
+    /// function-like macro: with none, no call is a macro expansion, and
+    /// `src/main.c`, which includes `src/wrap.h`, is not resolved again.
+    #[test]
+    fn a_translation_unit_goes_whole_for_an_added_header_only_beside_a_macro() {
+        const MAIN: (&str, &str) = (
+            "src/main.c",
+            "#include \"wrap.h\"\n\nint main(void) {\n    return 0;\n}\n",
+        );
+        const WRAP: (&str, &str) = ("src/wrap.h", "#include \"trace.h\"\n");
+        const BESIDE: (&str, &str) = ("src/trace.h", "int trace_depth(void);\n");
+        for (macro_header, whole) in [
+            (("include/trace.h", "int trace_level(void);\n"), false),
+            (("include/trace.h", "#define TRACE(value) (value)\n"), true),
+        ] {
+            let (dir, db) = fully_indexed("macro-gate", &[MAIN, WRAP, macro_header]);
+            take_dependent_refreshes();
+            write_files(dir.path(), &[BESIDE]);
+            sync_changed_paths(dir.path(), &db, [BESIDE.0]).unwrap();
+            let refreshes = take_dependent_refreshes();
+            assert_eq!(
+                refreshes
+                    .iter()
+                    .any(|refresh| refresh.file == MAIN.0 && refresh.whole),
+                whole,
+                "{macro_header:?}: {refreshes:?}"
+            );
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges("macro-gate-fresh", &[MAIN, WRAP, macro_header, BESIDE])
+            );
+        }
     }
 }

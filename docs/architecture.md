@@ -903,13 +903,23 @@ control inputs (a change to one is the control-input lane's, below); the
 `rust_crate_roots_version` marker is withdrawn and restored with the others, and a
 sync that finds it missing re-resolves every Rust file;
 an import names a file, a folder or a namespace rather than a symbol, so the parked
-imports an added file or a changed file's namespace can satisfy (by the file's
-name and stem, its folder's, or the namespace's whole name), and the parked
-references written as a path (a Liquid `{% render 'price' %}` waits under
+imports an added file, a kept file whose file node came or went across
+`indexing.max_file_size`, or a changed file's namespace can satisfy (by the
+file's name and stem, its folder's, or the namespace's whole name), and the
+parked references written as a path (a Liquid `{% render 'price' %}` waits under
 `price` for `snippets/price.liquid`), send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's
 resolved edges and keeps what its extraction produced (`contains` edges and
-same-file value references). Framework nodes (a React Router route) are made
+same-file value references). The resolved imports and path references those
+keys name are resolved again over the synced index, and one whose answer is
+not the target its edge holds (an added `api.ts` ahead of the `api/index.ts`
+that `./api` took) sends its file down that lane too, since the import's
+bindings and the calls through them follow its answer. A C or C++ translation
+unit's include walk takes each include's first indexed candidate and decides
+by what it reads whether a call is a macro expansion, so when the index holds
+a function-like macro, the files whose `#include` spells the name or stem of
+a file the sync added, removed or carried across the size limit go down the
+lane as well, with every file whose include spells one of those in turn. Framework nodes (a React Router route) are made
 by passes that run after a file's re-extraction, so comparing a
 changed file's stored nodes with its re-extracted ones touches their names; when
 that comparison is all that touched names in a sync, and once the passes have

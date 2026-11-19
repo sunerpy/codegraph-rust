@@ -1236,3 +1236,22 @@ target (`frameworks/laravel.rs`), a Godot autoload's script
 (`frameworks/godot.rs`), the same-stem header a C or C++ receiver's
 declaration is read from (`name_matcher.rs`), and a Shopify theme's root,
 found by probing for its folders (`shopify_themes.rs`).
+
+What an import answers moves without a touched name too (W7-27). colby's sync
+retries the parked imports an added file can satisfy (#2392). This port's
+also takes a kept file whose file node came or went across `max_file_size`
+as added, and resolves again the resolved imports and path references the
+same keys name: a file whose import's answer is not the target its edge
+holds (an added `api.ts` ahead of the `api/index.ts` that `./api` took, a PHP
+include's path as written ahead of its `.php` form) re-resolves whole, since
+the import's bindings and the calls through them follow that answer. And
+when the index holds a function-like macro, the files whose C or C++
+`#include` spells the name or stem of a file the sync added, removed or
+carried across the size limit re-resolve whole, with every file whose
+include spells one of those in turn: a translation unit's include walk takes
+each include's first indexed candidate and decides by what it reads whether
+a call is a macro expansion (`sync.rs`, `cpp_includers.rs`). colby's sync
+leaves both where they were. One shape stays different (OD-B37): a Rust
+module that gains `util.rs` beside its `util/mod.rs` without the leaf a `use`
+names keeps the edge into `util/mod.rs` through a sync, where a fresh index
+leaves the use unresolved; rustc rejects a module with both files (E0761).
