@@ -3,8 +3,9 @@
 //! the C# project files, the Cargo manifests and the Go module files
 //! (W7-15d1), the root files the Python frameworks are detected by
 //! (W7-19b), Spring and Play are (W7-19c), Laravel and Drupal are (W7-19d),
-//! Rails is (W7-19e), ASP.NET is (W7-19f) and Vapor is (W7-19g), and which
-//! frameworks the project uses.
+//! Rails is (W7-19e), ASP.NET is (W7-19f) and Vapor is (W7-19g), the
+//! workspace packages React Native's view components are detected by
+//! (W7-21), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
@@ -21,7 +22,8 @@
 //! [`codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES`],
 //! [`codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES`],
-//! [`codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES`]); every
+//! [`codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::fabric::workspace_listings`]); every
 //! full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
@@ -297,6 +299,30 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
             // The Tauri markers a framework is detected by.
             for marker in TAURI_MARKERS {
                 out.insert(marker.to_string(), file_digest(&project_root.join(marker)));
+            }
+            // React Native's view components are detected by a workspace
+            // package's `package.json` one level below `packages/`, `apps/`,
+            // `modules/` or `libraries/` (W7-21): each root's listing of the
+            // directories holding one, and each of those manifests. A
+            // directory holding none is nothing detection can tell from no
+            // directory, so an empty one left behind changes no digest.
+            for (dir, names) in codegraph_resolve::frameworks::fabric::workspace_listings(&root) {
+                let manifests: Vec<(String, String)> = names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let relative = format!("{dir}/{name}/package.json");
+                        let digest = file_digest(&project_root.join(&relative))?;
+                        Some((name, digest))
+                    })
+                    .collect();
+                let held: Vec<String> = manifests.iter().map(|(name, _)| name.clone()).collect();
+                out.insert(
+                    format!("dir:{dir}"),
+                    (!held.is_empty()).then(|| hash_content(&held.join("\n"))),
+                );
+                for (name, digest) in manifests {
+                    out.insert(format!("{dir}/{name}/package.json"), Some(digest));
+                }
             }
             let js: Vec<String> = files
                 .iter()
@@ -964,6 +990,59 @@ mod tests {
         assert!(!is_control_file("Sources/App/Package.swift"));
         assert!(!is_control_file("Sources/App/routes.swift"));
         assert_eq!(ControlKind::Swift.row_key(), "control_inputs:swift");
+    }
+
+    /// The JS kind reads the four workspace roots Fabric's detection lists
+    /// (W7-21): each root's listing of the directories that hold a
+    /// `package.json`, and each such manifest; a directory holding none, or
+    /// no root at all, is no listing.
+    #[test]
+    fn the_js_kind_digests_the_workspace_packages_fabric_detection_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-fabric-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fabric = |digests: Digests| -> Vec<(String, Option<String>)> {
+            digests
+                .into_iter()
+                .filter(|(key, _)| {
+                    ["packages", "apps", "modules", "libraries"]
+                        .iter()
+                        .any(|root| {
+                            key == &format!("dir:{root}") || key.starts_with(&format!("{root}/"))
+                        })
+                })
+                .collect()
+        };
+        let none = fabric(digests_of(ControlKind::Js, &dir, &[]));
+        std::fs::create_dir_all(dir.join("packages/native")).unwrap();
+        std::fs::create_dir_all(dir.join("apps/empty")).unwrap();
+        let empty = fabric(digests_of(ControlKind::Js, &dir, &[]));
+        let manifest = "{\"peerDependencies\":{\"react-native\":\"*\"}}\n";
+        std::fs::write(dir.join("packages/native/package.json"), manifest).unwrap();
+        let held = fabric(digests_of(ControlKind::Js, &dir, &[]));
+        std::fs::remove_dir_all(&dir).ok();
+        let roots = |packages: Option<String>| {
+            vec![
+                ("dir:apps".to_string(), None),
+                ("dir:libraries".to_string(), None),
+                ("dir:modules".to_string(), None),
+                ("dir:packages".to_string(), packages),
+            ]
+        };
+        assert_eq!(none, roots(None));
+        assert_eq!(empty, roots(None));
+        let mut expected = roots(Some(hash_content("native")));
+        expected.push((
+            "packages/native/package.json".to_string(),
+            Some(hash_content(manifest)),
+        ));
+        assert_eq!(held, expected);
     }
 
     /// The files the synthesis stage last read beside the index, and the

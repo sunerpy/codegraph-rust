@@ -15,14 +15,14 @@ use codegraph_core::source_file::{SourceText, read_source_file};
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_extract::ExtractOptions;
 use codegraph_store::Store;
-use codegraph_store::queries::ReferenceSite;
+use codegraph_store::queries::{MethodHeader, ReferenceSite};
 use rayon::prelude::*;
 
 use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     angular, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe,
-    iface, is_synthesized, jsx, links, registry, sveltekit, tier, vue,
+    iface, is_synthesized, jsx, links, react_native, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -109,6 +109,22 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         dispatch::kotlin_expect_actual_edges,
     ),
     ("goGrpcEdges", go::gate, go_dispatch::grpc_stub_impl_edges),
+    ("rnEventEdgesList", jsx::gate, react_native::rn_event_edges),
+    (
+        "fabricNativeEdges",
+        always,
+        react_native::fabric_native_impl_edges,
+    ),
+    (
+        "expoXPlatEdges",
+        |languages| languages.contains(&Language::Swift) && languages.contains(&Language::Kotlin),
+        react_native::expo_cross_platform_edges,
+    ),
+    (
+        "rnXPlatEdges",
+        jsx::gate,
+        react_native::rn_cross_platform_edges,
+    ),
     (
         "mybatisEdges",
         |languages| {
@@ -446,6 +462,45 @@ impl<'a> View<'a> {
         Ok(by_end)
     }
 
+    /// The ones of `targets` a `calls` edge reaches from a node written in
+    /// one of `languages`: the base edges and the overlay's, without the
+    /// stored synthesized ones, as [`Self::edges_into_each`] reads them
+    /// (W7-21's cost revision). The base edges come with one query that
+    /// reads their sources' languages, neither every edge into a target nor
+    /// a caller's whole row.
+    pub(super) fn called_from(
+        &self,
+        targets: &[String],
+        languages: &[Language],
+    ) -> Result<HashSet<String>> {
+        let mut called: HashSet<String> = self
+            .store
+            .calls_into_from_languages(targets, languages)?
+            .into_iter()
+            .filter(|edge| !is_synthesized(edge))
+            .map(|edge| edge.target)
+            .collect();
+        let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
+        let overlaid: Vec<&Edge> = self
+            .overlay
+            .of_kind(EdgeKind::Calls)
+            .filter(|edge| wanted.contains(edge.target.as_str()) && !called.contains(&edge.target))
+            .collect();
+        if !overlaid.is_empty() {
+            let callers: Vec<String> = overlaid.iter().map(|edge| edge.source.clone()).collect();
+            let callers = self.store.nodes_by_ids(&callers)?;
+            for edge in overlaid {
+                if callers
+                    .get(&edge.source)
+                    .is_some_and(|caller| languages.contains(&caller.language))
+                {
+                    called.insert(edge.target.clone());
+                }
+            }
+        }
+        Ok(called)
+    }
+
     /// [`Self::edges_from`] of each of `sources`, by source, read as
     /// [`Self::edges_into_each`] reads into its targets.
     pub(super) fn edges_from_each(
@@ -566,6 +621,17 @@ impl<'a> View<'a> {
         let mut nodes = self.store.nodes_of_kinds_in_languages(kinds, languages)?;
         nodes.sort_by(node_order);
         Ok(nodes)
+    }
+
+    /// The [`MethodHeader`]s of the methods written in `languages`, in
+    /// [`node_order`]: [`Self::nodes_of_kinds_in`]'s methods, five fields of
+    /// each (W7-21's cost revision).
+    pub(super) fn method_headers_in(&self, languages: &[Language]) -> Result<Vec<MethodHeader>> {
+        let mut headers = self.store.method_headers_in_languages(languages)?;
+        headers.sort_by(|a, b| {
+            (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
+        });
+        Ok(headers)
     }
 
     /// The nodes of `kind` whose signature holds `text` (see
@@ -1262,6 +1328,157 @@ mod tests {
         let mut found: Vec<&str> = found.keys().map(String::as_str).collect();
         found.sort_unstable();
         assert_eq!(found, ["f", "m1", "m2", "t", "u"]);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// W7-21's cost revision: the targets a script calls are read with one
+    /// query beside the overlay. A base `calls` edge from a script and an
+    /// overlay one count; a stored synthesized edge, another kind, a caller
+    /// in another language and an overlay edge into another node do not:
+    /// what [`View::edges_into_each`] and the callers' rows give.
+    #[test]
+    fn the_targets_a_language_calls_are_its_base_and_overlay_calls() {
+        let (mut store, dir) = temp_store("called-from");
+        let at = |id: &str, kind: NodeKind, language: Language| Node {
+            kind,
+            language,
+            ..function(id, "src/a.ts")
+        };
+        store
+            .upsert_nodes(&[
+                at("ts", NodeKind::Function, Language::TypeScript),
+                at("tsx", NodeKind::Function, Language::Tsx),
+                at("java", NodeKind::Function, Language::Java),
+                at("m1", NodeKind::Method, Language::Java),
+                at("m2", NodeKind::Method, Language::Java),
+                at("m3", NodeKind::Method, Language::Java),
+                at("m4", NodeKind::Method, Language::Java),
+                at("m5", NodeKind::Method, Language::ObjC),
+                at("m6", NodeKind::Method, Language::ObjC),
+            ])
+            .unwrap();
+        let calls = |source: &str, target: &str| Edge {
+            line: Some(1),
+            col: Some(0),
+            metadata: None,
+            provenance: None,
+            ..synthesized(source, target, "base")
+        };
+        store
+            .insert_edges(&[
+                calls("ts", "m1"),
+                synthesized("ts", "m2", "rn-cross-platform"),
+                calls("java", "m3"),
+                Edge {
+                    kind: EdgeKind::References,
+                    ..calls("ts", "m4")
+                },
+            ])
+            .unwrap();
+        let mut view = View::new(&store, &dir, 1 << 20);
+        view.overlay
+            .extend([calls("tsx", "m5"), calls("java", "m4"), calls("ts", "m6")]);
+        let targets: Vec<String> = ["m1", "m2", "m3", "m4", "m5"].map(String::from).to_vec();
+        let scripts = [
+            Language::TypeScript,
+            Language::Tsx,
+            Language::JavaScript,
+            Language::Jsx,
+        ];
+        let mut called: Vec<String> = view
+            .called_from(&targets, &scripts)
+            .unwrap()
+            .into_iter()
+            .collect();
+        called.sort();
+        assert_eq!(called, ["m1", "m5"]);
+        let into = view.edges_into_each(&targets, EdgeKind::Calls).unwrap();
+        let callers: Vec<String> = into
+            .values()
+            .flatten()
+            .map(|edge| edge.source.clone())
+            .collect();
+        let sources = view.nodes(&callers).unwrap();
+        let mut read: Vec<String> = targets
+            .iter()
+            .filter(|target| {
+                into.get(*target).is_some_and(|edges| {
+                    edges.iter().any(|edge| {
+                        sources
+                            .get(&edge.source)
+                            .is_some_and(|source| scripts.contains(&source.language))
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+        read.sort();
+        assert_eq!(read, called);
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// W7-21's cost revision: the methods' light rows come in
+    /// [`node_order`], the order of the whole nodes read before.
+    #[test]
+    fn method_headers_come_in_node_order() {
+        let (mut store, dir) = temp_store("method-headers");
+        let at = |id: &str, file: &str, line: i64, language: Language| Node {
+            kind: NodeKind::Method,
+            language,
+            start_line: line,
+            ..function(id, file)
+        };
+        store
+            .upsert_nodes(&[
+                at("b2", "src/b.m", 2, Language::ObjC),
+                at("a9", "src/a.java", 9, Language::Java),
+                at("b1z", "src/b.m", 1, Language::ObjC),
+                at("b1a", "src/b.m", 1, Language::ObjC),
+                at("c1", "src/c.swift", 1, Language::Swift),
+            ])
+            .unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        let languages = [Language::ObjC, Language::Java];
+        let headers: Vec<(String, String, Language, String, i64)> = view
+            .method_headers_in(&languages)
+            .unwrap()
+            .into_iter()
+            .map(|header| {
+                (
+                    header.id,
+                    header.name,
+                    header.language,
+                    header.file_path,
+                    header.start_line,
+                )
+            })
+            .collect();
+        let nodes: Vec<(String, String, Language, String, i64)> = view
+            .nodes_of_kinds_in(&[NodeKind::Method], &languages)
+            .unwrap()
+            .into_iter()
+            .map(|node| {
+                (
+                    node.id,
+                    node.name,
+                    node.language,
+                    node.file_path,
+                    node.start_line,
+                )
+            })
+            .collect();
+        assert_eq!(headers, nodes);
+        assert_eq!(
+            headers
+                .iter()
+                .map(|header| header.0.as_str())
+                .collect::<Vec<_>>(),
+            ["a9", "b1a", "b1z", "b2"]
+        );
+        drop(view);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

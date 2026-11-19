@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codegraph_core::types::{
@@ -144,45 +145,96 @@ pub enum LaneReferences {
     /// A Swift route's references: Vapor's, the only resolver that makes
     /// Swift routes.
     SwiftRoutes,
+    /// The references written in one of these languages: what the React
+    /// Native and Swift-Objective-C bridges read, which their lane narrows
+    /// by name (W7-21).
+    Languages(Vec<Language>),
 }
 
 impl LaneReferences {
     /// The family's `WHERE` clause and its parameters: a prefix is a range,
     /// which an index on its column serves.
-    fn predicate(&self) -> (&'static str, Vec<String>) {
+    fn predicate(&self) -> (Cow<'static, str>, Vec<String>) {
         // `:` is followed by `;`: the ids of the routes are the ones from
         // `route:` up to `route;`.
         match self {
             Self::PhpRoutes => (
-                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'",
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'php'".into(),
                 Vec::new(),
             ),
             Self::DrupalRoutingFiles => (
                 "from_node_id >= 'route:' AND from_node_id < 'route;' \
-                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'",
+                 AND language = 'yaml' AND substr(file_path, -12) = '.routing.yml'"
+                    .into(),
                 Vec::new(),
             ),
             // `_` is followed by a backtick.
             Self::PhpHooks => (
-                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'",
+                "reference_name >= 'hook_' AND reference_name < 'hook`' AND language = 'php'"
+                    .into(),
                 Vec::new(),
             ),
             // `:` is followed by `;`: the names starting `{class}::`.
             Self::PhpStaticCalls(class) => (
-                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'",
+                "reference_name >= ?1 AND reference_name < ?2 AND language = 'php'".into(),
                 vec![format!("{class}::"), format!("{class}:;")],
             ),
             Self::RubyRoutes => (
-                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'",
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'ruby'".into(),
                 Vec::new(),
             ),
             Self::SwiftRoutes => (
-                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'",
+                "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'"
+                    .into(),
                 Vec::new(),
+            ),
+            // No language is a clause that holds for no row.
+            Self::Languages(languages) if languages.is_empty() => ("0".into(), Vec::new()),
+            Self::Languages(languages) => (
+                format!(
+                    "language IN ({})",
+                    std::iter::repeat_n("?", languages.len())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+                .into(),
+                languages
+                    .iter()
+                    .map(|language| language.as_str().to_string())
+                    .collect(),
             ),
         }
     }
 }
+
+/// A method's id, name, language, file and first line: what a pass pairing
+/// methods by name reads of each (W7-21's cost revision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodHeader {
+    pub id: String,
+    pub name: String,
+    pub language: Language,
+    pub file_path: String,
+    pub start_line: i64,
+}
+
+/// [`Store::methods_named`]'s query: each name's rows of `idx_nodes_name`,
+/// whose kind and language it tests unindexed (`+`). Left to itself the
+/// planner, which has no row statistics for these tables, walks the
+/// language index instead, every method of the language for each name.
+const METHODS_NAMED_SQL: &str = "SELECT n.* FROM json_each(?1) AS k CROSS JOIN nodes AS n \
+     ON n.name = k.value WHERE +n.kind = 'method' AND +n.language = ?2";
+
+/// [`Store::methods_by_first_keyword`]'s query: each keyword's rows of
+/// `idx_nodes_name` equal to it, and those from `keyword:` up to `keyword;`
+/// (`;` follows `:`), compared byte for byte; the kind and language tested
+/// as [`METHODS_NAMED_SQL`] tests them.
+const METHODS_BY_FIRST_KEYWORD_SQL: &str = "SELECT n.* FROM json_each(?1) AS k \
+     CROSS JOIN nodes AS n ON n.name = k.value \
+     WHERE +n.kind = 'method' AND +n.language = ?2 \
+     UNION ALL SELECT n.* FROM json_each(?1) AS k \
+     CROSS JOIN nodes AS n ON n.name >= k.value || ':' AND n.name < k.value || ';' \
+     WHERE +n.kind = 'method' AND +n.language = ?2";
 
 /// One reference of a [`LaneReferences`] family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +445,115 @@ impl Store {
             .map(|kind| kind.as_str())
             .chain(languages.iter().map(|language| language.as_str()));
         query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// The methods written in `language` named one of `names` (W7-21's cost
+    /// revision): the rows of the name index, no other method read.
+    /// Unordered.
+    pub fn methods_named(
+        &self,
+        language: Language,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<Node>> {
+        self.methods_keyed(METHODS_NAMED_SQL, language, names.iter())
+    }
+
+    /// The methods written in `language` whose name up to its first `:` is
+    /// one of `keywords`, an Objective-C selector's first keyword (W7-21's
+    /// cost revision): a name equal to the keyword, or one starting
+    /// `keyword:`. A keyword holding a `:` is no name's first keyword and
+    /// reads none. Unordered.
+    pub fn methods_by_first_keyword(
+        &self,
+        language: Language,
+        keywords: &[String],
+    ) -> rusqlite::Result<Vec<Node>> {
+        self.methods_keyed(
+            METHODS_BY_FIRST_KEYWORD_SQL,
+            language,
+            keywords.iter().filter(|keyword| !keyword.contains(':')),
+        )
+    }
+
+    /// The `language` methods `sql` reads for the distinct `keys`.
+    fn methods_keyed<'k>(
+        &self,
+        sql: &str,
+        language: Language,
+        keys: impl Iterator<Item = &'k String>,
+    ) -> rusqlite::Result<Vec<Node>> {
+        let keys: BTreeSet<&str> = keys.map(String::as_str).collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = serde_json::to_string(&keys)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        query_nodes(&self.conn, sql, params![keys, language.as_str()])
+    }
+
+    /// The [`MethodHeader`]s of the methods written in `languages` (W7-21's
+    /// cost revision): the rows [`Self::nodes_of_kinds_in_languages`] reads
+    /// for them, five columns of each. Unordered.
+    pub fn method_headers_in_languages(
+        &self,
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<MethodHeader>> {
+        if languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT id, name, language, file_path, start_line FROM nodes \
+             WHERE kind = 'method' AND language IN ({})",
+            std::iter::repeat_n("?", languages.len())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(languages.iter().map(|language| language.as_str())),
+            |row| {
+                Ok(MethodHeader {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    language: parse_language(row.get::<_, String>(2)?)?,
+                    file_path: row.get(3)?,
+                    start_line: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect()
+    }
+
+    /// The `calls` edges into any of `targets` whose source is written in
+    /// one of `languages` (W7-21's cost revision): from each distinct target
+    /// through `idx_edges_target_kind` to its source's row, of which the
+    /// language alone is read. Unordered.
+    pub fn calls_into_from_languages(
+        &self,
+        targets: &[String],
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<Edge>> {
+        let targets: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
+        if targets.is_empty() || languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let targets = serde_json::to_string(&targets)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let sql = format!(
+            "SELECT e.* FROM json_each(?1) AS t \
+             CROSS JOIN edges AS e ON e.target = t.value AND e.kind = 'calls' \
+             CROSS JOIN nodes AS s ON s.id = e.source WHERE +s.language IN ({})",
+            (2..languages.len() + 2)
+                .map(|slot| format!("?{slot}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let values = std::iter::once(targets).chain(
+            languages
+                .iter()
+                .map(|language| language.as_str().to_string()),
+        );
+        query_edges(&self.conn, &sql, rusqlite::params_from_iter(values))
     }
 
     /// The nodes of `kind` whose signature holds `text` (W7-16a): a superset
@@ -7472,5 +7633,222 @@ mod tests {
     fn node_by_id_missing_returns_none() {
         let store = store("missing-node");
         assert_eq!(store.node_by_id("nope").unwrap(), None);
+    }
+
+    /// A method of `language` named `name`, in `file` at `line`.
+    fn method(id: &str, name: &str, language: Language, file: &str, line: i64) -> Node {
+        Node {
+            kind: NodeKind::Method,
+            language,
+            start_line: line,
+            end_line: line,
+            ..node(id, name, file)
+        }
+    }
+
+    /// W7-21's cost revision: the methods of a language read by their
+    /// names, or by an Objective-C selector's first keyword: the keyword
+    /// itself and every `keyword:` selector, compared byte for byte, and no
+    /// other name starting with the keyword (`kwx:`). Another kind, another
+    /// language, a keyword holding a `:` and an empty list read none.
+    #[test]
+    fn methods_are_read_by_name_and_by_first_keyword() {
+        let mut store = store("methods-keyed");
+        let objc = |id: &str, name: &str, line: i64| method(id, name, Language::ObjC, "A.m", line);
+        store
+            .upsert_nodes(&[
+                objc("method:kw", "kw", 1),
+                objc("method:kw:", "kw:", 2),
+                objc("method:kw:with:", "kw:with:", 3),
+                objc("method:kwx:", "kwx:", 4),
+                objc("method:Kw:", "Kw:", 5),
+                objc("method:KW", "KW", 6),
+                objc("method:other:", "other:", 7),
+                Node {
+                    kind: NodeKind::Function,
+                    ..objc("function:kw:", "kw:", 8)
+                },
+                method("method:java-kw", "kw", Language::Java, "A.java", 1),
+                method("method:java-kw:", "kw:", Language::Java, "A.java", 2),
+            ])
+            .unwrap();
+        let ids = |nodes: Vec<Node>| -> Vec<String> {
+            let mut ids: Vec<String> = nodes.into_iter().map(|node| node.id).collect();
+            ids.sort();
+            ids
+        };
+        let names = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|name| (*name).to_string()).collect()
+        };
+        let by_keyword = |language: Language, keywords: &[&str]| {
+            ids(store
+                .methods_by_first_keyword(language, &names(keywords))
+                .unwrap())
+        };
+        let named = |language: Language, wanted: &[&str]| {
+            ids(store.methods_named(language, &names(wanted)).unwrap())
+        };
+        assert_eq!(
+            by_keyword(Language::ObjC, &["kw"]),
+            ["method:kw", "method:kw:", "method:kw:with:"]
+        );
+        assert_eq!(
+            by_keyword(Language::ObjC, &["Kw", "other"]),
+            ["method:Kw:", "method:other:"]
+        );
+        assert!(by_keyword(Language::ObjC, &["kw:with"]).is_empty());
+        assert!(by_keyword(Language::ObjC, &[]).is_empty());
+        assert_eq!(
+            by_keyword(Language::Java, &["kw"]),
+            ["method:java-kw", "method:java-kw:"]
+        );
+        assert_eq!(
+            named(Language::ObjC, &["kw", "other:", "KW:"]),
+            ["method:kw", "method:other:"]
+        );
+        assert_eq!(named(Language::Java, &["kw"]), ["method:java-kw"]);
+        assert!(named(Language::ObjC, &[]).is_empty());
+    }
+
+    /// W7-21's cost revision: both method lookups walk `idx_nodes_name`
+    /// from each listed name and test the kind and language on its rows.
+    /// Left to itself the planner, which has no row statistics for these
+    /// tables, may take the kind or language index instead and walk every
+    /// method of the language for each name.
+    #[test]
+    fn method_lookups_walk_the_name_index() {
+        let store = store("methods-keyed-plan");
+        for (sql, searches) in [(METHODS_NAMED_SQL, 1), (METHODS_BY_FIRST_KEYWORD_SQL, 2)] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let steps = stmt
+                .query_map(params!["[\"kw\"]", "objc"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let on_nodes: Vec<&str> = steps
+                .iter()
+                .map(String::as_str)
+                .filter(|step| step.starts_with("SEARCH n ") || step.starts_with("SCAN n"))
+                .collect();
+            assert_eq!(on_nodes.len(), searches, "{sql}: {steps:?}");
+            assert!(
+                on_nodes
+                    .iter()
+                    .all(|step| step.starts_with("SEARCH n USING INDEX idx_nodes_name (")),
+                "{sql}: {steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| step.contains("idx_nodes_kind")
+                        || step.contains("idx_nodes_language")),
+                "{sql}: {steps:?}"
+            );
+        }
+    }
+
+    /// W7-21's cost revision: a method's light row is its id, name,
+    /// language, file and first line; another language's methods and
+    /// another kind's nodes have none.
+    #[test]
+    fn method_headers_are_the_languages_methods() {
+        let mut store = store("method-headers");
+        store
+            .upsert_nodes(&[
+                method("method:objc", "run:", Language::ObjC, "ios/A.m", 4),
+                method("method:java", "run", Language::Java, "android/A.java", 9),
+                method("method:swift", "run", Language::Swift, "ios/A.swift", 2),
+                Node {
+                    kind: NodeKind::Function,
+                    ..method("function:java", "run", Language::Java, "android/B.java", 1)
+                },
+            ])
+            .unwrap();
+        let mut headers = store
+            .method_headers_in_languages(&[Language::ObjC, Language::Java])
+            .unwrap();
+        headers.sort_by(|a, b| a.id.cmp(&b.id));
+        let header =
+            |id: &str, name: &str, language: Language, file: &str, line: i64| MethodHeader {
+                id: id.to_string(),
+                name: name.to_string(),
+                language,
+                file_path: file.to_string(),
+                start_line: line,
+            };
+        assert_eq!(
+            headers,
+            [
+                header("method:java", "run", Language::Java, "android/A.java", 9),
+                header("method:objc", "run:", Language::ObjC, "ios/A.m", 4),
+            ]
+        );
+        assert!(store.method_headers_in_languages(&[]).unwrap().is_empty());
+    }
+
+    /// W7-21's cost revision: the `calls` edges into the targets whose
+    /// source is written in one of the languages, stored synthesized ones
+    /// among them, each once however often its target is listed; another
+    /// kind, another target and a source in another language read none.
+    #[test]
+    fn calls_into_targets_are_read_by_their_sources_language() {
+        let mut store = store("calls-from-languages");
+        let caller = |id: &str, language: Language| Node {
+            language,
+            ..node(id, id, "src/a.ts")
+        };
+        store
+            .upsert_nodes(&[
+                caller("function:ts", Language::TypeScript),
+                caller("function:tsx", Language::Tsx),
+                caller("function:java", Language::Java),
+                method("method:m1", "m1", Language::Java, "A.java", 1),
+                method("method:m2", "m2", Language::Java, "A.java", 2),
+                method("method:m3", "m3", Language::Java, "A.java", 3),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[
+                edge("function:ts", "method:m1", EdgeKind::Calls),
+                Edge {
+                    metadata: Some(serde_json::json!({ "synthesizedBy": "rn-cross-platform" })),
+                    ..edge("function:tsx", "method:m2", EdgeKind::Calls)
+                },
+                edge("function:java", "method:m2", EdgeKind::Calls),
+                edge("function:ts", "method:m2", EdgeKind::References),
+                edge("function:ts", "method:m3", EdgeKind::Calls),
+            ])
+            .unwrap();
+        let targets = ["method:m1", "method:m2", "method:m1"].map(String::from);
+        let scripts = [Language::TypeScript, Language::Tsx];
+        let mut found: Vec<(String, String, bool)> = store
+            .calls_into_from_languages(&targets, &scripts)
+            .unwrap()
+            .into_iter()
+            .map(|edge| (edge.source, edge.target, edge.metadata.is_some()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("function:ts".to_string(), "method:m1".to_string(), false),
+                ("function:tsx".to_string(), "method:m2".to_string(), true),
+            ]
+        );
+        assert!(
+            store
+                .calls_into_from_languages(&[], &scripts)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .calls_into_from_languages(&targets, &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 }

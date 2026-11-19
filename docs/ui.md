@@ -194,10 +194,12 @@ the Rust graph holds different facts, the viewer shows what this index holds:
   Rust's axum and actix, ASP.NET and Vapor).
 - The Rust index synthesizes the field-observer, closure-collection,
   event-emitter, React and Flutter re-render, JSX render, C++ override, interface
-  override, Kotlin expect/actual, Delphi form, MyBatis mapper and object
-  registry dispatch edges, and the cross-tier HTTP client, queue job, event
-  bus and test request edges, so a flow shows a dashed `via …` hop for those
-  and for no other upstream synthesis pass. A Go interface's implicit implementations are in
+  override, Kotlin expect/actual, Delphi form, MyBatis mapper, object
+  registry, React Native event-channel, Fabric native-view, Expo
+  cross-platform and React Native cross-platform dispatch edges, and the
+  cross-tier HTTP client, queue job, event bus and test request edges, so a
+  flow shows a dashed `via …` hop for those and for no other upstream
+  synthesis pass. A Go interface's implicit implementations are in
   its type hierarchy, marked synthesized (`go-implements`).
 - An unresolved import is recorded by the binding it names, not by the module
   specifier, and the File view lists it that way.

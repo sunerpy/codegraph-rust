@@ -389,6 +389,27 @@ pub struct FrameworkResolverExtractionResult {
     pub references: Vec<RefView>,
 }
 
+/// The part of a method's name [`ResolutionContext::get_methods_named_shared`]
+/// matches (W7-21's cost revision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodKey {
+    /// The whole name.
+    Name,
+    /// The name up to its first `:`: an Objective-C selector's first
+    /// keyword.
+    FirstKeyword,
+}
+
+impl MethodKey {
+    /// The part of `name` this key reads.
+    pub fn of(self, name: &str) -> &str {
+        match self {
+            Self::Name => name,
+            Self::FirstKeyword => name.split(':').next().unwrap_or_default(),
+        }
+    }
+}
+
 /// Context for resolution — provides read access to the graph.
 ///
 /// Ports the upstream `ResolutionContext` interface (`types.ts:65-142`). Methods
@@ -851,6 +872,52 @@ pub trait ResolutionContext {
     /// time a router asks.
     fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
         Arc::new(crate::frameworks::route_href::RouteTables::default())
+    }
+
+    /// The nodes of `kind` whose language is one of `languages`, in
+    /// [`Self::get_nodes_by_kind_shared`]'s order (W7-21). The store context
+    /// reads only those rows.
+    fn get_nodes_by_kind_in_languages_shared(
+        &self,
+        kind: codegraph_core::types::NodeKind,
+        languages: &[Language],
+    ) -> Vec<Arc<Node>> {
+        self.get_nodes_by_kind_shared(kind)
+            .into_iter()
+            .filter(|node| languages.contains(&node.language))
+            .collect()
+    }
+
+    /// The methods written in `language` whose name's `key` part is one of
+    /// `names`, in [`Self::get_nodes_by_kind_in_languages_shared`]'s order
+    /// (W7-21's cost revision). The store context reads only those rows, in
+    /// no particular order.
+    fn get_methods_named_shared(
+        &self,
+        language: Language,
+        key: MethodKey,
+        names: &[String],
+    ) -> Vec<Arc<Node>> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let wanted: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        self.get_nodes_by_kind_in_languages_shared(NodeKind::Method, &[language])
+            .into_iter()
+            .filter(|node| wanted.contains(key.of(&node.name)))
+            .collect()
+    }
+
+    /// The non-empty bridge facts of `files`, in `files`' order: what the
+    /// React Native and Expo bridges read of each file (W7-21). The default
+    /// reads the files' text; a sync's store context reads a file's
+    /// `rn_bridge_surface:` row instead, but for the files the sync changed
+    /// ([`crate::context::StoreResolutionContext::with_recorded_bridge_rows`]).
+    fn bridge_facts_of_files(
+        &self,
+        files: &[String],
+    ) -> Vec<(String, Arc<crate::frameworks::react_native::BridgeFacts>)> {
+        crate::frameworks::react_native::bridge_facts_from_text(self, files)
     }
 }
 

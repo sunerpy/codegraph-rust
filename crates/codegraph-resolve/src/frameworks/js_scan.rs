@@ -505,6 +505,37 @@ fn is_type_assertion_or_empty(rest: &str) -> bool {
         })
 }
 
+/// Every match a JavaScript `/^…/gm` pattern finds in `text`, as
+/// `(offset, captures)`: `anchored` is the pattern with `^` at its start and
+/// no multiline flag, tried at each line start a JavaScript multiline `^`
+/// holds at (the text's start and the offset after each `\n`, `\r`,
+/// U+2028 and U+2029), from where the last match ended. The `regex` crate's
+/// multiline `^` holds after `\n` only.
+pub(crate) fn multiline_matches<'t>(
+    anchored: &regex::Regex,
+    text: &'t str,
+) -> Vec<(usize, regex::Captures<'t>)> {
+    let mut starts = vec![0];
+    for (at, ch) in text.char_indices() {
+        if matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
+            starts.push(at + ch.len_utf8());
+        }
+    }
+    let mut out = Vec::new();
+    let mut from = 0;
+    for start in starts {
+        if start < from || start > text.len() {
+            continue;
+        }
+        if let Some(found) = anchored.captures(&text[start..]) {
+            let end = start + found.get(0).map_or(0, |whole| whole.end());
+            out.push((start, found));
+            from = end.max(start + 1);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

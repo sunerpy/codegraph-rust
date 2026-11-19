@@ -23252,3 +23252,1474 @@ pub fn typescript_tier_excluded_import_candidate_goes() -> Case {
         .edge_metadata_after(TIER_LOAD_API, "synthesizedBy", "http-client")
         .no_edge_metadata_after(TIER_LOAD_LEGACY, "synthesizedBy", "http-client")
 }
+
+// ----- React Native, Expo modules, Fabric and Swift-ObjC bridges (W7-21) ---
+
+/// A root `package.json` that names `react-native`, which the React Native
+/// bridge is detected by.
+const RN_PACKAGE: &str = "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n";
+
+/// Two Swift modules with one method each, the shims that export them
+/// (`RCT_EXTERN_MODULE`; upstream reads one module from each file), a file
+/// that binds `captureView` to the first module, and a hook that calls the
+/// method through that binding.
+const RN_CAPTURE_SWIFT_FILE: &str = "ios/CaptureView.swift";
+const RN_CAPTURE_SWIFT: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func finalizeCaptureSession() {}\n}\n\n@objc(CaptureViewV2)\nclass CaptureViewV2: NSObject {\n  @objc func finalizeCaptureSession() {}\n}\n";
+const RN_CAPTURE_SHIM_FILE: &str = "ios/CaptureView.m";
+const RN_CAPTURE_SHIM: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(finalizeCaptureSession)\n@end\n";
+const RN_CAPTURE_V2_SHIM_FILE: &str = "ios/CaptureViewV2.m";
+const RN_CAPTURE_V2_SHIM: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureViewV2, NSObject)\nRCT_EXTERN_METHOD(finalizeCaptureSession)\n@end\n";
+const RN_ALIAS_FILE: &str = "src/a.ts";
+const RN_ALIAS: &str = "import { NativeModules } from 'react-native';\n\nexport const captureView = NativeModules.CaptureView;\n";
+const RN_ALIAS_V2: &str = "import { NativeModules } from 'react-native';\n\nexport const captureView = NativeModules.CaptureViewV2;\n";
+const RN_ALIAS_RIVAL_FILE: &str = "src/b.ts";
+const RN_ALIAS_RIVAL: &str =
+    "import { NativeModules } from 'react-native';\n\nconst captureView = NativeModules.Other;\n";
+const RN_HOOKS_FILE: &str = "src/hooks/use-review-handlers.ts";
+const RN_HOOKS: &str = "import { captureView } from '../a';\n\nexport function finish() {\n  captureView.finalizeCaptureSession();\n}\n";
+const RN_FINISH: &str = "function finish";
+const RN_CAPTURE_FINALIZE: &str = "method CaptureView::finalizeCaptureSession";
+const RN_CAPTURE_V2_FINALIZE: &str = "method CaptureViewV2::finalizeCaptureSession";
+const RN_ALIAS_CONSTANT: &str = "constant captureView @src/a.ts";
+
+/// The alias tree whose binding file is `alias`.
+fn rn_alias_case(change: Change, alias: &'static str) -> Case {
+    Case::new(
+        change,
+        &[Language::TypeScript, Language::Swift, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, RN_CAPTURE_SWIFT)
+    .file(RN_CAPTURE_SHIM_FILE, RN_CAPTURE_SHIM)
+    .file(RN_CAPTURE_V2_SHIM_FILE, RN_CAPTURE_V2_SHIM)
+    .file(RN_ALIAS_FILE, alias)
+    .file(RN_HOOKS_FILE, RN_HOOKS)
+}
+
+/// W7-21 (Q5 case 4): another file binds the same name to another module,
+/// so the name names no module anywhere in the project: the hook's call,
+/// which the alias took to the Swift method at 0.95, falls to the imported
+/// constant, as a fresh index has it (the 0.6 fallback finds two Swift
+/// methods and answers nothing).
+pub fn react_native_alias_becomes_ambiguous() -> Case {
+    rn_alias_case(Change::AddCompetitor, RN_ALIAS)
+        .write(RN_ALIAS_RIVAL_FILE, RN_ALIAS_RIVAL)
+        .edge_metadata_before(
+            (RN_FINISH, "calls", RN_CAPTURE_FINALIZE),
+            "bridge",
+            "react-native",
+        )
+        .edge_after(RN_FINISH, "calls", RN_ALIAS_CONSTANT)
+        .no_edge_after(RN_FINISH, "calls", RN_CAPTURE_FINALIZE)
+}
+
+/// W7-21: the rival binding goes: the alias names its module again, and the
+/// call is the bridge's.
+pub fn react_native_alias_stops_being_ambiguous() -> Case {
+    rn_alias_case(Change::AddCompetitor, RN_ALIAS)
+        .file(RN_ALIAS_RIVAL_FILE, RN_ALIAS_RIVAL)
+        .remove(RN_ALIAS_RIVAL_FILE)
+        .edge_before(RN_FINISH, "calls", RN_ALIAS_CONSTANT)
+        .edge_metadata_after(
+            (RN_FINISH, "calls", RN_CAPTURE_FINALIZE),
+            "bridge",
+            "react-native",
+        )
+}
+
+/// W7-21 (Q5 case 5): the alias comes to bind the other module: the hook's
+/// call, an unchanged file's, follows it to the other Swift class.
+pub fn react_native_alias_is_retargeted() -> Case {
+    rn_alias_case(Change::ReexportEdit, RN_ALIAS)
+        .write(RN_ALIAS_FILE, RN_ALIAS_V2)
+        .edge_before(RN_FINISH, "calls", RN_CAPTURE_FINALIZE)
+        .edge_metadata_after(
+            (RN_FINISH, "calls", RN_CAPTURE_V2_FINALIZE),
+            "module",
+            "CaptureViewV2",
+        )
+        .no_edge_after(RN_FINISH, "calls", RN_CAPTURE_FINALIZE)
+}
+
+/// W7-21: the alias goes back to the first module.
+pub fn react_native_alias_is_retargeted_back() -> Case {
+    rn_alias_case(Change::ReexportEdit, RN_ALIAS_V2)
+        .write(RN_ALIAS_FILE, RN_ALIAS)
+        .edge_before(RN_FINISH, "calls", RN_CAPTURE_V2_FINALIZE)
+        .edge_metadata_after(
+            (RN_FINISH, "calls", RN_CAPTURE_FINALIZE),
+            "module",
+            "CaptureView",
+        )
+        .no_edge_after(RN_FINISH, "calls", RN_CAPTURE_V2_FINALIZE)
+}
+
+/// A Swift module whose shim exports one method by `RCT_EXTERN_METHOD`, a
+/// second Swift class with a method of the same name, and a JS call through
+/// `NativeModules`.
+const RN_SETTINGS_SWIFT: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n\n@objc(CaptureViewImpl)\nclass CaptureViewImpl: NSObject {\n  @objc func syncSettings() {}\n}\n";
+const RN_SETTINGS_SHIM: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n";
+const RN_SETTINGS_SHIM_EMPTY: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\n@end\n";
+const RN_SETTINGS_SHIM_REMAP: &str = "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_REMAP_MODULE(CaptureView, CaptureViewImpl, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n";
+const RN_SAVE_FILE: &str = "src/save.ts";
+const RN_SAVE: &str = "import { NativeModules } from 'react-native';\n\nexport function save() {\n  NativeModules.CaptureView.syncSettings();\n}\n";
+const RN_SAVE_FN: &str = "function save";
+const RN_SYNC_SETTINGS: &str = "method CaptureView::syncSettings";
+const RN_SYNC_SETTINGS_IMPL: &str = "method CaptureViewImpl::syncSettings";
+
+/// The `RCT_EXTERN` tree with the shim `shim`.
+fn rn_settings_case(change: Change, shim: &'static str) -> Case {
+    Case::new(
+        change,
+        &[Language::TypeScript, Language::Swift, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, RN_SETTINGS_SWIFT)
+    .file(RN_CAPTURE_SHIM_FILE, shim)
+    .file(RN_SAVE_FILE, RN_SAVE)
+}
+
+/// W7-21 (Q5 case 6): the shim stops exporting the method, which is no
+/// node: the module the call names lacks the method, so the bridge answers
+/// nothing, as a fresh index has it.
+pub fn react_native_extern_shim_drops_its_method() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM_EMPTY)
+        .edge_metadata_before(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "bridge",
+            "react-native",
+        )
+        .no_edge_after(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+}
+
+/// W7-21: the shim comes to export the method: the waiting call links.
+pub fn react_native_extern_shim_gains_its_method() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM_EMPTY)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "bridge",
+            "react-native",
+        )
+}
+
+/// W7-21 (Q5 case 6): the shim becomes `RCT_EXTERN_REMAP_MODULE`, the same
+/// JS module implemented by another class: the call moves to that class's
+/// method.
+pub fn react_native_extern_shim_becomes_a_remap_module() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM_REMAP)
+        .edge_before(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS_IMPL),
+            "module",
+            "CaptureView",
+        )
+        .no_edge_after(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+}
+
+/// W7-21: the shim goes back to `RCT_EXTERN_MODULE`.
+pub fn react_native_extern_shim_stops_being_a_remap_module() -> Case {
+    rn_settings_case(Change::BodyEdit, RN_SETTINGS_SHIM_REMAP)
+        .write(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+        .edge_before(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS_IMPL)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "module",
+            "CaptureView",
+        )
+        .no_edge_after(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS_IMPL)
+}
+
+/// The class the shim names, holding the exported method, and the same
+/// method under a class of another name: renaming the class keeps the
+/// method's name, line and exposure, so its node keeps its id, and only its
+/// qualified name moves.
+const RN_MOVE_SWIFT_IN: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n";
+const RN_MOVE_SWIFT_OUT: &str = "import Foundation\n\n@objc(CaptureView)\nclass CaptureViewOld: NSObject {\n  @objc func syncSettings() {}\n}\n";
+
+/// The tree whose Swift file is `swift`.
+fn rn_move_case(swift: &'static str) -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::TypeScript, Language::Swift, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, swift)
+    .file(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+    .file(RN_SAVE_FILE, RN_SAVE)
+}
+
+/// W7-21 (round 1 of the gate): the class around the exported method is
+/// renamed away from the class the shim names: the method leaves the
+/// module, and the call, an unchanged file's, links to nothing.
+pub fn react_native_extern_method_moves_out_of_its_class() -> Case {
+    rn_move_case(RN_MOVE_SWIFT_IN)
+        .write(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_OUT)
+        .edge_before(RN_SAVE_FN, "calls", RN_SYNC_SETTINGS)
+        .no_edge_after(RN_SAVE_FN, "calls", "method CaptureViewOld::syncSettings")
+}
+
+/// W7-21: the class is renamed to the one the shim names: the call, waiting
+/// unresolved in an unchanged file, links.
+pub fn react_native_extern_method_moves_into_its_class() -> Case {
+    rn_move_case(RN_MOVE_SWIFT_OUT)
+        .write(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_IN)
+        .edge_metadata_after(
+            (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+            "bridge",
+            "react-native",
+        )
+}
+
+/// An `RCT_REMAP_METHOD` whose native selector no Objective-C method has
+/// yet, and the file that comes to declare one.
+const RN_PLAYER_FILE: &str = "ios/Player.m";
+const RN_PLAYER: &str = "#import <React/RCTBridgeModule.h>\n\n@implementation Player\n\nRCT_EXPORT_MODULE(Player)\n\nRCT_REMAP_METHOD(pause, pauseInferenceNow:(BOOL)flag)\n{\n}\n\n@end\n";
+const RN_ENGINE_FILE: &str = "ios/Engine.m";
+const RN_ENGINE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Engine\n- (void)pauseInferenceNow:(BOOL)flag {\n}\n@end\n";
+const RN_STOP_FILE: &str = "src/stop.ts";
+const RN_STOP: &str = "import { NativeModules } from 'react-native';\n\nexport function stop() {\n  NativeModules.Player.pause(true);\n}\n";
+const RN_PAUSE_NOW: &str = "method Engine::pauseInferenceNow:";
+
+/// W7-21 (Q5 case 7): the Objective-C method the remap names appears in
+/// another file: `pause`, the call's tail, is not its name, and the call
+/// links to it.
+pub fn react_native_remap_target_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_PLAYER_FILE, RN_PLAYER)
+    .file(RN_STOP_FILE, RN_STOP)
+    .write(RN_ENGINE_FILE, RN_ENGINE)
+    .named_before("method", "pause")
+    .edge_metadata_after(("function stop", "calls", RN_PAUSE_NOW), "module", "Player")
+}
+
+/// W7-21: the method's file is deleted: the call waits again.
+pub fn react_native_remap_target_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_PLAYER_FILE, RN_PLAYER)
+    .file(RN_STOP_FILE, RN_STOP)
+    .file(RN_ENGINE_FILE, RN_ENGINE)
+    .remove(RN_ENGINE_FILE)
+    .edge_metadata_before(("function stop", "calls", RN_PAUSE_NOW), "module", "Player")
+    .named_after("method", "pause")
+}
+
+/// A Java module exporting `add` by `@ReactMethod`, written on the method's
+/// own line so the method keeps its line without it, and a JS call.
+const RN_CALC_JAVA_FILE: &str = "android/app/src/main/java/com/app/CalcModule.java";
+const RN_CALC_JAVA: &str = "package com.app;\n\nimport com.facebook.react.bridge.ReactContextBaseJavaModule;\nimport com.facebook.react.bridge.ReactMethod;\n\npublic class CalcModule extends ReactContextBaseJavaModule {\n  @Override\n  public String getName() {\n    return \"Calc\";\n  }\n\n  @ReactMethod public void add(int a, int b) {\n  }\n}\n";
+const RN_CALC_JAVA_PLAIN: &str = "package com.app;\n\nimport com.facebook.react.bridge.ReactContextBaseJavaModule;\nimport com.facebook.react.bridge.ReactMethod;\n\npublic class CalcModule extends ReactContextBaseJavaModule {\n  @Override\n  public String getName() {\n    return \"Calc\";\n  }\n\n  public void add(int a, int b) {\n  }\n}\n";
+const RN_SUM_FILE: &str = "src/sum.ts";
+const RN_SUM: &str = "import { NativeModules } from 'react-native';\n\nexport function sum() {\n  NativeModules.Calc.add(1, 2);\n}\n";
+const RN_CALC_ADD_JAVA: &str = "method com.app::CalcModule::add";
+
+/// The JVM tree whose module is `java`.
+fn rn_jvm_case(java: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Java])
+        .file("package.json", RN_PACKAGE)
+        .file(RN_CALC_JAVA_FILE, java)
+        .file(RN_SUM_FILE, RN_SUM)
+}
+
+/// W7-21: the Java method loses `@ReactMethod`: the module no longer
+/// exports it, and the JS call links to nothing.
+pub fn react_native_jvm_method_loses_its_annotation() -> Case {
+    rn_jvm_case(RN_CALC_JAVA)
+        .write(RN_CALC_JAVA_FILE, RN_CALC_JAVA_PLAIN)
+        .edge_metadata_before(
+            ("function sum", "calls", RN_CALC_ADD_JAVA),
+            "module",
+            "Calc",
+        )
+        .no_edge_after("function sum", "calls", RN_CALC_ADD_JAVA)
+}
+
+/// W7-21: the Java method gains `@ReactMethod`: the waiting call links.
+pub fn react_native_jvm_method_gains_its_annotation() -> Case {
+    rn_jvm_case(RN_CALC_JAVA_PLAIN)
+        .write(RN_CALC_JAVA_FILE, RN_CALC_JAVA)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_JAVA),
+            "module",
+            "Calc",
+        )
+}
+
+/// A TurboModule spec that names `Calc` and declares `add`, the
+/// Objective-C++ class implementing it, and the same JS call.
+const RN_SPEC_FILE: &str = "src/NativeCalc.ts";
+const RN_SPEC: &str = "import type { TurboModule } from 'react-native';\nimport { TurboModuleRegistry } from 'react-native';\n\nexport interface Spec extends TurboModule {\n  add(a: number, b: number): number;\n}\n\nexport default TurboModuleRegistry.getEnforcing<Spec>('Calc');\n";
+const RN_SPEC_EMPTY: &str = "import type { TurboModule } from 'react-native';\nimport { TurboModuleRegistry } from 'react-native';\n\nexport interface Spec extends TurboModule {\n}\n\nexport default TurboModuleRegistry.getEnforcing<Spec>('Calc');\n";
+const RN_CALC_MM_FILE: &str = "ios/Calc.mm";
+const RN_CALC_MM: &str = "#import <Foundation/Foundation.h>\n\n@implementation Calc\n- (NSNumber *)add:(double)a b:(double)b {\n  return nil;\n}\n@end\n";
+const RN_CALC_ADD_OBJC: &str = "method Calc::add:b:";
+
+/// The TurboModule tree whose spec is `spec`.
+fn rn_spec_case(spec: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::ObjC])
+        .file("package.json", RN_PACKAGE)
+        .file(RN_SPEC_FILE, spec)
+        .file(RN_CALC_MM_FILE, RN_CALC_MM)
+        .file(RN_SUM_FILE, RN_SUM)
+}
+
+/// W7-21: the spec drops `add`: the module has no `add`, and the call links
+/// to nothing.
+pub fn react_native_turbo_spec_drops_a_method() -> Case {
+    rn_spec_case(RN_SPEC)
+        .write(RN_SPEC_FILE, RN_SPEC_EMPTY)
+        .edge_metadata_before(
+            ("function sum", "calls", RN_CALC_ADD_OBJC),
+            "module",
+            "Calc",
+        )
+        .no_edge_after("function sum", "calls", RN_CALC_ADD_OBJC)
+}
+
+/// W7-21: the spec comes to declare `add`: the call links to the
+/// Objective-C++ method.
+pub fn react_native_turbo_spec_gains_a_method() -> Case {
+    rn_spec_case(RN_SPEC_EMPTY)
+        .write(RN_SPEC_FILE, RN_SPEC)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_OBJC),
+            "module",
+            "Calc",
+        )
+}
+
+/// A Swift call whose name bridges to `fetchEntryForKey:`, before and after
+/// `Cache.m` declares it, and a second declaration in a path that sorts
+/// first.
+const SWIFT_OBJC_CACHE_FILE: &str = "Sources/Cache.m";
+const SWIFT_OBJC_CACHE_EMPTY: &str =
+    "#import <Foundation/Foundation.h>\n\n@implementation Cache\n- (void)clear {\n}\n@end\n";
+const SWIFT_OBJC_CACHE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Cache\n- (void)clear {\n}\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n@end\n";
+const SWIFT_OBJC_STORE_FILE: &str = "Lib/Store.m";
+const SWIFT_OBJC_STORE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Store\n- (id)fetchEntryForKey:(NSString *)key {\n  return nil;\n}\n@end\n";
+const SWIFT_OBJC_CALLER_FILE: &str = "Sources/Caller.swift";
+const SWIFT_OBJC_CALLER: &str =
+    "import Foundation\n\nfunc load(cache: Cache) {\n  _ = cache.fetchEntry(forKey: \"x\")\n}\n";
+const SWIFT_OBJC_LOAD: &str = "function load";
+const SWIFT_OBJC_FETCH: &str = "method Cache::fetchEntryForKey:";
+
+/// The Swift-ObjC tree whose `Cache.m` is `cache`.
+fn swift_objc_case(change: Change, cache: &'static str) -> Case {
+    Case::new(change, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_CACHE_FILE, cache)
+        .file(SWIFT_OBJC_CALLER_FILE, SWIFT_OBJC_CALLER)
+}
+
+/// W7-21 (Q5 case 8): `Cache.m` comes to declare `fetchEntryForKey:`: the
+/// Swift call `cache.fetchEntry`, waiting under a tail that is not the new
+/// name, links to it at 0.6.
+pub fn swift_objc_bridge_target_appears() -> Case {
+    swift_objc_case(Change::BodyEdit, SWIFT_OBJC_CACHE_EMPTY)
+        .write(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21: the method goes: the Swift call waits again.
+pub fn swift_objc_bridge_target_goes() -> Case {
+    swift_objc_case(Change::BodyEdit, SWIFT_OBJC_CACHE)
+        .write(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE_EMPTY)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21 (Q5 case 10, KEEP-RUST): a second `fetchEntryForKey:` appears in
+/// a path that sorts first: the name bridges to two methods, and the call
+/// links to neither.
+pub fn swift_objc_bridge_target_gains_a_namesake() -> Case {
+    swift_objc_case(Change::AddCompetitor, SWIFT_OBJC_CACHE)
+        .write(SWIFT_OBJC_STORE_FILE, SWIFT_OBJC_STORE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", "method Store::fetchEntryForKey:")
+}
+
+/// W7-21: the namesake goes: the call links to the one left.
+pub fn swift_objc_bridge_target_loses_its_namesake() -> Case {
+    swift_objc_case(Change::AddCompetitor, SWIFT_OBJC_CACHE)
+        .file(SWIFT_OBJC_STORE_FILE, SWIFT_OBJC_STORE)
+        .remove(SWIFT_OBJC_STORE_FILE)
+        .edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// A Swift method an Objective-C message bridges to once it is exposed:
+/// `@objc` written on its own line or on the line above, which a Swift node
+/// starts at, so the node keeps its line either way.
+const SWIFT_OBJC_CHART_FILE: &str = "Sources/Chart.swift";
+const SWIFT_OBJC_CHART_PLAIN: &str = "import Foundation\n\nclass Chart: NSObject {\n  func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n";
+const SWIFT_OBJC_CHART_SAME_LINE: &str = "import Foundation\n\nclass Chart: NSObject {\n  @objc func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n";
+const SWIFT_OBJC_CHART_LINE_ABOVE: &str = "import Foundation\n\nclass Chart: NSObject {\n  @objc\n  func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n}\n";
+const SWIFT_OBJC_ANIMATOR_FILE: &str = "Sources/Animator.m";
+const SWIFT_OBJC_ANIMATOR: &str = "#import <Foundation/Foundation.h>\n\n@implementation Animator\n- (void)run:(Chart *)chart {\n  [chart animateWithXAxisDuration:1.0 yAxisDuration:2.0];\n}\n@end\n";
+const SWIFT_OBJC_RUN: &str = "method Animator::run:";
+const SWIFT_OBJC_ANIMATE: &str = "method Chart::animate";
+
+/// The exposure tree whose Swift file is `chart`.
+fn swift_objc_exposure_case(chart: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_CHART_FILE, chart)
+        .file(SWIFT_OBJC_ANIMATOR_FILE, SWIFT_OBJC_ANIMATOR)
+}
+
+/// W7-21 (Q5 case 9): the Swift method gains `@objc` on its own line: the
+/// Objective-C message, waiting unresolved in an unchanged file, links.
+pub fn swift_objc_method_is_exposed_on_its_line() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_PLAIN)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_SAME_LINE)
+        .edge_metadata_after(
+            (SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21: the method loses `@objc` from its line: the message waits again.
+pub fn swift_objc_method_is_hidden_on_its_line() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_SAME_LINE)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_PLAIN)
+        .edge_before(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+        .no_edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+}
+
+/// W7-21 (Q5 case 9): `@objc` appears on a line of its own above the
+/// method: the message links.
+pub fn swift_objc_method_is_exposed_on_the_line_above() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_PLAIN)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_LINE_ABOVE)
+        .edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+}
+
+/// W7-21: the line above goes: the message waits again.
+pub fn swift_objc_method_is_hidden_on_the_line_above() -> Case {
+    swift_objc_exposure_case(SWIFT_OBJC_CHART_LINE_ABOVE)
+        .write(SWIFT_OBJC_CHART_FILE, SWIFT_OBJC_CHART_PLAIN)
+        .edge_before(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+        .no_edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_ANIMATE)
+}
+
+/// A root `package.json` that names `expo-modules-core`, which the Expo
+/// modules resolvers are detected by.
+const EXPO_PACKAGE: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"expo-modules-core\":\"^1.0.0\"}}\n";
+
+/// Two Expo modules with one function each, a file that binds the default
+/// export to the first by name, and a component that calls the function
+/// through the default import.
+const EXPO_CAMERA_SWIFT_FILE: &str = "ios/CameraModule.swift";
+const EXPO_CAMERA_SWIFT: &str = "import ExpoModulesCore\n\npublic class CameraModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoCamera\")\n    AsyncFunction(\"takePictureAsync\") {\n    }\n  }\n}\n";
+const EXPO_CAMERA2_SWIFT_FILE: &str = "ios/Camera2Module.swift";
+const EXPO_CAMERA2_SWIFT: &str = "import ExpoModulesCore\n\npublic class Camera2Module: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoCamera2\")\n    AsyncFunction(\"takePictureAsync\") {\n    }\n  }\n}\n";
+const EXPO_CAMERA_KOTLIN_FILE: &str = "android/src/main/java/expo/modules/camera/CameraModule.kt";
+const EXPO_CAMERA_KOTLIN: &str = "package expo.modules.camera\n\nimport expo.modules.kotlin.modules.Module\nimport expo.modules.kotlin.modules.ModuleDefinition\n\nclass CameraModule : Module() {\n  override fun definition() = ModuleDefinition {\n    Name(\"ExpoCamera\")\n    AsyncFunction(\"takePictureAsync\") {\n    }\n  }\n}\n";
+const EXPO_MANAGER_FILE: &str = "src/ExpoCameraManager.ts";
+const EXPO_MANAGER: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<CameraNativeModule>('ExpoCamera');\n";
+const EXPO_MANAGER_CAMERA2: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<CameraNativeModule>('ExpoCamera2');\n";
+const EXPO_VIEW_FILE: &str = "src/CameraView.tsx";
+const EXPO_VIEW: &str = "import CameraManager from './ExpoCameraManager';\n\nexport function takePhoto() {\n  CameraManager.takePictureAsync();\n}\n";
+const EXPO_TAKE_PHOTO: &str = "function takePhoto";
+const EXPO_TAKE_SWIFT: &str = "method ios/CameraModule.swift::ExpoCamera.takePictureAsync";
+const EXPO_TAKE_SWIFT2: &str = "method ios/Camera2Module.swift::ExpoCamera2.takePictureAsync";
+const EXPO_TAKE_KOTLIN: &str =
+    "method android/src/main/java/expo/modules/camera/CameraModule.kt::ExpoCamera.takePictureAsync";
+
+/// The two-module Expo tree whose binding file is `manager`.
+fn expo_module_case(manager: &'static str) -> Case {
+    Case::new(
+        Change::ReexportEdit,
+        &[Language::TypeScript, Language::Tsx, Language::Swift],
+    )
+    .file("package.json", EXPO_PACKAGE)
+    .file(EXPO_CAMERA_SWIFT_FILE, EXPO_CAMERA_SWIFT)
+    .file(EXPO_CAMERA2_SWIFT_FILE, EXPO_CAMERA2_SWIFT)
+    .file(EXPO_MANAGER_FILE, manager)
+    .file(EXPO_VIEW_FILE, EXPO_VIEW)
+}
+
+/// W7-21 (Q5 case 11): the binding file comes to name the other module:
+/// the component's call, an unchanged file's, follows it.
+pub fn expo_binding_names_another_module() -> Case {
+    expo_module_case(EXPO_MANAGER)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER_CAMERA2)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+        .edge_metadata_after(
+            (EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT2),
+            "framework",
+            "expo-modules-js",
+        )
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+}
+
+/// W7-21: the binding goes back to the first module.
+pub fn expo_binding_names_its_module_again() -> Case {
+    expo_module_case(EXPO_MANAGER_CAMERA2)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT2)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT2)
+}
+
+/// A binding that names no module the project implements, so its type
+/// argument answers, and two interfaces that declare the function.
+const EXPO_TYPES_FILE: &str = "src/Camera.types.ts";
+const EXPO_TYPES: &str = "export interface CameraNativeModule {\n  takePictureAsync(): Promise<void>;\n}\n\nexport interface LegacyNativeModule {\n  takePictureAsync(): Promise<void>;\n}\n";
+const EXPO_MANAGER_TYPED: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<CameraNativeModule>('Missing');\n";
+const EXPO_MANAGER_TYPED_LEGACY: &str = "import { requireNativeModule } from 'expo-modules-core';\n\nexport default requireNativeModule<LegacyNativeModule>('Missing');\n";
+const EXPO_TAKE_TYPED: &str = "method CameraNativeModule::takePictureAsync";
+const EXPO_TAKE_TYPED_LEGACY: &str = "method LegacyNativeModule::takePictureAsync";
+
+/// The type-fallback tree whose binding file is `manager`.
+fn expo_type_case(manager: &'static str) -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", EXPO_PACKAGE)
+        .file(EXPO_TYPES_FILE, EXPO_TYPES)
+        .file(EXPO_MANAGER_FILE, manager)
+        .file(EXPO_VIEW_FILE, EXPO_VIEW)
+}
+
+/// W7-21 (Q5 case 11): the binding's type argument changes: the call, an
+/// unchanged file's, follows it to the other interface's function.
+pub fn expo_binding_type_argument_changes() -> Case {
+    expo_type_case(EXPO_MANAGER_TYPED)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER_TYPED_LEGACY)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED)
+        .edge_metadata_after(
+            (EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED_LEGACY),
+            "framework",
+            "expo-modules-js",
+        )
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED)
+}
+
+/// W7-21: the type argument changes back.
+pub fn expo_binding_type_argument_changes_back() -> Case {
+    expo_type_case(EXPO_MANAGER_TYPED_LEGACY)
+        .write(EXPO_MANAGER_FILE, EXPO_MANAGER_TYPED)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED_LEGACY)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED)
+        .no_edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_TYPED_LEGACY)
+}
+
+/// The one-module Expo tree, with a Swift implementation only.
+fn expo_kotlin_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[
+            Language::TypeScript,
+            Language::Tsx,
+            Language::Swift,
+            Language::Kotlin,
+        ],
+    )
+    .file("package.json", EXPO_PACKAGE)
+    .file(EXPO_CAMERA_SWIFT_FILE, EXPO_CAMERA_SWIFT)
+    .file(EXPO_MANAGER_FILE, EXPO_MANAGER)
+    .file(EXPO_VIEW_FILE, EXPO_VIEW)
+}
+
+/// W7-21 (Q5 case 12): the module's Kotlin implementation appears: the call
+/// keeps the Swift function as its target and gains the Kotlin one beside
+/// it, and the two platforms pair.
+pub fn expo_module_gains_its_kotlin_implementation() -> Case {
+    expo_kotlin_case()
+        .write(EXPO_CAMERA_KOTLIN_FILE, EXPO_CAMERA_KOTLIN)
+        .edge_throughout(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_KOTLIN)
+        .edge_metadata_after(
+            (EXPO_TAKE_SWIFT, "calls", EXPO_TAKE_KOTLIN),
+            "synthesizedBy",
+            "expo-cross-platform",
+        )
+}
+
+/// W7-21: the Kotlin implementation is deleted: the call keeps the Swift
+/// one.
+pub fn expo_module_loses_its_kotlin_implementation() -> Case {
+    expo_kotlin_case()
+        .file(EXPO_CAMERA_KOTLIN_FILE, EXPO_CAMERA_KOTLIN)
+        .remove(EXPO_CAMERA_KOTLIN_FILE)
+        .edge_before(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_KOTLIN)
+        .edge_after(EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT)
+}
+
+/// A Fabric component spec outside every workspace root and its native
+/// view, with no root `package.json`: only a manifest under one of the
+/// four roots Fabric lists can show React Native, and no indexed file is
+/// under it.
+const FABRIC_SPEC_FILE: &str = "src/MyViewNativeComponent.ts";
+const FABRIC_SPEC: &str = "import type { ViewProps } from 'react-native';\nimport codegenNativeComponent from 'react-native/Libraries/Utilities/codegenNativeComponent';\n\nexport interface NativeProps extends ViewProps {\n  color?: string;\n}\n\nexport default codegenNativeComponent<NativeProps>('MyView');\n";
+const FABRIC_VIEW_FILE: &str = "ios/MyViewComponentView.mm";
+const FABRIC_VIEW: &str = "#import <UIKit/UIKit.h>\n\n@implementation MyViewComponentView\n- (void)prepareForRecycle {\n}\n@end\n";
+const FABRIC_MANIFEST_FILE: &str = "packages/native/package.json";
+const FABRIC_MANIFEST: &str =
+    "{\"name\":\"native\",\"peerDependencies\":{\"react-native\":\"*\"}}\n";
+const FABRIC_MANIFEST_PLAIN: &str =
+    "{\"name\":\"native\",\"peerDependencies\":{\"react\":\"*\"}}\n";
+const FABRIC_COMPONENT: &str = "component src/MyViewNativeComponent.ts::MyView";
+const FABRIC_NATIVE_VIEW: &str = "class MyViewComponentView";
+
+/// The Fabric tree.
+fn fabric_case() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript, Language::ObjC])
+        .file(FABRIC_SPEC_FILE, FABRIC_SPEC)
+        .file(FABRIC_VIEW_FILE, FABRIC_VIEW)
+}
+
+/// W7-21 (Q5 case 3): a workspace package's manifest that names
+/// `react-native` appears under `packages/`: Fabric is detected, the spec's
+/// component appears and pairs with its native view.
+pub fn fabric_workspace_manifest_appears() -> Case {
+    fabric_case()
+        .write(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST)
+        .detected_before("fabric-view", false)
+        .detected_after("fabric-view", true)
+        .edge_metadata_after(
+            (FABRIC_COMPONENT, "calls", FABRIC_NATIVE_VIEW),
+            "synthesizedBy",
+            "fabric-native-impl",
+        )
+}
+
+/// W7-21: the manifest is deleted, leaving its directory empty: Fabric is
+/// not detected, and the component goes.
+pub fn fabric_workspace_manifest_is_deleted() -> Case {
+    fabric_case()
+        .file(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST)
+        .remove(FABRIC_MANIFEST_FILE)
+        .detected_before("fabric-view", true)
+        .edge_before(FABRIC_COMPONENT, "calls", FABRIC_NATIVE_VIEW)
+        .detected_after("fabric-view", false)
+}
+
+/// W7-21: the manifest comes to name `react-native` in place: Fabric is
+/// detected.
+pub fn fabric_workspace_manifest_comes_to_name_react_native() -> Case {
+    fabric_case()
+        .file(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST_PLAIN)
+        .write(FABRIC_MANIFEST_FILE, FABRIC_MANIFEST)
+        .detected_before("fabric-view", false)
+        .detected_after("fabric-view", true)
+        .edge_after(FABRIC_COMPONENT, "calls", FABRIC_NATIVE_VIEW)
+}
+
+/// A JS caller that comes to call through the bridge while every native
+/// file stays as it was: a sync resolves the new call from the rows the
+/// unchanged files' facts were recorded in, where a fresh index reads their
+/// text.
+const RN_SUM_EMPTY: &str =
+    "import { NativeModules } from 'react-native';\n\nexport function sum() {\n  return 0;\n}\n";
+const RN_CALC_EXPORT: &str = "#import <React/RCTBridgeModule.h>\n\n@implementation CalcModule\n\nRCT_EXPORT_MODULE(Calc)\n\nRCT_EXPORT_METHOD(add:(double)a b:(double)b)\n{\n}\n\n@end\n";
+const RN_CALC_KOTLIN_FILE: &str = "android/app/src/main/java/com/app/CalcModule.kt";
+const RN_CALC_KOTLIN: &str = "package com.app\n\nimport com.facebook.react.bridge.ReactApplicationContext\nimport com.facebook.react.bridge.ReactContextBaseJavaModule\nimport com.facebook.react.bridge.ReactMethod\n\nclass CalcModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {\n  override fun getName() = \"Calc\"\n\n  @ReactMethod\n  fun add(a: Int, b: Int) {\n  }\n}\n";
+
+/// The tree of `files` whose JS caller `src/sum.ts` comes to call
+/// `NativeModules.Calc.add`.
+fn rn_call_appears(languages: &[Language], files: &[(&'static str, &'static str)]) -> Case {
+    files
+        .iter()
+        .fold(
+            Case::new(Change::BodyEdit, languages).file("package.json", RN_PACKAGE),
+            |case, (path, text)| case.file(path, text),
+        )
+        .file(RN_SUM_FILE, RN_SUM_EMPTY)
+        .write(RN_SUM_FILE, RN_SUM)
+}
+
+/// W7-21: the call appears beside an unchanged Objective-C export module.
+pub fn react_native_call_appears_beside_an_unchanged_export() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::ObjC],
+        &[("ios/CalcModule.m", RN_CALC_EXPORT)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", "method ios/CalcModule.m::Calc.add"),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged Objective-C++ export module.
+pub fn react_native_call_appears_beside_an_unchanged_objcpp_export() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::ObjC],
+        &[("ios/CalcModule.mm", RN_CALC_EXPORT)],
+    )
+    .edge_metadata_after(
+        (
+            "function sum",
+            "calls",
+            "method ios/CalcModule.mm::Calc.add",
+        ),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged Java module.
+pub fn react_native_call_appears_beside_an_unchanged_java_module() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::Java],
+        &[(RN_CALC_JAVA_FILE, RN_CALC_JAVA)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", RN_CALC_ADD_JAVA),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged Kotlin module.
+pub fn react_native_call_appears_beside_an_unchanged_kotlin_module() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::Kotlin],
+        &[(RN_CALC_KOTLIN_FILE, RN_CALC_KOTLIN)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", "method com.app::CalcModule::add"),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged TurboModule spec and its
+/// Objective-C++ implementation.
+pub fn react_native_call_appears_beside_an_unchanged_spec() -> Case {
+    rn_call_appears(
+        &[Language::TypeScript, Language::ObjC],
+        &[(RN_SPEC_FILE, RN_SPEC), (RN_CALC_MM_FILE, RN_CALC_MM)],
+    )
+    .edge_metadata_after(
+        ("function sum", "calls", RN_CALC_ADD_OBJC),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the call appears beside an unchanged `RCT_EXTERN` shim of a Swift
+/// module.
+pub fn react_native_call_appears_beside_an_unchanged_shim() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Swift, Language::ObjC])
+        .file("package.json", RN_PACKAGE)
+        .file(RN_CAPTURE_SWIFT_FILE, RN_SETTINGS_SWIFT)
+        .file(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+        .file(
+            RN_SAVE_FILE,
+            "import { NativeModules } from 'react-native';\n\nexport function save() {\n  return 0;\n}\n",
+        )
+        .write(RN_SAVE_FILE, RN_SAVE)
+        .edge_metadata_after((RN_SAVE_FN, "calls", RN_SYNC_SETTINGS), "bridge", "react-native")
+}
+
+/// W7-21: the hook comes to call through an alias another, unchanged file
+/// declares.
+pub fn react_native_call_appears_through_an_unchanged_alias() -> Case {
+    rn_alias_case(Change::BodyEdit, RN_ALIAS)
+        .file(
+            "src/hooks/use-later.ts",
+            "import { captureView } from '../a';\n\nexport function later() {\n  return 0;\n}\n",
+        )
+        .write(
+            "src/hooks/use-later.ts",
+            "import { captureView } from '../a';\n\nexport function later() {\n  captureView.finalizeCaptureSession();\n}\n",
+        )
+        .edge_metadata_after(("function later", "calls", RN_CAPTURE_FINALIZE), "module", "CaptureView")
+}
+
+/// W7-21: the component comes to call through a binding an unchanged file
+/// exports.
+pub fn expo_call_appears_beside_an_unchanged_binding() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx, Language::Swift])
+        .file("package.json", EXPO_PACKAGE)
+        .file(EXPO_CAMERA_SWIFT_FILE, EXPO_CAMERA_SWIFT)
+        .file(EXPO_MANAGER_FILE, EXPO_MANAGER)
+        .file(
+            EXPO_VIEW_FILE,
+            "import CameraManager from './ExpoCameraManager';\n\nexport function takePhoto() {\n  return CameraManager;\n}\n",
+        )
+        .write(EXPO_VIEW_FILE, EXPO_VIEW)
+        .edge_metadata_after(
+            (EXPO_TAKE_PHOTO, "calls", EXPO_TAKE_SWIFT),
+            "framework",
+            "expo-modules-js",
+        )
+}
+
+/// W7-21: the Objective-C++ class implementing a TurboModule spec appears:
+/// `add:b:` is not the call's tail `add`, and the call links to it.
+pub fn react_native_turbo_implementation_appears() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_SPEC_FILE, RN_SPEC)
+    .file(RN_SUM_FILE, RN_SUM)
+    .write(RN_CALC_MM_FILE, RN_CALC_MM)
+    .edge_metadata_after(
+        ("function sum", "calls", RN_CALC_ADD_OBJC),
+        "module",
+        "Calc",
+    )
+}
+
+/// W7-21: the implementation is deleted: the call waits again.
+pub fn react_native_turbo_implementation_is_deleted() -> Case {
+    Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_SPEC_FILE, RN_SPEC)
+    .file(RN_SUM_FILE, RN_SUM)
+    .file(RN_CALC_MM_FILE, RN_CALC_MM)
+    .remove(RN_CALC_MM_FILE)
+    .edge_metadata_before(
+        ("function sum", "calls", RN_CALC_ADD_OBJC),
+        "module",
+        "Calc",
+    )
+    .named_after("method", "add")
+}
+
+/// More unresolved `….syncSettings` calls than one tail retries in a sync:
+/// CFML calls, which no bridge reads.
+static UNTYPED_SYNC_SETTINGS_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.syncSettings({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// W7-21 (owner change 4): the class is renamed to the one the shim names
+/// beside more parked `….syncSettings` calls than one tail retries: the
+/// Swift rows move the call, an unchanged file's, uncapped.
+pub fn react_native_extern_method_moves_into_its_class_past_the_tail_ceiling() -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[
+            Language::TypeScript,
+            Language::Swift,
+            Language::ObjC,
+            Language::Cfml,
+        ],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_OUT)
+    .file(RN_CAPTURE_SHIM_FILE, RN_SETTINGS_SHIM)
+    .file(RN_SAVE_FILE, RN_SAVE)
+    .file("noise/Noise.cfc", UNTYPED_SYNC_SETTINGS_CALLS.as_str())
+    .write(RN_CAPTURE_SWIFT_FILE, RN_MOVE_SWIFT_IN)
+    .edge_metadata_after(
+        (RN_SAVE_FN, "calls", RN_SYNC_SETTINGS),
+        "bridge",
+        "react-native",
+    )
+}
+
+/// A top-level Swift function an Objective-C message bridges to once
+/// `@objc` exposes it: a function is the bridge's as a method is.
+const SWIFT_OBJC_EASING_FILE: &str = "Sources/Easing.swift";
+const SWIFT_OBJC_EASING_PLAIN: &str =
+    "import Foundation\n\nfunc animate(xAxisDuration: Double, yAxisDuration: Double) {}\n";
+const SWIFT_OBJC_EASING_EXPOSED: &str =
+    "import Foundation\n\n@objc func animate(xAxisDuration: Double, yAxisDuration: Double) {}\n";
+const SWIFT_OBJC_EASE: &str = "function animate";
+
+/// The function tree whose Swift file is `easing`.
+fn swift_objc_function_case(easing: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_EASING_FILE, easing)
+        .file(SWIFT_OBJC_ANIMATOR_FILE, SWIFT_OBJC_ANIMATOR)
+}
+
+/// W7-21: a top-level Swift function gains `@objc` on its line: the
+/// Objective-C message, waiting unresolved in an unchanged file, links.
+pub fn swift_objc_function_is_exposed_on_its_line() -> Case {
+    swift_objc_function_case(SWIFT_OBJC_EASING_PLAIN)
+        .write(SWIFT_OBJC_EASING_FILE, SWIFT_OBJC_EASING_EXPOSED)
+        .edge_metadata_after(
+            (SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_EASE),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// W7-21: the function loses `@objc`: the message waits again.
+pub fn swift_objc_function_is_hidden_on_its_line() -> Case {
+    swift_objc_function_case(SWIFT_OBJC_EASING_EXPOSED)
+        .write(SWIFT_OBJC_EASING_FILE, SWIFT_OBJC_EASING_PLAIN)
+        .edge_before(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_EASE)
+        .no_edge_after(SWIFT_OBJC_RUN, "calls", SWIFT_OBJC_EASE)
+}
+
+/// More unresolved `….add` calls than one tail retries in a sync: CFML
+/// calls, which no bridge reads.
+static UNTYPED_ADD_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("component {\n  function noise() {\n");
+    for index in 0..501 {
+        text.push_str(&format!("    n{index}.add({index});\n"));
+    }
+    text.push_str("    return 0;\n  }\n}\n");
+    text
+});
+
+/// A Kotlin and a Java TurboModule implementation, before and after they
+/// declare the spec's `add` (no `@ReactMethod`: the spec's method reaches
+/// it by name). The class is there before: a file that appears sends the
+/// JavaScript files down another lane whole.
+const RN_CALC_KT_FILE: &str = "android/app/src/main/java/com/app/CalcModule.kt";
+const RN_CALC_KT_EMPTY: &str = "package com.app\n\nclass CalcModule(context: ReactApplicationContext) : NativeCalcSpec(context) {\n  fun other() {}\n}\n";
+const RN_CALC_KT: &str = "package com.app\n\nclass CalcModule(context: ReactApplicationContext) : NativeCalcSpec(context) {\n  fun other() {}\n  override fun add(a: Double, b: Double): Double = a + b\n}\n";
+const RN_CALC_ADD_KOTLIN: &str = "method com.app::CalcModule::add";
+const RN_CALC_JAVA_TURBO_EMPTY: &str = "package com.app;\n\npublic class CalcModule extends NativeCalcSpec {\n  public void other() {\n  }\n}\n";
+const RN_CALC_JAVA_TURBO: &str = "package com.app;\n\npublic class CalcModule extends NativeCalcSpec {\n  public void other() {\n  }\n\n  @Override\n  public double add(double a, double b) {\n    return a + b;\n  }\n}\n";
+/// The TurboModule tree beside more parked `….add` calls than one tail
+/// retries.
+fn rn_turbo_ceiling_case(languages: &[Language]) -> Case {
+    Case::new(Change::BodyEdit, languages)
+        .file("package.json", RN_PACKAGE)
+        .file(RN_SPEC_FILE, RN_SPEC)
+        .file(RN_SUM_FILE, RN_SUM)
+        .file("noise/Noise.cfc", UNTYPED_ADD_CALLS.as_str())
+}
+
+/// W7-21: a Kotlin implementation comes to declare the spec's method beside
+/// more parked `….add` calls than one tail retries: the lane's JVM method
+/// seeds link the waiting call, uncapped.
+pub fn react_native_turbo_kotlin_implementation_gains_its_method_past_the_tail_ceiling() -> Case {
+    rn_turbo_ceiling_case(&[Language::TypeScript, Language::Kotlin, Language::Cfml])
+        .file(RN_CALC_KT_FILE, RN_CALC_KT_EMPTY)
+        .write(RN_CALC_KT_FILE, RN_CALC_KT)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_KOTLIN),
+            "module",
+            "Calc",
+        )
+}
+
+/// W7-21: a Java implementation likewise.
+pub fn react_native_turbo_java_implementation_gains_its_method_past_the_tail_ceiling() -> Case {
+    rn_turbo_ceiling_case(&[Language::TypeScript, Language::Java, Language::Cfml])
+        .file(RN_CALC_JAVA_FILE, RN_CALC_JAVA_TURBO_EMPTY)
+        .write(RN_CALC_JAVA_FILE, RN_CALC_JAVA_TURBO)
+        .edge_metadata_after(
+            ("function sum", "calls", RN_CALC_ADD_JAVA),
+            "module",
+            "Calc",
+        )
+}
+
+/// Two files binding one local name to two Expo modules, before and after
+/// each calls through it.
+const EXPO_X_MODULE_FILE: &str = "ios/XModule.swift";
+const EXPO_X_MODULE: &str = "import ExpoModulesCore\n\npublic class XModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoX\")\n    Function(\"go\") {\n    }\n  }\n}\n";
+const EXPO_Y_MODULE_FILE: &str = "ios/YModule.swift";
+const EXPO_Y_MODULE: &str = "import ExpoModulesCore\n\npublic class YModule: Module {\n  public func definition() -> ModuleDefinition {\n    Name(\"ExpoY\")\n    Function(\"go\") {\n    }\n  }\n}\n";
+const EXPO_X_FILE: &str = "src/x.ts";
+const EXPO_X_QUIET: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoX');\nexport function runX() {\n}\n";
+const EXPO_X_CALLING: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoX');\nexport function runX() {\n  M.go();\n}\n";
+const EXPO_Y_FILE: &str = "src/y.ts";
+const EXPO_Y_QUIET: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoY');\nexport function runY() {\n}\n";
+const EXPO_Y_CALLING: &str = "import { requireNativeModule } from 'expo-modules-core';\nconst M = requireNativeModule('ExpoY');\nexport function runY() {\n  M.go();\n}\n";
+
+/// W7-21: two files binding one local name to two modules come to call
+/// through it in one sync, which resolves both in one pass: each call
+/// reaches its own file's module (upstream's per-file `bindingMemo`).
+pub fn expo_one_binding_name_in_two_files_reaches_each_files_module() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Swift])
+        .file("package.json", EXPO_PACKAGE)
+        .file(EXPO_X_MODULE_FILE, EXPO_X_MODULE)
+        .file(EXPO_Y_MODULE_FILE, EXPO_Y_MODULE)
+        .file(EXPO_X_FILE, EXPO_X_QUIET)
+        .file(EXPO_Y_FILE, EXPO_Y_QUIET)
+        .write(EXPO_X_FILE, EXPO_X_CALLING)
+        .write(EXPO_Y_FILE, EXPO_Y_CALLING)
+        .edge_metadata_after(
+            (
+                "function runX",
+                "calls",
+                "method ios/XModule.swift::ExpoX.go",
+            ),
+            "framework",
+            "expo-modules-js",
+        )
+        .edge_metadata_after(
+            (
+                "function runY",
+                "calls",
+                "method ios/YModule.swift::ExpoY.go",
+            ),
+            "framework",
+            "expo-modules-js",
+        )
+}
+
+/// An Objective-C message to `self` whose selector's base name an `@objc`
+/// Swift method answers through the bridge at 0.6, beside a method of the
+/// selector out of the sender's hierarchy, and the sender's superclass,
+/// which comes to declare the selector itself: the name match then scores
+/// 0.4 (two candidates of the name), and a bridge fills in only where no
+/// candidate in the message's language is (KEEP-RUST, W7-21).
+const BRIDGE_BASE_HEADER_FILE: &str = "Base.h";
+const BRIDGE_BASE_HEADER: &str =
+    "#import <Foundation/Foundation.h>\n\n@interface Base : NSObject\n@end\n";
+const BRIDGE_BASE_FILE: &str = "Base.m";
+const BRIDGE_BASE_EMPTY: &str =
+    "#import \"Base.h\"\n\n@implementation Base\n- (void)clear {\n}\n@end\n";
+const BRIDGE_BASE: &str = "#import \"Base.h\"\n\n@implementation Base\n- (id)objectAtIndex:(NSUInteger)index {\n  return nil;\n}\n@end\n";
+const BRIDGE_SENDER_FILE: &str = "Foo.m";
+const BRIDGE_SENDER: &str = "#import \"Base.h\"\n\n@interface Foo : Base\n@end\n\n@implementation Foo\n- (id)first {\n  return [self objectAtIndex:0];\n}\n@end\n";
+const BRIDGE_OUTSIDER_FILE: &str = "Bar.m";
+const BRIDGE_OUTSIDER: &str = "#import <Foundation/Foundation.h>\n\n@implementation Bar\n- (id)objectAtIndex:(NSUInteger)index {\n  return nil;\n}\n@end\n";
+const BRIDGE_SWIFT_FILE: &str = "Map.swift";
+const BRIDGE_SWIFT: &str = "import Foundation\n\nclass Map: NSObject {\n  @objc public func object(forKey key: AnyObject) -> AnyObject? {\n    return nil\n  }\n}\n";
+const BRIDGE_FIRST: &str = "method Foo::first";
+const BRIDGE_BASE_METHOD: &str = "method Base::objectAtIndex:";
+const BRIDGE_SWIFT_METHOD: &str = "method Map::object";
+
+/// The superclass tree whose `Base.m` is `base`.
+fn swift_objc_namesake_case(base: &'static str) -> Case {
+    Case::new(Change::AddCompetitor, &[Language::ObjC, Language::Swift])
+        .file(BRIDGE_BASE_HEADER_FILE, BRIDGE_BASE_HEADER)
+        .file(BRIDGE_BASE_FILE, base)
+        .file(BRIDGE_SENDER_FILE, BRIDGE_SENDER)
+        .file(BRIDGE_OUTSIDER_FILE, BRIDGE_OUTSIDER)
+        .file(BRIDGE_SWIFT_FILE, BRIDGE_SWIFT)
+}
+
+/// W7-21 (KEEP-RUST): the sender's superclass comes to declare the
+/// selector: the unchanged message, which the bridge took to the Swift
+/// method, reaches the superclass's method.
+pub fn swift_objc_bridge_gives_way_to_a_namesake_in_the_messages_language() -> Case {
+    swift_objc_namesake_case(BRIDGE_BASE_EMPTY)
+        .write(BRIDGE_BASE_FILE, BRIDGE_BASE)
+        .edge_metadata_before(
+            (BRIDGE_FIRST, "calls", BRIDGE_SWIFT_METHOD),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(BRIDGE_FIRST, "calls", BRIDGE_BASE_METHOD)
+        .no_edge_after(BRIDGE_FIRST, "calls", BRIDGE_SWIFT_METHOD)
+}
+
+/// W7-21 (KEEP-RUST): the superclass's method goes: the message crosses
+/// the bridge again.
+pub fn swift_objc_bridge_answers_again_when_its_namesake_goes() -> Case {
+    swift_objc_namesake_case(BRIDGE_BASE)
+        .write(BRIDGE_BASE_FILE, BRIDGE_BASE_EMPTY)
+        .edge_before(BRIDGE_FIRST, "calls", BRIDGE_BASE_METHOD)
+        .edge_metadata_after(
+            (BRIDGE_FIRST, "calls", BRIDGE_SWIFT_METHOD),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// A bare TypeScript call a Java `@ReactMethod` of its name answers through
+/// the bridge at 0.6, and a TypeScript function of the name that another
+/// file comes to declare: the name match then scores 0.4 (the Java
+/// namesake makes two candidates), and a bridge fills in only where no
+/// candidate in the call's language is (KEEP-RUST, W7-21).
+const RN_FEATURE_CALLER_FILE: &str = "src/use.ts";
+const RN_FEATURE_CALLER: &str =
+    "export function useFeature(f: string) {\n  return hasFeature(f);\n}\n";
+const RN_FEATURE_FILE: &str = "src/feature.ts";
+const RN_FEATURE: &str = "export async function hasFeature(f: string) {\n  return f;\n}\n";
+const RN_FX_JAVA_FILE: &str = "android/src/main/java/com/fx/FxModule.java";
+const RN_FX_JAVA: &str = "package com.fx;\n\npublic class FxModule extends ReactContextBaseJavaModule {\n  @Override\n  public String getName() {\n    return \"Fx\";\n  }\n\n  @ReactMethod\n  public void hasFeature(String f, Promise p) {\n  }\n}\n";
+const RN_USE_FEATURE: &str = "function useFeature";
+const RN_HAS_FEATURE: &str = "function hasFeature";
+const RN_HAS_FEATURE_JAVA: &str = "method com.fx::FxModule::hasFeature";
+
+/// The React Native tree with its caller and Java module.
+fn rn_namesake_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::TypeScript, Language::Java],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_FEATURE_CALLER_FILE, RN_FEATURE_CALLER)
+    .file(RN_FX_JAVA_FILE, RN_FX_JAVA)
+}
+
+/// W7-21 (KEEP-RUST): another file comes to declare the TypeScript
+/// function: the unchanged call, which the bridge took to the Java method,
+/// reaches it.
+pub fn react_native_bridge_gives_way_to_a_namesake_in_the_calls_language() -> Case {
+    rn_namesake_case()
+        .write(RN_FEATURE_FILE, RN_FEATURE)
+        .edge_metadata_before(
+            (RN_USE_FEATURE, "calls", RN_HAS_FEATURE_JAVA),
+            "framework",
+            "react-native-bridge",
+        )
+        .edge_after(RN_USE_FEATURE, "calls", RN_HAS_FEATURE)
+        .no_edge_after(RN_USE_FEATURE, "calls", RN_HAS_FEATURE_JAVA)
+}
+
+/// W7-21 (KEEP-RUST): the TypeScript function's file is deleted: the call
+/// crosses the bridge again.
+pub fn react_native_bridge_answers_again_when_its_namesake_goes() -> Case {
+    rn_namesake_case()
+        .file(RN_FEATURE_FILE, RN_FEATURE)
+        .remove(RN_FEATURE_FILE)
+        .edge_before(RN_USE_FEATURE, "calls", RN_HAS_FEATURE)
+        .edge_metadata_after(
+            (RN_USE_FEATURE, "calls", RN_HAS_FEATURE_JAVA),
+            "framework",
+            "react-native-bridge",
+        )
+}
+
+/// An Objective-C view class with a property, a subclass and a use of the
+/// property, and a Paper view manager that comes and goes, minting an
+/// exported component named for the class and a prop named for the
+/// property: name matching offers neither (KEEP-RUST, W7-21), so the
+/// class's and the property's references hold throughout, while the
+/// component reaches the class it is named for (`fabric-native-impl`).
+const PAPER_HEADER_FILE: &str = "apple/RNSVGNode.h";
+const PAPER_HEADER: &str = "#import <UIKit/UIKit.h>\n\n@interface RNSVGNode : UIView\n@property (nonatomic, copy) RCTDirectEventBlock onSvgLayout;\n@end\n";
+const PAPER_VIEW_FILE: &str = "apple/RNSVGNode.mm";
+const PAPER_VIEW: &str = "#import \"RNSVGNode.h\"\n\n@implementation RNSVGNode\n- (void)layout\n{\n  self.onSvgLayout(@{});\n}\n@end\n";
+const PAPER_SUBCLASS_FILE: &str = "apple/Elements/RNSVGDefs.h";
+const PAPER_SUBCLASS: &str = "#import \"RNSVGNode.h\"\n\n@interface RNSVGDefs : RNSVGNode\n@end\n";
+const PAPER_MANAGER_FILE: &str = "apple/ViewManagers/RNSVGNodeManager.mm";
+const PAPER_MANAGER: &str = "#import \"RNSVGNode.h\"\n\n@implementation RNSVGNodeManager\nRCT_EXPORT_MODULE()\n- (UIView *)view\n{\n  return [RNSVGNode new];\n}\nRCT_EXPORT_VIEW_PROPERTY(onSvgLayout, RCTDirectEventBlock)\n@end\n";
+const PAPER_CLASS: &str = "class RNSVGNode @apple/RNSVGNode.h";
+const PAPER_PROPERTY: &str = "property RNSVGNode::onSvgLayout";
+const PAPER_COMPONENT: &str = "component apple/ViewManagers/RNSVGNodeManager.mm::RNSVGNode";
+
+/// The Paper tree, without its manager.
+fn paper_case() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::ObjC])
+        .file("package.json", RN_PACKAGE)
+        .file(PAPER_HEADER_FILE, PAPER_HEADER)
+        .file(PAPER_VIEW_FILE, PAPER_VIEW)
+        .file(PAPER_SUBCLASS_FILE, PAPER_SUBCLASS)
+}
+
+/// W7-21 (KEEP-RUST): the manager appears: the subclass's supertype and
+/// the property's use stay where they were, the manager's `[RNSVGNode new]`
+/// reaches the class, and the component reaches it too.
+pub fn paper_view_manager_appears_beside_its_view_class() -> Case {
+    paper_case()
+        .write(PAPER_MANAGER_FILE, PAPER_MANAGER)
+        .edge_throughout("class RNSVGDefs", "extends", PAPER_CLASS)
+        .edge_throughout("method RNSVGNode::layout", "calls", PAPER_PROPERTY)
+        .edge_after("method RNSVGNodeManager::view", "references", PAPER_CLASS)
+        .edge_metadata_after(
+            (PAPER_COMPONENT, "calls", PAPER_CLASS),
+            "synthesizedBy",
+            "fabric-native-impl",
+        )
+}
+
+/// W7-21 (KEEP-RUST): the manager is deleted: the supertype and the
+/// property's use stay where they were.
+pub fn paper_view_manager_is_deleted() -> Case {
+    paper_case()
+        .file(PAPER_MANAGER_FILE, PAPER_MANAGER)
+        .remove(PAPER_MANAGER_FILE)
+        .edge_before("method RNSVGNodeManager::view", "references", PAPER_CLASS)
+        .edge_metadata_before(
+            (PAPER_COMPONENT, "calls", PAPER_CLASS),
+            "synthesizedBy",
+            "fabric-native-impl",
+        )
+        .edge_throughout("class RNSVGDefs", "extends", PAPER_CLASS)
+        .edge_throughout("method RNSVGNode::layout", "calls", PAPER_PROPERTY)
+}
+
+/// A bare TypeScript call the React Native bridge answers by name at 0.6
+/// with the Objective-C method an `RCT_REMAP_METHOD` export maps it to,
+/// which is named otherwise, and a TypeScript function of the call's name
+/// that another file comes to declare: no edge reaches a node of the
+/// call's name, so the bridge lane's rival seed moves the call (KEEP-RUST,
+/// W7-21).
+const RN_REMAP_CALLER_FILE: &str = "src/halt.ts";
+const RN_REMAP_CALLER: &str = "export function halt() {\n  pause(true);\n}\n";
+const RN_REMAP_RIVAL_FILE: &str = "src/media.ts";
+const RN_REMAP_RIVAL: &str = "export function pause(flag: boolean) {\n  return flag;\n}\n";
+const RN_HALT: &str = "function halt";
+const RN_PAUSE_FUNCTION: &str = "function pause";
+
+/// The remapping tree with its bare caller.
+fn rn_remap_namesake_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::TypeScript, Language::ObjC],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(RN_PLAYER_FILE, RN_PLAYER)
+    .file(RN_ENGINE_FILE, RN_ENGINE)
+    .file(RN_REMAP_CALLER_FILE, RN_REMAP_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the TypeScript function appears: the unchanged call,
+/// which the bridge took to the remapped Objective-C method, reaches it.
+pub fn react_native_remapped_bridge_gives_way_to_a_namesake_of_the_call() -> Case {
+    rn_remap_namesake_case()
+        .write(RN_REMAP_RIVAL_FILE, RN_REMAP_RIVAL)
+        .edge_metadata_before(
+            (RN_HALT, "calls", RN_PAUSE_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+        .edge_after(RN_HALT, "calls", RN_PAUSE_FUNCTION)
+        .no_edge_after(RN_HALT, "calls", RN_PAUSE_NOW)
+}
+
+/// W7-21 (KEEP-RUST): the TypeScript function's file is deleted: the call
+/// crosses the bridge again.
+pub fn react_native_remapped_bridge_answers_again_when_its_namesake_goes() -> Case {
+    rn_remap_namesake_case()
+        .file(RN_REMAP_RIVAL_FILE, RN_REMAP_RIVAL)
+        .remove(RN_REMAP_RIVAL_FILE)
+        .edge_before(RN_HALT, "calls", RN_PAUSE_FUNCTION)
+        .edge_metadata_after(
+            (RN_HALT, "calls", RN_PAUSE_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+}
+
+/// A bare Swift call the bridge answers at 0.6 with the Objective-C method
+/// a base name of whose selector it names, beside an Objective-C method of
+/// the call's name (a match across languages, scoring 0.5), and a Swift
+/// function of the call's name that another file comes to declare: the
+/// name match then scores 0.4 (two candidates), and no edge reaches a node
+/// of the call's name, so the bridge lane's rival seed moves the call
+/// (KEEP-RUST, W7-21).
+const SWIFT_RIVAL_LEDGER_FILE: &str = "Sources/Ledger.m";
+const SWIFT_RIVAL_LEDGER: &str = "#import <Foundation/Foundation.h>\n\n@implementation Ledger\n- (id)fetchEntry {\n  return nil;\n}\n@end\n";
+const SWIFT_RIVAL_CALLER_FILE: &str = "Sources/Load.swift";
+const SWIFT_RIVAL_CALLER: &str =
+    "import Foundation\n\nfunc load() {\n  _ = fetchEntry(forKey: \"x\")\n}\n";
+const SWIFT_RIVAL_FILE: &str = "Sources/Lookup.swift";
+const SWIFT_RIVAL: &str =
+    "import Foundation\n\nfunc fetchEntry(forKey key: String) -> Any? {\n  return nil\n}\n";
+const SWIFT_RIVAL_FUNCTION: &str = "function fetchEntry";
+
+/// The tree of the bare Swift call.
+fn swift_rival_case() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Swift, Language::ObjC])
+        .file(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+        .file(SWIFT_RIVAL_LEDGER_FILE, SWIFT_RIVAL_LEDGER)
+        .file(SWIFT_RIVAL_CALLER_FILE, SWIFT_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the Swift function appears: the unchanged call, which
+/// the bridge took to the Objective-C method, reaches it.
+pub fn swift_objc_bridge_gives_way_to_a_swift_namesake_of_the_call() -> Case {
+    swift_rival_case()
+        .write(SWIFT_RIVAL_FILE, SWIFT_RIVAL)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_RIVAL_FUNCTION)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// W7-21 (KEEP-RUST): the Swift function's file is deleted: the call
+/// crosses the bridge again.
+pub fn swift_objc_bridge_answers_again_when_the_swift_namesake_goes() -> Case {
+    swift_rival_case()
+        .file(SWIFT_RIVAL_FILE, SWIFT_RIVAL)
+        .remove(SWIFT_RIVAL_FILE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", SWIFT_RIVAL_FUNCTION)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// A Swift call on an untyped receiver the bridge answers at 0.6 with the
+/// Objective-C method a base name of whose selector it names, beside a
+/// vendored C++ `Cache::fetchEntry`: one method of the call's name scores
+/// 0.5 across languages, below the bridge's answer, and with a second one,
+/// which another file comes to declare, the receiver's word picks one at
+/// 0.65 (instance-method), above it. C++ is no language of the call's, and
+/// no edge reaches a node of the call's name, so the bridge lane's rival
+/// seed moves the call, as it does for a declaration of any language
+/// (KEEP-RUST, W7-21).
+const CPP_RIVAL_CALLER_FILE: &str = "Sources/App/Load.swift";
+const CPP_RIVAL_CALLER: &str =
+    "import Foundation\n\nfunc load() {\n  _ = cache.fetchEntry(forKey: \"x\")\n}\n";
+const CPP_RIVAL_VENDORED_FILE: &str = "Vendor/Old/OldCache.cpp";
+const CPP_RIVAL_FILE: &str = "Sources/App/Cache.cpp";
+const CPP_RIVAL: &str = "class Cache {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Cache::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_RIVAL_METHOD: &str = "method Cache::fetchEntry @Sources/App/Cache.cpp";
+
+/// The tree of the Swift call beside the vendored C++ method.
+fn cpp_rival_case(change: Change) -> Case {
+    Case::new(change, &[Language::Swift, Language::ObjC, Language::Cpp])
+        .file(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+        .file(CPP_RIVAL_VENDORED_FILE, CPP_RIVAL)
+        .file(CPP_RIVAL_CALLER_FILE, CPP_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the second C++ method appears: the unchanged call,
+/// which the bridge took to the Objective-C method, reaches it.
+pub fn swift_objc_bridge_gives_way_to_a_cpp_namesake_of_the_call() -> Case {
+    cpp_rival_case(Change::AddCompetitor)
+        .write(CPP_RIVAL_FILE, CPP_RIVAL)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(SWIFT_OBJC_LOAD, "calls", CPP_RIVAL_METHOD)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// W7-21 (KEEP-RUST): the second C++ method's file is deleted: the call
+/// crosses the bridge again.
+pub fn swift_objc_bridge_answers_again_when_the_cpp_namesake_goes() -> Case {
+    cpp_rival_case(Change::AddCompetitor)
+        .file(CPP_RIVAL_FILE, CPP_RIVAL)
+        .remove(CPP_RIVAL_FILE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", CPP_RIVAL_METHOD)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// The same call beside two vendored C++ methods of its name whose classes
+/// share no word with the receiver, both far from it: they score 0.4, below
+/// the bridge's answer, until one class is renamed `Cache` in place. Its
+/// method keeps its name, line and id, and only its qualified name moves,
+/// so a seed counting names would miss it (KEEP-RUST, W7-21).
+const CPP_OWNER_LEDGER_FILE: &str = "Vendor/Old/Ledger.cpp";
+const CPP_OWNER_LEDGER: &str = "class Ledger {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Ledger::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_OWNER_FILE: &str = "Vendor/New/Store.cpp";
+const CPP_OWNER_STORE: &str = "class Store {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Store::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_OWNER_CACHE: &str = "class Cache {\npublic:\n  void *fetchEntry(const char *key);\n};\n\nvoid *Cache::fetchEntry(const char *key) {\n  return nullptr;\n}\n";
+const CPP_OWNER_METHOD: &str = "method Cache::fetchEntry @Vendor/New/Store.cpp";
+
+/// The tree of the Swift call beside the two vendored methods, the second
+/// of a class `owner`.
+fn cpp_owner_case(owner: &'static str) -> Case {
+    Case::new(
+        Change::RenameSymbol,
+        &[Language::Swift, Language::ObjC, Language::Cpp],
+    )
+    .file(SWIFT_OBJC_CACHE_FILE, SWIFT_OBJC_CACHE)
+    .file(CPP_OWNER_LEDGER_FILE, CPP_OWNER_LEDGER)
+    .file(CPP_OWNER_FILE, owner)
+    .file(CPP_RIVAL_CALLER_FILE, CPP_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the class is renamed `Cache`: the unchanged call,
+/// which the bridge took to the Objective-C method, reaches its method.
+pub fn swift_objc_bridge_gives_way_when_a_cpp_namesakes_class_is_renamed() -> Case {
+    cpp_owner_case(CPP_OWNER_STORE)
+        .write(CPP_OWNER_FILE, CPP_OWNER_CACHE)
+        .edge_metadata_before(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+        .edge_after(SWIFT_OBJC_LOAD, "calls", CPP_OWNER_METHOD)
+        .no_edge_after(SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH)
+}
+
+/// W7-21 (KEEP-RUST): the class is renamed back: the call crosses the
+/// bridge again.
+pub fn swift_objc_bridge_answers_again_when_the_cpp_class_is_renamed_back() -> Case {
+    cpp_owner_case(CPP_OWNER_CACHE)
+        .write(CPP_OWNER_FILE, CPP_OWNER_STORE)
+        .edge_before(SWIFT_OBJC_LOAD, "calls", CPP_OWNER_METHOD)
+        .edge_metadata_after(
+            (SWIFT_OBJC_LOAD, "calls", SWIFT_OBJC_FETCH),
+            "framework",
+            "swift-objc-bridge",
+        )
+}
+
+/// A TypeScript member call the React Native bridge answers by name at 0.6
+/// with the Objective-C method an `RCT_REMAP_METHOD` export maps it to, and
+/// an ArkTS class `Player` another file comes to declare with a method of
+/// the call's name: beside the export's own `rn-export` node of that name,
+/// the receiver's word picks the ArkTS method at 0.65 (instance-method),
+/// above the bridge's answer. ArkTS is no language of the call's, and no
+/// edge reaches a node of the call's name, so the bridge lane's rival seed
+/// moves the call, as it does for a declaration of any language (KEEP-RUST,
+/// W7-21).
+const ARKTS_RIVAL_DECK_FILE: &str = "ios/Deck.m";
+const ARKTS_RIVAL_DECK: &str = "#import <React/RCTBridgeModule.h>\n\n@implementation Deck\n\nRCT_EXPORT_MODULE(Deck)\n\nRCT_REMAP_METHOD(rewind, rewindInferenceNow:(BOOL)flag)\n{\n}\n\n@end\n";
+const ARKTS_RIVAL_ENGINE_FILE: &str = "ios/Engine.m";
+const ARKTS_RIVAL_ENGINE: &str = "#import <Foundation/Foundation.h>\n\n@implementation Engine\n- (void)rewindInferenceNow:(BOOL)flag {\n}\n@end\n";
+const ARKTS_RIVAL_CALLER_FILE: &str = "src/app/halt.ts";
+const ARKTS_RIVAL_CALLER: &str = "export function halt() {\n  player.rewind(true);\n}\n";
+const ARKTS_RIVAL_FILE: &str = "src/app/Player.ets";
+const ARKTS_RIVAL: &str =
+    "export class Player {\n  rewind(flag: boolean) {\n    return flag;\n  }\n}\n";
+const ARKTS_REWIND_NOW: &str = "method Engine::rewindInferenceNow:";
+const ARKTS_REWIND: &str = "method Player::rewind";
+
+/// The tree of the TypeScript call, its module and its native method.
+fn arkts_rival_case() -> Case {
+    Case::new(
+        Change::AddCompetitor,
+        &[Language::TypeScript, Language::ObjC, Language::ArkTs],
+    )
+    .file("package.json", RN_PACKAGE)
+    .file(ARKTS_RIVAL_DECK_FILE, ARKTS_RIVAL_DECK)
+    .file(ARKTS_RIVAL_ENGINE_FILE, ARKTS_RIVAL_ENGINE)
+    .file(ARKTS_RIVAL_CALLER_FILE, ARKTS_RIVAL_CALLER)
+}
+
+/// W7-21 (KEEP-RUST): the ArkTS class appears: the unchanged call, which
+/// the bridge took to the remapped Objective-C method, reaches its method.
+pub fn react_native_bridge_gives_way_to_an_arkts_namesake_of_the_call() -> Case {
+    arkts_rival_case()
+        .write(ARKTS_RIVAL_FILE, ARKTS_RIVAL)
+        .edge_metadata_before(
+            (RN_HALT, "calls", ARKTS_REWIND_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+        .edge_after(RN_HALT, "calls", ARKTS_REWIND)
+        .no_edge_after(RN_HALT, "calls", ARKTS_REWIND_NOW)
+}
+
+/// W7-21 (KEEP-RUST): the ArkTS file is deleted: the call crosses the
+/// bridge again.
+pub fn react_native_bridge_answers_again_when_the_arkts_namesake_goes() -> Case {
+    arkts_rival_case()
+        .file(ARKTS_RIVAL_FILE, ARKTS_RIVAL)
+        .remove(ARKTS_RIVAL_FILE)
+        .edge_before(RN_HALT, "calls", ARKTS_REWIND)
+        .edge_metadata_after(
+            (RN_HALT, "calls", ARKTS_REWIND_NOW),
+            "framework",
+            "react-native-bridge",
+        )
+}

@@ -91,7 +91,7 @@ fn is_call_result_chain(reference: &RefView) -> bool {
 /// plain segments not rooted at `this`/`window` (upstream v1.6.1
 /// `isUnresolvedJsMemberCall`, #1862). It is call-site evidence, not
 /// permission to infer a property type: only a framework resolver may bind it.
-fn is_unresolved_js_member_call(reference: &RefView) -> bool {
+pub(crate) fn is_unresolved_js_member_call(reference: &RefView) -> bool {
     fn is_segment(segment: &str) -> bool {
         let mut chars = segment.chars();
         chars
@@ -1463,6 +1463,9 @@ pub struct ReferenceResolver {
     /// The files whose class-head rows the contexts must not read, when the
     /// rows are trusted ([`Self::trust_recorded_class_heads`]).
     recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
+    /// The files whose bridge-facts rows the contexts must not read, when
+    /// the rows are trusted ([`Self::trust_recorded_bridge_rows`]).
+    recorded_bridge_stale: Option<Arc<std::collections::HashSet<String>>>,
     /// Detected `FrameworkResolver` implementations (`frameworks` field,
     /// `index.ts:264`). Empty until [`Self::initialize`] detects react/vue/nestjs.
     framework_resolver_extensions: Vec<Box<dyn FrameworkResolver>>,
@@ -1518,6 +1521,7 @@ impl ReferenceResolver {
             project_root: project_root.into(),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             recorded_heads_stale: None,
+            recorded_bridge_stale: None,
             framework_resolver_extensions: Vec::new(),
             app_gating: std::sync::Mutex::default(),
             framework_gating: None,
@@ -1550,6 +1554,7 @@ impl ReferenceResolver {
         crate::context::StoreResolutionContext::new(store, &self.project_root)
             .with_max_file_size(self.max_file_size)
             .with_recorded_class_heads(self.recorded_heads_stale.clone())
+            .with_recorded_bridge_rows(self.recorded_bridge_stale.clone())
     }
 
     /// Read class heads from the store's class-head rows for every file but
@@ -1557,6 +1562,14 @@ impl ReferenceResolver {
     /// rows were current when it began passes the files it changed.
     pub fn trust_recorded_class_heads(&mut self, stale: std::collections::HashSet<String>) {
         self.recorded_heads_stale = Some(Arc::new(stale));
+    }
+
+    /// Read the React Native and Expo bridges' facts from the store's
+    /// bridge-facts rows for every indexed file but `stale` in the contexts
+    /// this resolver builds (W7-21): a sync whose rows were current when it
+    /// began passes the files it changed.
+    pub fn trust_recorded_bridge_rows(&mut self, stale: std::collections::HashSet<String>) {
+        self.recorded_bridge_stale = Some(Arc::new(stale));
     }
 
     /// Detect the project's frameworks and populate the resolver's
@@ -2696,7 +2709,7 @@ impl ReferenceResolver {
             || crate::frameworks::play::is_routes_reference(reference)
             || crate::frameworks::drupal::is_routing_reference(reference)
         {
-            return (candidates.into_iter().reduce(highest_confidence), None);
+            return (best_candidate(candidates, reference, context), None);
         }
 
         // An imported root in `make().run()` does not prove what `make`
@@ -2714,7 +2727,7 @@ impl ReferenceResolver {
             ) {
                 candidates.push(action);
             }
-            return (candidates.into_iter().reduce(highest_confidence), None);
+            return (best_candidate(candidates, reference, context), None);
         }
         if is_unresolved_js_member_call(reference) {
             // A path through module namespaces is not untyped:
@@ -2758,7 +2771,7 @@ impl ReferenceResolver {
             {
                 candidates.push(through);
             }
-            return (candidates.into_iter().reduce(highest_confidence), None);
+            return (best_candidate(candidates, reference, context), None);
         }
 
         // KEEP-RUST (P15): a Rust method call whose receiver the extractor
@@ -2786,7 +2799,7 @@ impl ReferenceResolver {
             ) {
                 candidates.push(result);
             }
-            return (candidates.into_iter().reduce(highest_confidence), None);
+            return (best_candidate(candidates, reference, context), None);
         }
 
         // Strategy 2: import-based resolution (index.ts:704-708).
@@ -2819,14 +2832,14 @@ impl ReferenceResolver {
             || is_lua_require_ref(reference)
             || is_dart_import_ref(reference)
         {
-            return (candidates.into_iter().reduce(highest_confidence), None);
+            return (best_candidate(candidates, reference, context), None);
         }
 
         // A Python receiver bound to an imported module is authoritative. If
         // that module/member is missing or ambiguous, retain the unresolved
         // reference rather than guessing a same-named global callable.
         if python_module_member_is_claimed(reference, context) {
-            return (candidates.into_iter().reduce(highest_confidence), None);
+            return (best_candidate(candidates, reference, context), None);
         }
 
         // Strategy 3: name matching (index.ts:723-726), with the name
@@ -2882,7 +2895,7 @@ impl ReferenceResolver {
             return (None, None);
         }
 
-        (candidates.into_iter().reduce(highest_confidence), None)
+        (best_candidate(candidates, reference, context), None)
     }
 
     fn resolve_cpp_constructor(
@@ -4183,6 +4196,75 @@ fn highest_confidence(best: ResolvedRef, curr: ResolvedRef) -> ResolvedRef {
     } else {
         best
     }
+}
+
+/// The bridges whose answers below `0.9` only fill in (KEEP-RUST, W7-21):
+/// they guess a native method by its name alone, and colby's merge let that
+/// `0.6` guess beat a weaker match in the reference's own language. A sync
+/// re-resolves such an answer when a declaration of its reference's name
+/// comes or goes (`codegraph-watch`'s bridge lane).
+pub const FILL_IN_BRIDGES: [&str; 2] = [
+    crate::frameworks::swift_objc::NAME,
+    crate::frameworks::react_native::NAME,
+];
+
+/// Whether `candidate` is a [`FILL_IN_BRIDGES`] bridge's answer below `0.9`,
+/// by the resolver its edge names.
+fn is_fill_in_bridge_answer(candidate: &ResolvedRef) -> bool {
+    candidate.confidence < 0.9
+        && candidate
+            .edge
+            .as_ref()
+            .and_then(|edge| edge.metadata.get("framework"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|framework| FILL_IN_BRIDGES.contains(&framework))
+}
+
+/// A language as the bridge rule compares it: TypeScript, TSX, JavaScript
+/// and JSX are one script language, and every other language is its own,
+/// Swift and Objective-C two though name matching takes them for one family.
+fn bridge_rule_language(language: Language) -> Language {
+    match language {
+        Language::Tsx | Language::JavaScript | Language::Jsx => Language::TypeScript,
+        other => other,
+    }
+}
+
+/// The best of a reference's candidates, the most confident and the
+/// earlier on a tie (`reduce` in `index.ts:743-745`), after a
+/// [`FILL_IN_BRIDGES`] bridge's answer below `0.9` has given way to any
+/// other candidate whose target is in the reference's own language, however
+/// confident (KEEP-RUST, W7-21): the bridges fill in only where that
+/// language has no candidate.
+fn best_candidate(
+    candidates: Vec<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    if candidates.len() < 2 || !candidates.iter().any(is_fill_in_bridge_answer) {
+        return candidates.into_iter().reduce(highest_confidence);
+    }
+    let own = bridge_rule_language(reference.language);
+    let in_own_language: Vec<bool> = candidates
+        .iter()
+        .map(|candidate| {
+            context
+                .get_node_by_id_shared(&candidate.target_node_id)
+                .is_some_and(|target| bridge_rule_language(target.language) == own)
+        })
+        .collect();
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter(|(index, candidate)| {
+            !(is_fill_in_bridge_answer(candidate)
+                && in_own_language
+                    .iter()
+                    .enumerate()
+                    .any(|(other, &same)| other != *index && same))
+        })
+        .map(|(_, candidate)| candidate)
+        .reduce(highest_confidence)
 }
 
 /// Delete resolved rows from `unresolved_refs`
@@ -7184,5 +7266,641 @@ mod tests {
         );
         assert!(!rust_method_is_in_trait_impl(&facts, 1));
         assert!(!rust_method_is_in_trait_impl(&facts, 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // W7-21 (KEEP-RUST, OD-B28): a bridge's answer below 0.9 fills in only
+    // where no candidate of the reference's own language is
+    // ---------------------------------------------------------------------
+
+    /// Answers one reference name with one target at one confidence, under
+    /// `name`: a bridge's, or another framework's.
+    struct Answer {
+        name: &'static str,
+        reference: &'static str,
+        target: &'static str,
+        confidence: f64,
+    }
+    impl FrameworkResolver for Answer {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn detect(&self, _c: &dyn ResolutionContext) -> bool {
+            true
+        }
+        fn claims_reference(&self, name: &str) -> bool {
+            name == self.reference
+        }
+        fn resolve(&self, r: &RefView, _c: &dyn ResolutionContext) -> Option<ResolvedRef> {
+            (r.reference_name == self.reference).then(|| {
+                ResolvedRef::new(
+                    r.clone(),
+                    self.target.to_string(),
+                    self.confidence,
+                    ResolvedBy::Framework,
+                )
+            })
+        }
+    }
+
+    /// The two bridges whose answers below 0.9 fill in.
+    const FILL_IN: [&str; 2] = [
+        crate::frameworks::swift_objc::NAME,
+        crate::frameworks::react_native::NAME,
+    ];
+
+    /// The four script languages, one language to a bridge.
+    const SCRIPTS: [Language; 4] = [
+        Language::TypeScript,
+        Language::Tsx,
+        Language::JavaScript,
+        Language::Jsx,
+    ];
+
+    /// A `kind` reference named `name`, written in `file` in `language` by
+    /// `from` at `line`:`column`.
+    fn bridge_reference(
+        name: &str,
+        kind: EdgeKind,
+        language: Language,
+        file: &str,
+        from: &str,
+        (line, column): (i64, i64),
+    ) -> RefView {
+        RefView {
+            row_id: None,
+            from_node_id: from.to_string(),
+            reference_name: name.to_string(),
+            reference_kind: kind,
+            line,
+            column,
+            file_path: file.to_string(),
+            language,
+            is_function_ref: false,
+            reference_subkind: None,
+        }
+    }
+
+    /// `reference` resolved over `nodes`, with `files` on disk, by `answers`
+    /// (asked in that order) and the rest of the pipeline.
+    fn resolve_among(
+        slug: &str,
+        nodes: &[Node],
+        files: &[(&str, &str)],
+        answers: Vec<Answer>,
+        reference: &RefView,
+    ) -> Option<ResolvedRef> {
+        let tree = TempTree::new(slug, files);
+        let db = temp_db(slug);
+        let resolved = {
+            let mut store = Store::open(&db).expect("open");
+            let mut paths: Vec<&str> = nodes.iter().map(|node| node.file_path.as_str()).collect();
+            paths.sort_unstable();
+            paths.dedup();
+            for path in paths {
+                store.upsert_file(&file_rec(path)).expect("file");
+            }
+            store.upsert_nodes(nodes).expect("nodes");
+            let root = tree.0.to_string_lossy().to_string();
+            let mut resolver = ReferenceResolver::new(root.clone());
+            resolver.framework_resolver_extensions = answers
+                .into_iter()
+                .map(|answer| Box::new(answer) as Box<dyn FrameworkResolver>)
+                .collect();
+            let context = crate::context::StoreResolutionContext::new(&store, root);
+            resolver.warm_caches(&context);
+            resolver.resolve_one(reference, &context)
+        };
+        let _ = std::fs::remove_file(&db);
+        resolved
+    }
+
+    /// `bridge` answering `reference` with `bridged` at `confidence`, and
+    /// another framework with `other` at 0.5.
+    fn bridge_and_other(
+        bridge: &'static str,
+        reference: &'static str,
+        bridged: &'static str,
+        confidence: f64,
+        other: &'static str,
+    ) -> Vec<Answer> {
+        vec![
+            Answer {
+                name: bridge,
+                reference,
+                target: bridged,
+                confidence,
+            },
+            Answer {
+                name: "another-framework",
+                reference,
+                target: other,
+                confidence: 0.5,
+            },
+        ]
+    }
+
+    /// A caller in `file`, the bridge's target `bridged` in
+    /// `bridged_language` and the other answer's `other` in
+    /// `other_language`.
+    fn bridge_nodes(
+        file: &str,
+        language: Language,
+        bridged_language: Language,
+        other_language: Language,
+    ) -> Vec<Node> {
+        vec![
+            mk_node2(
+                "function:caller",
+                NodeKind::Function,
+                "caller",
+                file,
+                language,
+            ),
+            mk_node2(
+                "function:bridged",
+                NodeKind::Function,
+                "bridged",
+                "native/Bridged.src",
+                bridged_language,
+            ),
+            mk_node2(
+                "function:other",
+                NodeKind::Function,
+                "other",
+                "lib/Other.src",
+                other_language,
+            ),
+        ]
+    }
+
+    /// The reference languages each bridge answers, and a language of its
+    /// targets.
+    fn bridge_languages(bridge: &str) -> Vec<(Language, Language)> {
+        if bridge == crate::frameworks::swift_objc::NAME {
+            vec![
+                (Language::ObjC, Language::Swift),
+                (Language::Swift, Language::ObjC),
+            ]
+        } else {
+            SCRIPTS
+                .iter()
+                .map(|&script| (script, Language::Java))
+                .collect()
+        }
+    }
+
+    /// KEEP-RUST (W7-21): each bridge's answer below 0.9 gives way to a
+    /// candidate whose target is in the reference's own language, though
+    /// that candidate is less confident; the bridge fills in only where no
+    /// such candidate is.
+    #[test]
+    fn a_weak_bridge_answer_gives_way_to_a_candidate_in_the_references_language() {
+        for bridge in FILL_IN {
+            for (language, native) in bridge_languages(bridge) {
+                let reference = bridge_reference(
+                    "ping",
+                    EdgeKind::Calls,
+                    language,
+                    "app/Caller.src",
+                    "function:caller",
+                    (2, 4),
+                );
+                let resolved = resolve_among(
+                    "bridge-gives-way",
+                    &bridge_nodes("app/Caller.src", language, native, language),
+                    &[],
+                    bridge_and_other(bridge, "ping", "function:bridged", 0.6, "function:other"),
+                    &reference,
+                )
+                .unwrap_or_else(|| panic!("{bridge} {language:?}: resolves"));
+                assert_eq!(
+                    (resolved.target_node_id.as_str(), resolved.confidence),
+                    ("function:other", 0.5),
+                    "{bridge} {language:?}"
+                );
+            }
+        }
+    }
+
+    /// KEEP-RUST (W7-21): beside candidates in other languages only, the
+    /// bridge's answer stands, those of the reference's own family (Swift,
+    /// Objective-C, C and C++; the web languages) included.
+    #[test]
+    fn a_weak_bridge_answer_stands_beside_other_languages_only() {
+        for bridge in FILL_IN {
+            for (language, native) in bridge_languages(bridge) {
+                let others: &[Language] = if bridge == crate::frameworks::swift_objc::NAME {
+                    &[Language::Swift, Language::ObjC, Language::C, Language::Cpp]
+                } else {
+                    &[
+                        Language::Vue,
+                        Language::Svelte,
+                        Language::Astro,
+                        Language::ArkTs,
+                        Language::Java,
+                    ]
+                };
+                for &other in others.iter().filter(|&&other| other != language) {
+                    let reference = bridge_reference(
+                        "ping",
+                        EdgeKind::Calls,
+                        language,
+                        "app/Caller.src",
+                        "function:caller",
+                        (2, 4),
+                    );
+                    let resolved = resolve_among(
+                        "bridge-stands",
+                        &bridge_nodes("app/Caller.src", language, native, other),
+                        &[],
+                        bridge_and_other(bridge, "ping", "function:bridged", 0.6, "function:other"),
+                        &reference,
+                    )
+                    .unwrap_or_else(|| panic!("{bridge} {language:?} {other:?}: resolves"));
+                    assert_eq!(
+                        (resolved.target_node_id.as_str(), resolved.confidence),
+                        ("function:bridged", 0.6),
+                        "{bridge} {language:?} beside {other:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// W7-21: a bridge's answer at 0.9 or more returns before any other
+    /// strategy runs, as every framework's does: a candidate in the
+    /// reference's own language does not take its place.
+    #[test]
+    fn a_strong_bridge_answer_is_kept_beside_a_candidate_in_the_references_language() {
+        for bridge in FILL_IN {
+            for (language, native) in bridge_languages(bridge) {
+                for confidence in [0.9, 0.95] {
+                    let reference = bridge_reference(
+                        "ping",
+                        EdgeKind::Calls,
+                        language,
+                        "app/Caller.src",
+                        "function:caller",
+                        (2, 4),
+                    );
+                    let resolved = resolve_among(
+                        "bridge-strong",
+                        &bridge_nodes("app/Caller.src", language, native, language),
+                        &[],
+                        bridge_and_other(
+                            bridge,
+                            "ping",
+                            "function:bridged",
+                            confidence,
+                            "function:other",
+                        ),
+                        &reference,
+                    )
+                    .unwrap_or_else(|| panic!("{bridge} {language:?}: resolves"));
+                    assert_eq!(
+                        (resolved.target_node_id.as_str(), resolved.confidence),
+                        ("function:bridged", confidence),
+                        "{bridge} {language:?} at {confidence}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// KEEP-RUST (W7-21): TypeScript, TSX, JavaScript and JSX are one
+    /// language to a bridge: a call in any of them gives the bridge's weak
+    /// answer up for a candidate in any other of them.
+    #[test]
+    fn the_script_languages_are_one_language_to_a_bridge() {
+        for bridge in FILL_IN {
+            for language in SCRIPTS {
+                for other in SCRIPTS {
+                    let reference = bridge_reference(
+                        "ping",
+                        EdgeKind::Calls,
+                        language,
+                        "app/Caller.src",
+                        "function:caller",
+                        (2, 4),
+                    );
+                    let resolved = resolve_among(
+                        "bridge-scripts",
+                        &bridge_nodes("app/Caller.src", language, Language::Java, other),
+                        &[],
+                        bridge_and_other(bridge, "ping", "function:bridged", 0.6, "function:other"),
+                        &reference,
+                    )
+                    .unwrap_or_else(|| panic!("{language:?} {other:?}: resolves"));
+                    assert_eq!(
+                        resolved.target_node_id, "function:other",
+                        "{bridge}: {language:?} beside {other:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// W7-21: only the two bridges fill in: another framework's answer
+    /// below 0.9 is weighed against the other candidates by confidence
+    /// alone, as upstream weighs every one.
+    #[test]
+    fn another_frameworks_weak_answer_is_weighed_by_confidence_alone() {
+        let reference = bridge_reference(
+            "ping",
+            EdgeKind::Calls,
+            Language::TypeScript,
+            "app/Caller.src",
+            "function:caller",
+            (2, 4),
+        );
+        let resolved = resolve_among(
+            "bridge-other-framework",
+            &bridge_nodes(
+                "app/Caller.src",
+                Language::TypeScript,
+                Language::Java,
+                Language::TypeScript,
+            ),
+            &[],
+            bridge_and_other("express", "ping", "function:bridged", 0.6, "function:other"),
+            &reference,
+        )
+        .expect("resolves");
+        assert_eq!(
+            (resolved.target_node_id.as_str(), resolved.confidence),
+            ("function:bridged", 0.6)
+        );
+    }
+
+    /// KEEP-RUST (W7-21): a bridge's weak answer gives way to another
+    /// candidate in the reference's language, never to itself: one whose
+    /// own target is in that language stands beside a candidate in another.
+    #[test]
+    fn a_weak_bridge_answer_gives_way_to_another_candidate_only() {
+        for bridge in FILL_IN {
+            for (language, native) in bridge_languages(bridge) {
+                let reference = bridge_reference(
+                    "ping",
+                    EdgeKind::Calls,
+                    language,
+                    "app/Caller.src",
+                    "function:caller",
+                    (2, 4),
+                );
+                let resolved = resolve_among(
+                    "bridge-own-target",
+                    &bridge_nodes("app/Caller.src", language, language, native),
+                    &[],
+                    bridge_and_other(bridge, "ping", "function:bridged", 0.6, "function:other"),
+                    &reference,
+                )
+                .unwrap_or_else(|| panic!("{bridge} {language:?}: resolves"));
+                assert_eq!(
+                    (resolved.target_node_id.as_str(), resolved.confidence),
+                    ("function:bridged", 0.6),
+                    "{bridge} {language:?}"
+                );
+            }
+        }
+    }
+
+    /// W7-21: the merge lets only a bridge's answer below 0.9 give way. One
+    /// of 0.9 or more never reaches it through the pipeline, Strategy 1
+    /// returning it first, but kept beside a candidate in the reference's
+    /// language it stands there too.
+    #[test]
+    fn the_merge_keeps_a_strong_bridge_answer() {
+        let nodes = bridge_nodes(
+            "app/caller.ts",
+            Language::TypeScript,
+            Language::Java,
+            Language::TypeScript,
+        );
+        let db = temp_db("bridge-merge-strong");
+        {
+            let mut store = Store::open(&db).expect("open");
+            for path in ["app/caller.ts", "native/Bridged.src", "lib/Other.src"] {
+                store.upsert_file(&file_rec(path)).expect("file");
+            }
+            store.upsert_nodes(&nodes).expect("nodes");
+            let context = crate::context::StoreResolutionContext::new(&store, "/project");
+            let reference = bridge_reference(
+                "ping",
+                EdgeKind::Calls,
+                Language::TypeScript,
+                "app/caller.ts",
+                "function:caller",
+                (2, 4),
+            );
+            let answer = |target: &str, confidence: f64, by: &str| {
+                ResolvedRef::new(
+                    reference.clone(),
+                    target.to_string(),
+                    confidence,
+                    ResolvedBy::Framework,
+                )
+                .named_by(by)
+            };
+            for bridge in FILL_IN {
+                for (confidence, kept) in [(0.6, "function:other"), (0.9, "function:bridged")] {
+                    let best = best_candidate(
+                        vec![
+                            answer("function:bridged", confidence, bridge),
+                            answer("function:other", 0.5, "another-framework"),
+                        ],
+                        &reference,
+                        &context,
+                    )
+                    .expect("a candidate");
+                    assert_eq!(best.target_node_id, kept, "{bridge} at {confidence}");
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// KEEP-RUST (W7-21): every branch that returns the best of the
+    /// candidates gathered so far weighs a bridge's weak answer as the
+    /// final merge does: a Spring binding's key, a Play routes line's
+    /// action, a Drupal routing file's handler, a call on a call's result,
+    /// an untyped member chain, a Rust method call whose receiver was
+    /// dropped, a PHP include path, a Lua `require`, a Dart import, a Python
+    /// module member, and the final merge itself.
+    #[test]
+    fn every_merge_lets_a_weak_bridge_answer_give_way() {
+        struct Shape {
+            label: &'static str,
+            name: &'static str,
+            kind: EdgeKind,
+            language: Language,
+            file: &'static str,
+            from: &'static str,
+            at: (i64, i64),
+            bridged: Language,
+            source: &'static str,
+        }
+        let shapes = [
+            Shape {
+                label: "final merge",
+                name: "ping",
+                kind: EdgeKind::Calls,
+                language: Language::TypeScript,
+                file: "app/caller.ts",
+                from: "function:caller",
+                at: (2, 4),
+                bridged: Language::Java,
+                source: "",
+            },
+            Shape {
+                label: "call on a call's result",
+                name: "make().ping",
+                kind: EdgeKind::Calls,
+                language: Language::TypeScript,
+                file: "app/caller.ts",
+                from: "function:caller",
+                at: (2, 4),
+                bridged: Language::Java,
+                source: "",
+            },
+            Shape {
+                label: "untyped member chain",
+                name: "holder.values.ping",
+                kind: EdgeKind::Calls,
+                language: Language::TypeScript,
+                file: "app/caller.ts",
+                from: "function:caller",
+                at: (2, 4),
+                bridged: Language::Java,
+                source: "",
+            },
+            Shape {
+                label: "Spring binding",
+                name: "key.name",
+                kind: EdgeKind::References,
+                language: Language::Java,
+                file: "app/Config.java",
+                from: "spring-value:app/Config.java:1:key.name",
+                at: (1, 0),
+                bridged: Language::Kotlin,
+                source: "",
+            },
+            Shape {
+                label: "Play routes line",
+                name: "HomeController.index",
+                kind: EdgeKind::Calls,
+                language: Language::Scala,
+                file: "conf/routes",
+                from: "function:caller",
+                at: (1, 0),
+                bridged: Language::Java,
+                source: "",
+            },
+            Shape {
+                label: "Drupal routing file",
+                name: "menu.delete",
+                kind: EdgeKind::References,
+                language: Language::Yaml,
+                file: "menu.routing.yml",
+                from: "route:menu.routing.yml:1",
+                at: (1, 0),
+                bridged: Language::Php,
+                source: "",
+            },
+            Shape {
+                label: "Rust call without its receiver",
+                name: "ping",
+                kind: EdgeKind::Calls,
+                language: Language::Rust,
+                file: "src/lib.rs",
+                from: "function:caller",
+                at: (2, 4),
+                bridged: Language::C,
+                source: "fn caller() {\n    root()\n        .ping(1);\n}\n",
+            },
+            Shape {
+                label: "PHP include path",
+                name: "lib/helpers.php",
+                kind: EdgeKind::Imports,
+                language: Language::Php,
+                file: "index.php",
+                from: "file:index.php",
+                at: (1, 0),
+                bridged: Language::Yaml,
+                source: "",
+            },
+            Shape {
+                label: "Lua require",
+                name: "app.util",
+                kind: EdgeKind::Imports,
+                language: Language::Lua,
+                file: "main.lua",
+                from: "file:main.lua",
+                at: (1, 0),
+                bridged: Language::Yaml,
+                source: "",
+            },
+            Shape {
+                label: "Dart import",
+                name: "package:app/util.dart",
+                kind: EdgeKind::Imports,
+                language: Language::Dart,
+                file: "lib/main.dart",
+                from: "file:lib/main.dart",
+                at: (1, 0),
+                bridged: Language::Yaml,
+                source: "",
+            },
+            Shape {
+                label: "Python module member",
+                name: "m.ping",
+                kind: EdgeKind::Calls,
+                language: Language::Python,
+                file: "app.py",
+                from: "function:caller",
+                at: (4, 4),
+                bridged: Language::Java,
+                source: "import pkg.mod as m\n\ndef caller():\n    m.ping()\n",
+            },
+        ];
+        for bridge in FILL_IN {
+            for shape in &shapes {
+                let mut nodes =
+                    bridge_nodes(shape.file, shape.language, shape.bridged, shape.language);
+                nodes[0].id = shape.from.to_string();
+                // In the reference's own file, in scope wherever a scope rule
+                // reads one (a bare Rust name's).
+                nodes[2].file_path = shape.file.to_string();
+                nodes[2].qualified_name = format!("{}::other", shape.file);
+                let files: Vec<(&str, &str)> = if shape.source.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![(shape.file, shape.source)]
+                };
+                let reference = bridge_reference(
+                    shape.name,
+                    shape.kind,
+                    shape.language,
+                    shape.file,
+                    shape.from,
+                    shape.at,
+                );
+                let name: &'static str = shape.name;
+                let resolved = resolve_among(
+                    "bridge-every-merge",
+                    &nodes,
+                    &files,
+                    bridge_and_other(bridge, name, "function:bridged", 0.6, "function:other"),
+                    &reference,
+                )
+                .unwrap_or_else(|| panic!("{bridge}, {}: resolves", shape.label));
+                assert_eq!(
+                    (resolved.target_node_id.as_str(), resolved.confidence),
+                    ("function:other", 0.5),
+                    "{bridge}, {}",
+                    shape.label
+                );
+            }
+        }
     }
 }

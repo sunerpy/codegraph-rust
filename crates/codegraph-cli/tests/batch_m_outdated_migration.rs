@@ -565,13 +565,14 @@ fn incremental_sync_on_outdated_v2_forces_all_files() {
         "a forced migration must write the Play routes marker of `index --force`"
     );
     // The Laravel and Drupal lane markers (W7-19d), the Rails one
-    // (W7-19e), the Vapor one (W7-19g) and the Rust crate roots one
-    // (W7-19h), likewise.
+    // (W7-19e), the Vapor one (W7-19g), the Rust crate roots one (W7-19h)
+    // and the bridge one (W7-21), likewise.
     for (prefix, key) in [
         ("laravel_routes", "laravel_routes_version"),
         ("drupal_refs", "drupal_refs_version"),
         ("rails_routes", "rails_routes_version"),
         ("vapor_routes", "vapor_routes_version"),
+        ("rn_bridges", "rn_bridges_version"),
         ("rust_crate_roots", "rust_crate_roots_version"),
     ] {
         let marker = |paths: &IndexPaths| {
@@ -1761,6 +1762,92 @@ fn outdated_migration_writes_the_lua_module_rows_of_index_force() {
     );
 }
 
+/// W7-21: a migration writes the bridge rows (a shim's `RCT_EXTERN`
+/// entries, a JS file's `NativeModules` aliases, a Swift file's methods and
+/// their exposure) and their marker as `index --force` does.
+#[test]
+fn outdated_migration_writes_the_bridge_rows_of_index_force() {
+    let dir = TestDir::new("outdated-rn-bridges");
+    let project = dir.path().join("mini");
+    for (path, contents) in [
+        (
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react-native\":\"^0.74.0\"}}\n",
+        ),
+        (
+            "ios/CaptureView.swift",
+            "import Foundation\n\n@objc(CaptureView)\nclass CaptureView: NSObject {\n  @objc func syncSettings() {}\n}\n",
+        ),
+        (
+            "ios/CaptureView.m",
+            "#import <React/RCTBridgeModule.h>\n\n@interface RCT_EXTERN_MODULE(CaptureView, NSObject)\nRCT_EXTERN_METHOD(syncSettings)\n@end\n",
+        ),
+        (
+            "src/a.ts",
+            "import { NativeModules } from 'react-native';\n\nexport const captureView = NativeModules.CaptureView;\n",
+        ),
+        (
+            "src/plain.ts",
+            "export function plain() {\n  return 1;\n}\n",
+        ),
+    ] {
+        let full = project.join(path);
+        fs::create_dir_all(full.parent().unwrap()).expect("create the source directory");
+        fs::write(full, contents).expect("write a source file");
+    }
+    let run = cli(&["init", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "setup: `codegraph init` must succeed (stdout={}, stderr={})",
+        run.stdout, run.stderr
+    );
+    let paths = IndexPaths::resolve(&project, None).expect("resolve v2 paths");
+    stage_state_slot(
+        &paths,
+        100,
+        CURRENT_STORAGE_PROTOCOL,
+        CURRENT_EXTRACTION_VERSION - 1,
+        "current",
+    );
+    let run = cli(&["sync", project.to_str().unwrap()]);
+    assert!(
+        run.ok,
+        "sync must migrate an Outdated namespace: stdout={}, stderr={}",
+        run.stdout, run.stderr
+    );
+    let (_scratch, peer) = fresh_force_peer("outdated-rn-bridges", &project);
+    let bridge_rows = |paths: &IndexPaths| {
+        Store::open_for_read(paths, deadline(), || false)
+            .expect("readable namespace")
+            .project_metadata_with_prefix("rn_bridge")
+            .expect("bridge rows")
+    };
+    let migrated = bridge_rows(&paths);
+    assert_eq!(
+        migrated
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "rn_bridge_surface:ios/CaptureView.m",
+            "rn_bridge_surface:ios/CaptureView.swift",
+            "rn_bridge_surface:src/a.ts",
+            "rn_bridges_version",
+        ],
+        "a migration writes the bridge rows of the files holding a bridge fact, and their \
+         marker: {migrated:?}"
+    );
+    assert!(
+        migrated[0].1.contains("syncSettings") && migrated[2].1.contains("CaptureView"),
+        "a row holds its file's entries and aliases: {migrated:?}"
+    );
+    assert_eq!(
+        migrated,
+        bridge_rows(&IndexPaths::resolve(&peer, None).expect("resolve peer v2 paths")),
+        "a forced migration must write the bridge rows of `index --force`"
+    );
+}
+
 /// W4-PHP-01: a migration writes the PHP head rows (a type's kind and the
 /// supertypes its `extends` and trait `use`s name, through its file's
 /// imports) and their marker as `index --force` does.
@@ -2693,7 +2780,7 @@ fn outdated_migration_synthesizes_dispatch_edges() {
         |row| row.get::<_, String>(0),
     )
     .expect("the migration writes the synthesis marker");
-    assert_eq!(marker, "18");
+    assert_eq!(marker, "19");
     let (_scratch, peer) = fresh_force_peer("outdated-synthesis", &project);
     let rebuilt = canonicalize_db(
         &IndexPaths::resolve(&peer, None)

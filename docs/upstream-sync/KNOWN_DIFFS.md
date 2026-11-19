@@ -39,14 +39,14 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Rails, Spring, Play, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit and Vapor (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules (their JavaScript side and their Swift and Kotlin declarations), Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge and Fabric's view components (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  React Native / Expo / Fabric bridges and
-  Swift↔ObjC bridging. These are an additive heuristic layer; on a project where none
+  Terraform's (W7-24c) and CICS's, which is left out with COBOL (OD-2). These
+  are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction
   (frontmatter + `<script>` delegation, template `{call(...)}` and
@@ -85,7 +85,9 @@ colby behaviors are intentionally NOT ported in v1:
   object-registry, RTK Query, Pinia, Vuex, Celery, Spring event, MediatR,
   Sidekiq, Laravel event, C function-pointer, GoFrame route and Go func-field
   passes, the cross-tier and test-request passes (`tier-synthesizer.ts`), the
-  Vue and Angular template passes, the SvelteKit loader and page
+  React Native event-channel, Fabric native-view, Expo cross-platform and
+  React Native cross-platform passes, the Vue and Angular template passes,
+  the SvelteKit loader and page
   passes, the Expo Router return pass and the Next.js, React Router, TanStack
   Router, Vue Router and SvelteKit link passes, and the Go prerequisites
   (`go-method-contains`, `go-implements`) are ported
@@ -701,6 +703,81 @@ regex engine), is not listed.
   picomatch a Cargo workspace writes; any other form (a leading `!`, an
   extglob, a group, an escape, a POSIX class, a brace without a comma)
   expands to nothing (`frameworks/cargo_workspace.rs`).
+- **The bridge a name means (W7-21).** Where colby takes the first of the
+  sorted candidates, the bridges answer only through the sole one and nothing
+  when there are several, without trying the next: the Swift–Objective-C
+  bridge's Objective-C method a Swift call's name bridges to, and the exposed
+  Swift declarations of the first base name of an Objective-C selector that
+  names any; the React Native bridge's export target outside the export's
+  own file, an `RCT_EXTERN` class's Swift method, a JVM export's target
+  outside its own file, and the native method of the preferred platform;
+  Expo modules' type fallback; and the event channel's named handler. "The
+  sole one" counts distinct nodes, so two entries that reach one method are
+  one candidate, and a `0.6` answer names the module of that node's first
+  entry. The platform preference (Objective-C, then Swift, then any) is no
+  ambiguity and is colby's. colby's `localeCompare` order of the candidates
+  plays no part (`frameworks/swift_objc.rs`, `frameworks/react_native.rs`,
+  `frameworks/expo_modules.rs`, `synthesis/react_native.rs`). Two answers
+  colby gives are withheld besides (OD-B28). The Swift–Objective-C and React
+  Native bridges' answers below `0.9` only fill in: one gives way to any
+  other candidate whose target is in the reference's own language, however
+  confident, TypeScript, TSX, JavaScript and JSX counting as one language and
+  Swift and Objective-C as two. colby's Strategy 1 keeps such an answer
+  beside the import and name matches and takes the most confident, so its
+  `0.6` guess by name beat a `0.4` or `0.5` match of the selector a message's
+  own class declares, or of the function a call's own file declares; an
+  answer of `0.9` or more still returns first, as colby's does
+  (`resolver.rs`). And no name-matching strategy offers or counts the
+  component and prop nodes an Objective-C Paper view manager, or a Java or
+  Kotlin view manager, mints: colby exports them, so they took the classes
+  and properties they are named for, by the exported bonus or the same-file
+  one, and made those names ambiguous. A JavaScript-family spec's component
+  and props stay name-match targets, and the synthesis passes read every
+  component (`name_matcher.rs`, `frameworks/fabric.rs`).
+- **Framework candidates on a member chain (W7-21).** colby's Strategy 1
+  keeps a framework result below `0.9` as a candidate, but two early returns
+  after it read none of the candidates: an untyped JavaScript member chain of
+  three or more segments not starting `this.` or `window.` returns only the
+  object-path or namespace-import match, and a JavaScript, TypeScript or
+  Python call on a call's result (`make().run()`) only name matching. Rust's
+  resolver keeps a framework candidate in both branches (`resolver.rs`), so a
+  framework's low-confidence answer for such a reference can link where
+  colby's never does. The React Native bridge's `0.6` answer, the first wide
+  one this meets, is not given for either shape, as colby gives none; its
+  `0.95` answer for `NativeModules.Mod.m()`, which colby returns before the
+  gate, is (`frameworks/react_native.rs`). The other frameworks' low
+  answers in the two branches stay a difference.
+- **The single-candidate shortcut counts before the scope filters (#211).**
+  An exact-name match whose candidates the scope filters narrow to one (an
+  Objective-C message to `self` kept to its sender's hierarchy, a Swift
+  call's shape, a bare JavaScript call kept to what its file binds) scores
+  `0.4` or `0.7` when the name had several candidates before them, where
+  colby's `name-matcher.ts` at `e8ddc4e2` counts after them (11874-11884)
+  and gives the one left `0.9`, or `0.5` across languages. The count before
+  the filters keeps a filtered-out rival from turning a match the ranking
+  would decline into a `0.9` one (a GDScript `extends Node` reaching a Rust
+  `struct Node`). Counting after them moves confidences in every language
+  and the goldens, so it is left to the next round with the other audit rows
+  of OD-A1 (OD-B29, `name_matcher.rs`).
+- **No Expo export is bridge evidence (#2032).** colby's language gate takes
+  an exported Swift or Kotlin `expo-module:` node as bridge evidence for a
+  web `calls` reference (`hasBridgeEvidence`, `name-matcher.ts` at
+  `e8ddc4e2`, 194-200), so a JavaScript name match may cross to it:
+  `ExpoHaptics.fn()` with no `requireNativeModule` binding reaches
+  `…::ExpoHaptics.fn` by its qualified name at `0.85`. `has_bridge_evidence`
+  has no such clause, so that match is gated out and the call stays
+  unresolved unless `expo-modules-js` answers it. No corpus of the W7-21
+  review holds such a call; left to the next round (OD-B29,
+  `name_matcher.rs`).
+- **A partial qualified-name match takes any ending (W7-21 review).** A
+  dotted or `::` name that ends another node's qualified name matches it by
+  that ending alone, the call site's own file first, where colby's partial
+  match (`name-matcher.ts` at `e8ddc4e2`, 12024-12063) requires the ending to
+  start at a scope separator (`endsAtScopeBoundary`) and prefers a candidate
+  of the reference's own language family. W7-21's dotted qualified names
+  (`<file>::<Module>.<member>`) are new endings of that kind; no reference in
+  the W7-21 review corpora reaches the matcher with one. Left to the next
+  round (OD-B29, `name_matcher.rs`).
 - **Dart named constructors (#2380).** A named constructor, indexed as a
   method, is reached only by a call written through its class (`Foo.value(2)`).
   A call through a value of that type (a typed parameter or local, a chain's
@@ -731,7 +808,10 @@ regex engine), is not listed.
   project, and nothing when either has several: an ambiguous name stays
   unresolved. A gin handler (W7-15c) follows the same rule among the Go
   functions and methods, the registering file being that of the name's first
-  registration. colby takes the first of `getNodesByName`, the one of the file
+  registration, and a React Native event handler written by name (W7-21)
+  among the functions and methods; one registered under a constant event
+  name is the one function or method of that name in the registering file,
+  nothing when it has several and the enclosing function when it has none. colby takes the first of `getNodesByName`, the one of the file
   first by path. The passes otherwise walk colby's orders (`synthesis/stage.rs`,
   `synthesis/callback.rs`, `synthesis/go_dispatch.rs`).
 - **The handler a registry maps (W7-14d).** An object-registry handler named
@@ -838,7 +918,10 @@ regex engine), is not listed.
   shares with another statement renders from no one (#2587). A wrapper
   (`styled(Button)`, `memo(Button)`) does not render what it wraps, colby's
   `wrapped` edges: the base graph has no edge from the wrapper to it
-  (`synthesis/jsx.rs`).
+  (`synthesis/jsx.rs`). colby's default-import fallback (#2137) takes the
+  imported file's component only when that file declares exactly one; a
+  default import here binds the first component the file exports
+  (`import_resolver.rs`).
 - **A file that drifted since it was indexed (W7-14).** The stage reads a
   file only while its size and modification time, or its content hash, are
   the ones its file row records, the MCP engine's freshness probe; a drifted
@@ -1089,6 +1172,41 @@ that a sync adds or removes, or whose file node comes or goes as it crosses
 `max_file_size`, re-resolves the references named for the module or for the
 member's crate, since the module rule's target is a file node that no such
 name reaches (`rust_crate_roots_version`).
+So do the React Native, Expo modules and Swift–Objective-C bridges (W7-21),
+whose answers read what no node records: a JavaScript file's `NativeModules`
+aliases and `requireNativeModule` bindings, an Objective-C file's
+`RCT_EXPORT_*`, `RCT_REMAP_*` and `RCT_EXTERN_*` entries, a JVM module's name
+and `@ReactMethod`s, a TurboModule spec, and whether a Swift method is
+exposed to Objective-C. Each file holding any of them keeps a row of them,
+which a sync's resolution reads for the files it did not change instead of
+their text. A sync compares a changed file's old row with its new facts, and
+its Objective-C, Java and Kotlin method names before and after: an alias or
+binding that came, went or names another module re-resolves the references
+written through its name; an export, `RCT_EXTERN`, JVM or spec entry that
+came, went or changed, the JavaScript references whose last segment is its
+JavaScript name; an Objective-C method, the Swift references whose last
+segment is a base name of its selector and the JavaScript ones whose last
+segment is its first keyword or the JavaScript name of an export of it; a
+JVM method, the JavaScript references of its name; a Swift method that came,
+went, or changed its qualified name or its exposure, the Objective-C
+selectors that bridge from its name and the JavaScript names of the
+`RCT_EXTERN` entries of it; and a file whose exported binding changed, its
+importers, whole (`rn_bridges_version`). Since a bridge's answer below `0.9`
+gives way to a candidate in its reference's own language (OD-B28, above) and
+to any more confident one, a node of a changed file, of any language and
+kind, that came, went, moved or changed anything else name matching reads of
+it, compared once the framework nodes are back, also re-resolves the
+JavaScript-family, Swift and Objective-C references whose last segment is its
+name, case aside, and that such an answer resolved: an Objective-C reference
+only through a selector, a JavaScript one only through an entry's JavaScript
+name. A second C++ class `Cache` with a method of a Swift call's name on
+`cache`, or a class renamed `Cache` in place, takes the call from the bridge
+at `0.65`, as an ArkTS class `Player` takes `player.rewind()` in TypeScript.
+Fabric's detection reads the
+`package.json` of each directory below `packages/`, `apps/`, `modules/` and
+`libraries/`, which no index holds: those listings and manifests are
+JavaScript control inputs, so a manifest that comes, goes or changes there
+detects again.
 Laravel's route names need no lane: every sync recomputes them from their
 qualified names, as colby's does, so a mount that goes away is undone in
 both. ASP.NET's route names (W7-19f) need none either: every sync recomputes
