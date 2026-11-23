@@ -1,21 +1,26 @@
 //! ArkTS (HarmonyOS / OpenHarmony `.ets`) `LanguageSpec`.
 //!
-//! Extraction-tier port of `upstream extraction/languages/arkts.ts` (commit
-//! `9915221`). The ArkTS grammar is a TypeScript-superset fork, so this spec
-//! mirrors [`crate::lang::typescript::TYPESCRIPT_SPEC`] verbatim except for two
-//! things:
+//! Port of `upstream extraction/languages/arkts.ts` (#1186, behaviour as of
+//! `b635dd46`). The ArkTS grammar is a TypeScript-superset fork, so this spec
+//! mirrors [`crate::lang::typescript::TYPESCRIPT_SPEC`] except that:
 //!
 //! - the grammar handle is `tree-sitter-arkts` (which understands the ArkUI
-//!   `@Component struct` syntax `tree-sitter-typescript` cannot parse); and
+//!   `@Component struct` syntax `tree-sitter-typescript` cannot parse);
 //! - `struct_types` returns `["struct_declaration"]` so a `@Component struct`
-//!   extracts as a [`codegraph_core::types::NodeKind::Struct`].
+//!   extracts as a [`codegraph_core::types::NodeKind::Struct`];
+//! - the build() DSL's component expressions and leading-dot chains are call
+//!   sites (`call_types`): the walker's ArkTS branch of `extract_call` names
+//!   a component by its plain name and a chained attribute with a leading
+//!   dot (`.width`), which only an attribute helper a decorator marks can
+//!   resolve to; and
+//! - `extract_modifiers` puts a struct's, field's, method's or function's
+//!   decorator names on its node (upstream `collectDecoratorNames`), which
+//!   the attribute strategy and the ArkUI synthesis passes read.
 //!
-//! The ArkUI dynamic-dispatch / callback-synthesizer bridges (attribute-chain
-//! resolution, `arkui_component_expression` component-instantiation edges,
-//! state->build() re-render, emitter emit->subscriber pairing, router->`@Entry`,
-//! the decorator `extractModifiers` hook) are DELIBERATELY DEFERRED — the port
-//! has no callback synthesizer. Hence `call_types` is `["call_expression"]`
-//! only and `extract_modifiers` is left at the trait default.
+//! tree-sitter-arkts 0.3.0 (upstream vendors 0.2.0) has no
+//! `arkui_dsl_decorator_member_expression`, gives a `leading_dot_expression`
+//! an `expression` field, and keeps a chain written after a nested
+//! component's `}` on that component's one `arkui_component_expression`.
 
 use codegraph_core::types::Language;
 use tree_sitter::{Language as TsLanguage, Node};
@@ -82,7 +87,11 @@ impl LanguageSpec for ArkTsSpec {
     }
 
     fn call_types(&self) -> &'static [&'static str] {
-        &["call_expression"]
+        &[
+            "call_expression",
+            "arkui_component_expression",
+            "leading_dot_expression",
+        ]
     }
 
     fn variable_types(&self) -> &'static [&'static str] {
@@ -129,6 +138,19 @@ impl LanguageSpec for ArkTsSpec {
             }
         }
         None
+    }
+
+    fn extract_modifiers(&self, node: Node<'_>, source: &str) -> Vec<String> {
+        if !matches!(
+            node.kind(),
+            "struct_declaration"
+                | "public_field_definition"
+                | "method_definition"
+                | "function_declaration"
+        ) {
+            return Vec::new();
+        }
+        collect_decorator_names(node, source)
     }
 
     fn get_signature(&self, node: Node<'_>, source: &str) -> Option<String> {
@@ -204,6 +226,69 @@ impl LanguageSpec for ArkTsSpec {
 
 fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
     (0..node.child_count()).any(|i| node.child(i).is_some_and(|child| child.kind() == kind))
+}
+
+/// The name a decorator gives (upstream `collectDecoratorNames`' `nameOf`):
+/// its identifier, or its call's callee (`@StorageLink('theme')`,
+/// `@Extend(Text)`).
+fn decorator_name(decorator: Node<'_>, source: &str) -> Option<String> {
+    for i in 0..decorator.named_child_count() {
+        let Some(child) = decorator.named_child(i as u32) else {
+            continue;
+        };
+        match child.kind() {
+            "identifier" => return Some(node_text(child, source)),
+            "call_expression" => {
+                if let Some(function) =
+                    child_by_field(child, "function").filter(|f| f.kind() == "identifier")
+                {
+                    return Some(node_text(function, source));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `node`'s decorator names (upstream `collectDecoratorNames`): the run of
+/// `decorator` siblings right before it (a method's in a struct body, an
+/// exported struct's on its `export` statement), then its own `decorator`
+/// children, each in source order.
+fn collect_decorator_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for i in 0..node.named_child_count() {
+        if let Some(child) = node.named_child(i as u32)
+            && child.kind() == "decorator"
+            && let Some(name) = decorator_name(child, source)
+        {
+            names.push(name);
+        }
+    }
+    let Some(parent) = node.parent() else {
+        return names;
+    };
+    let siblings: Vec<Node<'_>> = (0..parent.named_child_count())
+        .filter_map(|i| parent.named_child(i as u32))
+        .collect();
+    let Some(index) = siblings
+        .iter()
+        .position(|sibling| sibling.start_byte() == node.start_byte())
+    else {
+        return names;
+    };
+    let mut before: Vec<String> = Vec::new();
+    for sibling in siblings[..index].iter().rev() {
+        if sibling.kind() != "decorator" {
+            break;
+        }
+        if let Some(name) = decorator_name(*sibling, source) {
+            before.push(name);
+        }
+    }
+    before.reverse();
+    before.extend(names);
+    before
 }
 
 #[cfg(test)]

@@ -29268,7 +29268,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "19".to_string())]
+            [("synthesis_version".to_string(), "20".to_string())]
         );
     }
 
@@ -43533,5 +43533,249 @@ mod arkui {
             )
             .index();
         assert_unresolved!(project, "file:app1/src/A.ets" => imports => "c1");
+    }
+
+    /// The edges the synthesis pass naming itself `by` drew, as `source ->
+    /// target (event or via) at registeredAt, line`, sorted (W7-24a2).
+    fn synthesized(graph: &super::support::Graph, by: &str) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == by)
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                let label = edge.metadata["event"]
+                    .as_str()
+                    .or_else(|| edge.metadata["via"].as_str())
+                    .unwrap_or("-");
+                format!(
+                    "{} -> {} ({label}) at {}, line {}",
+                    source.qualified_name,
+                    target.qualified_name,
+                    edge.metadata["registeredAt"].as_str().unwrap_or("?"),
+                    edge.line.unwrap_or(0)
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// The `calls` edges into the nodes `selector` matches.
+    fn calls_into(graph: &super::support::Graph, selector: &str) -> Vec<String> {
+        let targets: Vec<&str> = graph
+            .nodes_matching(selector)
+            .into_iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(!targets.is_empty(), "`{selector}` matches no node");
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls" && targets.contains(&edge.target.as_str()))
+            .map(|edge| graph.describe_edge(edge))
+            .collect()
+    }
+
+    /// Upstream `arkts-resolution.test.ts:36-100`: a chained attribute links
+    /// only an attribute helper a decorator marks (`@Extend`, 0.85), and a
+    /// framework attribute never a same-named symbol elsewhere.
+    #[test]
+    fn w724a2_attribute_chain_precision() {
+        let project = Project::new()
+            .file(
+                "decoy/Decoy.ets",
+                "export class Decoy {\n  width: number = 0;\n}\nexport function height(v: number): number {\n  return v * 2;\n}\n",
+            )
+            .file(
+                "pages/Home.ets",
+                "@Extend(Text) function titleStyle(size: number) {\n  .fontSize(size)\n}\n\n@Component\nstruct Home {\n  build() {\n    Column() {\n      Text(\"hello\")\n        .titleStyle(24)\n        .width(100)\n    }\n    .height(50)\n  }\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        let edges = graph.edges_matching("method Home::build", "calls", "function titleStyle");
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.resolved_by() == Some("exact-match")
+                    && edge.confidence() == Some(0.85)),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .nodes_matching("function titleStyle")
+                .iter()
+                .all(|node| node.decorators == serde_json::json!(["Extend"])),
+            "{}",
+            graph.report()
+        );
+        assert_eq!(
+            calls_into(graph, "property Decoy::width"),
+            Vec::<String>::new()
+        );
+        assert_eq!(calls_into(graph, "function height"), Vec::<String>::new());
+    }
+
+    /// The attribute strategy links a helper only when exactly one of the
+    /// name exists: with two, neither the file holding one nor a third file
+    /// links either (upstream's `preferCallSiteFile` only reorders, then
+    /// `chosen.length !== 1` drops the name, as the Scala port has it); a
+    /// helper in another file links when it is the only one; an undecorated
+    /// function of the name is never one.
+    #[test]
+    fn w724a2_dot_attribute_links_only_a_unique_helper() {
+        let pressed = "@Styles function pressed() {\n  .backgroundColor(Color.Red)\n}\n";
+        let user = |name: &str| {
+            format!(
+                "@Component\nstruct {name} {{\n  build() {{\n    Button('x')\n      .pressed()\n      .shared()\n      .width(100)\n  }}\n}}\n"
+            )
+        };
+        let project = Project::new()
+            .file("a/A.ets", &format!("{pressed}\n{}", user("A")))
+            .file(
+                "b/B.ets",
+                &format!("{pressed}@Styles function shared() {{\n  .opacity(0.5)\n}}\n"),
+            )
+            .file("c/C.ets", &user("C"))
+            .file(
+                "d/D.ets",
+                "export function width(v: number): number {\n  return v;\n}\n",
+            )
+            .index();
+        assert_unresolved!(project, "method A::build" => calls => ".pressed");
+        assert_unresolved!(project, "method C::build" => calls => ".pressed");
+        for user in ["method A::build", "method C::build"] {
+            assert_edge!(project, user => calls => "function shared", resolved_by = "exact-match");
+        }
+        assert_unresolved!(project, "method A::build" => calls => ".width");
+        assert_eq!(
+            calls_into(project.graph(), "function width"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// `$r` and `$rawfile` are ArkUI's resource intrinsics, never a project
+    /// symbol of the name (upstream `isBuiltInOrExternal`).
+    #[test]
+    fn w724a2_resource_intrinsics_link_nothing() {
+        let project = Project::new()
+            .file(
+                "hvigor/wrapper.ets",
+                "export function $r(name: string): string {\n  return name;\n}\nexport function $rawfile(name: string): string {\n  return name;\n}\n",
+            )
+            .file(
+                "pages/Logo.ets",
+                "@Component\nstruct Logo {\n  build() {\n    Image($r('app.media.icon'))\n    Image($rawfile('logo.png'))\n  }\n}\n",
+            )
+            .index();
+        assert_eq!(
+            calls_into(project.graph(), "function $r"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            calls_into(project.graph(), "function $rawfile"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream `arkts-resolution.test.ts:175-236`: a method assigning or
+    /// array-mutating a reactive property reaches `build()`; a method that
+    /// only reads it, a comparison, and a write to a property no reactive
+    /// decorator marks do not.
+    #[test]
+    fn w724a2_state_build_is_assignment_gated() {
+        let project = Project::new()
+            .file(
+                "Page.ets",
+                "@Entry\n@Component\nstruct Page {\n  @State todos: string[] = [];\n  @State count: number = 0;\n\n  addTodo(t: string): void {\n    this.todos.push(t);\n  }\n\n  reset(): void {\n    this.count = 0;\n  }\n\n  describeCount(): string {\n    return `count is ${this.count}`;\n  }\n\n  isEmpty(): boolean {\n    return this.count == 0 || this.count === 0;\n  }\n\n  build() {\n    Column() {\n      Text(this.describeCount())\n    }\n  }\n\n  plain: number = 0;\n\n  touch(): void {\n    this.plain = 1;\n  }\n}\n",
+            )
+            .index();
+        assert_eq!(
+            synthesized(project.graph(), "arkui-state"),
+            [
+                "Page::addTodo -> Page::build (state assignment) at Page.ets:23, line 7",
+                "Page::reset -> Page::build (state assignment) at Page.ets:23, line 11",
+            ]
+        );
+    }
+
+    /// Upstream `arkts-resolution.test.ts:249-296`: an emit and an `on` of
+    /// one named key, each read through a local `new EventsId(…)`, pair.
+    #[test]
+    fn w724a2_emitter_pairs_a_named_key() {
+        let project = Project::new()
+            .file(
+                "Bus.ets",
+                "import emitter from '@ohos.events.emitter';\n\nexport class EmitterConst {\n  static readonly ADD_EVENT_ID: number = 2;\n}\n\nclass EventsId {\n  eventId: number;\n  constructor(eventId: number) {\n    this.eventId = eventId;\n  }\n}\n\nexport class Bus {\n  subscribeCart(callback: Function): void {\n    let addGoodDataId: EventsId = new EventsId(EmitterConst.ADD_EVENT_ID);\n    emitter.on(addGoodDataId, (eventData) => {\n      callback(eventData);\n    });\n  }\n\n  publishAdd(goodId: number): void {\n    let addToCartId: EventsId = new EventsId(EmitterConst.ADD_EVENT_ID);\n    emitter.emit(addToCartId);\n  }\n}\n",
+            )
+            .index();
+        assert_eq!(
+            synthesized(project.graph(), "arkui-emitter"),
+            [
+                "Bus::publishAdd -> Bus::subscribeCart (EmitterConst.ADD_EVENT_ID) at Bus.ets:17, line 24"
+            ]
+        );
+    }
+
+    /// Upstream `arkts-resolution.test.ts:298-324`: a numeric key pairs
+    /// within one file only; and a key with more than eight emitters is
+    /// dynamic routing, not a pair (upstream's fan-out cap).
+    #[test]
+    fn w724a2_emitter_numeric_keys_stay_in_their_file_and_wide_keys_pair_nothing() {
+        let fan = (0..9)
+            .map(|i| {
+                format!("export function fire{i}(): void {{\n  emitter.emit(Keys.WIDE);\n}}\n")
+            })
+            .collect::<String>();
+        let project = Project::new()
+            .file(
+                "A.ets",
+                "import emitter from '@ohos.events.emitter';\nexport function fireA(): void {\n  emitter.emit({ eventId: 1 });\n}\n",
+            )
+            .file(
+                "B.ets",
+                "import emitter from '@ohos.events.emitter';\nexport function listenB(): void {\n  emitter.on({ eventId: 1 }, () => {});\n}\n",
+            )
+            .file(
+                "Wide.ets",
+                &format!("import emitter from '@ohos.events.emitter';\n{fan}export function listen(): void {{\n  emitter.on(Keys.WIDE, () => {{}});\n}}\n"),
+            )
+            .index();
+        assert_eq!(
+            synthesized(project.graph(), "arkui-emitter"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream `arkts-resolution.test.ts:337-375`: a literal `pushUrl`
+    /// reaches the `@Entry` struct of the page under the standard
+    /// `src/main/ets/` layout; with that page in two modules and the caller
+    /// in neither, nothing is guessed.
+    #[test]
+    fn w724a2_router_reaches_the_entry_page_and_drops_the_ambiguous() {
+        let detail = "@Component\nstruct Header {\n  build() {\n    Row() {}\n  }\n}\n\n@Entry\n@Component\nstruct Detail {\n  build() {\n    Column() {\n      Text(\"detail\")\n    }\n  }\n}\n";
+        let home = "import router from '@ohos.router';\n\n@Entry\n@Component\nstruct Home {\n  openDetail(id: string): void {\n    router.pushUrl({ url: 'pages/Detail', params: { id: id } });\n  }\n\n  build() {\n    Column() {\n      Button('go').onClick(this.openDetail)\n    }\n  }\n}\n";
+        let project = Project::new()
+            .file("entry/src/main/ets/pages/Detail.ets", detail)
+            .file("entry/src/main/ets/pages/Home.ets", home)
+            .index();
+        assert_eq!(
+            synthesized(project.graph(), "arkui-route"),
+            [
+                "Home::openDetail -> Detail (pages/Detail) at entry/src/main/ets/pages/Detail.ets:8, line 7"
+            ]
+        );
+        assert_edge!(project, "method Home::build" => calls => "method Home::openDetail");
+        let ambiguous = Project::new()
+            .file("feature/a/src/main/ets/pages/Detail.ets", detail)
+            .file("feature/b/src/main/ets/pages/Detail.ets", detail)
+            .file("tools/Nav.ets", &home.replace("struct Home", "struct Nav"))
+            .index();
+        assert_eq!(
+            synthesized(ambiguous.graph(), "arkui-route"),
+            Vec::<String>::new()
+        );
     }
 }

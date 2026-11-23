@@ -1084,6 +1084,13 @@ regex engine), is not listed.
   too. colby names any key by its text without quotes, so a computed
   `[types.SET]` member is a node named `[types.SET]`, qualifies by the file
   and skips a `function*` value (`walker.rs`).
+- **ArkTS grammar shapes (W7-24a2).** tree-sitter-arkts 0.3.0, where colby
+  vendors 0.2.0, has no `arkui_dsl_decorator_member_expression`, gives a
+  `leading_dot_expression` an `expression` field, and keeps a chain written
+  after a nested component's `}` on that component's one
+  `arkui_component_expression`. The extractor reads the 0.3.0 shapes and keeps
+  colby's detached-chain branch, which this grammar does not produce
+  (`lang/arkts.rs`, `walker.rs`).
 
 ### Scan scope
 

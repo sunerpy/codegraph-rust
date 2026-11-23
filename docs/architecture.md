@@ -307,7 +307,15 @@ the string-keyed emitter (`event-emitter`), the cross-tier channels
 (`http-client`, `queue-job`, `event-bus`) and test requests (`test-request`)
 described below, and the structural ones: a React
 class component's or a Flutter `State`'s re-render (`react-render`,
-`flutter-build`), the components a function's JSX tags render
+`flutter-build`), an ArkUI struct's method writing one of the struct's
+reactive properties (`@State`, `@Prop`, `@Link` and the other V1 and V2 state
+decorators) reaching its `build()` (`arkui-state`), an `@ohos.events.emitter`
+emit reaching each handler `on` or `once` registers for its statically
+recovered event key, a numeric key within its file and a named one within its
+workspace module, a key with more than eight emit or handler sites none
+(`arkui-emitter`, with `event`), a literal `router.pushUrl` or `replaceUrl`
+reaching the `@Entry` struct of its page under `src/main/ets/`, the caller's
+module's when several modules have the page (`arkui-route`), the components a function's JSX tags render
 (`jsx-render`), a C++ virtual override (`cpp-override`), a call through
 an interface or a base type reaching the same-named methods of the types that
 implement or extend it, a Go interface's unexported method only those of its
@@ -485,7 +493,7 @@ again. Each edge carries `registeredAt`, where in the template, or for a
 field in the class, it is written, and its line is the tag's in an inline
 template and the class's for a template file.
 Each walks its candidates in upstream's order (nodes by file, line and id,
-edges by their other end, line and column); the Flutter, C++, interface,
+edges by their other end, line and column); the Flutter, ArkUI, C++, interface,
 Kotlin, gRPC, React Native, Expo, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
 Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular and SvelteKit passes run only when the index

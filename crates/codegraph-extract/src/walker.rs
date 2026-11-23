@@ -232,6 +232,13 @@ fn is_js_identifier(segment: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
 }
 
+/// Whether an ArkUI attribute binds an event handler (`onClick`,
+/// `onChange`): `on` and an uppercase letter (upstream's `/^on[A-Z]/`).
+fn is_arkui_event_attribute(name: &str) -> bool {
+    name.strip_prefix("on")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
+}
+
 /// Languages whose member calls go through the TS/JS grammars
 /// (`TS_JS_CHAIN_LANGUAGES`, upstream v1.6.1).
 fn is_ts_js_chain_language(language: Language) -> bool {
@@ -3245,8 +3252,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             new_node.end_column = end_column;
         }
         // Upstream tree-sitter.ts:626-634: extractModifiers output (Kotlin
-        // expect/actual) merges into decorators.
-        let mods = self.spec.extract_modifiers(node);
+        // expect/actual, ArkTS decorators) merges into decorators.
+        let mods = self.spec.extract_modifiers(node, self.source);
         if !mods.is_empty() {
             new_node.decorators.extend(mods);
         }
@@ -6209,10 +6216,151 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.push_ref(&caller_id, &reference, EdgeKind::Calls, node);
     }
 
+    /// ArkUI's build() DSL (upstream `tree-sitter.ts` extractCall's arkts
+    /// branch, #1186), the three shapes a chained attribute takes, each
+    /// named with a leading dot (`.width`) so that only an attribute helper
+    /// a decorator marks can resolve it; a framework attribute on nearly
+    /// every UI line otherwise binds any same-named symbol. Returns whether
+    /// `node` was one of them; children are walked by the caller either way.
+    ///
+    /// 1. An `arkui_component_expression` (`Column() { … }.height(…)`): the
+    ///    component is a call by its plain name, and each chained attribute
+    ///    a repeated `property`/`arguments` pair on the node itself.
+    /// 2. A `call_expression` chained on a call's result (`Text(t)
+    ///    .fontSize(16)`), never on a named receiver; or the innermost call
+    ///    of a chain a `leading_dot_expression` heads, whose callee is a bare
+    ///    identifier (an `@Extend` body's `.fontSize(16).fontColor(…)`).
+    /// 3. A `leading_dot_expression` holding a bare identifier, its
+    ///    arguments in the next statement (upstream's 0.2.0 tree; 0.3.0 keeps
+    ///    the shape, which it does not produce).
+    ///
+    /// An `.onXxx(this.handler)` binding also calls the handler.
+    fn extract_arkui_call(&mut self, node: SyntaxNode<'tree>, caller_id: &str) -> bool {
+        match node.kind() {
+            "arkui_component_expression" => {
+                if let Some(component) =
+                    child_by_field(node, "function").filter(|f| f.kind() == "identifier")
+                {
+                    let name = node_text(component, self.source);
+                    self.push_ref(caller_id, &name, EdgeKind::Calls, node);
+                }
+                let children: Vec<SyntaxNode<'tree>> = (0..node.child_count())
+                    .filter_map(|i| node.child(i))
+                    .collect();
+                for (index, child) in children.iter().enumerate() {
+                    if child.kind() != "property_identifier" {
+                        continue;
+                    }
+                    self.push_arkui_attribute(caller_id, *child);
+                    if is_arkui_event_attribute(&node_text(*child, self.source)) {
+                        // The attribute's arguments: the next `arguments`
+                        // before the following attribute's name.
+                        let arguments = children[index + 1..]
+                            .iter()
+                            .take_while(|next| next.kind() != "property_identifier")
+                            .find(|next| next.kind() == "arguments");
+                        self.push_arkui_this_handlers(caller_id, arguments.copied());
+                    }
+                }
+                true
+            }
+            "call_expression" => {
+                let function = child_by_field(node, "function");
+                if let Some(function) = function.filter(|f| f.kind() == "member_expression")
+                    && let Some(property) = child_by_field(function, "property")
+                    && child_by_field(function, "object").is_some_and(|object| {
+                        matches!(
+                            object.kind(),
+                            "call_expression" | "arkui_component_expression"
+                        )
+                    })
+                {
+                    self.push_arkui_attribute(caller_id, property);
+                    if is_arkui_event_attribute(&node_text(property, self.source)) {
+                        self.push_arkui_this_handlers(caller_id, child_by_field(node, "arguments"));
+                    }
+                    return true;
+                }
+                if let Some(function) = function.filter(|f| f.kind() == "identifier") {
+                    let mut parent = node.parent();
+                    while let Some(up) = parent
+                        .filter(|up| matches!(up.kind(), "member_expression" | "call_expression"))
+                    {
+                        parent = up.parent();
+                    }
+                    if parent.is_some_and(|up| up.kind() == "leading_dot_expression") {
+                        self.push_arkui_attribute(caller_id, function);
+                        if is_arkui_event_attribute(&node_text(function, self.source)) {
+                            self.push_arkui_this_handlers(
+                                caller_id,
+                                child_by_field(node, "arguments"),
+                            );
+                        }
+                        return true;
+                    }
+                }
+                false
+            }
+            "leading_dot_expression" => {
+                let only = (node.named_child_count() == 1)
+                    .then(|| node.named_child(0))
+                    .flatten();
+                if let Some(only) = only.filter(|only| only.kind() == "identifier") {
+                    self.push_arkui_attribute(caller_id, only);
+                    if is_arkui_event_attribute(&node_text(only, self.source)) {
+                        let arguments = node
+                            .parent()
+                            .and_then(|statement| statement.next_named_sibling())
+                            .and_then(|next| next.named_child(0))
+                            .filter(|paren| paren.kind() == "parenthesized_expression");
+                        self.push_arkui_this_handlers(caller_id, arguments);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A chained ArkUI attribute: a call named `.` and the attribute's name,
+    /// where the name is written.
+    fn push_arkui_attribute(&mut self, caller_id: &str, name: SyntaxNode<'tree>) {
+        let attribute = node_text(name, self.source);
+        if attribute.is_empty() {
+            return;
+        }
+        self.push_ref(caller_id, &format!(".{attribute}"), EdgeKind::Calls, name);
+    }
+
+    /// A call of each bare `this.handler` among an event attribute's
+    /// arguments, where it is written (upstream `emitThisHandlers`).
+    fn push_arkui_this_handlers(&mut self, caller_id: &str, arguments: Option<SyntaxNode<'tree>>) {
+        let Some(arguments) = arguments else {
+            return;
+        };
+        for i in 0..arguments.named_child_count() {
+            let Some(argument) = arguments.named_child(i as u32) else {
+                continue;
+            };
+            if argument.kind() != "member_expression" {
+                continue;
+            }
+            if child_by_field(argument, "object").is_some_and(|object| object.kind() == "this")
+                && let Some(property) = child_by_field(argument, "property")
+            {
+                let handler = node_text(property, self.source);
+                self.push_ref(caller_id, &handler, EdgeKind::Calls, argument);
+            }
+        }
+    }
+
     fn extract_call(&mut self, node: SyntaxNode<'tree>) {
         let Some(caller_id) = self.node_stack.last().cloned() else {
             return;
         };
+        if self.spec.language() == Language::ArkTs && self.extract_arkui_call(node, &caller_id) {
+            return;
+        }
         // Java/Kotlin `method_invocation` and PHP `member_call_expression` /
         // `scoped_call_expression` carry `object`/`scope` + `name` fields instead
         // of a `function` member-expression (tree-sitter.ts:2573-2663).
@@ -10234,6 +10382,230 @@ class Model {}
             "{refs:?}"
         );
         assert!(has_ref(&refs, EdgeKind::References, "Summary"), "{refs:?}");
+    }
+
+    /// The `calls` reference names `from` (a method or function named so)
+    /// makes, in order.
+    fn arkts_calls_from(nodes: &[Node], refs: &[UnresolvedRef], from: &str) -> Vec<String> {
+        let id = &nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Method | NodeKind::Function) && n.name == from)
+            .unwrap_or_else(|| panic!("missing {from}"))
+            .id;
+        refs.iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls && &r.from_node_id == id)
+            .map(|r| r.reference_name.clone())
+            .collect()
+    }
+
+    /// W7-24a2: ArkUI decorators land on the struct, field, method and
+    /// function they mark, by name (upstream `arkts.ts` `collectDecoratorNames`,
+    /// `extraction.test.ts` 13123-13190, 13314-13330): a decorator's call
+    /// gives its callee (`@StorageLink('theme')`), and an exported struct's
+    /// sit on its `export` statement.
+    #[test]
+    fn w724a2_arkts_decorators_on_struct_field_method_function() {
+        let src = r#"
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+  @StorageLink('theme') theme: string = 'light';
+  private service: TodoService = new TodoService();
+
+  @Builder
+  headerBar(title: string) {
+    Row() {}
+  }
+
+  build() {
+    Column() {}
+  }
+}
+
+@Component
+export struct Card {
+  build() {
+    Row() {}
+  }
+}
+
+@Builder
+function EmptyHint(message: string) {
+  Column() {}
+}
+
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+"#;
+        let (nodes, _refs) = run("pages/Index.ets", src, Language::ArkTs);
+        let decorators = |kind: NodeKind, name: &str| node(&nodes, kind, name).decorators.clone();
+        assert_eq!(
+            decorators(NodeKind::Struct, "Index"),
+            ["Entry", "Component"]
+        );
+        assert_eq!(decorators(NodeKind::Property, "message"), ["State"]);
+        assert_eq!(decorators(NodeKind::Property, "count"), ["Prop"]);
+        assert_eq!(decorators(NodeKind::Property, "theme"), ["StorageLink"]);
+        assert!(decorators(NodeKind::Property, "service").is_empty());
+        assert_eq!(decorators(NodeKind::Method, "headerBar"), ["Builder"]);
+        assert!(decorators(NodeKind::Method, "build").is_empty());
+        assert_eq!(decorators(NodeKind::Struct, "Card"), ["Component"]);
+        assert!(node(&nodes, NodeKind::Struct, "Card").is_exported);
+        assert_eq!(decorators(NodeKind::Function, "EmptyHint"), ["Builder"]);
+        assert_eq!(decorators(NodeKind::Function, "titleStyle"), ["Extend"]);
+    }
+
+    /// W7-24a2: the build() DSL's call surface (upstream `extraction.test.ts`
+    /// 13200-13253, 13300-13312): a component is a call by its plain name, a
+    /// chained attribute a call named with a leading dot, and
+    /// `.onClick(this.handler)` a call of the handler.
+    #[test]
+    fn w724a2_arkts_build_dsl_call_surface() {
+        let src = r#"
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+
+@Component
+struct Page {
+  count: number = 0;
+
+  handleTap(): void {
+    this.count += 1;
+  }
+
+  @Builder
+  headerBar(title: string) {
+    Row() {
+      Text(title).titleStyle(24)
+      Button('Go').onClick(this.handleTap)
+    }
+  }
+
+  build() {
+    Column({ space: 8 }) {
+      this.headerBar('Home')
+      ChildCard({ label: 'hi' })
+    }
+    .height('100%')
+  }
+
+  refresh(svc: Service): void {
+    svc.save(1);
+    this.vm.load();
+  }
+}
+"#;
+        let (nodes, refs) = run("pages/Page.ets", src, Language::ArkTs);
+        // A call on a named receiver is no attribute (upstream's shape 2
+        // takes only a chain on a call's result).
+        let refresh = arkts_calls_from(&nodes, &refs, "refresh");
+        assert!(!refresh.is_empty(), "{refresh:?}");
+        assert!(
+            refresh.iter().all(|name| !name.starts_with('.')),
+            "{refresh:?}"
+        );
+        let build = arkts_calls_from(&nodes, &refs, "build");
+        for name in ["Column", "headerBar", "ChildCard", ".height"] {
+            assert!(build.contains(&name.to_string()), "{name}: {build:?}");
+        }
+        assert!(!build.contains(&"height".to_string()), "{build:?}");
+        let header = arkts_calls_from(&nodes, &refs, "headerBar");
+        for name in [
+            "Row",
+            "Text",
+            ".titleStyle",
+            "Button",
+            ".onClick",
+            "handleTap",
+        ] {
+            assert!(header.contains(&name.to_string()), "{name}: {header:?}");
+        }
+        for bare in ["titleStyle", "onClick"] {
+            assert!(!header.contains(&bare.to_string()), "{bare}: {header:?}");
+        }
+    }
+
+    /// W7-24a2: a chain written on the lines after a nested component's `}`
+    /// is one `arkui_component_expression` in tree-sitter-arkts 0.3.0, its
+    /// attributes the node's own property and argument pairs (upstream's
+    /// 0.2.0 tree detached them, `extraction.test.ts` 13256-13310): every
+    /// attribute is a dotted call where its name is written, never a bare
+    /// one.
+    #[test]
+    fn w724a2_arkts_chain_after_closing_brace_is_one_component() {
+        let panel = r#"@Component
+struct Panel {
+  close(): void {}
+
+  build() {
+    Column() {
+      Row() {
+        Text('x')
+      }
+      .width(10)
+      .onClick(this.close)
+      .id('close_button')
+    }
+  }
+}
+"#;
+        let (nodes, refs) = run("components/Panel.ets", panel, Language::ArkTs);
+        let build = arkts_calls_from(&nodes, &refs, "build");
+        for name in ["close", ".width", ".onClick", ".id"] {
+            assert!(build.contains(&name.to_string()), "{name}: {build:?}");
+        }
+        for bare in ["width", "onClick", "id"] {
+            assert!(!build.contains(&bare.to_string()), "{bare}: {build:?}");
+        }
+        let width = refs
+            .iter()
+            .find(|r| r.reference_name == ".width")
+            .expect("the .width reference");
+        assert_eq!((width.line, width.col), (10, 7));
+        let card = r#"@Component
+struct Card {
+  build() {
+    Column() {
+      List() {
+        Text('x')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .height('100%')
+    }
+  }
+}
+"#;
+        let (nodes, refs) = run("components/Card.ets", card, Language::ArkTs);
+        let build = arkts_calls_from(&nodes, &refs, "build");
+        for name in [".alignItems", ".layoutWeight", ".height"] {
+            assert!(build.contains(&name.to_string()), "{name}: {build:?}");
+        }
+        for bare in ["alignItems", "layoutWeight", "height"] {
+            assert!(!build.contains(&bare.to_string()), "{bare}: {build:?}");
+        }
+    }
+
+    /// W7-24a2: in an `@Extend`/`@Styles` body the leading dot heads a
+    /// chain whose innermost call has a bare callee: each link is a dotted
+    /// attribute call (upstream extractCall's identifier walk up to the
+    /// `leading_dot_expression`).
+    #[test]
+    fn w724a2_arkts_extend_body_dot_prefixes_the_inner_call() {
+        let src = "@Extend(Text) function f() {\n  .fontSize(16).fontColor(Color.Red)\n}\n@Styles function pressed() {\n  .backgroundColor(Color.Red)\n}\n";
+        let (nodes, refs) = run("common/styles.ets", src, Language::ArkTs);
+        let f = arkts_calls_from(&nodes, &refs, "f");
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f.contains(&".fontSize".to_string()), "{f:?}");
+        assert!(f.contains(&".fontColor".to_string()), "{f:?}");
+        assert_eq!(
+            arkts_calls_from(&nodes, &refs, "pressed"),
+            [".backgroundColor"]
+        );
     }
 
     // ---- Solidity (.sol) extraction tier (#1170) ----

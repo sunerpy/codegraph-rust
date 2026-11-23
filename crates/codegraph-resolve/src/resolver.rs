@@ -2682,6 +2682,12 @@ impl ReferenceResolver {
         // empty.
         let existence_name = if reference.language == Language::Erlang {
             strip_erlang_arity(&reference.reference_name)
+        } else if reference.language == Language::ArkTs
+            && let Some(attribute) = reference.reference_name.strip_prefix('.')
+        {
+            // A chained ArkUI attribute (`.titleStyle`) exists when its
+            // helper's name does (upstream #1186).
+            attribute
         } else if matches!(reference.language, Language::C | Language::Cpp) {
             // A C or C++ name written from the global scope
             // (`::_pbi::PrivateAccess::GenerateParseTable`, `::memset`)
@@ -3879,6 +3885,13 @@ impl ReferenceResolver {
         let is_js_ts = has_js_built_ins(reference.language);
 
         if is_js_ts && js_built_ins().contains(name.as_str()) {
+            return true;
+        }
+        // ArkUI's resource intrinsics (`$r('app.string.x')`,
+        // `$rawfile('x.png')`) are the framework's, never a project symbol of
+        // the name, such as a checked-in hvigor wrapper's `$r` (upstream
+        // #1186).
+        if reference.language == Language::ArkTs && matches!(name.as_str(), "$r" | "$rawfile") {
             return true;
         }
         if is_js_ts

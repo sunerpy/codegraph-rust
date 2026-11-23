@@ -21,8 +21,8 @@ use rayon::prelude::*;
 use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
-    angular, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field, goframe,
-    iface, is_synthesized, jsx, links, react_native, registry, sveltekit, tier, vue,
+    angular, arkui, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field,
+    goframe, iface, is_synthesized, jsx, links, react_native, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -97,6 +97,9 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         |languages| languages.contains(&Language::Dart),
         dispatch::flutter_build_edges,
     ),
+    ("arkuiStateEdges", arkui::gate, arkui::state_build_edges),
+    ("arkuiEmitter", arkui::gate, arkui::emitter_edges),
+    ("arkuiRoutes", arkui::gate, arkui::router_edges),
     (
         "cppEdges",
         |languages| languages.contains(&Language::Cpp),

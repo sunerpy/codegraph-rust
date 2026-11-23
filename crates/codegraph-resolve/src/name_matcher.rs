@@ -8470,10 +8470,62 @@ pub fn veto_self_target(
 
 /// Match all strategies in order of confidence (`matchReference`,
 /// `name-matcher.ts:1093-1157`).
+/// The decorators that make an ArkTS function an attribute helper a chained
+/// attribute may name (upstream `ARKUI_ATTRIBUTE_DECORATORS`).
+const ARKUI_ATTRIBUTE_DECORATORS: [&str; 4] = ["Extend", "Styles", "AnimatableExtend", "Builder"];
+
+/// The one ArkTS function named `attribute` that an attribute decorator
+/// marks, at 0.85; none when there is no such helper or more than one
+/// (upstream's `preferCallSiteFile` only reorders before its `chosen.length
+/// !== 1` check, as [`crate::scala_scope::match_scala_symbolic_type`] has it).
+fn match_arkui_attribute(
+    reference: &RefView,
+    attribute: &str,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let candidates: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(attribute)
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::ArkTs
+                && node.kind == NodeKind::Function
+                && node
+                    .decorators
+                    .iter()
+                    .any(|decorator| ARKUI_ATTRIBUTE_DECORATORS.contains(&decorator.as_str()))
+        })
+        .collect();
+    let chosen = if candidates.len() > 1 {
+        prefer_call_site_file(candidates, &reference.file_path)
+    } else {
+        candidates
+    };
+    match chosen.as_slice() {
+        [only] => Some(ResolvedRef::new(
+            reference.clone(),
+            only.id.clone(),
+            0.85,
+            ResolvedBy::ExactMatch,
+        )),
+        _ => None,
+    }
+}
+
 pub fn match_reference(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    // A chained ArkUI attribute, written with a leading dot (`.titleStyle`,
+    // `.width`), links only an attribute helper a decorator marks, and by no
+    // other strategy: a framework attribute on nearly every UI line would
+    // otherwise bind any same-named symbol (upstream #1186; on the
+    // OpenHarmony samples that made 36k wrong edges).
+    if reference.language == Language::ArkTs
+        && let Some(attribute) = reference.reference_name.strip_prefix('.')
+    {
+        return match_arkui_attribute(reference, attribute, context);
+    }
+
     // `import java.lang.reflect.Field;`: the file's `Field` is the JDK's,
     // never a project class of that name, by any strategy (upstream #2195:
     // gson's production code bound it to a test's nested

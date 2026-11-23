@@ -27293,3 +27293,63 @@ pub fn arkts_relative_import_target_appears() -> Case {
         .edge_after("file:pages/Home.ets", "imports", "file:pages/util.ets")
         .edge_after("function run", "calls", "function helper @pages/util.ets:1")
 }
+
+/// W7-24a2: the page whose `.titleStyle(24)` names an attribute helper in
+/// another file.
+const ARKUI_HOME: &str = "@Component\nstruct Home {\n  build() {\n    Column() {\n      Text(\"hello\")\n        .titleStyle(24)\n    }\n  }\n}\n";
+const ARKUI_STYLES_PLAIN: &str = "function titleStyle(size: number) {\n  .fontSize(size)\n}\n";
+const ARKUI_STYLES_EXTEND: &str =
+    "@Extend(Text) function titleStyle(size: number) {\n  .fontSize(size)\n}\n";
+
+/// W7-24a2: the helper another file's attribute names gains `@Extend`: the
+/// dotted reference, parked by its tail `titleStyle`, comes to link it.
+pub fn arkts_extend_decorator_added_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::ArkTs])
+        .file("pages/Home.ets", ARKUI_HOME)
+        .file("common/styles.ets", ARKUI_STYLES_PLAIN)
+        .write("common/styles.ets", ARKUI_STYLES_EXTEND)
+        .edge_after("method Home::build", "calls", "function titleStyle")
+}
+
+/// W7-24a2: the helper loses `@Extend`: the attribute links nothing.
+pub fn arkts_extend_decorator_removed_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::ArkTs])
+        .file("pages/Home.ets", ARKUI_HOME)
+        .file("common/styles.ets", ARKUI_STYLES_EXTEND)
+        .write("common/styles.ets", ARKUI_STYLES_PLAIN)
+        .edge_before("method Home::build", "calls", "function titleStyle")
+        .no_edge_after("method Home::build", "calls", "function titleStyle")
+}
+
+/// W7-24a2: a page whose `count` property the case makes reactive.
+const ARKUI_PAGE_PLAIN: &str = "@Component\nstruct Page {\n  count: number = 0;\n\n  reset(): void {\n    this.count = 0;\n  }\n\n  build() {\n    Column() {}\n  }\n}\n";
+const ARKUI_PAGE_STATE: &str = "@Component\nstruct Page {\n  @State count: number = 0;\n\n  reset(): void {\n    this.count = 0;\n  }\n\n  build() {\n    Column() {}\n  }\n}\n";
+
+/// W7-24a2: a property becomes `@State`: the method assigning it comes to
+/// reach `build()` (the synthesis stage's `arkui-state` pass).
+pub fn arkts_state_decorator_toggles() -> Case {
+    Case::new(Change::BodyEdit, &[Language::ArkTs])
+        .file("Page.ets", ARKUI_PAGE_PLAIN)
+        .write("Page.ets", ARKUI_PAGE_STATE)
+        .edge_after("method Page::reset", "calls", "method Page::build")
+}
+
+/// W7-24a2: the page a literal `pushUrl` names moves away: the
+/// `arkui-route` edge goes with it.
+pub fn arkts_router_page_renamed() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::ArkTs])
+        .file(
+            "entry/src/main/ets/pages/Detail.ets",
+            "@Entry\n@Component\nstruct Detail {\n  build() {\n    Column() {}\n  }\n}\n",
+        )
+        .file(
+            "entry/src/main/ets/pages/Home.ets",
+            "import router from '@ohos.router';\n\n@Entry\n@Component\nstruct Home {\n  openDetail(): void {\n    router.pushUrl({ url: 'pages/Detail' });\n  }\n\n  build() {\n    Column() {}\n  }\n}\n",
+        )
+        .rename(
+            "entry/src/main/ets/pages/Detail.ets",
+            "entry/src/main/ets/pages/Info.ets",
+        )
+        .edge_before("method Home::openDetail", "calls", "struct Detail")
+        .no_edge_after("method Home::openDetail", "calls", "struct Detail")
+}
