@@ -1807,6 +1807,9 @@ struct AngularApp {
 #[derive(Debug, Default)]
 struct AngularTable {
     by_root: BTreeMap<String, AngularApp>,
+    /// The files that lazy-load routes files, whose redirects the table
+    /// reads whether or not they hold a route of their own (W7-23b).
+    mount_files: BTreeSet<String>,
 }
 
 /// The routes every path reaches through `aliases` (redirect `from` → the
@@ -1911,7 +1914,10 @@ impl AngularTable {
                     .insert(to);
             }
         }
-        let mut table = Self::default();
+        let mut table = Self {
+            mount_files: mounts.mount_files,
+            ..Self::default()
+        };
         let no_paths = BTreeMap::new();
         for root in &apps {
             let paths = served.get(root).unwrap_or(&no_paths);
@@ -2087,15 +2093,38 @@ impl NavigationCalls for AngularNavigation {
         if !in_angular_table(route) {
             return None;
         }
-        Some(if angular_table(context).by_root.len() == 1 {
-            vec![String::new()]
-        } else {
-            vec![angular_app_root(
-                &route.file_path,
-                context,
-                &mut HashMap::new(),
-            )]
-        })
+        Some(angular_scope(&route.file_path, context))
+    }
+
+    /// KEEP-RUST (W7-23b): the table reads a redirect from its routes
+    /// files' text, which no route node holds.
+    fn table_reads_route_files(&self) -> bool {
+        true
+    }
+
+    /// KEEP-RUST (W7-23b): the table reads the redirects of a file that
+    /// only lazy-loads routes files, which holds no route node.
+    fn scopes_read_from(&self, file: &str, context: &dyn ResolutionContext) -> Option<Vec<String>> {
+        angular_table(context)
+            .mount_files
+            .contains(file)
+            .then(|| angular_scope(file, context))
+    }
+
+    /// KEEP-RUST (W7-23b): a destination reads route constants, class
+    /// properties and constants through the file's imports.
+    fn destinations_read_other_files(&self) -> bool {
+        true
+    }
+}
+
+/// The files whose calls navigate among the routes `file` gives the table:
+/// its app's, or every file while there is one app.
+fn angular_scope(file: &str, context: &dyn ResolutionContext) -> Vec<String> {
+    if angular_table(context).by_root.len() == 1 {
+        vec![String::new()]
+    } else {
+        vec![angular_app_root(file, context, &mut HashMap::new())]
     }
 }
 
@@ -3756,5 +3785,52 @@ mod tests {
             AngularRouterResolver.detect(&with("{\"dependencies\":{\"@angular/core\":\"19\"}}"))
         );
         assert!(!AngularRouterResolver.detect(&with("{\"dependencies\":{\"react\":\"19\"}}")));
+    }
+
+    /// W7-23b (KEEP-RUST): the table reads the redirects of a file that
+    /// lazy-loads routes files whether or not it holds a route of its own,
+    /// so the navigation hook scopes such a file to its app's calls, the
+    /// whole workspace's while there is one app. A routes file that mounts
+    /// nothing, and a file that is no routes file, scope nothing so.
+    #[test]
+    fn a_mount_file_scopes_the_navigation_of_its_app() {
+        let mount = "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'profile', loadChildren: () => import('./profile/profile.routes') },\n  { path: 'go', redirectTo: 'profile/a' },\n];\n";
+        let profile = "import { Routes } from '@angular/router';\nimport { ProfileComponent } from './profile.component';\nexport default [{ path: 'a', component: ProfileComponent }] satisfies Routes;\n";
+        let nav = "export function go(router) {\n  router.navigate(['/go']);\n}\n";
+        let navigation = AngularRouterResolver.navigation().expect("navigation");
+        let one = indexed(
+            &[
+                ("src/app/app.routes.ts", mount),
+                ("src/app/profile/profile.routes.ts", profile),
+                ("src/app/nav.ts", nav),
+            ],
+            &[],
+        );
+        assert_eq!(
+            navigation.scopes_read_from("src/app/app.routes.ts", &one),
+            Some(vec![String::new()])
+        );
+        assert_eq!(
+            navigation.scopes_read_from("src/app/profile/profile.routes.ts", &one),
+            None
+        );
+        assert_eq!(navigation.scopes_read_from("src/app/nav.ts", &one), None);
+        let other = routes_file("export const routes: Routes = [{ path: 'y', component: Y }];");
+        let two = indexed(
+            &[
+                ("apps/x/src/app/app.routes.ts", mount),
+                ("apps/x/src/app/profile/profile.routes.ts", profile),
+                ("apps/y/src/app/y.routes.ts", &other),
+            ],
+            &[],
+        );
+        assert_eq!(
+            navigation.scopes_read_from("apps/x/src/app/app.routes.ts", &two),
+            Some(vec!["apps/x/".to_string()])
+        );
+        assert_eq!(
+            navigation.scopes_read_from("apps/y/src/app/y.routes.ts", &two),
+            None
+        );
     }
 }

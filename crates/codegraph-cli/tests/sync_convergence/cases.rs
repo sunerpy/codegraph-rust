@@ -26121,3 +26121,960 @@ pub fn tsx_react_router_501_lazy_routes_wait_for_one_module() -> Case {
             "function TeamPage",
         )
 }
+
+// =============================================================================
+// W7-23b: a navigation call relinks when a route appears, goes or moves
+// =============================================================================
+//
+// A navigation call names its route by path and its reference by the
+// router's method (`navigate`, `router.push`), so no name a routes file
+// declares wakes it. Each case changes a file other than the call's, and
+// adds files only to folders the index has (a new folder moves the
+// JavaScript control inputs, which re-resolves every file).
+
+/// A component of `src/lib/nav.ts` that navigates to `/profile`.
+const W723_TANSTACK_OPEN_PROFILE: &str =
+    "export function open(navigate) {\n  navigate({ to: '/profile' })\n}\n";
+
+/// W7-23b (W7-10's seed, upstream #2425's TanStack Router case): the route
+/// file a parked `navigate({ to })` names appears beside the others.
+pub fn tsx_tanstack_route_appears_for_a_parked_call() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", TANSTACK_PACKAGE)
+    .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+    .file("src/lib/nav.ts", W723_TANSTACK_OPEN_PROFILE)
+    .write("src/routes/profile.tsx", TANSTACK_PROFILE)
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/routes/profile.tsx::route:/profile",
+    )
+}
+
+/// 501 calls that all navigate to `/profile`.
+static W723_TANSTACK_MANY_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::new();
+    for call in 0..501 {
+        text.push_str(&format!(
+            "export function open{call}(navigate) {{\n  navigate({{ to: '/profile' }})\n}}\n"
+        ));
+    }
+    text
+});
+
+/// W7-23b, no ceiling (OD-B42): 501 parked calls of one name wait for the
+/// route, and every one links once it appears (upstream skips a name more
+/// than 500 calls share).
+pub fn tsx_tanstack_route_appears_for_501_parked_calls() -> Case {
+    Case::new(
+        Change::AddImportTarget,
+        &[Language::TypeScript, Language::Tsx],
+    )
+    .file("package.json", TANSTACK_PACKAGE)
+    .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+    .file("src/lib/nav.ts", W723_TANSTACK_MANY_CALLS.as_str())
+    .write("src/routes/profile.tsx", TANSTACK_PROFILE)
+    .edge_after(
+        "function open0",
+        "navigates",
+        "route src/routes/profile.tsx::route:/profile",
+    )
+    .edge_after(
+        "function open500",
+        "navigates",
+        "route src/routes/profile.tsx::route:/profile",
+    )
+}
+
+/// W7-23b, a regression: the same route appears in a folder of its own,
+/// which moves the JavaScript control inputs.
+pub fn tsx_tanstack_route_appears_in_a_new_folder() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file("src/routes/settings.tsx", TANSTACK_SETTINGS)
+        .file("src/lib/nav.ts", W723_TANSTACK_OPEN_PROFILE)
+        .write(
+            "src/routes/profile/index.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/profile/')({ component: Profile })\nfunction Profile() {\n  return null\n}\n",
+        )
+        .edge_after(
+            "function open",
+            "navigates",
+            "route src/routes/profile/index.tsx::route:/profile",
+        )
+}
+
+/// W7-23b (W7-10's seed): a page file comes to render an outlet, so it is
+/// the layout around its address and the index route beside it is the one
+/// page there. The call the two routes made ambiguous binds to it.
+pub fn tsx_tanstack_route_file_becomes_a_layout() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file(
+            "src/routes/posts.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts')({ component: Posts })\nfunction Posts() {\n  return null\n}\n",
+        )
+        .file(
+            "src/routes/posts.index.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts/')({ component: PostsIndex })\nfunction PostsIndex() {\n  return null\n}\n",
+        )
+        .file(
+            "src/lib/nav.ts",
+            "export function list(navigate) {\n  navigate({ to: '/posts' })\n}\n",
+        )
+        .write(
+            "src/routes/posts.tsx",
+            "import { createFileRoute, Outlet } from '@tanstack/react-router'\nexport const Route = createFileRoute('/posts')({ component: Posts })\nfunction Posts() {\n  return <Outlet />\n}\n",
+        )
+        .edge_after(
+            "function list",
+            "navigates",
+            "route src/routes/posts.index.tsx::route:/posts",
+        )
+}
+
+/// A two-route Vue Router table, `home` and `login`.
+const W723_VUE_TABLE: &str = "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'login', path: '/login', component: () => import('../views/Login.vue') },\n  ],\n})\n";
+
+/// A Vue Router app with [`W723_VUE_TABLE`] and its views.
+fn w723_vue_app(case: Case) -> Case {
+    case.file("package.json", VUE_ROUTER_PACKAGE)
+        .file("src/views/Home.vue", VUE_VIEW)
+        .file("src/views/Login.vue", VUE_VIEW)
+}
+
+/// W7-23b (W7-11's seed, KEEP-RUST beyond upstream): the table gives the
+/// `/login` route the name another file already pushes. The route's node
+/// is the one it was (named by its path), so only the table's text moved.
+pub fn javascript_vue_router_route_gains_the_name_a_call_pushes() -> Case {
+    w723_vue_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file("src/router/index.js", W723_VUE_TABLE)
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'sign-in' })\n}\n",
+    )
+    .write(
+        "src/router/index.js",
+        "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'sign-in', path: '/login', component: () => import('../views/Login.vue') },\n  ],\n})\n",
+    )
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+}
+
+/// W7-23b, a regression: the table takes the name away, and the call bound
+/// by it loses its route (its edge reached the edited table file).
+pub fn javascript_vue_router_route_loses_the_name_a_call_pushes() -> Case {
+    w723_vue_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file("src/router/index.js", W723_VUE_TABLE)
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push({ name: 'login' })\n}\n",
+    )
+    .write(
+        "src/router/index.js",
+        "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'sign-in', path: '/login', component: () => import('../views/Login.vue') },\n  ],\n})\n",
+    )
+    .edge_before(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/login",
+    )
+    .edge_after("route src/router/index.js::route:/login", "calls", "component src/views/Login.vue::Login")
+}
+
+/// W7-23b (upstream #2425's Vue Router case, in the table file the index
+/// has): the table gains the `/about` route a call pushes by path.
+pub fn javascript_vue_router_route_appears_for_a_parked_push() -> Case {
+    w723_vue_app(Case::new(
+        Change::BodyEdit,
+        &[Language::JavaScript, Language::Vue],
+    ))
+    .file("src/router/index.js", W723_VUE_TABLE)
+    .file(
+        "src/lib/nav.js",
+        "export function open(router) {\n  router.push('/about')\n}\n",
+    )
+    .write(
+        "src/router/index.js",
+        "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: 'home', path: '/', component: () => import('../views/Home.vue') },\n    { name: 'login', path: '/login', component: () => import('../views/Login.vue') },\n    { name: 'about', path: '/about', component: () => import('../views/Login.vue') },\n  ],\n})\n",
+    )
+    .edge_after(
+        "function open",
+        "navigates",
+        "route src/router/index.js::route:/about",
+    )
+}
+
+/// W7-23b (W7-09d's seed, upstream #2425's table case): a file starts
+/// handing the router a table whose index route a parked navigation names.
+pub fn jsx_react_router_table_route_appears_for_a_parked_navigation() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
+        .file("package.json", REACT_ROUTER_PACKAGE)
+        .file("src/AppRoutes.js", APP_ROUTES_TABLE)
+        .file("src/App.js", APP_WRITES_A_ROUTE)
+        .file("src/Home.js", HOME_PAGE)
+        .file("src/Counter.js", COUNTER_PAGE)
+        .file("src/FetchData.js", FETCH_DATA_PAGE)
+        .file("src/NavMenu.js", NAV_MENU_HOME)
+        .write("src/App.js", APP_MAPS_THE_TABLE)
+        .edge_after(
+            "function NavMenu::goHome",
+            "navigates",
+            "route src/AppRoutes.js::route:/",
+        )
+}
+
+/// W7-23b (W7-09b's seed): the constant a route's path is built from moves
+/// from `/app` to `/dashboard`. The route is renamed in place: the call to
+/// `/app` loses it, and the parked call to `/dashboard` binds to it.
+pub fn tsx_react_router_route_constant_rename_rebinds_navigation() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        )
+        .file(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/app' } },\n} as const\n",
+        )
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router'\nimport { paths } from './config/paths'\nimport { AppRoot } from './AppRoot'\nexport const router = createBrowserRouter([\n  { path: paths.app.root.path, element: <AppRoot /> },\n])\n",
+        )
+        .file("src/AppRoot.tsx", "export function AppRoot() {\n  return null\n}\n")
+        .file(
+            "src/nav.ts",
+            "import { useNavigate } from 'react-router'\nexport function goApp() {\n  const navigate = useNavigate()\n  navigate('/app')\n}\nexport function goDashboard() {\n  const navigate = useNavigate()\n  navigate('/dashboard')\n}\n",
+        )
+        .write(
+            "src/config/paths.ts",
+            "export const paths = {\n  app: { root: { path: '/dashboard' } },\n} as const\n",
+        )
+        .edge_before(
+            "function goApp",
+            "navigates",
+            "route src/router.tsx::route:/{paths.app.root.path}",
+        )
+        .edge_after(
+            "function goDashboard",
+            "navigates",
+            "route src/router.tsx::route:/{paths.app.root.path}",
+        )
+        .no_edge_after(
+            "function goApp",
+            "navigates",
+            "route src/router.tsx::route:/{paths.app.root.path}",
+        )
+}
+
+/// W7-23b (upstream #2425's "a path built from a constant another file
+/// holds"): the constant comes to name the path a parked call navigates to.
+pub fn tsx_react_router_route_constant_names_a_parked_call() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file(
+            "package.json",
+            "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router\":\"7\"}}\n",
+        )
+        .file(
+            "src/config/paths.ts",
+            "export const paths = {\n  auth: { login: { path: '/auth/sign-in' } },\n} as const;\n",
+        )
+        .file(
+            "src/app/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\nimport { paths } from '../config/paths';\nimport { LoginRoute } from './routes/login';\nexport const router = createBrowserRouter([\n  { path: paths.auth.login.path, element: <LoginRoute /> },\n]);\n",
+        )
+        .file(
+            "src/app/routes/login.tsx",
+            "export function LoginRoute() { return null; }\n",
+        )
+        .file(
+            "src/lib/auth.tsx",
+            "import { useNavigate } from 'react-router';\nexport function Logout() {\n  const navigate = useNavigate();\n  return <button onClick={() => navigate('/auth/login')}>out</button>;\n}\n",
+        )
+        .write(
+            "src/config/paths.ts",
+            "export const paths = {\n  auth: { login: { path: '/auth/login' } },\n} as const;\n",
+        )
+        .edge_after(
+            "function Logout",
+            "navigates",
+            "route src/app/router.tsx::route:/{paths.auth.login.path}",
+        )
+}
+
+/// W7-23b (W7-13b's seed 1): another routes file of the app comes to serve
+/// the path a call names, so two routes serve it and the call reaches
+/// neither (KEEP-RUST: an `ExactTable` ambiguity).
+pub fn typescript_angular_second_route_at_a_path_makes_the_call_ambiguous() -> Case {
+    angular_app(Case::new(Change::AddCompetitor, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .file("src/app/nav.component.ts", ANGULAR_NAV_LOGIN)
+        .write(
+            "src/app/legacy.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { ProfileComponent } from './profile/profile.component';\nexport const legacyRoutes: Routes = [{ path: 'login', component: ProfileComponent }];\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/legacy.routes.ts::route:/login",
+        )
+}
+
+/// W7-23b: the other direction: the second `login` route goes, and the
+/// call that the two made ambiguous binds to the one left.
+pub fn typescript_angular_competing_route_goes() -> Case {
+    angular_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript],
+    ))
+    .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+    .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+    .file("src/app/nav.component.ts", ANGULAR_NAV_LOGIN)
+    .file(
+        "src/app/legacy.routes.ts",
+        "import { Routes } from '@angular/router';\nimport { ProfileComponent } from './profile/profile.component';\nexport const legacyRoutes: Routes = [{ path: 'login', component: ProfileComponent }];\n",
+    )
+    .remove("src/app/legacy.routes.ts")
+    .edge_after(
+        "method NavComponent::go",
+        "navigates",
+        "route src/app/app.routes.ts::route:/login",
+    )
+}
+
+/// A component whose `go` navigates to `/go`.
+const W723_ANGULAR_NAV_GO: &str = "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go() { this.router.navigate(['/go']); }\n}\n";
+
+/// W7-23b (W7-13b's seed 2): another routes file comes to redirect the path
+/// a call names to another route: the path's redirects disagree, so the call
+/// reaches neither route (KEEP-RUST).
+pub fn typescript_angular_second_redirect_of_a_path_makes_the_call_ambiguous() -> Case {
+    angular_app(Case::new(Change::AddCompetitor, &[Language::TypeScript]))
+        .file("src/app/x.routes.ts", ANGULAR_X_ROUTES)
+        .file("src/app/nav.component.ts", W723_ANGULAR_NAV_GO)
+        .write(
+            "src/app/more.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const moreRoutes: Routes = [\n  { path: 'more', component: AuthComponent },\n  { path: 'go', redirectTo: 'x2' },\n];\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x1",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x1",
+        )
+        .no_edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/x.routes.ts::route:/x2",
+        )
+}
+
+/// A routes file that only mounts another and redirects.
+const W723_ANGULAR_MOUNT: &str = "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'profile', loadChildren: () => import('./profile/profile.routes') },\n  { path: 'go', redirectTo: 'profile/a' },\n];\n";
+
+/// W7-23b (KEEP-RUST beyond upstream): a routes file that holds no route of
+/// its own, only a mount and a redirect, re-points the redirect. No route
+/// node moves; the table read the file's text.
+pub fn typescript_angular_mount_only_file_redirect_moves() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", W723_ANGULAR_MOUNT)
+        .file(
+            "src/app/profile/profile.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { ProfileComponent } from './profile.component';\nimport { AuthComponent } from '../auth.component';\nexport default [\n  { path: 'a', component: ProfileComponent },\n  { path: 'b', component: AuthComponent },\n] satisfies Routes;\n",
+        )
+        .file("src/app/nav.component.ts", W723_ANGULAR_NAV_GO)
+        .write(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: 'profile', loadChildren: () => import('./profile/profile.routes') },\n  { path: 'go', redirectTo: 'profile/b' },\n];\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/profile/profile.routes.ts::route:/a",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/profile/profile.routes.ts::route:/b",
+        )
+}
+
+/// W7-23b (W7-13b's seed 3, KEEP-RUST beyond upstream): the route constant
+/// a call navigates by is edited in another file: the call reaches the
+/// route the constant now builds, though no route moved.
+pub fn typescript_angular_route_constant_builds_another_path() -> Case {
+    angular_app(Case::new(Change::BodyEdit, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .file(
+            "src/app/links.ts",
+            "export const links = {\n  open: (name: string) => ['/login'],\n};\n",
+        )
+        .file(
+            "src/app/nav.component.ts",
+            "import { Router } from '@angular/router';\nimport { links } from './links';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go(name) { this.router.navigate(links.open(name)); }\n}\n",
+        )
+        .write(
+            "src/app/links.ts",
+            "export const links = {\n  open: (name: string) => ['/profile', name],\n};\n",
+        )
+        .edge_before(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/profile/profile.routes.ts::route:/:username",
+        )
+}
+
+/// W7-23b (W7-13b's seed 4, #2425): a route appears at the path a parked
+/// `navigate` names.
+pub fn typescript_angular_route_appears_where_a_navigate_points() -> Case {
+    angular_app(Case::new(Change::AddImportTarget, &[Language::TypeScript]))
+        .file("src/app/app.routes.ts", ANGULAR_APP_ROUTES)
+        .file("src/app/profile/profile.routes.ts", ANGULAR_PROFILE_ROUTES)
+        .file(
+            "src/app/nav.component.ts",
+            "import { Router } from '@angular/router';\nexport class NavComponent {\n  constructor(private router: Router) {}\n  go() { this.router.navigate(['/help']); }\n}\n",
+        )
+        .write(
+            "src/app/help.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const helpRoutes: Routes = [{ path: 'help', component: AuthComponent }];\n",
+        )
+        .edge_after(
+            "method NavComponent::go",
+            "navigates",
+            "route src/app/help.routes.ts::route:/help",
+        )
+}
+
+/// Upstream #2425's Angular screens: `HomeComponent`, whose `signIn`
+/// navigates to `/login`, and `LoginComponent`.
+const W723_ANGULAR_HOME_SIGN_IN: &str = "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'app-x', template: '<p>x</p>' })\nexport class HomeComponent {\n  constructor(private readonly router: Router) {}\n  signIn() { this.router.navigate(['/login']); }\n}\n";
+const W723_ANGULAR_LOGIN: &str = "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'app-x', template: '<p>x</p>' })\nexport class LoginComponent {\n  constructor(private readonly router: Router) {}\n}\n";
+/// The routes file that serves both screens.
+const W723_ANGULAR_HOME_LOGIN_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { HomeComponent } from './home.component';\nimport { LoginComponent } from './login.component';\nexport const routes: Routes = [\n  { path: 'home', component: HomeComponent },\n  { path: 'login', component: LoginComponent },\n];\n";
+
+/// W7-23b (upstream #2425's Angular case): the routes file appears after
+/// the component that navigates to one of its routes.
+pub fn typescript_angular_routes_file_appears_for_a_parked_navigate() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"@angular/core\":\"19\",\"@angular/router\":\"19\"}}\n",
+        )
+        .file("src/app/home.component.ts", W723_ANGULAR_HOME_SIGN_IN)
+        .file("src/app/login.component.ts", W723_ANGULAR_LOGIN)
+        .write("src/app/app.routes.ts", W723_ANGULAR_HOME_LOGIN_ROUTES)
+        .edge_after(
+            "method HomeComponent::signIn",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+}
+
+/// W7-23b, a regression: the routes file goes, and the call loses its
+/// route (its edge reached the removed file).
+pub fn typescript_angular_routes_file_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"@angular/core\":\"19\",\"@angular/router\":\"19\"}}\n",
+        )
+        .file("src/app/home.component.ts", W723_ANGULAR_HOME_SIGN_IN)
+        .file("src/app/login.component.ts", W723_ANGULAR_LOGIN)
+        .file("src/app/app.routes.ts", W723_ANGULAR_HOME_LOGIN_ROUTES)
+        .file("src/app/other.ts", "export const other = 1;\n")
+        .remove("src/app/app.routes.ts")
+        .edge_before(
+            "method HomeComponent::signIn",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+        .named_after("method", "signIn")
+}
+
+/// W7-23b, a regression (upstream #2425's Angular routerLink case): a link
+/// in a template is the synthesis stage's, which every sync that changes a
+/// file recomputes.
+pub fn typescript_angular_router_link_routes_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"@angular/core\":\"19\",\"@angular/router\":\"19\"}}\n",
+        )
+        .file(
+            "src/app/home.component.ts",
+            "import { Component } from '@angular/core';\nimport { Router } from '@angular/router';\n@Component({ selector: 'app-x', template: '<a routerLink=\"/login\">Sign in</a>' })\nexport class HomeComponent {\n  constructor(private readonly router: Router) {}\n}\n",
+        )
+        .file("src/app/login.component.ts", W723_ANGULAR_LOGIN)
+        .write("src/app/app.routes.ts", W723_ANGULAR_HOME_LOGIN_ROUTES)
+        .edge_after(
+            "class HomeComponent",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+}
+
+/// The package of the W7-23 Next.js cases.
+const W723_NEXT_PACKAGE: &str =
+    "{\"name\":\"site\",\"dependencies\":{\"next\":\"15\",\"react\":\"19\"}}\n";
+
+/// W7-23b (upstream #2425's Next.js case, in a pages folder the index has):
+/// the page a parked `router.push` names appears.
+pub fn tsx_nextjs_page_appears_for_a_parked_push() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", W723_NEXT_PACKAGE)
+        .file(
+            "pages/index.tsx",
+            "export default function Home() {\n  return null\n}\n",
+        )
+        .file(
+            "components/logout.tsx",
+            "import { useRouter } from 'next/router'\nexport function Logout() {\n  const router = useRouter()\n  const out = () => router.push('/login')\n  return <button onClick={out}>out</button>\n}\n",
+        )
+        .write(
+            "pages/login.tsx",
+            "export default function Login() {\n  return null\n}\n",
+        )
+        .edge_after(
+            "function Logout::out",
+            "navigates",
+            "route pages/login.tsx::route:/login",
+        )
+}
+
+/// W7-23b, a regression (upstream #2425's Next.js case as written): the page
+/// appears in a folder of its own, which moves the JavaScript control inputs.
+pub fn tsx_nextjs_upstream_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", W723_NEXT_PACKAGE)
+        .file(
+            "app/page.tsx",
+            "export default function Home() {\n  return null\n}\n",
+        )
+        .file(
+            "components/logout-button.tsx",
+            "'use client'\nimport { useRouter } from 'next/navigation'\nexport function LogoutButton() {\n  const router = useRouter()\n  const out = () => router.push('/login')\n  return <button onClick={out}>Log out</button>\n}\n",
+        )
+        .write(
+            "app/login/page.tsx",
+            "export default function LoginPage() {\n  return null\n}\n",
+        )
+        .edge_after(
+            "function LogoutButton::out",
+            "navigates",
+            "route app/login/page.tsx::route:/login",
+        )
+}
+
+/// A Next.js app whose `Add` pushes `/users/new`, beside a parameter page.
+fn w723_next_users(case: Case) -> Case {
+    case.file("package.json", W723_NEXT_PACKAGE)
+        .file(
+            "pages/index.tsx",
+            "export default function Home() {\n  return null\n}\n",
+        )
+        .file(
+            "pages/users/[id].tsx",
+            "export default function User() {\n  return null\n}\n",
+        )
+        .file(
+            "components/add.tsx",
+            "import { useRouter } from 'next/router'\nexport function Add() {\n  const router = useRouter()\n  const add = () => router.push('/users/new')\n  return <button onClick={add}>add</button>\n}\n",
+        )
+}
+
+/// W7-23b (upstream #2425's "a parameter route that took the call
+/// meanwhile", Next.js): the static page appears beside the parameter page
+/// that took the call.
+pub fn tsx_nextjs_static_page_takes_the_call_from_a_parameter_page() -> Case {
+    w723_next_users(Case::new(Change::AddCompetitor, &[Language::Tsx]))
+        .write(
+            "pages/users/new.tsx",
+            "export default function NewUser() {\n  return null\n}\n",
+        )
+        .edge_before(
+            "function Add::add",
+            "navigates",
+            "route pages/users/[id].tsx::route:/users/:id",
+        )
+        .edge_after(
+            "function Add::add",
+            "navigates",
+            "route pages/users/new.tsx::route:/users/new",
+        )
+}
+
+/// W7-23b, a regression: the static page goes, and the call falls back to
+/// the parameter page (its edge reached the removed file).
+pub fn tsx_nextjs_static_page_goes() -> Case {
+    w723_next_users(Case::new(Change::DeleteImportedModule, &[Language::Tsx]))
+        .file(
+            "pages/users/new.tsx",
+            "export default function NewUser() {\n  return null\n}\n",
+        )
+        .remove("pages/users/new.tsx")
+        .edge_before(
+            "function Add::add",
+            "navigates",
+            "route pages/users/new.tsx::route:/users/new",
+        )
+        .edge_after(
+            "function Add::add",
+            "navigates",
+            "route pages/users/[id].tsx::route:/users/:id",
+        )
+}
+
+/// The package of the W7-23 Expo Router cases.
+const W723_EXPO_PACKAGE: &str = "{\"name\":\"app\",\"dependencies\":{\"expo\":\"52\",\"expo-router\":\"4\",\"react\":\"18\"}}\n";
+
+/// W7-23b (upstream #2425's Expo Router case): the screen a parked
+/// `router.push` names appears in the app folder.
+pub fn typescript_expo_screen_appears_for_a_parked_push() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", W723_EXPO_PACKAGE)
+        .file(
+            "src/app/_layout.tsx",
+            "export default function Layout() { return null }\n",
+        )
+        .file(
+            "src/app/index.tsx",
+            "export default function Home() { return null }\n",
+        )
+        .file(
+            "src/services/nav.ts",
+            "import { router } from 'expo-router'\nexport function openSettings() {\n  router.push('/settings')\n}\n",
+        )
+        .write(
+            "src/app/settings.tsx",
+            "export default function Settings() { return null }\n",
+        )
+        .edge_after(
+            "function openSettings",
+            "navigates",
+            "route src/app/settings.tsx::route:/settings",
+        )
+}
+
+/// W7-23b (upstream #2425's "a catch-all screen that took the call
+/// meanwhile"): the screen appears beside the catch-all.
+pub fn typescript_expo_screen_takes_the_call_from_a_catch_all() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", W723_EXPO_PACKAGE)
+        .file(
+            "src/app/_layout.tsx",
+            "export default function Layout() { return null }\n",
+        )
+        .file(
+            "src/app/index.tsx",
+            "export default function Home() { return null }\n",
+        )
+        .file(
+            "src/app/[...missing].tsx",
+            "export default function NotFound() { return null }\n",
+        )
+        .file(
+            "src/services/session.ts",
+            "import { router } from 'expo-router'\nexport function signOut() {\n  router.replace('/login')\n}\n",
+        )
+        .write(
+            "src/app/login.tsx",
+            "export default function Login() { return null }\n",
+        )
+        .edge_after(
+            "function signOut",
+            "navigates",
+            "route src/app/login.tsx::route:/login",
+        )
+}
+
+/// W7-23b (upstream #2425's SvelteKit case, in a route folder the index has:
+/// its server file is there already): the page a parked `redirect` names
+/// appears.
+pub fn javascript_sveltekit_page_appears_beside_its_server_file() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript, Language::Svelte])
+        .file(
+            "package.json",
+            "{\"name\":\"conduit\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+        )
+        .file("src/routes/+page.svelte", "<h1>Home</h1>\n")
+        .file(
+            "src/routes/login/+page.server.js",
+            "export function load() {\n  return {}\n}\n",
+        )
+        .file("src/routes/settings/+page.svelte", "<h1>Settings</h1>\n")
+        .file(
+            "src/routes/settings/+page.server.js",
+            "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/login')\n}\n",
+        )
+        .write("src/routes/login/+page.svelte", "<h1>Sign in</h1>\n")
+        .edge_after(
+            "function load @src/routes/settings/+page.server.js",
+            "navigates",
+            "route src/routes/login/+page.svelte::route:/login",
+        )
+}
+
+/// The cart app of upstream #2425's React Router markup cases.
+const W723_CART_APP: &str = "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/cart' component={CartScreen} />\n  </Router>\n)\nexport default App\n";
+const W723_CART_APP_WITH_LOGIN: &str = "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport LoginScreen from './screens/LoginScreen'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/cart' component={CartScreen} />\n  </Router>\n)\nexport default App\n";
+
+/// A React Router 5 app whose cart screen checks out with `checkout`.
+fn w723_cart_app(case: Case, checkout: &'static str) -> Case {
+    case.file(
+        "package.json",
+        "{\"name\":\"shop\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+    )
+    .file("src/App.js", W723_CART_APP)
+    .file(
+        "src/screens/LoginScreen.js",
+        "const LoginScreen = () => <div>Login</div>\nexport default LoginScreen\n",
+    )
+    .file("src/screens/CartScreen.js", checkout)
+    .write("src/App.js", W723_CART_APP_WITH_LOGIN)
+}
+
+/// W7-23b (upstream #2425's "a <Route> in the markup" case): the routes file
+/// gains the route a parked `history.push` names.
+pub fn javascript_react_router_markup_route_appears_for_a_parked_push() -> Case {
+    w723_cart_app(
+        Case::new(Change::BodyEdit, &[Language::JavaScript]),
+        "const CartScreen = ({ history }) => {\n  const checkout = () => {\n    history.push('/login?redirect=shipping')\n  }\n  return <button onClick={checkout}>Checkout</button>\n}\nexport default CartScreen\n",
+    )
+    .edge_after(
+        "function CartScreen::checkout",
+        "navigates",
+        "route src/App.js::route:/login",
+    )
+}
+
+/// W7-23b, a regression (upstream #2425's "one arm of a conditional
+/// destination"): the call's other arm held an edge into the edited routes
+/// file.
+pub fn javascript_react_router_conditional_arm_appears() -> Case {
+    w723_cart_app(
+        Case::new(Change::BodyEdit, &[Language::JavaScript]),
+        "const CartScreen = ({ history, user }) => {\n  const checkout = () => {\n    history.push(user ? '/cart' : '/login')\n  }\n  return <button onClick={checkout}>Checkout</button>\n}\nexport default CartScreen\n",
+    )
+    .edge_after(
+        "function CartScreen::checkout",
+        "navigates",
+        "route src/App.js::route:/login",
+    )
+}
+
+/// The admin app of upstream #2425's parameter-route cases.
+const W723_ADMIN: &str = "import { useNavigate } from 'react-router-dom'\nexport const Admin = () => {\n  const navigate = useNavigate()\n  const add = () => navigate('/users/new')\n  return <button onClick={add}>Add</button>\n}\n";
+
+/// W7-23b, a regression (upstream #2425's "a parameter route that took the
+/// call meanwhile"): the static route appears in the routes file the
+/// call's edge reached.
+pub fn jsx_react_router_parameter_route_took_the_call() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Jsx])
+        .file(
+            "package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+        )
+        .file(
+            "src/App.jsx",
+            "import { Routes, Route } from 'react-router-dom'\nimport { User } from './User'\nexport const App = () => (\n  <Routes>\n    <Route path=\"/users/:id\" element={<User />} />\n  </Routes>\n)\n",
+        )
+        .file(
+            "src/User.jsx",
+            "export const User = () => <div>User</div>\nexport const NewUser = () => <div>New</div>\n",
+        )
+        .file("src/Admin.jsx", W723_ADMIN)
+        .write(
+            "src/App.jsx",
+            "import { Routes, Route } from 'react-router-dom'\nimport { User, NewUser } from './User'\nexport const App = () => (\n  <Routes>\n    <Route path=\"/users/new\" element={<NewUser />} />\n    <Route path=\"/users/:id\" element={<User />} />\n  </Routes>\n)\n",
+        )
+        .edge_after(
+            "function Admin::add",
+            "navigates",
+            "route src/App.jsx::route:/users/new",
+        )
+}
+
+/// W7-23b (upstream #2425's "a route that goes away"): of two parameter
+/// routes a call matched, one goes; the call binds to the one left.
+pub fn jsx_react_router_tie_goes_away() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Jsx])
+        .file(
+            "package.json",
+            "{\"name\":\"admin\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+        )
+        .file(
+            "src/App.jsx",
+            "import { Routes, Route } from 'react-router-dom'\nimport { User } from './User'\nexport const App = () => (\n  <Routes>\n    <Route path=\"/users/:id\" element={<User />} />\n    <Route path=\"/users/:name\" element={<User />} />\n  </Routes>\n)\n",
+        )
+        .file("src/User.jsx", "export const User = () => <div>User</div>\n")
+        .file(
+            "src/Admin.jsx",
+            "import { useNavigate } from 'react-router-dom'\nexport const Admin = () => {\n  const navigate = useNavigate()\n  const open = () => navigate('/users/5')\n  return <button onClick={open}>Open</button>\n}\n",
+        )
+        .write(
+            "src/App.jsx",
+            "import { Routes, Route } from 'react-router-dom'\nimport { User } from './User'\nexport const App = () => (\n  <Routes>\n    <Route path=\"/users/:id\" element={<User />} />\n  </Routes>\n)\n",
+        )
+        .edge_after(
+            "function Admin::open",
+            "navigates",
+            "route src/App.jsx::route:/users/:id",
+        )
+}
+
+/// W7-23b, a regression (the router half of upstream #2749, audit row B
+/// 87): the module a route's layout is the default import of moves its
+/// default export; the layout reference follows (its edge reached the
+/// edited module).
+pub fn tsx_react_router_layout_default_import_moves() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport { default as AppRoot } from './root';\nimport { One } from './one';\nexport const router = createBrowserRouter([\n  {\n    path: '/app',\n    element: <AppRoot />,\n    children: [{ path: 'one', element: <One /> }],\n  },\n]);\n",
+        )
+        .file("src/one.tsx", "export function One() { return null; }\n")
+        .file(
+            "src/root.tsx",
+            "export function AppRoot() { return null; }\nexport function Shell() { return null; }\nexport default AppRoot;\n",
+        )
+        .write(
+            "src/root.tsx",
+            "export function AppRoot() { return null; }\nexport function Shell() { return null; }\nexport default Shell;\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/app/one",
+            "references",
+            "function Shell",
+        )
+}
+
+/// W7-23b (upstream #2425's TanStack Router case as written: the route file
+/// appears beside the index route whose component navigates to it).
+pub fn tsx_tanstack_upstream_route_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", TANSTACK_PACKAGE)
+        .file(
+            "src/routes/index.tsx",
+            "import { createFileRoute, useNavigate } from '@tanstack/react-router'\nexport const Route = createFileRoute('/')({ component: IndexComponent })\nfunction IndexComponent() {\n  const navigate = useNavigate()\n  const signIn = () => navigate({ to: '/login' })\n  return <button onClick={signIn}>Sign in</button>\n}\n",
+        )
+        .write(
+            "src/routes/login.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/login')({ component: LoginComponent })\nfunction LoginComponent() {\n  return <div>Login</div>\n}\n",
+        )
+        .edge_after(
+            "function IndexComponent::signIn",
+            "navigates",
+            "route src/routes/login.tsx::route:/login",
+        )
+}
+
+/// W7-23b (upstream #2425's Vue Router case as written): the table gains the
+/// `login` route a view's `router.push` names; the views are named through
+/// an alias no configuration declares.
+pub fn javascript_vue_router_upstream_route_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Vue])
+        .file(
+            "package.json",
+            "{\"name\":\"conduit\",\"dependencies\":{\"vue\":\"3\",\"vue-router\":\"4\"}}\n",
+        )
+        .file(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"home\", path: \"/\", component: () => import(\"@/views/Home\") },\n  ]\n})\nexport default router\n",
+        )
+        .file(
+            "src/views/Home.vue",
+            "<template>\n  <button @click=\"signIn\">Sign in</button>\n</template>\n<script setup>\nimport { useRouter } from \"vue-router\"\nconst router = useRouter()\nfunction signIn() {\n  router.push(\"/login\")\n}\n</script>\n",
+        )
+        .file(
+            "src/views/Login.vue",
+            "<template>\n  <div>Login</div>\n</template>\n<script setup>\nconst x = 1\n</script>\n",
+        )
+        .write(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from \"vue-router\"\nconst router = createRouter({\n  history: createWebHistory(),\n  routes: [\n    { name: \"home\", path: \"/\", component: () => import(\"@/views/Home\") },\n    { name: \"login\", path: \"/login\", component: () => import(\"@/views/Login\") },\n  ]\n})\nexport default router\n",
+        )
+        .edge_after(
+            "function signIn",
+            "navigates",
+            "route src/router/index.js::route:/login",
+        )
+}
+
+/// W7-23b (upstream #2425's Angular case as written): the routes file gains
+/// the `login` route a component navigates to.
+pub fn typescript_angular_upstream_route_appears() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"dependencies\":{\"@angular/core\":\"19\",\"@angular/router\":\"19\"}}\n",
+        )
+        .file("src/app/home.component.ts", W723_ANGULAR_HOME_SIGN_IN)
+        .file("src/app/login.component.ts", W723_ANGULAR_LOGIN)
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { HomeComponent } from './home.component';\nexport const routes: Routes = [\n  { path: 'home', component: HomeComponent },\n];\n",
+        )
+        .write("src/app/app.routes.ts", W723_ANGULAR_HOME_LOGIN_ROUTES)
+        .edge_after(
+            "method HomeComponent::signIn",
+            "navigates",
+            "route src/app/app.routes.ts::route:/login",
+        )
+}
+
+/// W7-23b, a regression (upstream #2425's SvelteKit case as written): the
+/// page appears in a folder of its own, which moves the JavaScript control
+/// inputs.
+pub fn javascript_sveltekit_upstream_page_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript, Language::Svelte])
+        .file(
+            "package.json",
+            "{\"name\":\"conduit\",\"devDependencies\":{\"@sveltejs/kit\":\"2\",\"svelte\":\"5\"}}\n",
+        )
+        .file("src/routes/+page.svelte", "<h1>Home</h1>\n")
+        .file("src/routes/settings/+page.svelte", "<h1>Settings</h1>\n")
+        .file(
+            "src/routes/settings/+page.server.js",
+            "import { redirect } from '@sveltejs/kit'\nexport function load({ locals }) {\n  if (!locals.user) redirect(302, '/login')\n}\n",
+        )
+        .write("src/routes/login/+page.svelte", "<h1>Sign in</h1>\n")
+        .edge_after(
+            "function load @src/routes/settings/+page.server.js",
+            "navigates",
+            "route src/routes/login/+page.svelte::route:/login",
+        )
+}

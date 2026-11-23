@@ -20,6 +20,7 @@ pub mod lua_modules;
 pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;
+mod navigation;
 pub mod objc_heads;
 pub mod php_heads;
 pub mod play_routes;

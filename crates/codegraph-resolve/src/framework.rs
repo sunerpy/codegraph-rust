@@ -200,10 +200,10 @@ pub trait FrameworkResolver: Sync {
     /// its route by path and its reference by the router's method, so a call
     /// parked while its route was missing, or bound to the best route then,
     /// is invisible to a sync's retry by name tail; this says which calls a
-    /// changed route may answer, so a sync can put them back. `None` when the
-    /// resolver binds no navigation. Every router resolver (Next.js, Expo
-    /// Router, React Router, TanStack Router, Vue Router, SvelteKit, Angular
-    /// Router) answers it; no sync calls it yet.
+    /// changed route may answer, so a sync can put them back (W7-23b).
+    /// `None` when the resolver binds no navigation. Every router resolver
+    /// (Next.js, Expo Router, React Router, TanStack Router, Vue Router,
+    /// SvelteKit, Angular Router) answers it.
     fn navigation(&self) -> Option<&dyn NavigationCalls> {
         None
     }
@@ -245,6 +245,38 @@ pub trait NavigationCalls: Sync {
     /// of the apps whose table it is in (`""` for every file), or `None` when
     /// it is not one of this router's routes.
     fn scope(&self, route: &Node, context: &dyn ResolutionContext) -> Option<Vec<String>>;
+
+    /// Whether the router's table reads its route files' text beyond the
+    /// route nodes (KEEP-RUST, W7-23b): Vue Router a route's `name`, Angular
+    /// a redirect. A sync then counts each route of a file it re-extracted
+    /// or removed as changed, before and after the change, since an edit
+    /// there can move a call though no route node moved. Defaults to
+    /// `false`.
+    fn table_reads_route_files(&self) -> bool {
+        false
+    }
+
+    /// The files whose calls the table may answer differently because it
+    /// reads `file`, which holds no route of its own (KEEP-RUST, W7-23b):
+    /// Angular reads the redirects of a file that only lazy-loads routes
+    /// files. `None` when the table reads nothing of `file` so.
+    fn scopes_read_from(
+        &self,
+        _file: &str,
+        _context: &dyn ResolutionContext,
+    ) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Whether the router reads a call's destination through files other
+    /// than the call's (KEEP-RUST, W7-23b): Angular a route constant, a
+    /// class property or a constant an import brings, React Router a route
+    /// config's `path` or `getHref`. A sync then re-resolves the router's
+    /// calls in the files whose references into a changed file it
+    /// refreshes. Defaults to `false`.
+    fn destinations_read_other_files(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

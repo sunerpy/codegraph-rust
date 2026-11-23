@@ -829,6 +829,11 @@ fn sync_paths_with_store(
         }
         on_progress(done + 1, total);
     }
+    // The files whose references into a changed or removed file this sync
+    // refreshes at their sites, as the paths left them: a navigation call
+    // in one may read its destination through the changed file (W7-23b's
+    // N2).
+    let extraction_dependents: BTreeSet<String> = dependent_sites.keys().cloned().collect();
 
     // What resolution reads of the control files (W5-06), compared once the
     // paths are processed and before any lane reads the changes: a kind that
@@ -1844,19 +1849,44 @@ fn sync_paths_with_store(
                 changed_names.note_any(names);
             }
         }
-        // W7-23a — the route and value references a changed module can move,
-        // read once the framework nodes are back: a route's lazily loaded
-        // module (#2422), through the barrels that forward it (#2560), and a
-        // same-file lazy value a route or a tag renders (#2452). None of them
-        // names a symbol the module declares or holds an edge into a barrel.
-        // They go back by site, with no ceiling. A sync that re-resolves
-        // every JavaScript-family file whole already covers them.
+        // W7-23 — the navigation calls a changed route may answer, and the
+        // route and value references a changed module can move, read once
+        // the framework nodes are back: a call naming a route by path
+        // (#2425), a route's lazily loaded module (#2422), through the
+        // barrels that forward it (#2560), and a same-file lazy value a
+        // route or a tag renders (#2452). None of them names a symbol the
+        // changed file declares or holds an edge into a barrel. They go
+        // back by site, with no ceiling. A sync that re-resolves every
+        // JavaScript-family file whole already covers them.
         let js_whole = frameworks_changed
             || surface_bootstrap
             || control
                 .changed
                 .contains(&crate::control_inputs::ControlKind::Js);
         if !js_whole {
+            // W7-23b — the navigation calls a route that appeared, went or
+            // moved may answer (N1, #2425), and those whose destination a
+            // rewritten file may move (N2), before the route-module lanes.
+            let rewritten: BTreeSet<String> = reindexed
+                .iter()
+                .chain(&changed_names.removed_files)
+                .cloned()
+                .collect();
+            let navigation = crate::navigation::navigation_sites(
+                store,
+                &resolver,
+                &crate::navigation::NavigationChanges {
+                    routes_before: changed_names.routes_before.as_deref(),
+                    rewritten: &rewritten,
+                    dependents: &extraction_dependents,
+                },
+                &reindexed,
+            )?;
+            for found in navigation {
+                if !dependent_fallbacks.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
             let mut modules: BTreeSet<String> = BTreeSet::new();
             for file in reindexed.iter().chain(&changed_names.file_nodes_changed) {
                 let language = store.file_by_path(file)?.map(|record| record.language);
@@ -3227,6 +3257,11 @@ struct ChangedNames {
     /// Whether this sync already withdrew the surface version marker, as it
     /// does before its first mutation and restores once everything persisted.
     surface_dirty: bool,
+    /// The route nodes a navigation router may bind a call to, read before
+    /// this sync's first mutation (W7-23b's N1, upstream #2425's
+    /// `routesBefore`): the routes after the change are compared with them.
+    /// `None` while the sync changed nothing.
+    routes_before: Option<Vec<Node>>,
     /// What the changed C/C++ files held that resolution in other files reads
     /// (W4-CPP-04).
     cpp: crate::cpp_dependents::CppChanges,
@@ -3373,6 +3408,9 @@ impl ChangedNames {
     /// next sync reconciles every JavaScript-family file (W4a-F3).
     fn begin_mutation(&mut self, store: &Store) -> Result<()> {
         if !self.surface_dirty {
+            // Read before anything changes, whatever the frameworks are:
+            // they are detected only once the changed files are written.
+            self.routes_before = Some(crate::navigation::route_snapshot(store)?);
             store.delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)?;
             crate::cpp_dependents::withdraw_marker(store)?;
             crate::java_heads::withdraw_marker(store)?;
@@ -3814,6 +3852,21 @@ pub(crate) mod tests {
         /// sorted.
         static RETRY_NAMES: std::cell::RefCell<Vec<Vec<String>>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// The steps the navigation lanes took on this thread (W7-23b):
+        /// `routes` when the routes after a change were read, `calls` when
+        /// the calls a changed route may answer were looked up,
+        /// `destinations` when a dependent's navigation calls were.
+        static NAVIGATION_STEPS: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note_navigation(step: &'static str) {
+        NAVIGATION_STEPS.with(|steps| steps.borrow_mut().push(step));
+    }
+
+    /// The navigation lanes' steps since the last call, in order.
+    fn take_navigation_steps() -> Vec<&'static str> {
+        NAVIGATION_STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
     }
 
     pub(crate) fn note_retry_names(names: &HashSet<String>) {
@@ -11963,6 +12016,344 @@ pub(crate) mod tests {
                 "route-module-fail-fresh",
                 &[W723_PACKAGE, W723_ROUTER, W723_TEAM, W723_OTHER, W723_LIB]
             )
+        );
+    }
+
+    // W7-23b: the navigation calls a sync sends back when a route a call
+    // may name appears, goes or moves (upstream #2425's
+    // `reopenNavigationsFor`, `sync-navigation-retry.test.ts`).
+
+    /// One React Router app of the upstream monorepo: its `/` route, and a
+    /// home screen that navigates to `/login` and `/back`, which the app
+    /// lacks, and to its `/`.
+    fn w723_app(name: &str) -> [(String, String); 3] {
+        [
+            (
+                format!("apps/{name}/package.json"),
+                format!(
+                    "{{\"name\":\"{name}\",\"dependencies\":{{\"react\":\"18\",\"react-router-dom\":\"6\"}}}}\n"
+                ),
+            ),
+            (
+                format!("apps/{name}/src/App.jsx"),
+                "import { Routes, Route } from 'react-router-dom'\nimport { Home } from './Home'\nexport const App = () => (\n  <Routes>\n    <Route path=\"/\" element={<Home />} />\n  </Routes>\n)\n".to_string(),
+            ),
+            (
+                format!("apps/{name}/src/Home.jsx"),
+                "import { useNavigate } from 'react-router-dom'\nexport const Home = () => {\n  const navigate = useNavigate()\n  const go = () => navigate('/login')\n  const back = () => navigate('/back')\n  const home = () => navigate('/')\n  return <button onClick={go} onDoubleClick={back} onBlur={home}>Go</button>\n}\n".to_string(),
+            ),
+        ]
+    }
+
+    /// The upstream monorepo of two such apps, `web` and `admin`, indexed.
+    fn w723_monorepo(name: &str) -> (TestDir, PathBuf) {
+        let mut owned = vec![(
+            "package.json".to_string(),
+            "{\"name\":\"mono\",\"private\":true,\"workspaces\":[\"apps/*\"]}\n".to_string(),
+        )];
+        owned.extend(w723_app("web"));
+        owned.extend(w723_app("admin"));
+        let files: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        fully_indexed(name, &files)
+    }
+
+    /// A resolver for `root`, detected over `store` as a sync detects it.
+    fn w723_resolver(root: &Path, store: &Store) -> ReferenceResolver {
+        let mut resolver = ReferenceResolver::new(root.to_string_lossy());
+        {
+            let context = resolver.store_context(store);
+            resolver.initialize(&context);
+        }
+        resolver
+    }
+
+    /// `route` moved to `path`: a route of its file the sync added.
+    fn w723_route_at(route: &Node, path: &str) -> Node {
+        let mut moved = route.clone();
+        moved.id = format!("route:{}:{}:{path}", route.file_path, route.start_line);
+        moved.name = path.to_string();
+        moved
+    }
+
+    /// The route of `file`.
+    fn w723_route_of(store: &Store, file: &str) -> Node {
+        store
+            .nodes_by_kind(NodeKind::Route)
+            .unwrap()
+            .into_iter()
+            .find(|route| route.file_path == file)
+            .unwrap_or_else(|| panic!("a route in {file}"))
+    }
+
+    /// Each site's file and line, sorted.
+    fn w723_lines(sites: &BTreeSet<FileReferenceSite>) -> Vec<(String, i64)> {
+        let mut lines: Vec<(String, i64)> = sites
+            .iter()
+            .map(|found| {
+                (
+                    found.file_path.clone(),
+                    found.site.as_ref().expect("a site").line,
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    /// Upstream: a route sends back the navigation calls of the app it
+    /// belongs to, the parked ones and the resolved one, and no other app's.
+    #[test]
+    fn a_route_sends_back_the_navigation_calls_of_its_own_app() {
+        let (dir, db) = w723_monorepo("nav-own-app");
+        let store = Store::open(&db).unwrap();
+        let resolver = w723_resolver(dir.path(), &store);
+        let web = w723_route_of(&store, "apps/web/src/App.jsx");
+        let sites = crate::navigation::reopened_by_routes(
+            &store,
+            &resolver,
+            &[w723_route_at(&web, "/login")],
+            &[],
+            &BTreeSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let home = "apps/web/src/Home.jsx".to_string();
+        assert_eq!(
+            w723_lines(&sites),
+            [(home.clone(), 4), (home.clone(), 5), (home, 6)]
+        );
+    }
+
+    /// Upstream: the calls of a file the sync resolved anew stay as that
+    /// resolution left them.
+    #[test]
+    fn a_file_the_sync_resolved_anew_keeps_its_navigation_calls() {
+        let (dir, db) = w723_monorepo("nav-reindexed");
+        let store = Store::open(&db).unwrap();
+        let resolver = w723_resolver(dir.path(), &store);
+        let web = w723_route_of(&store, "apps/web/src/App.jsx");
+        let reindexed: HashSet<String> = ["apps/web/src/Home.jsx".to_string()].into();
+        let sites = crate::navigation::reopened_by_routes(
+            &store,
+            &resolver,
+            &[w723_route_at(&web, "/login")],
+            &[],
+            &BTreeSet::new(),
+            &reindexed,
+        )
+        .unwrap();
+        assert!(sites.is_empty(), "{sites:?}");
+    }
+
+    /// No ceiling (OD-B42; upstream skips a name more calls share than 500):
+    /// both apps' routes changed send back all six calls, and 501 calls of
+    /// one name go back every one.
+    #[test]
+    fn every_navigation_call_a_route_may_answer_goes_back_however_many_share_a_name() {
+        let (dir, db) = w723_monorepo("nav-both-apps");
+        let store = Store::open(&db).unwrap();
+        let resolver = w723_resolver(dir.path(), &store);
+        let changed: Vec<Node> = ["apps/web/src/App.jsx", "apps/admin/src/App.jsx"]
+            .iter()
+            .map(|file| w723_route_at(&w723_route_of(&store, file), "/login"))
+            .collect();
+        let sites = crate::navigation::reopened_by_routes(
+            &store,
+            &resolver,
+            &changed,
+            &[],
+            &BTreeSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 6, "{sites:?}");
+
+        let mut calls = String::from(
+            "import { useNavigate } from 'react-router-dom'\nexport const Many = () => {\n  const navigate = useNavigate()\n",
+        );
+        for call in 0..501 {
+            calls.push_str(&format!("  navigate('/a{call}')\n"));
+        }
+        calls.push_str("  return null\n}\n");
+        let (dir, db) = fully_indexed(
+            "nav-501",
+            &[
+                (
+                    "package.json",
+                    "{\"name\":\"web\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\"}}\n",
+                ),
+                (
+                    "src/App.jsx",
+                    "import { Routes, Route } from 'react-router-dom'\nimport { Many } from './Many'\nexport const App = () => (\n  <Routes>\n    <Route path=\"/\" element={<Many />} />\n  </Routes>\n)\n",
+                ),
+                ("src/Many.jsx", calls.as_str()),
+            ],
+        );
+        let store = Store::open(&db).unwrap();
+        let resolver = w723_resolver(dir.path(), &store);
+        let app = w723_route_of(&store, "src/App.jsx");
+        let sites = crate::navigation::reopened_by_routes(
+            &store,
+            &resolver,
+            &[w723_route_at(&app, "/a0")],
+            &[],
+            &BTreeSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 501);
+    }
+
+    /// Upstream: a route no router navigates to (a nested route's relative
+    /// path) looks up no call at all.
+    #[test]
+    fn a_route_no_router_navigates_to_looks_up_no_call() {
+        let (dir, db) = w723_monorepo("nav-relative");
+        let store = Store::open(&db).unwrap();
+        let resolver = w723_resolver(dir.path(), &store);
+        let changed: Vec<Node> = store
+            .nodes_by_kind(NodeKind::Route)
+            .unwrap()
+            .iter()
+            .map(|route| w723_route_at(route, "login"))
+            .collect();
+        take_navigation_steps();
+        let sites = crate::navigation::reopened_by_routes(
+            &store,
+            &resolver,
+            &changed,
+            &[],
+            &BTreeSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(sites.is_empty(), "{sites:?}");
+        assert!(
+            !take_navigation_steps().contains(&"calls"),
+            "a lookup ran for no router's route"
+        );
+    }
+
+    /// Upstream #2425's first case: a React Router 5 app whose cart screen
+    /// pushes `/login?redirect=shipping`.
+    const W723_CART_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"name\":\"shop\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"5\"}}\n",
+    );
+    const W723_CART_APP: (&str, &str) = (
+        "src/App.js",
+        "import { BrowserRouter as Router, Route } from 'react-router-dom'\nimport LoginScreen from './screens/LoginScreen'\nimport CartScreen from './screens/CartScreen'\nconst App = () => (\n  <Router>\n    <Route path='/login' component={LoginScreen} />\n    <Route path='/cart' component={CartScreen} />\n  </Router>\n)\nexport default App\n",
+    );
+    const W723_LOGIN_SCREEN: (&str, &str) = (
+        "src/screens/LoginScreen.js",
+        "const LoginScreen = () => <div>Login</div>\nexport default LoginScreen\n",
+    );
+    const W723_CART_SCREEN: (&str, &str) = (
+        "src/screens/CartScreen.js",
+        "const CartScreen = ({ history }) => {\n  const checkout = () => {\n    history.push('/login?redirect=shipping')\n  }\n  return <button onClick={checkout}>Checkout</button>\n}\nexport default CartScreen\n",
+    );
+
+    /// Upstream "a sync that changes no route looks up no failed
+    /// navigation": a body edit to the file the routes are declared in, and
+    /// to an unrelated one.
+    #[test]
+    fn a_sync_that_changes_no_route_looks_up_no_navigation_call() {
+        let files = [
+            W723_CART_PACKAGE,
+            W723_CART_APP,
+            W723_LOGIN_SCREEN,
+            W723_CART_SCREEN,
+        ];
+        let (dir, db) = fully_indexed("nav-no-route-change", &files);
+        let app = W723_CART_APP
+            .1
+            .replace("export default App", "export default App // routes");
+        let login = (
+            W723_LOGIN_SCREEN.0,
+            "const LoginScreen = () => <div>Sign in</div>\nexport default LoginScreen\n",
+        );
+        write_files(dir.path(), &[(W723_CART_APP.0, app.as_str()), login]);
+        take_navigation_steps();
+        let outcome =
+            sync_changed_paths(dir.path(), &db, [W723_CART_APP.0, W723_LOGIN_SCREEN.0]).unwrap();
+        assert_eq!(outcome.files_reindexed, 2);
+        assert!(
+            !take_navigation_steps().contains(&"calls"),
+            "a sync that changed no route looked up navigation calls"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "nav-no-route-change-fresh",
+                &[
+                    W723_CART_PACKAGE,
+                    (W723_CART_APP.0, app.as_str()),
+                    login,
+                    W723_CART_SCREEN
+                ]
+            )
+        );
+    }
+
+    /// Upstream "takes no route snapshot without a router that navigates":
+    /// in a project no navigation router reads, a sync reads no route after
+    /// its change and looks up no call.
+    #[test]
+    fn a_project_without_a_navigation_router_reads_no_navigation() {
+        let (dir, db) = fully_indexed(
+            "nav-no-router",
+            &[
+                ("package.json", "{\"name\":\"lib\"}\n"),
+                ("src/a.ts", "export function a() { return 1; }\n"),
+            ],
+        );
+        write_files(
+            dir.path(),
+            &[("src/a.ts", "export function a() { return 2; }\n")],
+        );
+        take_navigation_steps();
+        let outcome = sync_changed_paths(dir.path(), &db, ["src/a.ts"]).unwrap();
+        assert_eq!(outcome.files_reindexed, 1);
+        assert_eq!(take_navigation_steps(), Vec::<&str>::new());
+    }
+
+    /// W7-23b: a sync that adds the route a parked call waits for and fails
+    /// after its mutations leaves the call parked, and the next sync sees no
+    /// changed file and no route snapshot. That sync still binds it: the
+    /// JavaScript-family marker the failed one withdrew makes it reconcile
+    /// every JavaScript-family file.
+    #[test]
+    fn a_route_a_failed_sync_added_binds_the_call_next_time() {
+        let package = (
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"19\",\"@tanstack/react-router\":\"1\"}}\n",
+        );
+        let settings = (
+            "src/routes/settings.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/settings')({ component: Settings })\nfunction Settings() {\n  return null\n}\n",
+        );
+        let nav = (
+            "src/lib/nav.ts",
+            "export function open(navigate) {\n  navigate({ to: '/profile' })\n}\n",
+        );
+        let profile = (
+            "src/routes/profile.tsx",
+            "import { createFileRoute } from '@tanstack/react-router'\nexport const Route = createFileRoute('/profile')({ component: Profile })\nfunction Profile() {\n  return null\n}\n",
+        );
+        let (dir, db) = fully_indexed("nav-fail", &[package, settings, nav]);
+        write_files(dir.path(), &[profile]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [profile.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the failed sync withdrew it");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("nav-fail-fresh", &[package, settings, nav, profile])
         );
     }
 }

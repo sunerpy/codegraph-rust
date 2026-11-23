@@ -56,6 +56,7 @@ pub mod member_types;
 mod member_value;
 pub mod module_surface;
 pub mod name_matcher;
+pub mod navigation;
 pub mod objc_scope;
 mod object_literal;
 mod object_owners;

@@ -2484,6 +2484,13 @@ impl NavigationCalls for ReactRouterNavigation {
     fn scope(&self, route: &Node, _context: &dyn ResolutionContext) -> Option<Vec<String>> {
         is_destination(route).then(|| vec![react_router_root(&route.file_path)])
     }
+
+    /// KEEP-RUST (W7-23b): a destination written as a route config's `path`
+    /// or `getHref` reads the constant an import brings
+    /// ([`config_href_expression`]).
+    fn destinations_read_other_files(&self) -> bool {
+        true
+    }
 }
 
 impl FrameworkResolver for ReactRouterResolver {

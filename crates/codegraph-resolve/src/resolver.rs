@@ -1711,6 +1711,76 @@ impl ReferenceResolver {
         crate::frameworks::react::lazy_module_file(module_path, from_file, context)
     }
 
+    /// Whether a detected router binds navigation calls to its routes
+    /// (upstream `hasNavigationRouters`, #2425): a sync then compares its
+    /// routes before and after its change (W7-23b).
+    pub fn has_navigation_routers(&self) -> bool {
+        self.framework_resolver_extensions
+            .iter()
+            .any(|resolver| resolver.navigation().is_some())
+    }
+
+    /// The routers whose calls a sync's changes may move, each with the
+    /// files whose calls it may answer (upstream `reopenNavigationsFor`'s
+    /// plans, #2425, W7-23b's N1). Each route of `changed` scopes its
+    /// router's calls ([`crate::framework::NavigationCalls::scope`]). So does
+    /// each route of `rewritten_routes` (the routes of the files the sync
+    /// re-extracted or removed, before and after) for a router whose table
+    /// reads its route files' text, and each file of `rewritten` the table
+    /// reads although it holds no route. Every route is scoped through
+    /// `context`, the store after the change, the routes before it too.
+    pub fn navigation_plan(
+        &self,
+        changed: &[Node],
+        rewritten_routes: &[Node],
+        rewritten: &BTreeSet<String>,
+        context: &dyn ResolutionContext,
+    ) -> crate::navigation::NavigationPlan<'_> {
+        let mut routers = Vec::new();
+        for resolver in &self.framework_resolver_extensions {
+            let Some(navigation) = resolver.navigation() else {
+                continue;
+            };
+            let mut scopes: BTreeSet<String> = BTreeSet::new();
+            for route in changed {
+                scopes.extend(navigation.scope(route, context).unwrap_or_default());
+            }
+            if navigation.table_reads_route_files() {
+                for route in rewritten_routes {
+                    scopes.extend(navigation.scope(route, context).unwrap_or_default());
+                }
+            }
+            for file in rewritten {
+                scopes.extend(
+                    navigation
+                        .scopes_read_from(file, context)
+                        .unwrap_or_default(),
+                );
+            }
+            if !scopes.is_empty() {
+                routers.push((resolver.as_ref(), scopes.into_iter().collect()));
+            }
+        }
+        crate::navigation::NavigationPlan::new(routers)
+    }
+
+    /// The routers that read a call's destination through files other than
+    /// the call's, each for every file (W7-23b's N2,
+    /// [`crate::framework::NavigationCalls::destinations_read_other_files`]).
+    pub fn destination_plan(&self) -> crate::navigation::NavigationPlan<'_> {
+        crate::navigation::NavigationPlan::new(
+            self.framework_resolver_extensions
+                .iter()
+                .filter(|resolver| {
+                    resolver
+                        .navigation()
+                        .is_some_and(|navigation| navigation.destinations_read_other_files())
+                })
+                .map(|resolver| (resolver.as_ref(), vec![String::new()]))
+                .collect(),
+        )
+    }
+
     pub fn plan_cross_file_nodes(&self, store: &Store) -> anyhow::Result<CrossFilePlan> {
         let mut passes = Vec::new();
         {

@@ -258,6 +258,64 @@ pub struct LaneReference {
     pub resolved: bool,
 }
 
+/// A `navigates` edge a router's resolver drew, at its site, with the name of
+/// a reference resolved there ([`Store::navigation_sites`], W7-23b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavigationSite {
+    /// Where the edge's reference is, always with its site.
+    pub site: FileReferenceSite,
+    /// The name of a reference `resolved_refs` holds at the site; `None`
+    /// when it holds none there (rows that predate the table), which a
+    /// caller reads as any name rather than skip the call.
+    pub reference_name: Option<String>,
+}
+
+/// [`Store::navigation_sites`]'s query: the `navigates` edges through
+/// `idx_edges_kind`, the provenance tested unindexed (`+`: nearly every edge
+/// has none, and left to itself the planner, which has no row statistics,
+/// may walk `idx_edges_provenance`), each edge's source for its file, and
+/// the references resolved at its site through `idx_resolved_refs_site`.
+const NAVIGATION_SITES_SQL: &str = "SELECT DISTINCT n.file_path, e.source, e.line, e.col, \
+     r.reference_name FROM edges AS e CROSS JOIN nodes AS n ON n.id = e.source \
+     LEFT JOIN resolved_refs AS r \
+     ON r.from_node_id = e.source AND r.line = e.line AND r.col = e.col \
+     WHERE e.kind = 'navigates' AND +e.provenance IS NULL \
+     AND e.line IS NOT NULL AND e.col IS NOT NULL \
+     ORDER BY n.file_path, e.source, e.line, e.col, r.reference_name";
+
+/// The same for the files of the JSON array `?1`: their nodes through
+/// `idx_nodes_file_path`, the nodes' `navigates` edges through
+/// `idx_edges_source_kind`.
+const NAVIGATION_SITES_IN_FILES_SQL: &str = "SELECT DISTINCT n.file_path, e.source, e.line, \
+     e.col, r.reference_name FROM json_each(?1) AS f \
+     CROSS JOIN nodes AS n ON n.file_path = f.value \
+     CROSS JOIN edges AS e ON e.source = n.id AND e.kind = 'navigates' \
+     LEFT JOIN resolved_refs AS r \
+     ON r.from_node_id = e.source AND r.line = e.line AND r.col = e.col \
+     WHERE +e.provenance IS NULL AND e.line IS NOT NULL AND e.col IS NOT NULL \
+     ORDER BY n.file_path, e.source, e.line, e.col, r.reference_name";
+
+/// [`Store::unresolved_calls_by_tails`]'s whole-name query: each tail's rows
+/// of `idx_unresolved_name`.
+const CALLS_NAMED_SQL: &str = "SELECT r.file_path, r.from_node_id, r.line, r.col, \
+     r.reference_name FROM json_each(?1) AS t \
+     CROSS JOIN unresolved_refs AS r ON r.reference_name = t.value \
+     WHERE r.reference_kind = 'calls'";
+
+/// Its query of the calls written through a receiver (`history.push`): one
+/// pass over the rows, as [`Store::unresolved_refs_retried_by_names`] reads
+/// them.
+const CALLS_THROUGH_RECEIVERS_SQL: &str = "SELECT file_path, from_node_id, line, col, \
+     reference_name FROM unresolved_refs WHERE reference_kind = 'calls' \
+     AND (instr(reference_name, '.') > 0 OR instr(reference_name, ':') > 0)";
+
+/// Its query for the files of the JSON array `?1`: their rows of
+/// `idx_unresolved_file_path`.
+const CALLS_IN_FILES_SQL: &str = "SELECT r.file_path, r.from_node_id, r.line, r.col, \
+     r.reference_name FROM json_each(?1) AS f \
+     CROSS JOIN unresolved_refs AS r ON r.file_path = f.value \
+     WHERE r.reference_kind = 'calls'";
+
 impl Store {
     /// Ports `insertNode` / `insertNodes` / `updateNode` from `upstream db/queries.ts:243-382`.
     /// Uses one batched transaction and an upsert that fires the FTS update trigger on conflicts.
@@ -2869,6 +2927,98 @@ impl Store {
         Ok(out)
     }
 
+    /// The parked `calls` references whose name's tail is one of `tails`,
+    /// sorted by site and deduplicated (upstream `getFailedCallsByTail`,
+    /// #2425, W7-23b): the navigation calls (`navigate`, `history.push`) a
+    /// sync looks through when a route they may name changed; the caller
+    /// decides on each whole name. A name that is a tail itself is read
+    /// through `idx_unresolved_name`, a name written through a receiver in
+    /// one pass over the table. `files` narrows to those files' rows, read
+    /// through `idx_unresolved_file_path`. No ceiling: a call left out is a
+    /// sync that differs from a fresh index (OD-B42).
+    pub fn unresolved_calls_by_tails(
+        &self,
+        tails: &[String],
+        files: Option<&[String]>,
+    ) -> rusqlite::Result<Vec<LaneReference>> {
+        if tails.is_empty() || files.is_some_and(<[String]>::is_empty) {
+            return Ok(Vec::new());
+        }
+        let wanted: HashSet<&str> = tails.iter().map(String::as_str).collect();
+        let mut found: BTreeSet<(String, String, i64, i64, String)> = BTreeSet::new();
+        let mut read = |sql: &str, json: Option<String>| -> rusqlite::Result<()> {
+            let mut stmt = self.conn.prepare_cached(sql)?;
+            let mut rows = match &json {
+                Some(json) => stmt.query([json])?,
+                None => stmt.query([])?,
+            };
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(4)?;
+                if wanted.contains(reference_name_tail_of(&name, EdgeKind::Calls)) {
+                    found.insert((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, name));
+                }
+            }
+            Ok(())
+        };
+        match files {
+            Some(files) => read(CALLS_IN_FILES_SQL, Some(to_json_array(files)?))?,
+            None => {
+                read(CALLS_NAMED_SQL, Some(to_json_array(tails)?))?;
+                read(CALLS_THROUGH_RECEIVERS_SQL, None)?;
+            }
+        }
+        Ok(found
+            .into_iter()
+            .map(
+                |(file_path, from_node_id, line, col, reference_name)| LaneReference {
+                    site: FileReferenceSite {
+                        file_path,
+                        site: Some(ReferenceSite {
+                            from_node_id,
+                            line,
+                            col,
+                        }),
+                    },
+                    reference_name,
+                    reference_kind: EdgeKind::Calls,
+                    resolved: false,
+                },
+            )
+            .collect())
+    }
+
+    /// The `navigates` edges a router's resolver drew (no provenance: a
+    /// synthesizer's are `heuristic`), each at its site with the name of
+    /// every reference resolved there, sorted by site and deduplicated
+    /// (upstream `getResolvedNavigations`, #2425, W7-23b): a sync sends such
+    /// a call back when a route it may name changed. `files` narrows to the
+    /// edges whose source is in one of them. A conditional's arms are edges
+    /// of one site, which is read once.
+    pub fn navigation_sites(
+        &self,
+        files: Option<&[String]>,
+    ) -> rusqlite::Result<Vec<NavigationSite>> {
+        let map = |row: &Row<'_>| {
+            Ok(NavigationSite {
+                site: row_to_file_reference_site(row)?,
+                reference_name: row.get(4)?,
+            })
+        };
+        match files {
+            Some([]) => Ok(Vec::new()),
+            Some(files) => {
+                let mut stmt = self.conn.prepare_cached(NAVIGATION_SITES_IN_FILES_SQL)?;
+                let rows = stmt.query_map([to_json_array(files)?], map)?;
+                rows.collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare_cached(NAVIGATION_SITES_SQL)?;
+                let rows = stmt.query_map([], map)?;
+                rows.collect()
+            }
+        }
+    }
+
     /// Ports `getDependencyFilePaths` from
     /// `upstream db/queries.ts:1410-1420`: the OUTGOING twin of
     /// `dependent_file_paths` — every file containing a symbol that a symbol of
@@ -3286,6 +3436,12 @@ const CONFIG_KEY_REFERENCE: &str = "((reference_kind = 'references' \
     AND instr(reference_name, '::') = 0) \
     OR (substr(reference_name, -7) = ':prefix' \
     AND language IN ('java', 'kotlin', 'yaml', 'properties')))";
+
+/// `values` as the JSON array a `json_each(?)` reads.
+fn to_json_array(values: &[String]) -> rusqlite::Result<String> {
+    serde_json::to_string(values)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+}
 
 fn row_to_file_reference_site(row: &Row<'_>) -> rusqlite::Result<FileReferenceSite> {
     let file_path = row.get(0)?;
@@ -6321,6 +6477,56 @@ mod tests {
         assert!(
             !steps.iter().any(|step| step.contains("idx_nodes_language")),
             "the language index drives the query: {steps:?}"
+        );
+    }
+
+    /// W7-23b: the navigation sites are read from the `navigates` edges
+    /// through the kind index, each edge's references at its site through
+    /// the site index; a file's from its nodes through the file index and
+    /// their edges through `idx_edges_source_kind`. Left to itself the
+    /// planner, which has no row statistics, may take `idx_edges_provenance`
+    /// for the provenance test: nearly every edge has none.
+    #[test]
+    fn navigation_sites_read_the_navigates_edges_through_the_kind_index() {
+        let store = store("navigation-sites-plan");
+        let steps = |sql: &str, params: &[&dyn ToSql]| -> Vec<String> {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            stmt.query_map(params, |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let all = steps(NAVIGATION_SITES_SQL, &[]);
+        assert!(
+            all.first()
+                .is_some_and(|step| step.starts_with("SEARCH e USING INDEX idx_edges_kind")),
+            "the edges are not read by kind: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|step| step.contains("idx_resolved_refs_site")),
+            "the references are not read by site: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|step| step.contains("idx_edges_provenance")),
+            "the provenance index drives the query: {all:?}"
+        );
+        let files = "[\"src/a.tsx\"]";
+        let in_files = steps(NAVIGATION_SITES_IN_FILES_SQL, &[&files]);
+        assert!(
+            in_files
+                .iter()
+                .any(|step| step.contains("idx_nodes_file_path"))
+                && in_files
+                    .iter()
+                    .any(|step| step.contains("idx_edges_source_kind"))
+                && in_files
+                    .iter()
+                    .any(|step| step.contains("idx_resolved_refs_site")),
+            "a file's sites are not read from its nodes: {in_files:?}"
         );
     }
 

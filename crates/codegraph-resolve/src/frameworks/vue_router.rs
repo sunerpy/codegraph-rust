@@ -964,6 +964,12 @@ impl NavigationCalls for VueNavigation {
     fn scope(&self, route: &Node, _context: &dyn ResolutionContext) -> Option<Vec<String>> {
         in_vue_table(route).then(|| vec![app_root_for(&route.file_path)])
     }
+
+    /// KEEP-RUST (W7-23b): the table reads a route's `name` from its routes
+    /// file's text, which the route node (named by its path) does not hold.
+    fn table_reads_route_files(&self) -> bool {
+        true
+    }
 }
 
 impl FrameworkResolver for VueRouterResolver {
