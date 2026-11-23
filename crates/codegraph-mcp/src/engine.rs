@@ -74,6 +74,21 @@ const MIN_WINDOW_LINES: usize = 12;
 /// span the query anchored. Above a protected focus (11) and a root (10).
 const EXACT_IMPORTANCE: u32 = 12;
 
+/// A protected focus (Rust's own, §3.1): above an entry point, below an
+/// exact target.
+const FOCUS_IMPORTANCE: u32 = 11;
+
+/// A symbol the query named (upstream's importance 9, `tools.ts` b635dd46
+/// 6514): the floor of what a cluster protects.
+const NAMED_IMPORTANCE: u32 = 9;
+
+/// A spine method longer than this renders as its signature head and a window
+/// on its next-hop call (upstream `OVERSIZE_SPINE_LINES`, b635dd46 6640).
+const OVERSIZE_SPINE_LINES: usize = 200;
+
+/// Lines either side of that call (upstream `SPINE_WINDOW`, 5873).
+const SPINE_WINDOW: usize = 28;
+
 /// Lines either side of a single-line anchor that no callable encloses.
 const ANCHOR_LINE_CONTEXT: usize = 15;
 
@@ -1277,7 +1292,8 @@ impl CodeGraphEngine {
 
         // The Flow section opens the response (upstream prepends it to the
         // header), so everything below spends against it too.
-        let flow_text = self.build_flow_section(&match_query);
+        let flow = self.build_flow_section(&match_query);
+        let flow_text: &str = &flow.text;
         // The summary is written once the final cut is known (#1046): it
         // counts the files whose source the response shows. This placeholder
         // holds the raw gather, never shorter than the line that replaces it.
@@ -1376,7 +1392,15 @@ impl CodeGraphEngine {
         // render needs: `(line index, path, focuses, exact focus)`.
         let mut named_clipped: Vec<(usize, &String, Vec<usize>, Vec<BodyFocus>)> = Vec::new();
         let precise_tokens = precise_query_tokens(&match_query);
-        let question_ids = subgraph.question_ids(&precise_tokens);
+        // The symbols the question is about: its exact targets, the named ones
+        // and the spine (upstream `questionIds`, `tools.ts` b635dd46 5209).
+        let question_ids: HashSet<String> = subgraph
+            .exact_ids
+            .iter()
+            .chain(&flow.path_node_ids)
+            .chain(&flow.named_node_ids)
+            .cloned()
+            .collect();
         let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
         let effective_budget = budget
             .max_output_chars
@@ -1407,6 +1431,7 @@ impl CodeGraphEngine {
                 file_path,
                 &path_extraction.line_anchors,
                 &question_ids,
+                &flow.spine_call_sites,
             );
             let available = effective_budget
                 .saturating_sub(total_chars)
@@ -1425,6 +1450,7 @@ impl CodeGraphEngine {
                 funded_headroom,
                 focuses: &focuses,
                 exact_focus: &exact_focus,
+                flow: &flow,
                 lift_file_cap: false,
                 drifted: possibly_drifted,
             };
@@ -1446,9 +1472,13 @@ impl CodeGraphEngine {
             if rendered.source_emitted {
                 rendered_sources.push(((*file_path).clone(), lines.len()));
             }
+            // A file holding a spine node renders again too (KEEP-RUST: upstream
+            // funds the spine first through its CG-12 allocation, `tools.ts`
+            // b635dd46 5271-5288, which this port does not have).
             let named = subgraph.is_pinned(file_path)
                 || subgraph.holds_exact(file_path)
-                || !focuses.is_empty();
+                || !focuses.is_empty()
+                || flow.path_files.contains(file_path.as_str());
             if rendered.clipped && named {
                 named_clipped.push((lines.len(), file_path, focuses, exact_focus));
             }
@@ -1458,9 +1488,10 @@ impl CodeGraphEngine {
             files_included += 1;
         }
 
-        // A file the query NAMED — by path, or by a symbol it defines — that its
-        // per-file ceiling clipped is rendered again into what the response left
-        // unspent (upstream #2068), in file order. Only that: every other file
+        // A file the query NAMED — by path, or by a symbol it defines — or one
+        // holding a node of the Flow's spine, that its per-file ceiling clipped
+        // is rendered again into what the response left unspent (upstream
+        // #2068), in file order. Only that: every other file
         // keeps exactly the section it was given, and the pointer list below
         // keeps the room it would have had. Where nothing is spare a named file
         // renders exactly as before.
@@ -1502,6 +1533,7 @@ impl CodeGraphEngine {
                 funded_headroom: given + spare,
                 focuses,
                 exact_focus,
+                flow: &flow,
                 lift_file_cap: true,
                 drifted: source.is_possibly_drifted(),
             };
@@ -1659,14 +1691,17 @@ impl CodeGraphEngine {
     /// The rest of upstream's builder is not here: the dynamic-boundary and
     /// polymorphic-dispatch announcements for a flow that does not connect —
     /// the port keeps its own boundary scan over the explore seeds. The
-    /// spine's weight in file ranking and windowing is W7-25's.
-    fn build_flow_section(&self, match_query: &str) -> String {
+    /// spine weighs in the file's clusters and windows ([`FlowSection`]).
+    fn build_flow_section(&self, match_query: &str) -> FlowSection {
         let flow =
             resolve_named_symbol_flow(&self.store, match_query, &NamedSymbolFlowOptions::default());
         if flow.tokens.len() < 2 {
-            return String::new();
+            return FlowSection::default();
         }
-        self.flow_section_of(&flow).unwrap_or_default()
+        match self.flow_section_of(&flow) {
+            Ok(text) => FlowSection::of(&flow, text),
+            Err(_) => FlowSection::default(),
+        }
     }
 
     /// [`Self::build_flow_section`] for a resolved flow.
@@ -2092,9 +2127,15 @@ impl CodeGraphEngine {
 
         // Whole-file rule (`tools.ts:2645-2672`): a relevant file small enough to
         // afford comes back ENTIRELY — clustering exists only to tame god-files.
-        const WHOLE_FILE_MAX_LINES: usize = 220;
+        // A central file, where the query's entry points live, gets the larger
+        // ceiling (`WHOLE_FILE_MAX_LINES`, b635dd46 6319-6328).
+        let whole_file_max_lines = if subgraph.central_files.contains(file_path) {
+            280
+        } else {
+            220
+        };
         let whole_file_max_chars = budget.max_chars_per_file * 3;
-        if total_lines <= WHOLE_FILE_MAX_LINES && content.len() <= whole_file_max_chars {
+        if total_lines <= whole_file_max_lines && content.len() <= whole_file_max_chars {
             let numbered = number_source_lines_at(&body.split('\n').collect::<Vec<_>>(), 1);
             let names =
                 subgraph.file_header_names_capped(file_path, budget.max_symbols_in_file_header);
@@ -2136,16 +2177,51 @@ impl CodeGraphEngine {
         // Cluster nearby symbol ranges; merge ranges within `gapThreshold`
         // lines, rank by importance, and select clusters until the per-file cap
         // is hit (`tools.ts:2674-2848`).
-        let mut ranges: Vec<ClusterRange> = subgraph
+        // The file's gathered nodes plus every definition the query named or
+        // singled out that lives here: the gather can miss a named def in a big
+        // file, and it would form no cluster (b635dd46 6495-6503). Injected in
+        // `(line, column, id)` order, so no set order reaches the output.
+        let in_file = |n: &Node| {
+            n.file_path == file_path
+                && n.kind != NodeKind::Import
+                && n.kind != NodeKind::Export
+                && n.start_line > 0
+                && n.end_line > 0
+        };
+        let mut range_nodes: Vec<Node> = subgraph
             .nodes
             .iter()
-            .filter(|n| {
-                n.file_path == file_path
-                    && n.kind != NodeKind::Import
-                    && n.kind != NodeKind::Export
-                    && n.start_line > 0
-                    && n.end_line > 0
-            })
+            .filter(|n| in_file(n))
+            .cloned()
+            .collect();
+        let mut wanted_ids: Vec<&String> = ctx
+            .flow
+            .named_node_ids
+            .iter()
+            .chain(&subgraph.exact_ids)
+            .filter(|id| subgraph.node(id).is_none())
+            .collect();
+        wanted_ids.sort();
+        wanted_ids.dedup();
+        let mut injected: Vec<Node> = wanted_ids
+            .into_iter()
+            .filter_map(|id| self.store.node_by_id(id).ok().flatten())
+            .filter(|n| in_file(n))
+            .collect();
+        injected.sort_by(|a, b| {
+            (a.start_line, a.start_column, a.id.as_str()).cmp(&(
+                b.start_line,
+                b.start_column,
+                b.id.as_str(),
+            ))
+        });
+        range_nodes.extend(injected);
+        let is_entry = |id: &str| {
+            subgraph.roots.iter().any(|r| r == id)
+                || subgraph.named_seed_ids.iter().any(|r| r == id)
+        };
+        let mut ranges: Vec<ClusterRange> = range_nodes
+            .iter()
             // Drop whole-file envelope containers (>50% of the file) so a class
             // body doesn't merge every method into one whole-file cluster
             // (`tools.ts:2693-2718`).
@@ -2154,17 +2230,26 @@ impl CodeGraphEngine {
                     && (n.end_line - n.start_line + 1) as usize > total_lines / 2)
             })
             .map(|n| {
-                // A protected focus outranks an ordinary root, so a cluster that
-                // owns one sorts ahead of equally-important siblings. It is
-                // matched on the STORED definition line: a focus whose line the
-                // clamp below moves is one the range filters would drop anyway,
-                // and §3.1.1 conditions the guarantee on surviving them.
+                // Upstream's importance (b635dd46 6511-6522): exact, an entry
+                // point 10, a named symbol 9, glue 6, one edge from an entry 3,
+                // the rest 1. A protected focus (Rust's own, §3.1) sits between
+                // the exact target and the entry point, so a cluster that owns
+                // one sorts ahead of equally-important siblings. It is matched
+                // on the STORED definition line: a focus whose line the clamp
+                // below moves is one the range filters would drop anyway, and
+                // §3.1.1 conditions the guarantee on surviving them.
                 let importance = if subgraph.is_exact(&n.id) {
                     EXACT_IMPORTANCE
                 } else if ctx.focuses.contains(&(n.start_line as usize)) {
-                    11
-                } else if subgraph.roots.iter().any(|r| r == &n.id) {
+                    FOCUS_IMPORTANCE
+                } else if is_entry(&n.id) {
                     10
+                } else if ctx.flow.named_node_ids.contains(&n.id) {
+                    NAMED_IMPORTANCE
+                } else if subgraph.glue_ids.contains(&n.id) {
+                    6
+                } else if subgraph.connected_ids.contains(&n.id) {
+                    3
                 } else {
                     1
                 };
@@ -2186,6 +2271,14 @@ impl CodeGraphEngine {
                     },
                     importance,
                     qualified_name: Some(n.qualified_name.clone()),
+                    spine: ctx.flow.path_node_ids.contains(&n.id),
+                    spine_call_line: ctx
+                        .flow
+                        .spine_call_sites
+                        .get(&n.id)
+                        .filter(|&&line| line > 0)
+                        .map(|&line| line as usize),
+                    continuation: false,
                 }
             })
             // Drop ranges whose start is past EOF (a fully-stale node).
@@ -2211,9 +2304,26 @@ impl CodeGraphEngine {
                 },
                 importance: EXACT_IMPORTANCE,
                 qualified_name: None,
+                spine: false,
+                spine_call_line: None,
+                continuation: false,
             });
         }
         ranges.sort_by_key(|r| r.start);
+        // What the section sets out to deliver (#2077), before an oversize
+        // spine method is cut to its windows.
+        let wanted: Vec<WantedSpan> = ranges
+            .iter()
+            .map(|r| WantedSpan {
+                name: r.member.name.clone(),
+                kind: r.member.kind,
+                start: r.start,
+                end: r.end,
+                importance: r.importance,
+                qualified_name: r.qualified_name.clone(),
+            })
+            .collect();
+        let spine_windowed = window_oversize_spine_methods(&mut ranges);
 
         if ranges.is_empty() {
             return ExploreFileRender {
@@ -2228,12 +2338,7 @@ impl CodeGraphEngine {
         let mut current = Cluster::from_range(&ranges[0]);
         for r in &ranges[1..] {
             if r.start <= current.end + budget.gap_threshold {
-                current.end = current.end.max(r.end);
-                current.symbols.push(r.label.clone());
-                current.members.push(r.member.clone());
-                current.spans.push((r.start, r.end, r.importance));
-                current.score += r.importance;
-                current.max_importance = current.max_importance.max(r.importance);
+                current.absorb(r);
             } else {
                 clusters.push(current);
                 current = Cluster::from_range(r);
@@ -2317,13 +2422,24 @@ impl CodeGraphEngine {
         // Only the focuses inside THIS cluster's span may claim its reserve;
         // clamping an out-of-span focus in would spend the reserve re-emitting
         // lines the head window already covers.
+        // The cluster's spine call line comes first (upstream `focusLinesOf`,
+        // b635dd46 6883-6896), so a window of a spine member reaches the call
+        // to the next hop.
         let focuses_in = |c: &Cluster| -> Vec<usize> {
             let (start_idx, end_idx) = span_of(c);
-            ctx.focuses
-                .iter()
-                .copied()
-                .filter(|&line| line > start_idx && line <= end_idx)
-                .collect()
+            let inside = |line: usize| line > start_idx && line <= end_idx;
+            let mut lines: Vec<usize> = c
+                .spine_call_line
+                .filter(|&line| inside(line))
+                .into_iter()
+                .collect();
+            lines.extend(
+                ctx.focuses
+                    .iter()
+                    .copied()
+                    .filter(|&line| inside(line) && Some(line) != c.spine_call_line),
+            );
+            lines
         };
         // CG-30: a cluster too big for its room is emitted as WHOLE-LINE windows
         // instead of being taken whole (which then costs the entire file) or
@@ -2385,16 +2501,18 @@ impl CodeGraphEngine {
                 + GAP_MARKER.len() * windows.len().saturating_sub(1)
         };
 
-        // Rank clusters: entry-point importance first, then density, then span
-        // (`tools.ts:2803-2812`).
+        // Rank clusters: exact targets first, then the spine's, then importance,
+        // density, score and span (b635dd46 6970-6990).
         let mut ranked: Vec<usize> = (0..clusters.len()).collect();
         ranked.sort_by(|&a, &b| {
             let ca = &clusters[a];
             let cb = &clusters[b];
             let span_a = (ca.end - ca.start + 1) as f64;
             let span_b = (cb.end - cb.start + 1) as f64;
-            cb.max_importance
-                .cmp(&ca.max_importance)
+            (cb.max_importance >= EXACT_IMPORTANCE)
+                .cmp(&(ca.max_importance >= EXACT_IMPORTANCE))
+                .then(cb.has_spine.cmp(&ca.has_spine))
+                .then(cb.max_importance.cmp(&ca.max_importance))
                 .then((cb.score as f64 / span_b).total_cmp(&(ca.score as f64 / span_a)))
                 .then(cb.score.cmp(&ca.score))
                 .then((span_a as usize).cmp(&(span_b as usize)))
@@ -2418,10 +2536,12 @@ impl CodeGraphEngine {
             ((budget.max_chars_per_file as f64 * 1.5).round() as usize).min(ctx.funded_headroom)
         };
         let ceiling = file_cap.saturating_sub(section_frame);
-        // A member the query asked for — a root or a protected focus — rather
-        // than incidental context that merely sits within `gap_threshold` of one
-        // (#2062).
-        let is_protected = |importance: u32| importance >= 10;
+        // A member the query asked for — named, an entry point, a protected
+        // focus or an exact target (importance 9 or more), or one on the
+        // Flow's spine — rather than incidental context that merely sits within
+        // `gap_threshold` of one (#2062; upstream `isProtectedMember`, b635dd46
+        // 6731).
+        let is_protected = |s: &(usize, usize, u32, bool)| s.2 >= NAMED_IMPORTANCE || s.3;
         // Member ranges re-merged in source order and padded into windows, so
         // adjacent survivors read as one block.
         let member_windows = |spans: &[(usize, usize)]| -> Vec<(usize, usize)> {
@@ -2456,7 +2576,7 @@ impl CodeGraphEngine {
             let core = c
                 .spans
                 .iter()
-                .filter(|s| is_protected(s.2))
+                .filter(|s| is_protected(s))
                 .map(|s| (s.0, s.1))
                 .collect::<Vec<_>>();
             if core.is_empty() {
@@ -2476,8 +2596,8 @@ impl CodeGraphEngine {
                 }
                 let mut order = c.spans.clone();
                 order.sort_by(|a, b| {
-                    is_protected(b.2)
-                        .cmp(&is_protected(a.2))
+                    is_protected(b)
+                        .cmp(&is_protected(a))
                         .then(b.2.cmp(&a.2))
                         .then((a.1 - a.0).cmp(&(b.1 - b.0)))
                         .then(a.0.cmp(&b.0))
@@ -2487,7 +2607,7 @@ impl CodeGraphEngine {
                     let mut candidate = kept.clone();
                     candidate.push((span.0, span.1));
                     let cost = bare_len(&member_windows(&candidate));
-                    if kept.is_empty() || is_protected(span.2) {
+                    if kept.is_empty() || is_protected(span) {
                         if cost > room {
                             return None;
                         }
@@ -2574,15 +2694,15 @@ impl CodeGraphEngine {
             let core = member_windows(&exact);
             let focuses = exact_focuses_in(c);
             let mut windows = if bare_len(&core) <= room {
-                let mut order: Vec<(usize, usize, u32)> = c
+                let mut order: Vec<(usize, usize, u32, bool)> = c
                     .spans
                     .iter()
                     .filter(|s| s.2 < EXACT_IMPORTANCE)
                     .copied()
                     .collect();
                 order.sort_by(|a, b| {
-                    is_protected(b.2)
-                        .cmp(&is_protected(a.2))
+                    is_protected(b)
+                        .cmp(&is_protected(a))
                         .then(b.2.cmp(&a.2))
                         .then((a.1 - a.0).cmp(&(b.1 - b.0)))
                         .then(a.0.cmp(&b.0))
@@ -2591,7 +2711,7 @@ impl CodeGraphEngine {
                 for span in order {
                     let mut candidate = kept.clone();
                     candidate.push((span.0, span.1));
-                    let limit = if is_protected(span.2) {
+                    let limit = if is_protected(&span) {
                         room
                     } else {
                         cap.min(room)
@@ -2657,7 +2777,7 @@ impl CodeGraphEngine {
                     let cap = room.saturating_sub(owed_below);
                     return exact_render(c, room, cap);
                 }
-                let has_protected = c.spans.iter().any(|s| is_protected(s.2));
+                let has_protected = c.spans.iter().any(is_protected);
                 let cap = match (owed_below > 0, has_protected) {
                     (true, _) => Some(room.saturating_sub(owed_below)),
                     (false, true) => Some(room),
@@ -2753,7 +2873,7 @@ impl CodeGraphEngine {
         let file_index_nodes = self.store.nodes_by_file_path(file_path).unwrap_or_default();
         let mut file_section =
             join_parts_with_named_gaps(file_path, &parts, &file_index_nodes, spare);
-        let clipped = chosen_count < clusters.len() || any_cluster_windowed;
+        let clipped = chosen_count < clusters.len() || any_cluster_windowed || spine_windowed;
         if clipped {
             file_section.push_str("\n\n... (gap) ...");
         }
@@ -2777,18 +2897,8 @@ impl CodeGraphEngine {
             budget.max_symbols_in_file_header,
         );
         // Every member of every cluster, chosen or not: a dropped cluster, a
-        // shrunk one and a windowed body all leave a member short (#2077).
-        let wanted: Vec<WantedSpan> = ranges
-            .iter()
-            .map(|r| WantedSpan {
-                name: r.member.name.clone(),
-                kind: r.member.kind,
-                start: r.start,
-                end: r.end,
-                importance: r.importance,
-                qualified_name: r.qualified_name.clone(),
-            })
-            .collect();
+        // shrunk one and a windowed body all leave a member short (#2077); the
+        // spans are `wanted`, taken before an oversize spine method was cut.
         let delivered: Vec<(usize, usize)> = parts
             .iter()
             .map(|(first, last, _)| (*first, *last))
@@ -3380,14 +3490,16 @@ impl CodeGraphEngine {
 
     /// Per exact target in `file_path`, `(start, end, focus lines)`: the lines a
     /// window of its body must reach when it does not fit whole — an anchored
-    /// line inside it, then every line where it uses another symbol the
-    /// question is about (upstream `bodyFocusLines`), capped.
+    /// line inside it, the line where it calls the spine's next hop, then
+    /// every line where it uses another symbol the question is about
+    /// (upstream `bodyFocusLines`, `tools.ts` b635dd46 5217-5233), capped.
     fn exact_body_focus(
         &self,
         subgraph: &ExploreSubgraph,
         file_path: &str,
         anchors: &[QueryLineAnchor],
         question_ids: &HashSet<String>,
+        spine_call_sites: &HashMap<String, i64>,
     ) -> Vec<BodyFocus> {
         let mut out = Vec::new();
         for id in &subgraph.exact_ids {
@@ -3403,6 +3515,11 @@ impl CodeGraphEngine {
                 .filter(|a| a.file == n.file_path && a.start > start && a.start <= end)
                 .map(|a| a.start)
                 .collect();
+            if let Some(&call) = spine_call_sites.get(&n.id)
+                && call > 0
+            {
+                lines.push(call as usize);
+            }
             let mut uses: Vec<usize> = self
                 .store
                 .edges_by_source_kind(&n.id, None)
@@ -4420,17 +4537,6 @@ impl ExploreSubgraph {
             .collect()
     }
 
-    /// The symbols the question is about: its exact targets and the roots a
-    /// shape-precise query token names — the port's analog of upstream's
-    /// `questionIds` (exact ∪ named ∪ spine), since it has no flow spine.
-    fn question_ids(&self, precise: &[String]) -> HashSet<String> {
-        let named = self.roots.iter().filter(|id| {
-            self.node(id)
-                .is_some_and(|n| precise.iter().any(|t| t.eq_ignore_ascii_case(&n.name)))
-        });
-        self.exact_ids.iter().chain(named).cloned().collect()
-    }
-
     fn insert(&mut self, node: Node) -> bool {
         if self.index.contains_key(&node.id) {
             return false;
@@ -4584,6 +4690,8 @@ struct RenderCtx<'a> {
     /// This file's exact targets as `(start, end, body focus lines)`, from
     /// [`CodeGraphEngine::exact_body_focus`].
     exact_focus: &'a [BodyFocus],
+    /// The Flow's spine and named symbols, which rank this file's clusters.
+    flow: &'a FlowSection,
     /// Bound the section by `funded_headroom` alone, not also by the per-file
     /// ceiling: set only when a named file is re-rendered into the budget the
     /// rest of the response left unspent (#2068).
@@ -4625,6 +4733,7 @@ impl ExactTargets {
 }
 
 /// Cluster source range used when sizing a god-file (`tools.ts:2708-2718`).
+#[derive(Clone)]
 struct ClusterRange {
     start: usize,
     end: usize,
@@ -4633,6 +4742,13 @@ struct ClusterRange {
     importance: u32,
     /// The node's qualified name; `None` for an anchored line span.
     qualified_name: Option<String>,
+    /// On the Flow's spine.
+    spine: bool,
+    /// Where this spine node calls the next hop.
+    spine_call_line: Option<usize>,
+    /// The window of an oversize spine method after its head: it renders, but
+    /// names nothing the head does not already name.
+    continuation: bool,
 }
 
 /// A merged run of adjacent ranges (`tools.ts:2744-2771`).
@@ -4643,25 +4759,172 @@ struct Cluster {
     /// Every member's name, kind and definition line, so the header can name
     /// the ones a trim cut (#1711).
     members: Vec<ElidedSymbol>,
-    /// Every member's `(start, end, importance)` source range, 1-based, so a
-    /// cluster can render its protected members without its incidental ones
-    /// (#2062).
-    spans: Vec<(usize, usize, u32)>,
+    /// Every member's `(start, end, importance, on the spine)` source range,
+    /// 1-based, so a cluster can render its protected members without its
+    /// incidental ones (#2062).
+    spans: Vec<(usize, usize, u32, bool)>,
     score: u32,
     max_importance: u32,
+    /// Holds a spine node (upstream `hasSpine`).
+    has_spine: bool,
+    /// The first spine call line among its members (upstream `spineCallLine`).
+    spine_call_line: Option<usize>,
 }
 
 impl Cluster {
     fn from_range(r: &ClusterRange) -> Self {
-        Self {
+        let mut cluster = Self {
             start: r.start,
             end: r.end,
-            symbols: vec![r.label.clone()],
-            members: vec![r.member.clone()],
-            spans: vec![(r.start, r.end, r.importance)],
-            score: r.importance,
-            max_importance: r.importance,
+            symbols: Vec::new(),
+            members: Vec::new(),
+            spans: Vec::new(),
+            score: 0,
+            max_importance: 0,
+            has_spine: false,
+            spine_call_line: None,
+        };
+        cluster.absorb(r);
+        cluster
+    }
+
+    /// Merges `r` in (upstream's cluster loop, `tools.ts` b635dd46 6580-6604).
+    fn absorb(&mut self, r: &ClusterRange) {
+        self.end = self.end.max(r.end);
+        if !r.continuation {
+            self.symbols.push(r.label.clone());
+            self.members.push(r.member.clone());
         }
+        self.spans.push((r.start, r.end, r.importance, r.spine));
+        self.score += r.importance;
+        self.max_importance = self.max_importance.max(r.importance);
+        self.has_spine |= r.spine;
+        self.spine_call_line = self.spine_call_line.or(r.spine_call_line);
+    }
+}
+
+/// Cuts each oversize spine method among `ranges` (sorted by start) to its
+/// signature head and a window on its next-hop call (upstream `oversizeSpine`
+/// and `spineWindowOf`, `tools.ts` b635dd46 6622-6663): a method on the Flow
+/// longer than [`OVERSIZE_SPINE_LINES`] whose call lies in its own body, unless
+/// an exact target overlaps it, since that body is what was asked for. The
+/// size test is on the method, never on the cluster it merges into. A range
+/// nested in a cut method goes with the lines it sat on. True when a method
+/// was cut.
+fn window_oversize_spine_methods(ranges: &mut Vec<ClusterRange>) -> bool {
+    let exact: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.importance >= EXACT_IMPORTANCE)
+        .map(|r| (r.start, r.end))
+        .collect();
+    let oversize: Vec<(usize, usize, usize)> = ranges
+        .iter()
+        .filter_map(|r| {
+            let call = r.spine_call_line?;
+            (r.spine
+                && r.end - r.start + 1 > OVERSIZE_SPINE_LINES
+                && call >= r.start
+                && call <= r.end
+                && !exact.iter().any(|&(s, e)| s <= r.end && e >= r.start))
+            .then_some((r.start, r.end, call))
+        })
+        .collect();
+    if oversize.is_empty() {
+        return false;
+    }
+    let mut out: Vec<ClusterRange> = Vec::with_capacity(ranges.len() + oversize.len());
+    for r in ranges.drain(..) {
+        let cut = oversize
+            .iter()
+            .find(|&&(s, e, call)| {
+                r.spine && r.start == s && r.end == e && r.spine_call_line == Some(call)
+            })
+            .copied();
+        if let Some((start, end, call)) = cut {
+            let window_start = start.max(call.saturating_sub(SPINE_WINDOW));
+            let window_end = end.min(call + SPINE_WINDOW);
+            // The signature head, only when it sits clearly above the window.
+            let head_end = (start + 4).min(window_start.saturating_sub(2));
+            if head_end >= start {
+                out.push(ClusterRange {
+                    end: head_end,
+                    ..r.clone()
+                });
+                out.push(ClusterRange {
+                    start: window_start,
+                    end: window_end,
+                    continuation: true,
+                    ..r
+                });
+            } else {
+                out.push(ClusterRange {
+                    start: window_start,
+                    end: window_end,
+                    ..r
+                });
+            }
+            continue;
+        }
+        let nested = oversize
+            .iter()
+            .any(|&(s, e, _)| r.start >= s && r.end <= e && (r.start, r.end) != (s, e));
+        if !nested {
+            out.push(r);
+        }
+    }
+    out.sort_by_key(|r| r.start);
+    *ranges = out;
+    true
+}
+
+/// What the Flow builder hands the rest of explore (upstream
+/// `buildFlowFromNamedSymbols`' return value, `tools.ts` b635dd46 3471-3684):
+/// the section's text, the rendered chain (the spine), every symbol the query
+/// named, and where each spine node calls the next hop. Upstream's
+/// `uniqueNamedNodeIds` joins with the skeleton view that reads it.
+#[derive(Debug, Default)]
+struct FlowSection {
+    text: String,
+    path_node_ids: HashSet<String>,
+    /// The files the spine runs through.
+    path_files: HashSet<String>,
+    named_node_ids: HashSet<String>,
+    spine_call_sites: HashMap<String, i64>,
+}
+
+impl FlowSection {
+    /// The section for `flow`, whose rendered `text` is empty when nothing
+    /// connects and no link was found. The named identity is a separate
+    /// output then (CG-38, upstream `identityOnly`, 3517-3543): only the ids
+    /// of shape-precise tokens, since no prose corroborates the resolution.
+    /// With fewer than two named callables there is no spine (3560).
+    fn of(flow: &NamedSymbolFlow, text: String) -> Self {
+        if text.is_empty() {
+            return Self {
+                named_node_ids: flow.precise_named_ids.clone(),
+                ..Self::default()
+            };
+        }
+        let mut section = Self {
+            text,
+            named_node_ids: flow
+                .named
+                .keys()
+                .chain(flow.dyn_named.keys())
+                .cloned()
+                .collect(),
+            ..Self::default()
+        };
+        if flow.named.len() >= 2
+            && let Some(chain) = flow.chains.first()
+        {
+            for step in &chain.steps {
+                section.path_node_ids.insert(step.node.id.clone());
+                section.path_files.insert(step.node.file_path.clone());
+            }
+            section.spine_call_sites = chain.call_sites.clone();
+        }
+        section
     }
 }
 
@@ -6425,6 +6688,10 @@ mod tests {
         }
     }
 
+    /// No Flow: what `handle_explore` hands the renderer for a query naming
+    /// fewer than two symbols.
+    static NO_FLOW: LazyLock<FlowSection> = LazyLock::new(FlowSection::default);
+
     /// A direct-call render context with nothing already spent, mirroring what
     /// `handle_explore` builds for the FIRST file of a response.
     fn render_ctx<'a>(budget: &'a ExploreOutputBudget, focuses: &'a [usize]) -> RenderCtx<'a> {
@@ -6433,6 +6700,7 @@ mod tests {
             funded_headroom: budget.max_output_chars.saturating_sub(1),
             focuses,
             exact_focus: &[],
+            flow: &NO_FLOW,
             lift_file_cap: false,
             drifted: false,
         }
@@ -7282,6 +7550,7 @@ mod tests {
             funded_headroom: whole.len() - 1,
             focuses: &[],
             exact_focus: &[],
+            flow: &NO_FLOW,
             lift_file_cap: false,
             drifted: false,
         };
@@ -14122,5 +14391,270 @@ mod tests {
         assert_eq!(rank_penalty(true, true, false), 0.3, "not 0.15");
         assert_eq!(rank_penalty(false, false, true), 0.5);
         assert_eq!(rank_penalty(true, true, true), 0.15);
+    }
+
+    // === W7-25c: the flow spine in clusters and windows =====================
+
+    /// W7-25c: with no narrative the named identity is still handed over
+    /// (CG-38, upstream `identityOnly`, `tools.ts` b635dd46 3517-3543): two
+    /// shape-precise names that do not connect keep their ids for importance
+    /// 9; bare words keep nothing, since no prose corroborates them.
+    #[test]
+    fn w725c_a_precise_name_without_a_flow_keeps_its_identity() {
+        let mut engine = test_engine();
+        let queue = w725_fn("queueMessage", "src/store.ts", 10);
+        let flush = w725_fn("flushQueuedMessages", "src/store.ts", 20);
+        let drain = w725_fn("drain", "src/pump.ts", 1);
+        let fire = w725_fn("fire", "src/pump.ts", 10);
+        put_nodes(&mut engine, &[queue.clone(), flush.clone(), drain, fire]);
+        let flow = engine.build_flow_section("queueMessage flushQueuedMessages");
+        assert!(flow.text.is_empty(), "{}", flow.text);
+        assert!(flow.path_node_ids.is_empty());
+        let both: HashSet<String> = [queue.id.clone(), flush.id.clone()].into_iter().collect();
+        assert_eq!(flow.named_node_ids, both);
+        let bare = engine.build_flow_section("drain fire");
+        assert!(bare.text.is_empty());
+        assert!(bare.named_node_ids.is_empty(), "{:?}", bare.named_node_ids);
+    }
+
+    /// W7-25c: a rendered chain hands over its spine, the named ids and where
+    /// each spine node calls the next (b635dd46 3565-3571, 3678).
+    #[test]
+    fn w725c_a_flow_hands_over_its_spine_and_call_sites() {
+        let mut engine = test_engine();
+        let a = w725_fn("startJob", "src/a.ts", 1);
+        let b = w725_fn("relayJob", "src/b.ts", 1);
+        let c = w725_fn("finishJob", "src/c.ts", 1);
+        put_nodes(&mut engine, &[a.clone(), b.clone(), c.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&a, &b, EdgeKind::Calls, 2),
+                w725_edge_at(&b, &c, EdgeKind::Calls, 2),
+            ],
+        );
+        let flow = engine.build_flow_section("startJob finishJob");
+        assert!(
+            flow.text
+                .contains("**Flow (call path among the symbols you queried)**"),
+            "{}",
+            flow.text
+        );
+        let spine: HashSet<String> = [a.id.clone(), b.id.clone(), c.id.clone()]
+            .into_iter()
+            .collect();
+        assert_eq!(flow.path_node_ids, spine);
+        assert!(flow.named_node_ids.contains(&a.id) && flow.named_node_ids.contains(&c.id));
+        assert!(
+            !flow.named_node_ids.contains(&b.id),
+            "the bridge is on the spine, not named"
+        );
+        assert_eq!(flow.spine_call_sites.get(&a.id), Some(&2));
+        assert_eq!(flow.spine_call_sites.get(&b.id), Some(&2));
+        assert!(flow.path_files.contains("src/b.ts"));
+    }
+
+    /// A file of `count` numbered filler lines of about `width` chars.
+    fn w725c_lines(count: usize, width: usize) -> Vec<String> {
+        (1..=count)
+            .map(|i| {
+                format!(
+                    "  const line{i} = '{}';",
+                    "x".repeat(width.saturating_sub(20))
+                )
+            })
+            .collect()
+    }
+
+    /// Whether `section` rendered 1-based `line`.
+    fn w725c_rendered(section: &str, line: usize) -> bool {
+        section.lines().any(|l| {
+            l.split_once('\t')
+                .is_some_and(|(n, _)| n == line.to_string())
+        })
+    }
+
+    /// W7-25c: a definition the query named that the gather missed still forms
+    /// a cluster (b635dd46 6495-6503): it is read from the index and ranked 9.
+    #[test]
+    fn w725c_a_named_definition_outside_the_gather_still_renders() {
+        let mut engine = test_engine();
+        let file = "src/store.ts";
+        let owned = w725c_lines(400, 60);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openStore", file, 1, 10, NodeKind::Function);
+        let named = node("flushStore", file, 380, 390, NodeKind::Function);
+        put_nodes(&mut engine, &[entry.clone(), named.clone()]);
+        let sg = subgraph_with(vec![entry.clone()], vec![entry.id.clone()]);
+        let flow = FlowSection {
+            named_node_ids: [named.id.clone()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let section = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &ctx)
+            .section;
+        assert!(w725c_rendered(&section, 380), "{section}");
+    }
+
+    /// W7-25c: a named cluster (9) ranks above denser incidental ones and is
+    /// protected, so the file's room reaches it (b635dd46 6511-6522, 6731).
+    #[test]
+    fn w725c_a_named_cluster_outranks_incidental_ones() {
+        let engine = test_engine();
+        let file = "src/big.ts";
+        let owned = w725c_lines(600, 60);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openBig", file, 1, 5, NodeKind::Function);
+        let named = node("closeBig", file, 500, 540, NodeKind::Function);
+        let mut nodes = vec![entry.clone(), named.clone()];
+        for i in 0..12 {
+            let start = 50 + 20 * i as i64;
+            nodes.push(node(
+                &format!("helper{i}"),
+                file,
+                start,
+                start + 2,
+                NodeKind::Function,
+            ));
+        }
+        let sg = subgraph_with(nodes, vec![entry.id.clone()]);
+        let flow = FlowSection {
+            named_node_ids: [named.id.clone()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let section = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &ctx)
+            .section;
+        assert!(
+            w725c_rendered(&section, 500) && w725c_rendered(&section, 540),
+            "{section}"
+        );
+    }
+
+    /// W7-25c: a central file comes back whole up to 280 lines, others up to
+    /// 220 (`WHOLE_FILE_MAX_LINES`, b635dd46 6319-6328).
+    #[test]
+    fn w725c_a_central_file_up_to_280_lines_comes_back_whole() {
+        let engine = test_engine();
+        let file = "src/central.ts";
+        let owned = w725c_lines(250, 30);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openCentral", file, 1, 3, NodeKind::Function);
+        let mut sg = subgraph_with(vec![entry.clone()], vec![entry.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let plain = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        assert!(
+            !w725c_rendered(&plain, 250),
+            "a 250-line file clusters: {plain}"
+        );
+        sg.central_files.insert(file.to_string());
+        let central = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        assert!(
+            (1..=250).all(|line| w725c_rendered(&central, line)),
+            "{central}"
+        );
+    }
+
+    /// W7-25c: a spine member too big for its room is windowed on the line
+    /// where it calls the next hop (upstream `focusLinesOf`, b635dd46
+    /// 6883-6896), not only from its head.
+    #[test]
+    fn w725c_a_clipped_spine_member_is_windowed_at_its_call() {
+        let engine = test_engine();
+        let file = "src/relay.ts";
+        let owned = w725c_lines(160, 80);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let relay = node("relayJob", file, 1, 150, NodeKind::Function);
+        let sg = subgraph_with(vec![relay.clone()], Vec::new());
+        let flow = FlowSection {
+            path_node_ids: [relay.id.clone()].into_iter().collect(),
+            path_files: [file.to_string()].into_iter().collect(),
+            spine_call_sites: [(relay.id.clone(), 140)].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let rendered = engine.render_explore_file(&sg, file, &file_lines, "typescript", &ctx);
+        assert!(rendered.clipped, "{}", rendered.section);
+        assert!(w725c_rendered(&rendered.section, 1), "{}", rendered.section);
+        assert!(
+            w725c_rendered(&rendered.section, 140),
+            "{}",
+            rendered.section
+        );
+    }
+
+    /// W7-25c: an exact body's window reaches the line where it calls the
+    /// spine's next hop (upstream `bodyFocusLines`, b635dd46 5217-5233).
+    #[test]
+    fn w725c_an_exact_body_focuses_its_spine_call() {
+        let engine = test_engine();
+        let file = "src/run.ts";
+        let run = node("runAll", file, 10, 400, NodeKind::Method);
+        let mut sg = subgraph_with(vec![run.clone()], vec![run.id.clone()]);
+        sg.exact_ids.push(run.id.clone());
+        let sites: HashMap<String, i64> = [(run.id.clone(), 390)].into_iter().collect();
+        let focus = engine.exact_body_focus(&sg, file, &[], &HashSet::new(), &sites);
+        assert_eq!(focus, vec![(10, 400, vec![390])]);
+    }
+
+    /// W7-25c: a cluster holding a spine node ranks ahead of one holding only
+    /// an entry point (upstream `rankedClusters`, b635dd46 6970-6990), so when
+    /// the file's room holds one of them whole, it is the spine's.
+    #[test]
+    fn w725c_a_spine_cluster_ranks_before_an_entry_cluster() {
+        let engine = test_engine();
+        let file = "src/flow.ts";
+        let owned = w725c_lines(400, 55);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openFlow", file, 1, 60, NodeKind::Function);
+        let bridge = node("relayFlow", file, 300, 360, NodeKind::Function);
+        let sg = subgraph_with(vec![entry.clone(), bridge.clone()], vec![entry.id.clone()]);
+        let flow = FlowSection {
+            path_node_ids: [bridge.id.clone()].into_iter().collect(),
+            path_files: [file.to_string()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let section = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &ctx)
+            .section;
+        assert!(
+            (300..=360).all(|line| w725c_rendered(&section, line)),
+            "{section}"
+        );
     }
 }

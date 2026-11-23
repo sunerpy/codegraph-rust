@@ -220,6 +220,16 @@ confined to `codegraph_explore` and `codegraph_status`.
     cluster windowing (whole methods, never sliced) instead of signature
     skeletons — a strictly larger-but-bounded response on sibling-heavy flows,
     never a correctness change.
+  - **DEFER: upstream's `shrinkCluster` member rule (CG-27).** When a
+    protected member of a cluster overruns its room, the port's
+    `shrink_to_members` gives up on the cluster and windows its head, while
+    upstream's `shrinkCluster` (`tools.ts` b635dd46 6849-6866) skips that
+    member once something is kept. On a factory-closure file (one function
+    spanning the file around the closures a query names, upstream's
+    `explore-factory-closure` fixture) the port therefore renders fewer of the
+    inner closures. Porting the rule alone breaks the
+    `explore_named_definition_line_always_renders` golden test and still loses
+    `refreshMetrics`.
 - **`codegraph_status` Database size MB can differ by rounding.** colby reports
   `fs.statSync(dbPath).size` (`reference/colby/src/db/index.ts:177-180`); the
   port reports the same on-disk file size. The byte count drifts only because

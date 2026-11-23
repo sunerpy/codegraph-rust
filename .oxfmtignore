@@ -30,6 +30,11 @@ crates/codegraph-bench/fixtures/
 crates/codegraph-extract/tests/fixtures/
 crates/codegraph-resolve/tests/fixtures/
 
+# An upstream colbymchenry/codegraph explore fixture, copied byte for byte
+# from its `__tests__/fixtures/` (W7-25): the probes assert on the line numbers
+# of the definitions inside it, so reflowing it moves what they measure.
+crates/codegraph-cli/tests/fixtures/explore_tail_render_ts/
+
 # Embedded verbatim into the MCP tools/list response and byte-compared against
 # golden; reformatting breaks the MCP golden test.
 crates/codegraph-mcp/src/tools_list.json

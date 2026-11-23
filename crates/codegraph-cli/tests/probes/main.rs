@@ -45293,3 +45293,822 @@ mod explore_ranking {
         );
     }
 }
+
+mod explore_spine {
+    //! W7-25c: the flow spine's weight in clusters and windows (upstream
+    //! `handleExplore`, `tools.ts` b635dd46 5199-5233 and 6470-7100), ported
+    //! from upstream's `__tests__` at `e8ddc4e2`: `explore-named-symbol-render`
+    //! (CG-38), `explore-isolated-named-cluster` and
+    //! `explore-merged-spine-cluster`; `explore-factory-closure` (CG-27) waits
+    //! on upstream's `shrinkCluster` member rule (KNOWN_DIFFS). The fixture
+    //! tree `tests/fixtures/explore_tail_render_ts/` is upstream's
+    //! `__tests__/fixtures/tail-render-ts` without its README, byte for byte.
+    //! Upstream reads
+    //! its CG-4 diagnostic sidecar for a file's render mode and clipping; Rust
+    //! has none, so these read the section itself: a clustered section is one
+    //! that sends fewer lines than the file has, a clipped one ends with the
+    //! `... (gap) ...` marker.
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use super::support::{Indexed, Project, codegraph};
+
+    /// The hard ceiling of the response (upstream `hardCeiling`).
+    const HARD_CEILING: usize = 25_000;
+
+    fn explore(root: &Path, query: &str) -> String {
+        let output = codegraph(root, ["explore", query, "-p", "."]);
+        String::from_utf8(output.stdout).expect("explore prints UTF-8")
+    }
+
+    /// The `#### <path>` section of `file`, header to closing fence.
+    fn section<'a>(text: &'a str, file: &str) -> Option<&'a str> {
+        let start = text.find(&format!("#### {file} — "))?;
+        let rest = &text[start..];
+        let fence = rest.find("\n```")?;
+        let body = &rest[fence + 4..];
+        let end = body
+            .find("\n```\n")
+            .map_or(rest.len(), |at| fence + 4 + at + 4);
+        Some(&rest[..end])
+    }
+
+    /// Every `<n>\t` line number the response sent inside `file`'s section.
+    fn rendered_lines(text: &str, file: &str) -> BTreeSet<i64> {
+        let mut out = BTreeSet::new();
+        let Some(section) = section(text, file) else {
+            return out;
+        };
+        for line in section.lines() {
+            if let Some((n, _)) = line.split_once('\t')
+                && let Ok(n) = n.parse::<i64>()
+            {
+                out.insert(n);
+            }
+        }
+        out
+    }
+
+    /// The project indexed from `tests/fixtures/<name>/`.
+    fn fixture(name: &str) -> Indexed {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        let mut files = Vec::new();
+        let mut stack = vec![base.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read the fixture") {
+                let path = entry.expect("fixture entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        let mut project = Project::new();
+        for path in files {
+            let relative = path
+                .strip_prefix(&base)
+                .expect("inside the fixture")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let contents = std::fs::read_to_string(&path).expect("fixture text");
+            project = project.file(&relative, &contents);
+        }
+        project.index()
+    }
+
+    /// `(start_line, end_line)` of the node `name` in `file` (not an import).
+    fn span_of(project: &Indexed, file: &str, name: &str) -> (i64, i64) {
+        project
+            .graph()
+            .nodes
+            .iter()
+            .find(|n| {
+                n.file_path == file && n.name == name && n.kind != "import" && n.start_line > 0
+            })
+            .map(|n| (n.start_line, n.end_line))
+            .unwrap_or_else(|| panic!("{name} is not indexed in {file}"))
+    }
+
+    /// The names in `names` whose whole definition in `file` did not render.
+    fn incomplete_bodies(project: &Indexed, text: &str, file: &str, names: &[&str]) -> Vec<String> {
+        let sent = rendered_lines(text, file);
+        names
+            .iter()
+            .filter(|name| {
+                let (start, end) = span_of(project, file, name);
+                (start..=end).any(|line| !sent.contains(&line))
+            })
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    fn calls_between(project: &Indexed, a: &str, b: &str) -> bool {
+        let graph = project.graph();
+        graph.edges.iter().any(|e| {
+            e.kind == "calls"
+                && graph.node(&e.source).is_some_and(|n| n.name == a)
+                && graph.node(&e.target).is_some_and(|n| n.name == b)
+        })
+    }
+
+    // --- explore-named-symbol-render (CG-38) -------------------------------
+
+    const SESSION_STORE: &str = "src/lib/session-store.ts";
+    const WORKER_DTS: &str = "types/worker-configuration.d.ts";
+
+    #[test]
+    fn cg38_fixture_shape() {
+        let project = fixture("explore_tail_render_ts");
+        let source = std::fs::read_to_string(project.root().join(SESSION_STORE)).expect("read");
+        let lines = source.split('\n').count() as i64;
+        assert!(lines > 1300, "{lines}");
+        assert!(span_of(&project, SESSION_STORE, "queueMessage").0 > 1000);
+        assert!(span_of(&project, SESSION_STORE, "flushQueuedMessages").0 > 1000);
+        let (start, end) = span_of(&project, SESSION_STORE, "createSessionStore");
+        assert!((end - start + 1) as f64 > lines as f64 * 0.5);
+        let decoy = project
+            .graph()
+            .nodes
+            .iter()
+            .find(|n| n.file_path == SESSION_STORE && n.name == "QueuedMessage")
+            .expect("the decoy");
+        assert_eq!(decoy.kind, "interface");
+        assert!(decoy.start_line < 100);
+        let dts = std::fs::read_to_string(project.root().join(WORKER_DTS)).expect("read");
+        assert!(dts.split('\n').count() > 2000);
+        assert!(!calls_between(
+            &project,
+            "queueMessage",
+            "flushQueuedMessages"
+        ));
+        assert!(!calls_between(
+            &project,
+            "flushQueuedMessages",
+            "queueMessage"
+        ));
+    }
+
+    /// Upstream: both reported query shapes and the three-sibling one; only a
+    /// definition LINE among the rendered lines counts.
+    #[test]
+    fn cg38_renders_every_named_definition() {
+        let project = fixture("explore_tail_render_ts");
+        let cases: [(&str, &[&str]); 3] = [
+            (
+                "queueMessage flushQueuedMessages",
+                &["queueMessage", "flushQueuedMessages"],
+            ),
+            (
+                "how does queueMessage hand its entries to flushQueuedMessages",
+                &["queueMessage", "flushQueuedMessages"],
+            ),
+            (
+                "explain queueMessage, removeQueuedMessage and flushQueuedMessages",
+                &["queueMessage", "removeQueuedMessage", "flushQueuedMessages"],
+            ),
+        ];
+        for (query, symbols) in cases {
+            let text = explore(project.root(), query);
+            let sent = rendered_lines(&text, SESSION_STORE);
+            for name in symbols {
+                let (line, _) = span_of(&project, SESSION_STORE, name);
+                assert!(
+                    sent.contains(&line),
+                    "{name} ({SESSION_STORE}:{line}) did not render for {query:?}\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cg38_never_steers_the_agent_to_read() {
+        let project = fixture("explore_tail_render_ts");
+        let text = explore(project.root(), "queueMessage flushQueuedMessages");
+        let steer = regex::Regex::new(r"(?i)\buse Read\b|\bRead the file\b").expect("regex");
+        assert!(!steer.is_match(&text), "{text}");
+    }
+
+    /// Upstream: a penalty on one file cannot shrink an unrelated file's
+    /// render. Flipping `files.generated` on the `.d.ts` row holds the index
+    /// constant otherwise.
+    #[test]
+    fn cg38_a_penalty_on_one_file_does_not_cost_another_its_names() {
+        let project = fixture("explore_tail_render_ts");
+        let set_generated = |value: i64| {
+            let conn = rusqlite::Connection::open(project.db()).expect("open the index");
+            conn.execute(
+                "UPDATE files SET generated = ?1 WHERE path = ?2",
+                rusqlite::params![value, WORKER_DTS],
+            )
+            .expect("flip the flag");
+        };
+        let query = "queueMessage flushQueuedMessages";
+        set_generated(1);
+        let flagged = rendered_lines(&explore(project.root(), query), SESSION_STORE);
+        set_generated(0);
+        let unflagged = rendered_lines(&explore(project.root(), query), SESSION_STORE);
+        for name in ["queueMessage", "flushQueuedMessages"] {
+            let (line, _) = span_of(&project, SESSION_STORE, name);
+            assert!(
+                flagged.contains(&line),
+                "{name} missing with the .d.ts flagged"
+            );
+            assert!(
+                unflagged.contains(&line),
+                "{name} missing with the .d.ts unflagged"
+            );
+        }
+    }
+
+    // --- explore-isolated-named-cluster ------------------------------------
+
+    const RESPONSE: &str = "lib/response.ts";
+    const RESPONSE_NAMED: [&str; 5] = [
+        "sendBody",
+        "sendJson",
+        "renderView",
+        "redirectTo",
+        "sendFileStream",
+    ];
+
+    /// Upstream's `responseSource`: five named functions, three unrelated
+    /// `headerSlotN` helpers between each pair when `interleave`, 45 after.
+    fn response_source(interleave: bool) -> String {
+        let mut out: Vec<String> = [
+            "export interface Res {",
+            "  body: string[];",
+            "  setHeader(name: string, value: string): void;",
+            "}",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut slot = 0;
+        let mut helper = |out: &mut Vec<String>| {
+            slot += 1;
+            out.push(format!(
+                "export function headerSlot{slot}(res: Res, value: string): void {{"
+            ));
+            for k in 0..6 {
+                out.push(format!(
+                    "  res.setHeader('x-slot-{slot}-{k}', `max-age=31536000; includeSubDomains; preload; report-uri=https://reports.example.test/csp/slot-{slot}/{k}?format=json&v=${{value}}`);"
+                ));
+            }
+            out.push("}".to_string());
+            out.push(String::new());
+        };
+        for (i, name) in RESPONSE_NAMED.iter().enumerate() {
+            out.push(format!(
+                "export function {name}(res: Res, payload: string): void {{"
+            ));
+            for k in 0..24 {
+                out.push(format!("  res.body.push('{name}:{k}:' + payload);"));
+            }
+            out.push("}".to_string());
+            out.push(String::new());
+            if interleave && i < RESPONSE_NAMED.len() - 1 {
+                for _ in 0..3 {
+                    helper(&mut out);
+                }
+            }
+        }
+        for _ in 0..45 {
+            helper(&mut out);
+        }
+        out.join("\n")
+    }
+
+    fn response_project(interleave: bool) -> Indexed {
+        Project::new()
+            .file(RESPONSE, &response_source(interleave))
+            .file(
+                "package.json",
+                "{\"name\":\"isolated-named\",\"version\":\"1.0.0\"}\n",
+            )
+            .index()
+    }
+
+    #[test]
+    fn isolated_named_fixture_shape_and_contiguous_control() {
+        let project = response_project(true);
+        for pair in RESPONSE_NAMED.windows(2) {
+            let above = span_of(&project, RESPONSE, pair[0]);
+            let below = span_of(&project, RESPONSE, pair[1]);
+            let between = project
+                .graph()
+                .nodes
+                .iter()
+                .filter(|n| {
+                    n.file_path == RESPONSE
+                        && n.kind == "function"
+                        && n.name.starts_with("headerSlot")
+                        && n.start_line > above.1
+                        && n.end_line < below.0
+                })
+                .count();
+            assert_eq!(between, 3, "{pair:?}");
+        }
+        for a in RESPONSE_NAMED {
+            for b in RESPONSE_NAMED {
+                assert!(!calls_between(&project, a, b), "{a} -> {b}");
+            }
+        }
+        let text = explore(project.root(), &RESPONSE_NAMED.join(" "));
+        let section = section(&text, RESPONSE).expect("the file renders");
+        assert!(
+            section.ends_with("... (gap) ...\n```\n") || section.contains("... (gap) ..."),
+            "clustered and clipped:\n{section}"
+        );
+        let contiguous = response_project(false);
+        let text = explore(contiguous.root(), &RESPONSE_NAMED.join(" "));
+        assert_eq!(
+            incomplete_bodies(&contiguous, &text, RESPONSE, &RESPONSE_NAMED),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn isolated_named_bodies_render_whole_with_helpers_between() {
+        let project = response_project(true);
+        let text = explore(project.root(), &RESPONSE_NAMED.join(" "));
+        assert_eq!(
+            incomplete_bodies(&project, &text, RESPONSE, &RESPONSE_NAMED),
+            Vec::<String>::new(),
+            "{text}"
+        );
+        assert!(text.len() <= HARD_CEILING);
+    }
+
+    #[test]
+    fn isolated_named_a_later_cluster_is_not_trimmed_for_the_helpers_above_it() {
+        let project = response_project(true);
+        let text = explore(project.root(), "renderView redirectTo");
+        assert_eq!(
+            incomplete_bodies(&project, &text, RESPONSE, &["renderView", "redirectTo"]),
+            Vec::<String>::new(),
+            "{text}"
+        );
+        assert!(text.len() <= HARD_CEILING);
+    }
+
+    #[test]
+    fn isolated_named_a_cluster_with_nothing_named_below_keeps_its_context() {
+        let project = response_project(true);
+        let text = explore(project.root(), "renderView");
+        let (view_start, _) = span_of(&project, RESPONSE, "renderView");
+        let above = project
+            .graph()
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.file_path == RESPONSE
+                    && n.kind == "function"
+                    && n.name.starts_with("headerSlot")
+                    && n.end_line < view_start
+            })
+            .max_by_key(|n| n.end_line)
+            .expect("a helper above renderView")
+            .name
+            .clone();
+        assert_eq!(
+            incomplete_bodies(&project, &text, RESPONSE, &["renderView", above.as_str()]),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
+
+    // --- explore-merged-spine-cluster --------------------------------------
+
+    const PROTOCOL: &str = "src/rpc/protocol.ts";
+    const PROTOCOL_QUERY: &str = "protocol.ts MessageKind MessageCodec receiveOne serializeRequest serializeReply serializeReplyErr serializeCancel serializeAck";
+    const PROTOCOL_ANSWER: [&str; 8] = [
+        "receiveOne",
+        "dispatchRequest",
+        "MessageKind",
+        "serializeRequest",
+        "serializeAck",
+        "serializeCancel",
+        "serializeReply",
+        "serializeReplyErr",
+    ];
+
+    /// Upstream's `protocolSource`: a `receiveOne` -> `dispatchRequest` ->
+    /// `MessageCodec.serializeReply` flow, the `MessageKind` enum, and a
+    /// `MessageCodec` whose five serializers are followed by `fields` small
+    /// members, with `helpers` unrelated methods inside `Protocol`.
+    fn protocol_source(fields: usize, helpers: usize) -> String {
+        let mut l: Vec<String> = [
+            "export class Protocol {",
+            "  private handlers = new Map<string, (x: Uint8Array) => unknown>();",
+            "  private outbox: Uint8Array[] = [];",
+            "",
+            "  receiveOne(raw: Uint8Array): void {",
+            "    const kind = raw[0] as MessageKind;",
+            "    switch (kind) {",
+            "      case MessageKind.Request:",
+            "        this.dispatchRequest(raw);",
+            "        break;",
+            "      case MessageKind.Cancel:",
+            "        this.outbox.push(MessageCodec.serializeCancel(raw[1] ?? 0));",
+            "        break;",
+            "      default:",
+            "        this.outbox.push(MessageCodec.serializeAck(raw[1] ?? 0));",
+            "    }",
+            "  }",
+            "",
+            "  dispatchRequest(raw: Uint8Array): void {",
+            "    const id = raw[1] ?? 0;",
+            "    const method = String(raw[2] ?? '');",
+            "    const handler = this.handlers.get(method);",
+            "    if (!handler) {",
+            "      this.outbox.push(MessageCodec.serializeReplyErr(id, new Error(`no handler: ${method}`)));",
+            "      return;",
+            "    }",
+            "    const started = Date.now();",
+            "    let result: unknown;",
+            "    try {",
+            "      result = handler(raw.subarray(3));",
+            "    } catch (err) {",
+            "      this.outbox.push(MessageCodec.serializeReplyErr(id, err as Error));",
+            "      return;",
+            "    }",
+            "    const elapsed = Date.now() - started;",
+            "    if (elapsed > 1000) {",
+            "      this.outbox.push(MessageCodec.serializeAck(id));",
+            "    }",
+            "    if (result === undefined) {",
+            "      result = null;",
+            "    }",
+            "    if (this.outbox.length > 64) {",
+            "      this.outbox.splice(0, this.outbox.length - 64);",
+            "    }",
+            "    this.outbox.push(MessageCodec.serializeReply(id, result));",
+            "  }",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for i in 0..helpers {
+            l.push(String::new());
+            l.push(format!("  trackMetric{i}(value: number): number {{"));
+            l.push(format!(
+                "    return value * {} + this.outbox.length;",
+                i + 1
+            ));
+            l.push("  }".to_string());
+        }
+        l.extend(
+            [
+                "}",
+                "",
+                "export const enum MessageKind {",
+                "  Request = 1,",
+                "  Reply = 2,",
+                "  ReplyErr = 3,",
+                "  Cancel = 4,",
+                "  Ack = 5,",
+                "}",
+                "",
+                "export class MessageCodec {",
+                "  static serializeRequest(id: number, method: string): Uint8Array {",
+                "    const body = new TextEncoder().encode(method);",
+                "    const out = new Uint8Array(body.length + 2);",
+                "    out[0] = MessageKind.Request;",
+                "    out[1] = id & 0xff;",
+                "    out.set(body, 2);",
+                "    return out;",
+                "  }",
+                "",
+                "  static serializeAck(id: number): Uint8Array {",
+                "    return Uint8Array.of(MessageKind.Ack, id & 0xff);",
+                "  }",
+                "",
+                "  static serializeCancel(id: number): Uint8Array {",
+                "    return Uint8Array.of(MessageKind.Cancel, id & 0xff);",
+                "  }",
+                "",
+                "  static serializeReply(id: number, value: unknown): Uint8Array {",
+                "    const body = new TextEncoder().encode(JSON.stringify(value ?? null));",
+                "    const out = new Uint8Array(body.length + 2);",
+                "    out[0] = MessageKind.Reply;",
+                "    out[1] = id & 0xff;",
+                "    out.set(body, 2);",
+                "    return out;",
+                "  }",
+                "",
+                "  static serializeReplyErr(id: number, err: Error): Uint8Array {",
+                "    const body = new TextEncoder().encode(err.message);",
+                "    const out = new Uint8Array(body.length + 2);",
+                "    out[0] = MessageKind.ReplyErr;",
+                "    out[1] = id & 0xff;",
+                "    out.set(body, 2);",
+                "    return out;",
+                "  }",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        for i in 0..fields {
+            l.push(String::new());
+            l.push(format!(
+                "  static encodeField{i}(id: number): Uint8Array {{"
+            ));
+            l.push(format!(
+                "    return Uint8Array.of({}, id & 0xff, {});",
+                i % 250,
+                (i * 7) % 250
+            ));
+            l.push("  }".to_string());
+        }
+        l.push("}".to_string());
+        l.join("\n") + "\n"
+    }
+
+    /// Upstream's `workflowSource`: `prepareRun` -> `runExecution` (240 lines,
+    /// its call to `executeNode` in the middle) -> `executeNode`, adjacent.
+    fn workflow_source() -> String {
+        let mut l: Vec<String> = vec![
+            "export class WorkflowRunner {".to_string(),
+            "  private log: string[] = [];".to_string(),
+            String::new(),
+            "  prepareRun(input: number[]): number {".to_string(),
+        ];
+        for i in 0..9 {
+            l.push(format!("    this.log.push('prepare-{i}:' + input.length);"));
+        }
+        l.push("    return this.runExecution(input, input.length);".to_string());
+        l.push("  }".to_string());
+        l.push(String::new());
+        l.push("  runExecution(input: number[], seed: number): number {".to_string());
+        l.push("    let acc = seed;".to_string());
+        for i in 0..117 {
+            l.push(format!("    acc = acc * 3 + {i};"));
+        }
+        l.push("    acc = this.executeNode(acc);".to_string());
+        for i in 0..118 {
+            l.push(format!("    acc = acc - {i};"));
+        }
+        l.push("    return acc;".to_string());
+        l.push("  }".to_string());
+        l.push(String::new());
+        l.push("  executeNode(value: number): number {".to_string());
+        for i in 0..7 {
+            l.push(format!("    value = value ^ {};", i + 11));
+        }
+        l.push("    this.log.push('node:' + value);".to_string());
+        l.push("    return value;".to_string());
+        l.push("  }".to_string());
+        l.push(String::new());
+        for i in 0..12 {
+            l.push(format!("  auditTrail{i}(): string {{"));
+            l.push(format!("    return this.log.slice({i}).join(',');"));
+            l.push("  }".to_string());
+            l.push(String::new());
+        }
+        l.push("}".to_string());
+        l.join("\n") + "\n"
+    }
+
+    #[test]
+    fn merged_spine_a_pinned_file_returns_every_named_body() {
+        let project = Project::new()
+            .file(PROTOCOL, &protocol_source(150, 0))
+            .index();
+        let text = explore(project.root(), PROTOCOL_QUERY);
+        let lines = protocol_source(150, 0).split('\n').count();
+        assert!(lines > 280, "{lines}");
+        let (start, end) = span_of(&project, PROTOCOL, "receiveOne");
+        assert!(end - start + 1 < 200);
+        assert!(
+            text.contains("Flow (call path among the symbols you queried)"),
+            "{text}"
+        );
+        assert!(
+            (rendered_lines(&text, PROTOCOL).len()) < lines - 1,
+            "the file clusters rather than rendering whole"
+        );
+        assert_eq!(
+            incomplete_bodies(&project, &text, PROTOCOL, &PROTOCOL_ANSWER),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn merged_spine_a_god_method_is_windowed_as_a_member() {
+        const FILE: &str = "src/engine/workflow.ts";
+        let project = Project::new().file(FILE, &workflow_source()).index();
+        let text = explore(project.root(), "prepareRun runExecution executeNode");
+        assert_eq!(
+            incomplete_bodies(&project, &text, FILE, &["prepareRun", "executeNode"]),
+            Vec::<String>::new(),
+            "{text}"
+        );
+        let (start, end) = span_of(&project, FILE, "runExecution");
+        assert!(end - start + 1 > 200);
+        let call_line = workflow_source()
+            .split('\n')
+            .position(|l| l.contains("this.executeNode(acc)"))
+            .expect("the call") as i64
+            + 1;
+        let sent = rendered_lines(&text, FILE);
+        assert!(sent.contains(&start), "signature");
+        assert!(sent.contains(&call_line), "the call to executeNode\n{text}");
+        let body_sent = (start..=end).filter(|l| sent.contains(l)).count() as i64;
+        assert!(
+            body_sent < (end - start + 1) / 2,
+            "{body_sent} of {}",
+            end - start + 1
+        );
+        let section = section(&text, FILE).expect("the file renders");
+        assert!(
+            section.contains("... (gap) ..."),
+            "reported as clipped:\n{section}"
+        );
+    }
+
+    #[test]
+    fn merged_spine_the_cluster_leaves_room_for_the_files_other_clusters() {
+        let project = Project::new()
+            .file(PROTOCOL, &protocol_source(150, 300))
+            .index();
+        assert!(
+            project
+                .graph()
+                .nodes
+                .iter()
+                .filter(|n| n.file_path == PROTOCOL)
+                .count()
+                > 300
+        );
+        let text = explore(project.root(), PROTOCOL_QUERY);
+        assert_eq!(
+            incomplete_bodies(&project, &text, PROTOCOL, &PROTOCOL_ANSWER),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn merged_spine_a_shrunk_cluster_is_trimmed_never_skipped() {
+        let mut project = Project::new().file(PROTOCOL, &protocol_source(300, 0));
+        for i in 0..520 {
+            project = project.file(
+                &format!("src/pad/pad{i}.ts"),
+                &format!("export const pad{i} = {i};\n"),
+            );
+        }
+        let project = project.index();
+        let text = explore(project.root(), PROTOCOL_QUERY);
+        assert!(
+            !rendered_lines(&text, PROTOCOL).is_empty(),
+            "the file renders\n{text}"
+        );
+        assert_eq!(
+            incomplete_bodies(&project, &text, PROTOCOL, &PROTOCOL_ANSWER),
+            Vec::<String>::new(),
+            "{text}"
+        );
+        assert!(text.len() <= HARD_CEILING, "{}", text.len());
+    }
+
+    // --- Rust's own --------------------------------------------------------
+
+    /// W7-25c: a spine method past 200 lines renders its signature and a
+    /// window on the line where it calls the next hop, here near its end,
+    /// which a head window would miss (upstream `spineWindowOf`, b635dd46
+    /// 6640-6663).
+    #[test]
+    fn explore_windows_a_spine_method_at_its_next_hop() {
+        let mut pump = vec![
+            "export function pumpQueue(items: number[]): number {".to_string(),
+            "  let total = 0;".to_string(),
+        ];
+        for i in 0..380 {
+            pump.push(format!("  total += items.length * {i};"));
+        }
+        pump.push("  total += finishQueue(total);".to_string());
+        for i in 0..10 {
+            pump.push(format!("  total -= {i};"));
+        }
+        pump.push("  return total;".to_string());
+        pump.push("}".to_string());
+        let pump_source = pump.join("\n") + "\n";
+        let call_line = pump
+            .iter()
+            .position(|l| l.contains("finishQueue(total)"))
+            .unwrap() as i64
+            + 1;
+        let project = Project::new()
+            .file("src/start.ts", "import { pumpQueue } from './pump';\nexport function startQueue(): number {\n  return pumpQueue([1, 2, 3]);\n}\n")
+            .file("src/pump.ts", &format!("import {{ finishQueue }} from './finish';\n{pump_source}"))
+            .file("src/finish.ts", "export function finishQueue(total: number): number {\n  return total + 1;\n}\n")
+            .index();
+        let text = explore(project.root(), "startQueue pumpQueue finishQueue");
+        assert!(
+            text.contains("Flow (call path among the symbols you queried)"),
+            "{text}"
+        );
+        let sent = rendered_lines(&text, "src/pump.ts");
+        let (start, end) = span_of(&project, "src/pump.ts", "pumpQueue");
+        assert!(sent.contains(&start), "the signature\n{text}");
+        assert!(
+            sent.contains(&(call_line + 1)),
+            "the call to the next hop\n{text}"
+        );
+        let body_sent = (start..=end).filter(|l| sent.contains(l)).count() as i64;
+        assert!(body_sent < (end - start + 1) / 2, "{body_sent}");
+    }
+
+    /// W7-25c: the symbols the question is about are its exact targets, the
+    /// spine and the named symbols (upstream `questionIds`, b635dd46 5209): an
+    /// exact body too long for its room is windowed on its call into a named
+    /// symbol, here near its end.
+    #[test]
+    fn explore_windows_an_exact_body_at_its_call_into_a_named_symbol() {
+        let mut svc = vec![
+            "import { helperStep } from './helper';".to_string(),
+            "export class Svc {".to_string(),
+            "  run(): number {".to_string(),
+        ];
+        for i in 0..300 {
+            svc.push(format!(
+                "    const step{i} = {i} * 2; // keeps the body long enough to window it"
+            ));
+        }
+        svc.push("    return helperStep();".to_string());
+        svc.push("  }".to_string());
+        svc.push("}".to_string());
+        let call_line = svc
+            .iter()
+            .position(|l| l.contains("return helperStep()"))
+            .unwrap() as i64
+            + 1;
+        let project = Project::new()
+            .file("src/svc.ts", &(svc.join("\n") + "\n"))
+            .file(
+                "src/helper.ts",
+                "export function helperStep(): number {\n  return 1;\n}\n",
+            )
+            .index();
+        let text = explore(project.root(), "Svc.run helperStep");
+        let sent = rendered_lines(&text, "src/svc.ts");
+        assert!(
+            sent.contains(&call_line),
+            "the call into helperStep\n{text}"
+        );
+        let (start, end) = span_of(&project, "src/svc.ts", "run");
+        assert!(
+            ((start..=end).filter(|l| sent.contains(l)).count() as i64) < end - start,
+            "windowed\n{text}"
+        );
+    }
+
+    /// W7-25c: a file holding a spine node that the per-file ceiling clipped
+    /// renders again into what the response left (#2068, KEEP-RUST: upstream
+    /// funds spine files first through CG-12, which Rust does not have). The
+    /// bridge `relayJob` is on the Flow but named by no query token.
+    #[test]
+    fn explore_rerenders_a_clipped_spine_file() {
+        let mut relay = vec![
+            "import { finishJob } from './finish';".to_string(),
+            "export function relayJob(input: number): number {".to_string(),
+            "  let acc = input;".to_string(),
+        ];
+        for i in 0..85 {
+            relay.push(format!(
+                "  acc = acc * 7 + {i}; // relay step {i} keeps the accumulator moving forward"
+            ));
+        }
+        relay.push("  return finishJob(acc);".to_string());
+        relay.push("}".to_string());
+        // A tail no symbol owns, so the file is past the whole-file rule while
+        // `relayJob` alone fits what the response leaves.
+        for i in 0..70 {
+            relay.push(format!(
+                "// relay notes {i}: the accumulator is advanced once per step and never reset"
+            ));
+        }
+        let relay_source = relay.join("\n") + "\n";
+        let project = Project::new()
+            .file("src/start.ts", "import { relayJob } from './relay';\nexport function startJob(): number {\n  return relayJob(1);\n}\n")
+            .file("src/relay.ts", &relay_source)
+            .file("src/finish.ts", "export function finishJob(acc: number): number {\n  return acc + 1;\n}\n")
+            .index();
+        let text = explore(project.root(), "startJob finishJob");
+        assert!(
+            text.contains("2. relayJob (src/relay.ts:"),
+            "relayJob is on the Flow\n{text}"
+        );
+        assert_eq!(
+            incomplete_bodies(&project, &text, "src/relay.ts", &["relayJob"]),
+            Vec::<String>::new(),
+            "{text}"
+        );
+    }
+}
