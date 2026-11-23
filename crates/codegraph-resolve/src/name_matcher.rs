@@ -18,7 +18,7 @@ use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 use std::borrow::Borrow;
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Ceiling on same-name candidates a proximity-SCORED strategy will rank
@@ -3812,6 +3812,35 @@ fn leading_dotted_identifier(text: &str) -> Option<&str> {
         }
     }
     Some(&text[..end])
+}
+
+/// Whether an Erlang reference is a macro use, `?NAME` or `?NAME(…)`: the
+/// source at its byte column starts with `?` (OD-B58). A function or remote
+/// call carries its arity or module in its name and is none.
+fn is_erlang_macro_use(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    if reference.language != Language::Erlang
+        || !matches!(
+            reference.reference_kind,
+            EdgeKind::Calls | EdgeKind::References
+        )
+        || reference.reference_name.contains(['/', ':'])
+    {
+        return false;
+    }
+    let (Ok(row), Ok(column)) = (
+        usize::try_from(reference.line - 1),
+        usize::try_from(reference.column),
+    ) else {
+        return false;
+    };
+    context
+        .read_file_shared(&reference.file_path)
+        .is_some_and(|text| {
+            text.split('\n')
+                .nth(row)
+                .and_then(|line| line.get(column..))
+                .is_some_and(|rest| rest.starts_with('?'))
+        })
 }
 
 /// Last `::`-separated segment of a C++ name (`cppLastSegment`,
@@ -8677,6 +8706,51 @@ pub fn match_reference(
                     ResolvedBy::ExactMatch,
                 )
             });
+    }
+
+    // KEEP-RUST (OD-B58): an Erlang macro use (`?X`, `?X(…)`, read from its
+    // source) means a `-define` of its name and nothing else: the call
+    // site's own (the first by line), else that of the one header (`.hrl`)
+    // defining it. A macro is file-scoped, so another module's define is no
+    // candidate; a same-named type, record or function never answers it;
+    // and a macro two headers define links neither, as no `-include` is read.
+    // On rebar3, 833 `?config(…)` uses (Common Test's macro, from a header
+    // outside the project) bound a vendored `-type config()` by name.
+    if is_erlang_macro_use(reference, context) {
+        let macros: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(&reference.reference_name)
+            .into_iter()
+            .filter(|node| node.language == Language::Erlang && node.kind == NodeKind::Constant)
+            .collect();
+        let first = |nodes: &mut dyn Iterator<Item = &Arc<Node>>| {
+            nodes
+                .min_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)))
+                .cloned()
+        };
+        let own = first(
+            &mut macros
+                .iter()
+                .filter(|node| node.file_path == reference.file_path),
+        );
+        let in_headers: Vec<&Arc<Node>> = macros
+            .iter()
+            .filter(|node| node.file_path.ends_with(".hrl"))
+            .collect();
+        let headers: BTreeSet<&str> = in_headers
+            .iter()
+            .map(|node| node.file_path.as_str())
+            .collect();
+        let target = match (own, headers.len()) {
+            (Some(own), _) => own,
+            (None, 1) => first(&mut in_headers.into_iter())?,
+            _ => return None,
+        };
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.9,
+            ResolvedBy::ExactMatch,
+        ));
     }
 
     // A Scala chain link the extractor records with its last receiver

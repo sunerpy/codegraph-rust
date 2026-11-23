@@ -815,6 +815,14 @@ regex engine), is not listed.
   manifest that does not parse once its comments and trailing commas are
   stripped reads as none, where colby's `jsonc-parser` recovers a partial
   value (`workspace_packages.rs`).
+- **Erlang macro uses (W7-24d, OD-B58).** A `?X` or `?X(…)` use binds only a
+  `-define` of its name: the file's own, else that of the one header
+  (`.hrl`) defining it. A same-named type, record or function never answers
+  it, another module's define is no candidate, and a macro two headers
+  define links neither, as no `-include` is read. colby matches the macro's
+  name like any other reference: on rebar3, 833 `?config(…)` uses (Common
+  Test's macro, from a header outside the project) bound a vendored
+  module's `-type config()` (`name_matcher.rs`).
 
 ### Synthesis
 

@@ -204,7 +204,9 @@ module block's `:`-scoped references bridge to the entry file, variables and
 outputs of its local source directory, and a cloudposse remote-state output to
 the one directory of the component's name that declares it; a registry or git
 source stays unresolved. An Erlang `-behaviour(m)`, and each name an OTP
-application resource file writes, resolves only to an Erlang module. Calls in Vue, Svelte and
+application resource file writes, resolves only to an Erlang module, and a
+macro use only to a `-define` of its name, the file's own or that of the one
+header defining it. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on

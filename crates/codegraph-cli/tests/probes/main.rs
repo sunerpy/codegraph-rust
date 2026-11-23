@@ -44801,6 +44801,58 @@ mod erlang_otp {
         );
     }
 
+    /// OD-B58 (KEEP-RUST): a macro use binds only a `-define` of its name.
+    /// Common Test's `?config(Key, Config)` comes from a header outside the
+    /// project, and a vendored module's `-type config()`, or a header's,
+    /// never answers it (rebar3: 833 such uses bound the type by name).
+    #[test]
+    fn w724_b58_a_macro_use_never_binds_a_same_named_type() {
+        let project = Project::new()
+            .file(
+                "src/vendored/r3_hex_core.erl",
+                "-module(r3_hex_core).\n-export_type([config/0]).\n-type config() :: map().\n",
+            )
+            .file("include/types.hrl", "-type config() :: list().\n")
+            .file(
+                "test/my_SUITE.erl",
+                "-module(my_SUITE).\n-include_lib(\"common_test/include/ct.hrl\").\n-export([t/1]).\n\nt(Config) ->\n    ?config(priv_dir, Config).\n",
+            )
+            .index();
+        assert_unresolved!(project, "function my_SUITE::t/1" => calls => "config");
+        assert_no_edge!(
+            project,
+            "function my_SUITE::t/1" => calls => "type_alias r3_hex_core::config"
+        );
+    }
+
+    /// OD-B58: a macro use binds the file's own `-define`, else the one
+    /// header defining it. A module's define is no other file's (a macro is
+    /// file-scoped), and two headers defining it link neither: the port
+    /// reads no `-include`.
+    #[test]
+    fn w724_b58_a_macro_use_binds_its_own_or_its_one_headers_define() {
+        let project = Project::new()
+            .file("include/limits.hrl", "-define(RETRIES, 3).\n")
+            .file("include/a.hrl", "-define(TIMEOUT, 1000).\n")
+            .file("include/b.hrl", "-define(TIMEOUT, 2000).\n")
+            .file(
+                "src/other.erl",
+                "-module(other).\n-define(LOCAL, 1).\n-export([x/0]).\n\nx() -> ?LOCAL.\n",
+            )
+            .file(
+                "src/user.erl",
+                "-module(user).\n-include(\"limits.hrl\").\n-include(\"a.hrl\").\n-define(config(K, C), proplists:get_value(K, C)).\n-record(state, {a}).\n-export([run/1]).\n\nrun(C) ->\n    {?config(a, C), ?RETRIES, ?TIMEOUT, ?LOCAL, #state{a = C}}.\n",
+            )
+            .index();
+        assert_edge!(project, "function user::run/1" => calls => "constant user::config");
+        assert_edge!(project, "function user::run/1" => references => "constant RETRIES");
+        assert_edge!(project, "function other::x/0" => references => "constant other::LOCAL");
+        assert_unresolved!(project, "function user::run/1" => references => "TIMEOUT");
+        assert_unresolved!(project, "function user::run/1" => references => "LOCAL");
+        // A record's use is no macro use: it keeps its record.
+        assert_edge!(project, "function user::run/1" => references => "struct user::state");
+    }
+
     /// `-behaviour(x)` names a module and nothing else: an OTP behaviour
     /// stays unresolved though a macro, a record and a function share its
     /// name (a record is a type an `implements` could otherwise bind), and a
