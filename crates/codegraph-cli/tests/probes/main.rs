@@ -29268,7 +29268,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "20".to_string())]
+            [("synthesis_version".to_string(), "21".to_string())]
         );
     }
 
@@ -43776,6 +43776,405 @@ mod arkui {
         assert_eq!(
             synthesized(ambiguous.graph(), "arkui-route"),
             Vec::<String>::new()
+        );
+    }
+}
+
+/// W7-24b: the Nix module system (upstream #1190): path imports name files,
+/// names bind in their own file, and option writes reach their declarations.
+mod nix_modules {
+    use super::support::{Graph, Project, assert_edge};
+
+    /// The files `from`'s `imports` edges reach, sorted.
+    fn imported_files(graph: &Graph, from: &str) -> Vec<String> {
+        let source = format!("file:{from}");
+        let mut files: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.source == source && edge.kind == "imports")
+            .filter_map(|edge| graph.node(&edge.target))
+            .filter(|node| node.kind == "file")
+            .map(|node| node.file_path.clone())
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// The `nix-option-path` edges, as `source (file) -> target (file) at
+    /// optionPath`, sorted.
+    fn option_edges(graph: &Graph) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "nix-option-path")
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                format!(
+                    "{} ({}) -> {} ({}) at {}",
+                    source.name,
+                    source.file_path,
+                    target.name,
+                    target.file_path,
+                    edge.metadata["optionPath"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// Upstream `resolution.test.ts:5871-5890`.
+    #[test]
+    fn w724b_relative_import_links_the_file() {
+        let project = Project::new()
+            .file("core/ports.nix", "{ http = 80; https = 443; }")
+            .file(
+                "data/postgresql.nix",
+                "let\n  ports = import ../core/ports.nix;\nin\n{\n  port = ports.https;\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "file:data/postgresql.nix" => imports => "file:core/ports.nix",
+            resolved_by = "import"
+        );
+        assert_eq!(
+            imported_files(project.graph(), "data/postgresql.nix"),
+            ["core/ports.nix"]
+        );
+    }
+
+    /// Upstream `resolution.test.ts:5892-5912`: a directory imports its
+    /// `default.nix`, and a called import links once.
+    #[test]
+    fn w724b_directory_import_and_called_import() {
+        let project = Project::new()
+            .file("dir/default.nix", "{ value = 1; }")
+            .file("x.nix", "{ value = 2; }")
+            .file(
+                "main.nix",
+                "let\n  dir = import ./dir;\n  x = import ./x.nix {};\nin\n{\n  inherit dir x;\n}\n",
+            )
+            .index();
+        assert_eq!(
+            imported_files(project.graph(), "main.nix"),
+            ["dir/default.nix", "x.nix"]
+        );
+    }
+
+    /// Upstream `resolution.test.ts:5914-5942`: a module's `imports` list and
+    /// a `callPackage` path.
+    #[test]
+    fn w724b_module_lists_and_callpackage_paths() {
+        let project = Project::new()
+            .file("modules/users.nix", "{ users.users.demo.isNormalUser = true; }")
+            .file("common/default.nix", "{ time.timeZone = \"UTC\"; }")
+            .file(
+                "pkgs/hello/default.nix",
+                "{ stdenv }: stdenv.mkDerivation { pname = \"hello\"; }",
+            )
+            .file(
+                "configuration.nix",
+                "{ config, pkgs, ... }:\n{\n  imports = [ ./modules/users.nix ./common ];\n  environment.systemPackages = [ (pkgs.callPackage ./pkgs/hello { }) ];\n}\n",
+            )
+            .index();
+        assert_eq!(
+            imported_files(project.graph(), "configuration.nix"),
+            [
+                "common/default.nix",
+                "modules/users.nix",
+                "pkgs/hello/default.nix"
+            ]
+        );
+    }
+
+    /// Same-named files: each path reaches the file it names, which the
+    /// basename strategy could not pick.
+    #[test]
+    fn w724b_same_named_files_resolve_by_path() {
+        let project = Project::new()
+            .file("foo.nix", "{ x = 1; }")
+            .file("a/foo.nix", "{ y = 1; }")
+            .file("b/foo.nix", "{ z = 1; }")
+            .file("default.nix", "let\n  foo = import ./foo.nix;\nin\n{\n  inherit foo;\n}\n")
+            .file(
+                "a/default.nix",
+                "let\n  here = import ./foo.nix;\n  up = import ../foo.nix;\nin\n{\n  inherit here up;\n}\n",
+            )
+            .index();
+        assert_eq!(imported_files(project.graph(), "default.nix"), ["foo.nix"]);
+        assert_eq!(
+            imported_files(project.graph(), "a/default.nix"),
+            ["a/foo.nix", "foo.nix"]
+        );
+    }
+
+    /// A path import whose file is missing names nothing: it never falls
+    /// back to the one file of that name elsewhere (the basename strategy
+    /// linked it at 0.7 before path imports were resolved).
+    #[test]
+    fn w724b_a_missing_path_never_falls_back_to_a_namesake() {
+        let project = Project::new()
+            .file("elsewhere/gone.nix", "{ x = 1; }")
+            .file(
+                "c/default.nix",
+                "let\n  gone = import ./gone.nix;\nin\n{\n  inherit gone;\n}\n",
+            )
+            .index();
+        assert_eq!(
+            imported_files(project.graph(), "c/default.nix"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream `resolution.test.ts:5972-6025`: a Nix name binds in its own
+    /// file only, so no call crosses files by name; a same-file binding
+    /// still links.
+    #[test]
+    fn w724b_nix_names_bind_in_their_own_file() {
+        let project = Project::new()
+            .file(
+                "alpha.nix",
+                "{ lib, ... }:\nlet\n  inherit (lib) mkOption;\n  mkPort = default: mkOption { inherit default; };\nin\n{\n  options.alpha.port = mkPort 8080;\n}\n",
+            )
+            .file(
+                "beta.nix",
+                "{ lib, ... }:\nlet\n  inherit (lib) mkOption;\nin\n{\n  options.beta.enable = mkOption { default = false; };\n}\n",
+            )
+            .file(
+                "helpers.nix",
+                "{ lib }:\n{\n  mkEnableOption = name: lib.mkOption { default = false; };\n}\n",
+            )
+            .file("three.nix", "{ lib }:\n{\n  c = mkEnableOption \"x\";\n}\n")
+            .index();
+        let graph = project.graph();
+        let calls: Vec<(String, String)> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == "calls")
+            .filter_map(|edge| {
+                let source = graph.node(&edge.source)?;
+                let target = graph.node(&edge.target)?;
+                Some((source.file_path.clone(), target.file_path.clone()))
+            })
+            .collect();
+        assert!(
+            calls.iter().all(|(from, to)| from == to),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            calls.iter().any(|(from, _)| from == "alpha.nix"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `resolution.test.ts:5944-5970`: no other language's call
+    /// reaches a Nix binding: neither Python's, which `gate_language` keeps
+    /// out (another code family), nor GDScript's, which has no code family
+    /// and so passes that gate, and only the Nix target gate keeps out.
+    #[test]
+    fn w724b_other_languages_never_reach_nix_bindings() {
+        let project = Project::new()
+            .file(
+                "helpers.nix",
+                "let\n  resolve = x: x;\nin\n{\n  inherit resolve;\n}\n",
+            )
+            .file("tool.py", "def main():\n    return resolve(\"target\")\n")
+            .file("tool.gd", "func run():\n\treturn resolve(\"target\")\n")
+            .index();
+        let graph = project.graph();
+        let into_nix: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                graph
+                    .node(&edge.target)
+                    .is_some_and(|target| target.language == "nix")
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|source| source.language != "nix")
+            })
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        assert_eq!(into_nix, Vec::<String>::new());
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.language == "gdscript" && node.kind == "function"),
+            "{}",
+            graph.report()
+        );
+    }
+
+    /// Upstream `resolution.test.ts:6027-6047`: a channel, an attribute path
+    /// and a variable name no project file.
+    #[test]
+    fn w724b_dynamic_imports_are_no_files() {
+        let project = Project::new()
+            .file("nixpkgs.nix", "{ bogus = true; }")
+            .file("selectedPath.nix", "{ bogus = true; }")
+            .file(
+                "main.nix",
+                "let\n  pkgs = import <nixpkgs> {};\n  fromSources = import sources.nixpkgs {};\n  dynamic = import selectedPath;\nin\n{\n  inherit pkgs fromSources dynamic;\n}\n",
+            )
+            .index();
+        assert_eq!(
+            imported_files(project.graph(), "main.nix"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream `nix-option-synthesizer.test.ts:41-75`.
+    #[test]
+    fn w724b_option_write_reaches_its_flat_declaration() {
+        let project = Project::new()
+            .file(
+                "modules/launchd.nix",
+                "{ config, lib, ... }:\n{\n  options.launchd.user.agents = lib.mkOption {\n    type = lib.types.attrsOf (lib.types.submodule {});\n    default = {};\n    description = \"launchd agents\";\n  };\n}\n",
+            )
+            .file(
+                "modules/yabai.nix",
+                "{ config, lib, ... }:\n{\n  config = lib.mkIf config.services.yabai.enable {\n    launchd.user.agents.yabai = {\n      command = \"yabai\";\n      keepAlive = true;\n    };\n  };\n}\n",
+            )
+            // `config.` heads the same write explicitly.
+            .file(
+                "modules/skhd.nix",
+                "{ ... }:\n{\n  config.launchd.user.agents.skhd = {\n    command = \"skhd\";\n  };\n}\n",
+            )
+            .index();
+        assert_eq!(
+            option_edges(project.graph()),
+            [
+                "config.launchd.user.agents.skhd (modules/skhd.nix) -> options.launchd.user.agents (modules/launchd.nix) at launchd.user.agents",
+                "launchd.user.agents.yabai (modules/yabai.nix) -> options.launchd.user.agents (modules/launchd.nix) at launchd.user.agents",
+            ]
+        );
+    }
+
+    /// Upstream `nix-option-synthesizer.test.ts:77-117`: nested spellings
+    /// compose, and the longest declared prefix wins.
+    #[test]
+    fn w724b_option_nested_declarations_and_the_longest_prefix() {
+        let project = Project::new()
+            .file(
+                "git-module.nix",
+                "{ lib, ... }:\n{\n  options = {\n    programs.git = {\n      enable = lib.mkOption {\n        type = lib.types.bool;\n        default = false;\n      };\n      signing.key = lib.mkOption {\n        type = lib.types.str;\n        default = \"\";\n      };\n    };\n  };\n}\n",
+            )
+            .file(
+                "user-config.nix",
+                "{ ... }:\n{\n  programs.git.enable = true;\n  programs.git.signing.key = \"ABCD1234\";\n}\n",
+            )
+            .index();
+        assert_eq!(
+            option_edges(project.graph()),
+            [
+                "programs.git.enable (user-config.nix) -> enable (git-module.nix) at programs.git.enable",
+                "programs.git.signing.key (user-config.nix) -> signing.key (git-module.nix) at programs.git.signing.key",
+            ]
+        );
+    }
+
+    /// Upstream `nix-option-synthesizer.test.ts:119-185`: a quoted segment
+    /// is an opaque token: a write matches through it only to the static
+    /// prefix, a quoted write only its own quoted declaration, and an
+    /// undeclared one nothing.
+    #[test]
+    fn w724b_option_quoted_segments() {
+        let project = Project::new()
+            .file(
+                "xdg.nix",
+                "{ lib, ... }:\n{\n  options.xdg.configFile = lib.mkOption {\n    type = lib.types.attrsOf (lib.types.anything);\n    default = {};\n  };\n}\n",
+            )
+            .file(
+                "writer.nix",
+                "{ ... }:\n{\n  xdg.configFile.\"git/config\".text = \"[user]\";\n}\n",
+            )
+            .file(
+                "domain.nix",
+                "{ lib, ... }:\n{\n  options = {\n    system.defaults.NSGlobalDomain.\"com.apple.keyboard.fnState\" = lib.mkOption {\n      type = lib.types.nullOr lib.types.bool;\n      default = null;\n    };\n    system.defaults.NSGlobalDomain.\"com.apple.mouse.tapBehavior\" = lib.mkOption {\n      type = lib.types.nullOr lib.types.int;\n      default = null;\n    };\n  };\n}\n",
+            )
+            .file(
+                "defaults.nix",
+                "{ ... }:\n{\n  system.defaults.NSGlobalDomain.\"com.apple.mouse.tapBehavior\" = 1;\n  system.defaults.NSGlobalDomain.\"com.apple.undeclared.domain\" = 2;\n}\n",
+            )
+            .index();
+        assert_eq!(
+            option_edges(project.graph()),
+            [
+                "system.defaults.NSGlobalDomain.\"com.apple.mouse.tapBehavior\" (defaults.nix) -> system.defaults.NSGlobalDomain.\"com.apple.mouse.tapBehavior\" (domain.nix) at system.defaults.NSGlobalDomain.\"com.apple.mouse.tapBehavior\"",
+                "xdg.configFile.\"git/config\".text (writer.nix) -> options.xdg.configFile (xdg.nix) at xdg.configFile",
+            ]
+        );
+    }
+
+    /// Upstream `nix-option-synthesizer.test.ts:187-231`: a prefix two files
+    /// declare, an interpolated head and a one-segment declaration link
+    /// nothing.
+    #[test]
+    fn w724b_option_ambiguous_dynamic_and_single_segment_link_nothing() {
+        let project = Project::new()
+            .file(
+                "dup-a.nix",
+                "{ lib, ... }: { options.services.dup = lib.mkOption { default = {}; }; }\n",
+            )
+            .file(
+                "dup-b.nix",
+                "{ lib, ... }:\n{\n  options.services.dup = lib.mkOption {\n    default = {};\n  };\n}\n",
+            )
+            .file(
+                "meta-decl.nix",
+                "{ lib, ... }:\n{\n  options.meta = lib.mkOption {\n    default = {};\n  };\n}\n",
+            )
+            .file(
+                "writers.nix",
+                "{ name, ... }:\n{\n  services.dup.enable = true;\n  services.${name}.enable = true;\n  meta.maintainers = [ \"someone\" ];\n}\n",
+            )
+            // The longest declared prefix two files declare decides: the
+            // write links neither, and never the shorter `services.nginx`.
+            .file(
+                "nginx.nix",
+                "{ lib, ... }:\n{\n  options.services.nginx = lib.mkOption {\n    default = {};\n  };\n}\n",
+            )
+            .file(
+                "vhosts-a.nix",
+                "{ lib, ... }:\n{\n  options.services.nginx.virtualHosts = lib.mkOption {\n    default = {};\n  };\n}\n",
+            )
+            .file(
+                "vhosts-b.nix",
+                "{ lib, ... }:\n{\n  options.services.nginx.virtualHosts = lib.mkOption {\n    default = {};\n  };\n}\n",
+            )
+            .file(
+                "site.nix",
+                "{ ... }:\n{\n  services.nginx.virtualHosts.site = { };\n}\n",
+            )
+            .index();
+        assert_eq!(option_edges(project.graph()), Vec::<String>::new());
+    }
+
+    /// Upstream `nix-option-synthesizer.test.ts:233-268`: a submodule's own
+    /// `options` are not addressable from outside, while the declaration
+    /// around them still anchors writes into its attribute set.
+    #[test]
+    fn w724b_option_submodule_options_are_quarantined() {
+        let project = Project::new()
+            .file(
+                "agents.nix",
+                "{ lib, ... }:\n{\n  options.launchd.agents = lib.mkOption {\n    type = lib.types.attrsOf (lib.types.submodule {\n      options = {\n        command.text = lib.mkOption {\n          type = lib.types.str;\n          default = \"\";\n        };\n      };\n    });\n  };\n}\n",
+            )
+            .file(
+                "writer.nix",
+                "{ ... }:\n{\n  command.text = \"not an option write\";\n  launchd.agents.myapp = { };\n}\n",
+            )
+            .index();
+        assert_eq!(
+            option_edges(project.graph()),
+            [
+                "launchd.agents.myapp (writer.nix) -> options.launchd.agents (agents.nix) at launchd.agents"
+            ]
         );
     }
 }

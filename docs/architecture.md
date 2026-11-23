@@ -187,7 +187,12 @@ with ArkTS's own extensions and ohpm's `Index.ets` entry, and a bare name an
 `oh-package.json5` `file:` dependency declares is the workspace member it
 names, which resolves to the member's `main`: a bounded walk reads every
 `oh-package.json5` of the project, and a name two manifests point at different
-directories, or a target or entry outside the project, is no member. Calls in Vue, Svelte and
+directories, or a target or entry outside the project, is no member. Nix has
+no ambient cross-file namespace: a static relative path import (`import
+./x.nix`, `callPackage ./pkgs/hello`, a module's `imports = [ ./a.nix ]`)
+resolves by import alone, to the indexed file its path names or a directory's
+`default.nix`, and a name match from Nix into another file is dropped, as is
+another language's name match onto a Nix node. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -382,7 +387,12 @@ and then to the route's own addon, one handler or none (`goframe-route`, with
 struct field holding a function, reaching each function or method value a
 composite literal or an assignment puts in the field or in the func field it
 is copied from, the receiver typed by its scope at most one field or one
-embedding away (`go-func-field`, with `field`, `via` and `registeredAt`).
+embedding away (`go-func-field`, with `field`, `via` and `registeredAt`), and a Nix
+module's config write (`launchd.user.agents.yabai = …`) reaching the option
+declaration (`options.launchd.user.agents = mkOption …`) of the longest
+static prefix of its path, two to six segments, that one file declares, a
+submodule's own options registering nothing and a longest prefix two files
+declare linking nothing (`nix-option-path`, with `optionPath`).
 The link passes read navigation the routers' resolvers never see, because
 it is markup or a helper's return value rather than a call: a navigation
 fed by a helper's call (`router.push(await pick())`) reaches each Expo
@@ -496,7 +506,7 @@ Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, ArkUI, C++, interface,
 Kotlin, gRPC, React Native, Expo, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
 Spring, MediatR, Sidekiq,
-Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular and SvelteKit passes run only when the index
+Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular, SvelteKit and Nix passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,
 whenever it changed the index, bootstrapped a lane, swept, found a recorded

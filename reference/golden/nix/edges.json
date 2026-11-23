@@ -4,8 +4,8 @@
     "kind": "imports",
     "line": 3,
     "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "file-path"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:default.nix",
@@ -16,8 +16,8 @@
     "kind": "imports",
     "line": 10,
     "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "file-path"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:default.nix",
@@ -28,8 +28,8 @@
     "kind": "imports",
     "line": 10,
     "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "file-path"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:default.nix",
@@ -40,8 +40,8 @@
     "kind": "imports",
     "line": 4,
     "metadata": {
-      "confidence": 0.7,
-      "resolvedBy": "file-path"
+      "confidence": 0.9,
+      "resolvedBy": "import"
     },
     "provenance": null,
     "source": "file:default.nix",

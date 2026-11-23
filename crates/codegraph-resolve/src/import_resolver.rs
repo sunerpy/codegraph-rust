@@ -108,6 +108,9 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
         Language::Php => &[".php"],
         Language::Ruby => &[".rb"],
         Language::ObjC => &[".h", ".m", ".mm"],
+        // A Nix path names a file, or a directory by its `default.nix`
+        // (upstream #1190).
+        Language::Nix => &[".nix", "/default.nix"],
         _ => &[],
     }
 }
@@ -679,6 +682,25 @@ pub fn is_js_path_import_ref(reference: &RefView) -> bool {
                 | Language::ArkTs
         )
         && is_js_path_specifier(&reference.reference_name)
+}
+
+/// A Nix import of a static relative path (upstream `isNixPathImportRef`,
+/// #1190): `import ./x.nix`, `import ../lib`, `callPackage ./pkgs/hello`, a
+/// module's `imports = [ ./a.nix ]`. It names a file, never a symbol; a
+/// channel (`<nixpkgs>`), an attribute path, a variable or an interpolated
+/// path is none.
+pub fn is_nix_path_import_ref(reference: &RefView) -> bool {
+    let name = &reference.reference_name;
+    reference.language == Language::Nix
+        && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+        && (name.starts_with("./") || name.starts_with("../"))
+        && !name.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '{' | '}' | '(' | ')' | '[' | ']' | ';' | '"' | '\'' | '<' | '>' | '$'
+                )
+        })
 }
 
 /// A Lua / Luau `require` (upstream `isLuaRequireRef`, #2392): it names a
@@ -2105,6 +2127,28 @@ pub fn resolve_via_import(
             }
         }
         return None;
+    }
+
+    // A Nix path import names a file, the indexed one its path resolves to,
+    // or nothing: never a symbol by its name (upstream #1190).
+    if is_nix_path_import_ref(reference) {
+        let resolved_path = resolve_import_path(
+            &reference.reference_name,
+            &reference.file_path,
+            reference.language,
+            context,
+        )?;
+        let basename = pathutil::basename(&resolved_path);
+        let file_node = context
+            .get_nodes_by_name_shared(basename)
+            .into_iter()
+            .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)?;
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
 
     let imports = context.get_import_mappings(&reference.file_path, reference.language);
@@ -7643,5 +7687,82 @@ export default defaultTarget;
         let r = reference("ns", EdgeKind::Imports, "src/a.ets", Language::ArkTs);
         let resolved = resolve_via_import(&r, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, "file:src/ns.ets");
+    }
+
+    /// W7-24b: a Nix path names a file, or a directory by its
+    /// `default.nix` (upstream `EXTENSION_RESOLUTION.nix`, #1190).
+    #[test]
+    fn w724b_nix_resolves_files_and_directories() {
+        assert_eq!(
+            extension_resolution(Language::Nix),
+            [".nix", "/default.nix"]
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from([
+                "default.nix".to_string(),
+                "foo.nix".to_string(),
+                "a/foo.nix".to_string(),
+                "lib/util/default.nix".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let resolve = |spec: &str, from: &str| resolve_import_path(spec, from, Language::Nix, &ctx);
+        assert_eq!(
+            resolve("./foo.nix", "a/default.nix").as_deref(),
+            Some("a/foo.nix")
+        );
+        assert_eq!(
+            resolve("../foo.nix", "a/default.nix").as_deref(),
+            Some("foo.nix")
+        );
+        assert_eq!(
+            resolve("./lib/util", "default.nix").as_deref(),
+            Some("lib/util/default.nix")
+        );
+        assert_eq!(resolve("./missing.nix", "default.nix"), None);
+    }
+
+    /// W7-24b: only a static relative path is a Nix path import (upstream
+    /// `isNixPathImportRef`): never a channel, an attribute, a variable, an
+    /// interpolation or another language's import.
+    #[test]
+    fn w724b_nix_path_import_refs_are_static_relative_paths() {
+        let r = |name: &str, kind: EdgeKind, language: Language| {
+            reference(name, kind, "a.nix", language)
+        };
+        assert!(is_nix_path_import_ref(&r(
+            "./x.nix",
+            EdgeKind::Imports,
+            Language::Nix
+        )));
+        assert!(is_nix_path_import_ref(&r(
+            "../lib",
+            EdgeKind::Imports,
+            Language::Nix
+        )));
+        for name in [
+            "<nixpkgs>",
+            "sources.nixpkgs",
+            "selectedPath",
+            "./x${y}.nix",
+            "./a b.nix",
+            "/abs.nix",
+        ] {
+            assert!(
+                !is_nix_path_import_ref(&r(name, EdgeKind::Imports, Language::Nix)),
+                "{name}"
+            );
+        }
+        assert!(!is_nix_path_import_ref(&r(
+            "./x.nix",
+            EdgeKind::Calls,
+            Language::Nix
+        )));
+        assert!(!is_nix_path_import_ref(&r(
+            "./x.nix",
+            EdgeKind::Imports,
+            Language::Python
+        )));
     }
 }

@@ -2207,6 +2207,9 @@ matrix! {
     arkts_extend_decorator_removed_elsewhere,
     arkts_state_decorator_toggles,
     arkts_router_page_renamed,
+    nix_directory_import_default_appears,
+    nix_directory_import_default_goes,
+    nix_option_declared_elsewhere_changes,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -2411,7 +2414,7 @@ fn tier_passes_recompute_an_index_of_the_last_synthesis_version() {
         }
         assert_eq!(
             support::project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "20".to_string())],
+            [("synthesis_version".to_string(), "21".to_string())],
             "[{driver}]"
         );
     }

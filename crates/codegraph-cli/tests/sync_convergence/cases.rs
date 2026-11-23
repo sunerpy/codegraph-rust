@@ -27353,3 +27353,52 @@ pub fn arkts_router_page_renamed() -> Case {
         .edge_before("method Home::openDetail", "calls", "struct Detail")
         .no_edge_after("method Home::openDetail", "calls", "struct Detail")
 }
+
+/// W7-24b: the importer of a Nix directory whose `default.nix` the case
+/// adds or removes.
+const NIX_UTIL_IMPORTER: &str =
+    "let\n  util = import ./lib/util;\nin\n{\n  value = util.helper 1;\n}\n";
+const NIX_UTIL_DEFAULT: &str = "{\n  helper = x: x;\n}\n";
+
+/// W7-24b: a directory a Nix import names gains its `default.nix`: the
+/// import comes to name it (W7-27b's import-candidate lane, keyed by the
+/// directory's name).
+pub fn nix_directory_import_default_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Nix])
+        .file("default.nix", NIX_UTIL_IMPORTER)
+        .file("lib/util/notes.nix", "{ }\n")
+        .write("lib/util/default.nix", NIX_UTIL_DEFAULT)
+        .edge_after("file:default.nix", "imports", "file:lib/util/default.nix")
+}
+
+/// W7-24b: the directory's `default.nix` goes: the import names nothing.
+pub fn nix_directory_import_default_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Nix])
+        .file("default.nix", NIX_UTIL_IMPORTER)
+        .file("lib/util/default.nix", NIX_UTIL_DEFAULT)
+        .remove("lib/util/default.nix")
+        .edge_before("file:default.nix", "imports", "file:lib/util/default.nix")
+}
+
+/// W7-24b: the option another file declares is renamed: the write that
+/// reached it reaches nothing (the synthesis stage recomputes whole).
+pub fn nix_option_declared_elsewhere_changes() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Nix])
+        .file(
+            "modules/launchd.nix",
+            "{ lib, ... }:\n{\n  options.launchd.user.agents = lib.mkOption {\n    default = {};\n  };\n}\n",
+        )
+        .file(
+            "modules/yabai.nix",
+            "{ ... }:\n{\n  launchd.user.agents.yabai = {\n    command = \"yabai\";\n  };\n}\n",
+        )
+        .write(
+            "modules/launchd.nix",
+            "{ lib, ... }:\n{\n  options.launchd.daemons = lib.mkOption {\n    default = {};\n  };\n}\n",
+        )
+        .edge_before(
+            "variable launchd.user.agents.yabai",
+            "references",
+            "variable options.launchd.user.agents",
+        )
+}

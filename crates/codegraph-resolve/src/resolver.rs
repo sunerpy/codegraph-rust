@@ -11,7 +11,7 @@ use crate::alias_binding::resolve_alias_binding;
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
     PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_dart_import_ref,
-    is_js_path_import_ref, is_lua_require_ref, is_php_include_path_ref,
+    is_js_path_import_ref, is_lua_require_ref, is_nix_path_import_ref, is_php_include_path_ref,
     python_module_member_is_claimed, resolve_jvm_import, resolve_php_imported_static_call,
     resolve_via_import,
 };
@@ -2701,8 +2701,10 @@ impl ReferenceResolver {
         };
         let call_result_chain = is_call_result_chain(reference);
         // A JS/TS module path names a file, not a symbol (#2263); a CommonJS
-        // `require('./x')` has no node of that name to pass the check.
+        // `require('./x')` has no node of that name to pass the check. So
+        // does a Nix path import (upstream #1190).
         if !is_js_path_import_ref(reference)
+            && !is_nix_path_import_ref(reference)
             && !self.has_any_possible_match_for(existence_name, reference.language)
             // PHP, Pascal and CFML names ignore case: `formatprice()` calls
             // `FormatPrice`, which the exact-name set never lists (upstream
@@ -2944,10 +2946,12 @@ impl ReferenceResolver {
         // A Lua / Luau `require` reaches a module file or nothing: its leaf
         // name-matched the local it is assigned to (#2392). So does a Dart
         // import's URI: `package:flutter/foundation.dart` matched by its last
-        // segment went to riverpod's own foundation.dart (#2388).
+        // segment went to riverpod's own foundation.dart (#2388), and a Nix
+        // path import: `./x.nix` would name-match an unrelated node (#1190).
         if is_php_include_path_ref(reference)
             || is_lua_require_ref(reference)
             || is_dart_import_ref(reference)
+            || is_nix_path_import_ref(reference)
         {
             return (best_candidate(candidates, reference, context), None);
         }
@@ -2983,6 +2987,22 @@ impl ReferenceResolver {
         )
         .map(|result| {
             crate::overloads::retarget_overload(result, reference, context, &self.overload_sets)
+        });
+        // Nix has no ambient cross-file namespace: a name binds in its own
+        // file, or through an import the path branch resolved, so a name
+        // match into another file is wrong by construction (every module
+        // `inherit (lib) mkOption`s the same helpers). And no other language
+        // names a Nix binding: interop is evaluation, never a linkable
+        // symbol. `gate_language` already drops that for a language of
+        // another code family, not for one with none, such as GDScript
+        // (upstream #1190, `resolution/index.ts` at `b635dd46`).
+        let name_result = name_result.filter(|result| {
+            let target = context.get_node_by_id_shared(&result.target_node_id);
+            if reference.language == Language::Nix {
+                target.is_some_and(|target| target.file_path == reference.file_path)
+            } else {
+                !target.is_some_and(|target| target.language == Language::Nix)
+            }
         });
         if let Some(name_result) = self.gate_test_suite(name_result, reference, context) {
             candidates.push(name_result);

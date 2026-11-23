@@ -22,7 +22,7 @@ use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
     angular, arkui, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field,
-    goframe, iface, is_synthesized, jsx, links, react_native, registry, sveltekit, tier, vue,
+    goframe, iface, is_synthesized, jsx, links, nix, react_native, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::RouteTables;
@@ -222,6 +222,7 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         |languages| languages.contains(&Language::Svelte),
         links::sveltekit_link_edges,
     ),
+    ("nixOptionEdges", nix::gate, nix::option_path_edges),
 ];
 
 /// Compute every synthesized edge over `store`'s base graph and replace the
