@@ -26,6 +26,8 @@ pub enum CommentLang {
     Rust,
     /// C and C++ (upstream's `c` / `cpp`).
     Cpp,
+    /// Erlang (upstream's `erlang`, #1169).
+    Erlang,
 }
 
 /// Replace comments + string literals with spaces, preserving offsets.
@@ -34,6 +36,7 @@ pub enum CommentLang {
 pub fn strip_comments_for_regex(content: &str, lang: CommentLang) -> String {
     match lang {
         CommentLang::Python => strip_python(content),
+        CommentLang::Erlang => strip_erlang(content),
         CommentLang::Ruby => strip_ruby(content),
         CommentLang::Rust => strip_rust(content),
         CommentLang::Php => strip_php(content),
@@ -44,6 +47,55 @@ pub fn strip_comments_for_regex(content: &str, lang: CommentLang) -> String {
             strip_c_style(content, false)
         }
     }
+}
+
+/// `stripErlang` (upstream `strip-comments.ts`, #1169): `%` starts a line
+/// comment unless it sits in a `"string"`, a `'quoted atom'` or the
+/// character literal `$%`; strings and quoted atoms stay (a callback's name
+/// can be a quoted atom), and only the comment becomes spaces.
+fn strip_erlang(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = chars.clone();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '"' || c == '\'' {
+            i += 1;
+            while i < n && chars[i] != c {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+            continue;
+        }
+        // A character literal (`$x`, `$\n`, `$%`): the next character, or
+        // escape, is data.
+        if c == '$' {
+            i += 1;
+            if i < n && chars[i] == '\\' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '%' {
+            let mut end = i;
+            while end < n && chars[end] != '\n' {
+                end += 1;
+            }
+            blank_range(&mut out, &chars, i, end);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
 }
 
 /// Replace `[start, end)` with spaces, keeping newlines so line numbers stay
@@ -1865,6 +1917,19 @@ mod tests {
         ] {
             assert_eq!(strip_comments_for_regex("", lang), "");
         }
+    }
+
+    /// W7-24d: Erlang's `%` comments become spaces; a string, a quoted atom
+    /// and a `$%` character literal stay, and every offset holds (upstream
+    /// `stripErlang`).
+    #[test]
+    fn w724d_strip_erlang_keeps_strings_atoms_and_char_literals() {
+        let src = "f() -> \"%s\", '%a', $%, ok. % trailing note\n-callback g() -> ok. %% doc\n";
+        let out = strip_comments_for_regex(src, CommentLang::Erlang);
+        let expected = src
+            .replace("% trailing note", &" ".repeat(15))
+            .replace("%% doc", &" ".repeat(6));
+        assert_eq!(out, expected);
     }
 
     #[test]

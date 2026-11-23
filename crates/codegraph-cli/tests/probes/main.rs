@@ -29268,7 +29268,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "21".to_string())]
+            [("synthesis_version".to_string(), "22".to_string())]
         );
     }
 
@@ -44414,5 +44414,289 @@ mod terraform_modules {
             .index();
         assert_unresolved!(project, "variable output.o" => references => "module.vpc");
         assert_unresolved!(project, "variable output.o" => references => "module.vpc:output.id");
+    }
+}
+
+/// W7-24d: Erlang behaviours, macros and application files (upstream
+/// #1165, #1168, #1169).
+mod erlang_otp {
+    use super::support::{Graph, Project, assert_edge, assert_no_edge, assert_unresolved};
+
+    /// The `erlang-behaviour` edges, as `source -> file:target via`, sorted.
+    fn behaviour_edges(graph: &Graph) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "erlang-behaviour")
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                format!(
+                    "{} -> {}:{} via {}",
+                    source.name,
+                    target.file_path.rsplit('/').next().unwrap_or(""),
+                    target.name,
+                    edge.metadata["via"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// Upstream `erlang-behaviour-synthesizer.test.ts:41-116`.
+    #[test]
+    fn w724d_behaviour_dispatch_reaches_every_implementer() {
+        let project = Project::new()
+            .file(
+                "src/worker_behaviour.erl",
+                "-module(worker_behaviour).\n\n-callback handle_thing(Arg :: term()) -> ok | {error, term()}.\n-callback init(list()) -> {ok, term()}.\n\n-export([dispatch/2]).\n\ndispatch(Mod, Arg) ->\n    Mod:handle_thing(Arg).\n",
+            )
+            .file(
+                "src/worker_a.erl",
+                "-module(worker_a).\n-behaviour(worker_behaviour).\n-export([handle_thing/1, init/1]).\n\nhandle_thing(X) -> {ok, X}.\ninit(_) -> {ok, state}.\n",
+            )
+            .file(
+                "src/worker_b.erl",
+                "-module(worker_b).\n-behaviour(worker_behaviour).\n-export([handle_thing/1, init/1]).\n\nhandle_thing(X) -> {done, X}.\ninit(_) -> {ok, state}.\n",
+            )
+            .file(
+                "src/freeloader.erl",
+                "-module(freeloader).\n-export([handle_thing/1]).\n\nhandle_thing(X) -> X.\n",
+            )
+            .file(
+                "src/runner.erl",
+                "-module(runner).\n-export([run/2, wrong/2, self_call/1]).\n\nrun(Mod, Arg) ->\n    Mod:handle_thing(Arg).\n\nwrong(Mod, Arg) ->\n    Mod:handle_thing(Arg, extra).\n\nself_call(X) ->\n    ?MODULE:handle_thing(X).\n",
+            )
+            .index();
+        assert_eq!(
+            behaviour_edges(project.graph()),
+            [
+                "dispatch -> worker_a.erl:handle_thing via worker_behaviour:handle_thing/1",
+                "dispatch -> worker_b.erl:handle_thing via worker_behaviour:handle_thing/1",
+                "run -> worker_a.erl:handle_thing via worker_behaviour:handle_thing/1",
+                "run -> worker_b.erl:handle_thing via worker_behaviour:handle_thing/1",
+            ]
+        );
+        assert_edge!(
+            project,
+            "namespace worker_a" => implements => "namespace worker_behaviour",
+            resolved_by = "exact-match"
+        );
+    }
+
+    /// Upstream `erlang-behaviour-synthesizer.test.ts:118-150`: two
+    /// behaviours declaring one callback name and arity link nothing.
+    #[test]
+    fn w724d_an_ambiguous_callback_links_nothing() {
+        let mut project = Project::new();
+        for behaviour in ["left_behaviour", "right_behaviour"] {
+            project = project.file(
+                &format!("src/{behaviour}.erl"),
+                &format!("-module({behaviour}).\n\n-callback common_cb(term()) -> ok.\n"),
+            );
+        }
+        let project = project
+            .file(
+                "src/impl_left.erl",
+                "-module(impl_left).\n-behaviour(left_behaviour).\n-export([common_cb/1]).\n\ncommon_cb(X) -> X.\n",
+            )
+            .file(
+                "src/caller.erl",
+                "-module(caller).\n-export([go/2]).\n\ngo(Mod, X) ->\n    Mod:common_cb(X).\n",
+            )
+            .index();
+        assert_eq!(behaviour_edges(project.graph()), Vec::<String>::new());
+    }
+
+    /// Upstream `erlang-behaviour-synthesizer.test.ts:152-189`: an
+    /// implementer that does not export the callback is no target.
+    #[test]
+    fn w724d_an_unexported_callback_is_no_target() {
+        let project = Project::new()
+            .file(
+                "src/hook_behaviour.erl",
+                "-module(hook_behaviour).\n\n-callback on_event(term()) -> ok.\n\n-export([fire/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n",
+            )
+            .file(
+                "src/private_impl.erl",
+                "-module(private_impl).\n-behaviour(hook_behaviour).\n-export([start/0]).\n\nstart() -> ok.\n\non_event(_Ev) -> ok.\n",
+            )
+            .file(
+                "src/public_impl.erl",
+                "-module(public_impl).\n-behaviour(hook_behaviour).\n-export([on_event/1]).\n\non_event(Ev) -> {seen, Ev}.\n",
+            )
+            .index();
+        assert_eq!(
+            behaviour_edges(project.graph()),
+            ["fire -> public_impl.erl:on_event via hook_behaviour:on_event/1"]
+        );
+    }
+
+    /// Upstream `erlang-behaviour-synthesizer.test.ts:191-230`: a binary
+    /// literal's commas count no argument.
+    #[test]
+    fn w724d_dispatch_arity_reads_past_binary_literals() {
+        let project = Project::new()
+            .file(
+                "src/codec_behaviour.erl",
+                "-module(codec_behaviour).\n\n-callback decode(binary(), list()) -> term().\n\n-export([run/3]).\n\nrun(Mod, Bin, Opts) ->\n    Mod:decode(Bin, Opts).\n",
+            )
+            .file(
+                "src/json_codec.erl",
+                "-module(json_codec).\n-behaviour(codec_behaviour).\n-export([decode/2]).\n\ndecode(Bin, _Opts) -> Bin.\n",
+            )
+            .file(
+                "src/probe.erl",
+                "-module(probe).\n-export([go/1]).\n\ngo(Mod) ->\n    Mod:decode(<<1,2,3>>, []).\n",
+            )
+            .index();
+        assert_eq!(
+            behaviour_edges(project.graph()),
+            [
+                "go -> json_codec.erl:decode via codec_behaviour:decode/2",
+                "run -> json_codec.erl:decode via codec_behaviour:decode/2",
+            ]
+        );
+    }
+
+    /// Upstream's fan-out cap: a behaviour with more than 24 implementers
+    /// of a callback leaves its dispatch site dynamic.
+    #[test]
+    fn w724d_a_wide_behaviour_leaves_its_dispatch_dynamic() {
+        let mut project = Project::new().file(
+            "src/plugin.erl",
+            "-module(plugin).\n\n-callback handle(term()) -> ok.\n\n-export([fire/2]).\n\nfire(Mod, X) ->\n    Mod:handle(X).\n",
+        );
+        for i in 0..25 {
+            project = project.file(
+                &format!("src/plugin_{i:02}.erl"),
+                &format!(
+                    "-module(plugin_{i:02}).\n-behaviour(plugin).\n-export([handle/1]).\n\nhandle(X) -> X.\n"
+                ),
+            );
+        }
+        let project = project.index();
+        assert_eq!(behaviour_edges(project.graph()), Vec::<String>::new());
+    }
+
+    /// A behaviour with one callback, `on_event/1`, and its dispatcher.
+    const HOOK: &str = "-module(hook).\n\n-callback on_event(term()) -> ok.\n\n-export([fire/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n";
+    /// One implementer of [`HOOK`].
+    const IMPL: &str = "-module(impl).\n-behaviour(hook).\n-export([on_event/1]).\n\non_event(Ev) -> {seen, Ev}.\n";
+
+    /// A site reaches the implementer's function of the site's arity: a
+    /// same-named function of another arity, written first, is no target
+    /// (upstream's `qnArity`).
+    #[test]
+    fn w724d_a_dispatch_reaches_the_function_of_its_arity() {
+        let project = Project::new()
+            .file("src/hook.erl", HOOK)
+            .file(
+                "src/impl.erl",
+                "-module(impl).\n-behaviour(hook).\n-export([on_event/2, on_event/1]).\n\non_event(Ev, Extra) -> {Ev, Extra}.\n\non_event(Ev) -> {seen, Ev}.\n",
+            )
+            .index();
+        assert_edge!(project, "function hook::fire/2" => calls => "function impl::on_event/1");
+        assert_no_edge!(project, "function hook::fire/2" => calls => "function impl::on_event/2");
+    }
+
+    /// The pass reads comment-stripped text: a comment inside a callback's
+    /// argument list counts no argument, and a commented-out site
+    /// dispatches nothing.
+    #[test]
+    fn w724d_comments_count_no_argument_and_dispatch_nothing() {
+        let project = Project::new()
+            .file(
+                "src/hook.erl",
+                "-module(hook).\n\n-callback on_event(Ev :: term() % one event, or a batch\n                  ) -> ok.\n\n-export([fire/2, later/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n\nlater(_Mod, _Ev) ->\n    %% Mod:on_event(Ev) in the next release.\n    ok.\n",
+            )
+            .file("src/impl.erl", IMPL)
+            .index();
+        assert_eq!(
+            behaviour_edges(project.graph()),
+            ["fire -> impl.erl:on_event via hook:on_event/1"]
+        );
+    }
+
+    /// An implementer's callback that dispatches through a variable to its
+    /// own name makes no self edge.
+    #[test]
+    fn w724d_a_dispatch_makes_no_self_edge() {
+        let project = Project::new()
+            .file("src/hook.erl", HOOK)
+            .file(
+                "src/impl.erl",
+                "-module(impl).\n-behaviour(hook).\n-export([on_event/1]).\n\non_event({next, Mod, Ev}) ->\n    Mod:on_event(Ev);\non_event(Ev) -> {seen, Ev}.\n",
+            )
+            .index();
+        assert_eq!(
+            behaviour_edges(project.graph()),
+            ["fire -> impl.erl:on_event via hook:on_event/1"]
+        );
+    }
+
+    /// `-behaviour(x)` names a module and nothing else: an OTP behaviour
+    /// stays unresolved though a macro, a record and a function share its
+    /// name (a record is a type an `implements` could otherwise bind), and a
+    /// project behaviour links its module (upstream's module-only rule).
+    #[test]
+    fn w724d_a_behaviour_names_a_module_only() {
+        let project = Project::new()
+            .file(
+                "src/macros.erl",
+                "-module(macros).\n-define(supervisor, sup_macro).\n-record(supervisor, {id}).\n-export([supervisor/0]).\n\nsupervisor() -> ok.\n",
+            )
+            .file(
+                "src/my_behaviour.erl",
+                "-module(my_behaviour).\n-callback init(term()) -> term().\n",
+            )
+            .file(
+                "src/my_sup.erl",
+                "-module(my_sup).\n-behaviour(supervisor).\n-behaviour(my_behaviour).\n-export([init/1]).\n\ninit(_) -> {ok, {#{}, []}}.\n",
+            )
+            .index();
+        assert_unresolved!(project, "namespace my_sup" => implements => "supervisor");
+        assert_edge!(
+            project,
+            "namespace my_sup" => implements => "namespace my_behaviour",
+            resolved_by = "exact-match"
+        );
+    }
+
+    /// An application file's names are modules only: `kernel` stays
+    /// unresolved though a function shares its name, and an umbrella
+    /// sibling app's module links.
+    #[test]
+    fn w724d_an_app_file_names_modules_only() {
+        let project = Project::new()
+            .file(
+                "apps/sample_core/src/other.erl",
+                "-module(other).\n-export([ssl/0, kernel/0]).\n\nssl() -> ok.\nkernel() -> ok.\n",
+            )
+            .file(
+                "apps/sample_core/src/sample_core.erl",
+                "-module(sample_core).\n-export([ping/0]).\n\nping() -> pong.\n",
+            )
+            .file(
+                "apps/sample/src/sample_app.erl",
+                "-module(sample_app).\n-behaviour(application).\n-export([start/2, stop/1]).\n\nstart(_Type, _Args) -> ok.\nstop(_State) -> ok.\n",
+            )
+            .file(
+                "apps/sample/src/sample.app.src",
+                "{application, sample, [\n    {mod, {sample_app, []}},\n    {applications, [kernel, stdlib, sample_core]}\n]}.\n",
+            )
+            .index();
+        assert_unresolved!(project, "file:apps/sample/src/sample.app.src" => imports => "kernel");
+        assert_edge!(
+            project,
+            "file:apps/sample/src/sample.app.src" => imports => "namespace sample_core",
+            resolved_by = "exact-match"
+        );
+        assert_edge!(
+            project,
+            "file:apps/sample/src/sample.app.src" => references => "namespace sample_app",
+            resolved_by = "exact-match"
+        );
     }
 }

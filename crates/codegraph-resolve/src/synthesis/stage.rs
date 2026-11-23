@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use super::context::ViewContext;
 use super::inputs::{self, Inputs, UnindexedReader};
 use super::{
-    angular, arkui, c_fnptr, callback, dispatch, framework, go, go_dispatch, go_func_field,
+    angular, arkui, c_fnptr, callback, dispatch, erlang, framework, go, go_dispatch, go_func_field,
     goframe, iface, is_synthesized, jsx, links, nix, react_native, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
@@ -173,6 +173,11 @@ const PASSES: &[(&str, Gate, Pass)] = &[
         "sidekiqEdges",
         |languages| languages.contains(&Language::Ruby),
         framework::sidekiq_dispatch_edges,
+    ),
+    (
+        "erlangBehaviourEdges",
+        erlang::gate,
+        erlang::behaviour_dispatch_edges,
     ),
     (
         "laravelEdges",

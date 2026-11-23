@@ -149,7 +149,7 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "sol" => Language::Solidity,
         "nix" => Language::Nix,
         "tf" | "tfvars" | "tofu" => Language::Terraform,
-        "erl" | "hrl" => Language::Erlang,
+        "erl" | "hrl" | "escript" => Language::Erlang,
         "cfc" | "cfm" | "cfs" => Language::Cfml,
         "yml" | "yaml" => Language::Yaml,
         "twig" => Language::Twig,
@@ -193,6 +193,12 @@ pub fn detect_language_with(
     if crate::embedded::shopify::is_shopify_liquid_json(&normalized, overrides.project_root()) {
         return Language::Liquid;
     }
+    // An OTP application resource file holds Erlang terms; its last
+    // extension (`.src`) is too generic for the table (upstream
+    // `isErlangAppFile`, #1169).
+    if is_erlang_app_file(&normalized) {
+        return Language::Erlang;
+    }
     if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
         return language;
     }
@@ -212,6 +218,14 @@ pub fn detect_language_with(
         return language;
     }
     Language::Unknown
+}
+
+/// Whether `path` is an OTP application resource file, `<app>.app.src` or
+/// its compiled `<app>.app`, by its whole suffix in any case (upstream
+/// `isErlangAppFile`): the Erlang extractor reads its application tuple.
+pub fn is_erlang_app_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".app") || lower.ends_with(".app.src")
 }
 
 /// Whether `path` (project-relative, `/`-separated) is a Play routes file:
@@ -2011,6 +2025,19 @@ mod tests {
     fn erlang_extensions_map_to_erlang() {
         assert_eq!(detect_language("m.erl"), Language::Erlang);
         assert_eq!(detect_language("defs.hrl"), Language::Erlang);
+    }
+
+    /// W7-24d: an escript, and an OTP application resource file by its whole
+    /// suffix, in any case (upstream `isErlangAppFile`), are Erlang; a bare
+    /// `.src` is nothing.
+    #[test]
+    fn w724d_escripts_and_app_resource_files_are_erlang() {
+        assert_eq!(detect_language("bin/tool.escript"), Language::Erlang);
+        assert_eq!(detect_language("src/sample.app.src"), Language::Erlang);
+        assert_eq!(detect_language("ebin/sample.app"), Language::Erlang);
+        assert_eq!(detect_language("src/SAMPLE.APP.SRC"), Language::Erlang);
+        assert_eq!(detect_language("notes.src"), Language::Unknown);
+        assert_eq!(detect_language("app"), Language::Unknown);
     }
 
     #[test]

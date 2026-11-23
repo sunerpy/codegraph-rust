@@ -2214,6 +2214,12 @@ matrix! {
     terraform_module_entry_file_appears,
     terraform_remote_state_default_changes,
     terraform_variable_declared_in_the_same_dir_appears,
+    erlang_behaviour_added,
+    erlang_behaviour_removed,
+    erlang_callback_declared_elsewhere,
+    erlang_callback_added,
+    erlang_app_src_appears,
+    erlang_app_src_goes,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -2418,7 +2424,7 @@ fn tier_passes_recompute_an_index_of_the_last_synthesis_version() {
         }
         assert_eq!(
             support::project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "21".to_string())],
+            [("synthesis_version".to_string(), "22".to_string())],
             "[{driver}]"
         );
     }

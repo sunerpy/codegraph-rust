@@ -8576,6 +8576,33 @@ pub fn match_reference(
         }
     }
 
+    // An Erlang `-behaviour(m)` names a module, and so does every name an
+    // `.app`/`.app.src` resource file writes (its callback module, the apps
+    // it depends on): the module's namespace, never a same-named macro or
+    // function; an OTP behaviour or application outside the project stays
+    // unresolved (upstream #1169: on emqx `-behaviour(supervisor)` bound a
+    // `-define(supervisor, …)`, and the `ssl` app a test helper `ssl/0`).
+    if reference.language == Language::Erlang
+        && (reference.reference_kind == EdgeKind::Implements
+            || codegraph_extract::engine::is_erlang_app_file(&reference.file_path))
+    {
+        let modules: Vec<Arc<Node>> = context
+            .get_nodes_by_name_shared(&reference.reference_name)
+            .into_iter()
+            .filter(|node| node.language == Language::Erlang && node.kind == NodeKind::Namespace)
+            .collect();
+        return prefer_call_site_file(modules, &reference.file_path)
+            .first()
+            .map(|module| {
+                ResolvedRef::new(
+                    reference.clone(),
+                    module.id.clone(),
+                    0.9,
+                    ResolvedBy::ExactMatch,
+                )
+            });
+    }
+
     // A Scala chain link the extractor records with its last receiver
     // segment, `b.c` for `a.b.c()` (KEEP-RUST G14), is the bare `c` upstream
     // records: what the receiver strategies below choose must pass

@@ -27515,3 +27515,127 @@ pub fn terraform_variable_declared_in_the_same_dir_appears() -> Case {
             "variable var.region @app/variables.tf:1",
         )
 }
+
+/// W7-24d: a behaviour, a dispatcher and one implementer.
+const ERL_BEHAVIOUR: &str = "-module(hook).\n\n-callback on_event(term()) -> ok.\n\n-export([fire/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n";
+const ERL_IMPL: &str =
+    "-module(impl).\n-behaviour(hook).\n-export([on_event/1]).\n\non_event(Ev) -> {seen, Ev}.\n";
+const ERL_IMPL_PLAIN: &str =
+    "-module(impl).\n-export([on_event/1]).\n\non_event(Ev) -> {seen, Ev}.\n";
+
+/// W7-24d: an implementer gains `-behaviour(hook)`: the dispatch site
+/// comes to reach it (the `erlang-behaviour` pass).
+pub fn erlang_behaviour_added() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Erlang])
+        .file("src/hook.erl", ERL_BEHAVIOUR)
+        .file("src/impl.erl", ERL_IMPL_PLAIN)
+        .write("src/impl.erl", ERL_IMPL)
+        .edge_after(
+            "function hook::fire/2",
+            "calls",
+            "function impl::on_event/1",
+        )
+}
+
+/// W7-24d: the implementer loses it: the site reaches nothing.
+pub fn erlang_behaviour_removed() -> Case {
+    Case::new(Change::EditHeritage, &[Language::Erlang])
+        .file("src/hook.erl", ERL_BEHAVIOUR)
+        .file("src/impl.erl", ERL_IMPL)
+        .write("src/impl.erl", ERL_IMPL_PLAIN)
+        .edge_before(
+            "function hook::fire/2",
+            "calls",
+            "function impl::on_event/1",
+        )
+        .no_edge_after(
+            "function hook::fire/2",
+            "calls",
+            "function impl::on_event/1",
+        )
+}
+
+/// W7-24d: the behaviour stops declaring the callback, in another file
+/// than the implementer and the site.
+pub fn erlang_callback_declared_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Erlang])
+        .file("src/hook.erl", ERL_BEHAVIOUR)
+        .file("src/impl.erl", ERL_IMPL)
+        .file(
+            "src/runner.erl",
+            "-module(runner).\n-export([go/2]).\n\ngo(Mod, Ev) ->\n    Mod:on_event(Ev).\n",
+        )
+        .write(
+            "src/hook.erl",
+            "-module(hook).\n\n-export([fire/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n",
+        )
+        .edge_before(
+            "function runner::go/2",
+            "calls",
+            "function impl::on_event/1",
+        )
+        .no_edge_after(
+            "function runner::go/2",
+            "calls",
+            "function impl::on_event/1",
+        )
+}
+
+/// W7-24d: the behaviour comes to declare the callback, in another file
+/// than the implementer and the site: the site comes to reach it.
+pub fn erlang_callback_added() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Erlang])
+        .file(
+            "src/hook.erl",
+            "-module(hook).\n\n-export([fire/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n",
+        )
+        .file("src/impl.erl", ERL_IMPL)
+        .file(
+            "src/runner.erl",
+            "-module(runner).\n-export([go/2]).\n\ngo(Mod, Ev) ->\n    Mod:on_event(Ev).\n",
+        )
+        .write("src/hook.erl", ERL_BEHAVIOUR)
+        .edge_after(
+            "function runner::go/2",
+            "calls",
+            "function impl::on_event/1",
+        )
+}
+
+/// W7-24d: an application resource file appears: the scan takes it in,
+/// and its callback module links.
+pub fn erlang_app_src_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Erlang])
+        .file(
+            "src/sample_app.erl",
+            "-module(sample_app).\n-export([start/2]).\n\nstart(_T, _A) -> ok.\n",
+        )
+        .write(
+            "src/sample.app.src",
+            "{application, sample, [\n    {mod, {sample_app, []}}\n]}.\n",
+        )
+        .edge_after(
+            "file:src/sample.app.src",
+            "references",
+            "namespace sample_app",
+        )
+}
+
+/// W7-24d: the application resource file goes.
+pub fn erlang_app_src_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Erlang])
+        .file(
+            "src/sample_app.erl",
+            "-module(sample_app).\n-export([start/2]).\n\nstart(_T, _A) -> ok.\n",
+        )
+        .file(
+            "src/sample.app.src",
+            "{application, sample, [\n    {mod, {sample_app, []}}\n]}.\n",
+        )
+        .remove("src/sample.app.src")
+        .edge_before(
+            "file:src/sample.app.src",
+            "references",
+            "namespace sample_app",
+        )
+}

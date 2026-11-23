@@ -199,7 +199,8 @@ assignment and a provider configuration, of the nearest ancestor directory; a
 module block's `:`-scoped references bridge to the entry file, variables and
 outputs of its local source directory, and a cloudposse remote-state output to
 the one directory of the component's name that declares it; a registry or git
-source stays unresolved. Calls in Vue, Svelte and
+source stays unresolved. An Erlang `-behaviour(m)`, and each name an OTP
+application resource file writes, resolves only to an Erlang module. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -377,7 +378,11 @@ reaching every `@EventListener`, `@TransactionalEventListener` or
 (`mediatr-dispatch`), a Sidekiq `perform_async`, `perform_in` or
 `perform_at` reaching the worker's `perform`, a name only when one worker
 class has it, by its qualified name, else by its last segment
-(`sidekiq-dispatch`), a Laravel
+(`sidekiq-dispatch`), an Erlang call through a variable module
+(`Mod:handle_thing(X)`) reaching each in-repo implementer's exported function
+of its name and arity when exactly one behaviour declares that callback with
+`-callback`, at most 24 implementers (`erlang-behaviour`, with `via` and
+`registeredAt`), a Laravel
 `event(new X(…))` reaching each listener's `handle` for `X`, typed or
 registered in a `$listen` map (`laravel-event`), a C or C++ call through a
 struct's function-pointer field reaching each function a table, a designated
@@ -512,7 +517,7 @@ template and the class's for a template file.
 Each walks its candidates in upstream's order (nodes by file, line and id,
 edges by their other end, line and column); the Flutter, ArkUI, C++, interface,
 Kotlin, gRPC, React Native, Expo, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
-Spring, MediatR, Sidekiq,
+Spring, MediatR, Sidekiq, Erlang behaviour,
 Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular, SvelteKit and Nix passes run only when the index
 has files of their languages, as upstream's gates have them. A full index and a migration run
 the stage after resolution. A sync runs it last, after the orphan sweep,

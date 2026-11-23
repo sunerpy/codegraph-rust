@@ -232,6 +232,21 @@ fn is_js_identifier(segment: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
 }
 
+/// The compiler-predefined Erlang macros: no `-define` exists to link a use
+/// to (upstream `ERLANG_PREDEFINED_MACROS`).
+const ERLANG_PREDEFINED_MACROS: [&str; 10] = [
+    "MODULE",
+    "MODULE_STRING",
+    "FILE",
+    "LINE",
+    "MACHINE",
+    "FUNCTION_NAME",
+    "FUNCTION_ARITY",
+    "OTP_RELEASE",
+    "FEATURE_AVAILABLE",
+    "FEATURE_ENABLED",
+];
+
 /// Whether an ArkUI attribute binds an event handler (`onClick`,
 /// `onChange`): `on` and an uppercase letter (upstream's `/^on[A-Z]/`).
 fn is_arkui_event_attribute(name: &str) -> bool {
@@ -1112,7 +1127,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// `record_decl` are consumed WITHOUT descending into their type-position
     /// `call` children, so `-spec f(integer()) -> integer().` mints no bogus
     /// `integer` call ref. Static gen_server and spawn/apply MFA dispatch is
-    /// lifted here; behaviour and resource-tuple bridges remain deferred.
+    /// lifted here, and so are a `-behaviour` (`implements`), a macro use
+    /// (its `-define`, whose replacement is walked from the macro) and an
+    /// application resource file's tuple (W7-24d).
     /// CFML extraction (upstream `CfmlExtractor`, `cfml-extractor.ts`). A
     /// first-token sniff (`is_bare_script_cfml`) selects the dialect.
     /// Bare-script: the cfscript type-set config drives the generic dispatch,
@@ -1689,7 +1706,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             .chars()
                             .take(200)
                             .collect();
-                    self.create_node(
+                    let created = self.create_node(
                         NodeKind::Constant,
                         &name,
                         node,
@@ -1698,11 +1715,65 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             ..NodeExtra::default()
                         },
                     );
+                    // The replacement runs where the macro is used, and its
+                    // references are the macro's, once: each `?M(…)` use
+                    // calls the macro, so `caller → M → callee` holds
+                    // without a copy per use (upstream #1168).
+                    if let Some(created) = created
+                        && let Some(replacement) = child_by_field(node, "replacement")
+                    {
+                        self.node_stack.push(created.id);
+                        self.visit_node(replacement);
+                        self.node_stack.pop();
+                    }
                 }
-                // The replacement's call attribution to the macro node is
-                // DEFERRED (macro_call_expr use-site linking); consume the
-                // subtree so its type-position/expression children don't mint
-                // spurious refs from file scope.
+                true
+            }
+            // `-behaviour(m)` implements m's callbacks, from the module
+            // (upstream #1169); an OTP behaviour stays unresolved.
+            "behaviour_attribute" => {
+                if let Some(name) = child_by_field(node, "name")
+                    .map(|name| crate::lang::erlang_atom_text(name, self.source))
+                    .filter(|name| !name.is_empty())
+                    && let Some(from) = self.node_stack.last().cloned()
+                {
+                    self.push_ref(&from, &name, EdgeKind::Implements, node);
+                }
+                true
+            }
+            // A macro use links its `-define` (upstream #1168): a
+            // function-like use (`?LOG(X)`) calls it, a bare read
+            // (`?TIMEOUT`) references it; a predefined macro has no
+            // definition. Its arguments are walked as code.
+            "macro_call_expr" => {
+                if let Some(name) = child_by_field(node, "name")
+                    .map(|name| node_text(name, self.source))
+                    .filter(|name| !ERLANG_PREDEFINED_MACROS.contains(&name.as_str()))
+                    && let Some(from) = self.node_stack.last().cloned()
+                {
+                    let kind = if child_by_field(node, "args").is_some() {
+                        EdgeKind::Calls
+                    } else {
+                        EdgeKind::References
+                    };
+                    self.push_ref(&from, &name, kind, node);
+                }
+                self.visit_named_children(node);
+                true
+            }
+            // An OTP application resource file's `{application, Name,
+            // Props}.` (upstream #1169).
+            "tuple"
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "source_file")
+                    && crate::engine::is_erlang_app_file(self.file_path)
+                    && node.named_child(0).is_some_and(|first| {
+                        first.kind() == "atom"
+                            && crate::lang::erlang_atom_text(first, self.source) == "application"
+                    }) =>
+            {
+                self.visit_erlang_app_tuple(node);
                 true
             }
             // -spec / -callback: their type expressions parse as `call` nodes;
@@ -1742,6 +1813,50 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// An application tuple's graph: `{mod, {Mod, _}}` references the
+    /// application-callback module, and `{applications, […]}` and
+    /// `{included_applications, […]}` import the apps it depends on; the
+    /// other properties carry none (upstream `handleAppResourceTuple`).
+    fn visit_erlang_app_tuple(&mut self, node: SyntaxNode<'tree>) {
+        let Some(from) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let Some(props) = node.named_child(2).filter(|props| props.kind() == "list") else {
+            return;
+        };
+        for prop in props.named_children(&mut props.walk()) {
+            if prop.kind() != "tuple" || prop.named_child_count() < 2 {
+                continue;
+            }
+            let (Some(key), Some(value)) = (prop.named_child(0), prop.named_child(1)) else {
+                continue;
+            };
+            if key.kind() != "atom" {
+                continue;
+            }
+            let key = crate::lang::erlang_atom_text(key, self.source);
+            let push = |walker: &mut Self, atom: SyntaxNode<'tree>, kind: EdgeKind| {
+                let name = crate::lang::erlang_atom_text(atom, walker.source);
+                if !name.is_empty() {
+                    walker.push_ref(&from, &name, kind, atom);
+                }
+            };
+            if key == "mod" && value.kind() == "tuple" {
+                if let Some(module) = value.named_child(0).filter(|m| m.kind() == "atom") {
+                    push(self, module, EdgeKind::References);
+                }
+            } else if matches!(key.as_str(), "applications" | "included_applications")
+                && value.kind() == "list"
+            {
+                for app in value.named_children(&mut value.walk()) {
+                    if app.kind() == "atom" {
+                        push(self, app, EdgeKind::Imports);
+                    }
+                }
+            }
         }
     }
 
@@ -1964,33 +2079,40 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return own_module();
         }
 
+        // Upstream's macro table (OD-W724-3): a define of the name as
+        // `?MODULE` anywhere in the file names the module itself, whatever
+        // another branch of an `-ifdef` defines; otherwise the last define
+        // of it as an atom names the server.
+        let mut module_itself = false;
+        let mut atom: Option<String> = None;
         for form in self.root.named_children(&mut self.root.walk()) {
             if form.kind() != "pp_define" {
                 continue;
             }
-            let Some(lhs) = child_by_field(form, "lhs") else {
+            let Some(name) =
+                child_by_field(form, "lhs").and_then(|lhs| child_by_field(lhs, "name"))
+            else {
                 continue;
             };
-            let Some(name) = child_by_field(lhs, "name") else {
+            let Some(replacement) = child_by_field(form, "replacement") else {
                 continue;
             };
             if node_text(name, self.source) != macro_name {
                 continue;
             }
-            let replacement = child_by_field(form, "replacement")?;
-            if replacement.kind() == "atom" {
-                let name = crate::lang::erlang_atom_text(replacement, self.source);
-                return (!name.is_empty()).then_some(name);
-            }
             if replacement.kind() == "macro_call_expr"
                 && child_by_field(replacement, "name")
                     .is_some_and(|name| node_text(name, self.source) == "MODULE")
             {
-                return own_module();
+                module_itself = true;
+            } else if replacement.kind() == "atom" {
+                atom = Some(crate::lang::erlang_atom_text(replacement, self.source));
             }
-            return None;
         }
-        None
+        if module_itself {
+            return own_module();
+        }
+        atom.filter(|name| !name.is_empty())
     }
 
     /// Terraform/HCL extraction (upstream `terraformExtractor.visitNode`,
@@ -14495,6 +14617,163 @@ go() -> codec:decode(<<1,2,3>>, []).\n";
         let (_nodes, refs) = run("probe.erl", src, Language::Erlang);
         assert!(has_ref(&refs, EdgeKind::Calls, "codec::decode/2"));
         assert!(!has_ref(&refs, EdgeKind::Calls, "codec::decode/4"));
+    }
+
+    /// `kind:name` of the references `from` (a node named so) makes.
+    fn erlang_refs_from(nodes: &[Node], refs: &[UnresolvedRef], from: &str) -> Vec<String> {
+        let id = &nodes
+            .iter()
+            .find(|n| n.name == from && n.kind != NodeKind::File)
+            .unwrap_or_else(|| panic!("missing {from}"))
+            .id;
+        refs.iter()
+            .filter(|r| &r.from_node_id == id)
+            .map(|r| format!("{}:{}", r.reference_kind.as_str(), r.reference_name))
+            .collect()
+    }
+
+    /// W7-24d: an escript's functions and calls (behind its shebang), and an
+    /// app resource file's callback module and dependency apps (upstream
+    /// `extraction.test.ts` 12568-12613).
+    #[test]
+    fn w724d_erlang_escript_and_app_files() {
+        let src = "#!/usr/bin/env escript\n%%! -smp enable\n\nmain([Path]) ->\n    Result = analyze(Path),\n    io:format(\"~p~n\", [Result]).\n\nanalyze(Path) ->\n    {ok, Bin} = file:read_file(Path),\n    byte_size(Bin).\n";
+        let (nodes, refs) = run("bin/tool.escript", src, Language::Erlang);
+        assert!(has_node(&nodes, NodeKind::Function, "main"), "{nodes:?}");
+        assert!(has_node(&nodes, NodeKind::Function, "analyze"), "{nodes:?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "analyze/1"), "{refs:?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "io::format/2"), "{refs:?}");
+
+        let app = "{application, sample, [\n    {description, \"Sample application\"},\n    {vsn, \"1.0.0\"},\n    {registered, [sample_server]},\n    {mod, {sample_app, []}},\n    {applications, [kernel, stdlib, sample_core]},\n    {included_applications, [sample_extra]},\n    {env, [{limit, 100}]},\n    {modules, []}\n]}.\n";
+        let (nodes, refs) = run("src/sample.app.src", app, Language::Erlang);
+        let file = &nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::File)
+            .expect("file")
+            .id;
+        let names: Vec<String> = refs
+            .iter()
+            .filter(|r| &r.from_node_id == file)
+            .map(|r| format!("{}:{}", r.reference_kind.as_str(), r.reference_name))
+            .collect();
+        for wanted in [
+            "references:sample_app",
+            "imports:kernel",
+            "imports:stdlib",
+            "imports:sample_core",
+            "imports:sample_extra",
+        ] {
+            assert!(names.iter().any(|n| n == wanted), "{wanted}: {names:?}");
+        }
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.reference_name == "sample_server" || r.reference_name == "limit"),
+            "{refs:?}"
+        );
+        // The same tuple in a module is no resource term.
+        let (_nodes, refs) = run("src/m.erl", app, Language::Erlang);
+        assert!(!has_ref(&refs, EdgeKind::Imports, "kernel"), "{refs:?}");
+    }
+
+    /// W7-24d: macro linkage (upstream `extraction.test.ts` 12616-12688): a
+    /// define's body calls from the macro, a function-like use calls the
+    /// macro, a bare read references it, a predefined macro links nothing,
+    /// and a use's arguments are walked.
+    #[test]
+    fn w724d_erlang_macro_linkage() {
+        let src = "-module(m).\n-export([do_thing/1]).\n\n-define(LOG_AUDIT(Event), audit_logger:log(Event, ?MODULE)).\n\ndo_thing(X) ->\n    ?LOG_AUDIT({thing, X}),\n    ok.\n";
+        let (nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(
+            erlang_refs_from(&nodes, &refs, "LOG_AUDIT")
+                .contains(&"calls:audit_logger::log/2".to_string()),
+            "{refs:?}"
+        );
+        assert!(
+            erlang_refs_from(&nodes, &refs, "do_thing").contains(&"calls:LOG_AUDIT".to_string()),
+            "{refs:?}"
+        );
+
+        let src = "-module(m).\n-export([wait/0]).\n\n-define(TIMEOUT, 5000).\n\nwait() ->\n    receive after ?TIMEOUT -> ok end.\n";
+        let (_nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(has_ref(&refs, EdgeKind::References, "TIMEOUT"), "{refs:?}");
+        assert!(!has_ref(&refs, EdgeKind::Calls, "TIMEOUT"), "{refs:?}");
+
+        let src = "-module(m).\n-export([check/0]).\n\ncheck() ->\n    ?assertEqual(ok, prepare()),\n    {?MODULE, ?LINE, ?FUNCTION_NAME}.\n\nprepare() -> ok.\n";
+        let (_nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(has_ref(&refs, EdgeKind::Calls, "prepare/0"), "{refs:?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "assertEqual"), "{refs:?}");
+        for predefined in ["MODULE", "LINE", "FUNCTION_NAME"] {
+            assert!(
+                !refs.iter().any(|r| r.reference_name == predefined),
+                "{predefined}: {refs:?}"
+            );
+        }
+
+        let src = "-module(m).\n\n-define(TARGET, target_fn()).\n-define(ALIAS, ?TARGET).\n";
+        let (nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(
+            erlang_refs_from(&nodes, &refs, "TARGET").contains(&"calls:target_fn/0".to_string()),
+            "{refs:?}"
+        );
+        assert!(
+            erlang_refs_from(&nodes, &refs, "ALIAS").contains(&"references:TARGET".to_string()),
+            "{refs:?}"
+        );
+    }
+
+    /// W7-24d: `-behaviour(x)` implements x, from the module; a `-callback`
+    /// declares no function (upstream `extraction.test.ts` 12691-12712).
+    #[test]
+    fn w724d_erlang_behaviour_attribute() {
+        let (nodes, refs) = run(
+            "src/m.erl",
+            "-module(m).\n-behaviour(gen_server).\n\ninit(_) -> {ok, #{}}.\n",
+            Language::Erlang,
+        );
+        let implements: Vec<&UnresolvedRef> = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Implements)
+            .collect();
+        assert_eq!(implements.len(), 1, "{refs:?}");
+        assert_eq!(implements[0].reference_name, "gen_server");
+        assert_eq!(
+            implements[0].from_node_id,
+            node(&nodes, NodeKind::Namespace, "m").id
+        );
+        let (nodes, _refs) = run(
+            "src/b.erl",
+            "-module(b).\n\n-callback handle_thing(term()) -> ok.\n-callback init(list()) -> {ok, term()}.\n",
+            Language::Erlang,
+        );
+        assert!(
+            !nodes.iter().any(|n| n.kind == NodeKind::Function),
+            "{nodes:?}"
+        );
+    }
+
+    /// W7-24d (OD-W724-3): a gen_server target macro defined as `?MODULE`
+    /// in one branch is the module itself, whatever the other branch
+    /// defines (upstream's macro table).
+    #[test]
+    fn w724d_erlang_gen_server_macro_table_prefers_the_module() {
+        let src = "-module(kv).\n-behaviour(gen_server).\n-export([get/1, handle_call/3]).\n\n-ifdef(TEST).\n-define(SERVER, other_srv).\n-else.\n-define(SERVER, ?MODULE).\n-endif.\n\nget(K) -> gen_server:call(?SERVER, {get, K}).\n\nhandle_call(_R, _F, S) -> {reply, ok, S}.\n";
+        let (_nodes, refs) = run("src/kv.erl", src, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "kv::handle_call/3"),
+            "{refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "other_srv::handle_call/3"),
+            "{refs:?}"
+        );
+        // Two atom definitions: the last one names the server.
+        let src = "-module(kv).\n-export([get/1]).\n-ifdef(TEST).\n-define(SERVER, test_srv).\n-else.\n-define(SERVER, prod_srv).\n-endif.\nget(K) -> gen_server:call(?SERVER, {get, K}).\n";
+        let (_nodes, refs) = run("src/kv.erl", src, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "prod_srv::handle_call/3"),
+            "{refs:?}"
+        );
     }
 
     // ---- CFML (dual-grammar: cfscript for bare-script, cfml for tag) ----

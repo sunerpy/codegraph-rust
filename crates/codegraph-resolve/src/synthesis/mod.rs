@@ -33,6 +33,7 @@ mod c_fnptr;
 mod callback;
 mod context;
 mod dispatch;
+mod erlang;
 mod framework;
 mod go;
 mod go_dispatch;
@@ -67,7 +68,7 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "21";
+pub const VERSION: &str = "22";
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

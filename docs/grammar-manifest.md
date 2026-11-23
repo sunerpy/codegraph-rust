@@ -48,7 +48,7 @@ grammar crates.
 | `solidity`          | `tree-sitter-solidity`   | `.sol`                                                                 |
 | `nix`               | `tree-sitter-nix`        | `.nix`                                                                 |
 | `terraform`         | `tree-sitter-hcl`        | `.tf`, `.tfvars`, `.tofu`                                              |
-| `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`                                                         |
+| `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`, `.escript`, `.app`, `.app.src`                         |
 | `cfml`              | `tree-sitter-cfml`       | script/tag entry by source; `<cfscript>`/`<cfquery>` bodies in place   |
 | `gdscript`          | `tree-sitter-gdscript`   | `.gd`; framework resolution adds Godot relationships                   |
 
