@@ -174,52 +174,46 @@ text-formatting / relevance-ordering differences. Six of the eight shared tools 
 `codegraph_files` tree/flat/grouped) are byte-identical; the diffs below are
 confined to `codegraph_explore` and `codegraph_status`.
 
-- **`codegraph_explore` relevance ranking (RWR/skeletonization) is not
-  ported; the size-adaptive output BUDGET and the Flow section are.** colby's
-  `findRelevantContext` (`reference/colby/src/context/index.ts`) ranks the
-  subgraph with Random-Walk-with-Restart / personalized PageRank, computes a
-  FLOW spine among named symbols (`buildFlowFromNamedSymbols`), and adaptively
-  SKELETONIZES off-spine polymorphic-sibling files to signatures
-  (`adaptiveExplore`, `tools.ts:2422-2623`). The port opens the response with
-  the same Flow section (the chain, `dynamic:` hop tags, `(when …)` branch
-  conditions), followed by the "Dynamic-dispatch links among your symbols"
-  section as `e8ddc4e2` prints it (#2748, #2751). The spine does not yet weight
-  file ranking or body windows, and a flow that does not connect gets no
-  boundary or polymorphic-dispatch announcement of its own; the port's boundary
-  scan over the explore seeds still runs. The low-value files the links put
-  last and `excludeLowValueFiles` drops are `b635dd46`'s `isLowValue` patterns;
-  upstream has since moved both onto its engine-wide test predicate (#2557,
-  PARTIAL in the 2026-10-22 audit). The Rust port reproduces the DETERMINISTIC
-  structure — header,
-  blast radius, relationship map, dynamic boundaries, and per-file source
-  grouped by file — by seeding roots from the FTS search results
-  (`searchLimit: 8`) and pulling their callers/callees + `contains` children into
-  the subgraph. It DOES now apply colby's `getExploreOutputBudget`
-  (`tools.ts:160-258`, ported in `explore_budget.rs`): the size-tiered total /
-  per-file caps, `defaultMaxFiles`, gap-threshold clustering, header symbol cap,
-  relationship edge cap, `excludeLowValueFiles`, the whole-method-drop +
-  "Not shown above" excluded-file list, and the gated completeness-signal /
-  budget-note / relationships sections. Consequences on the mini golden:
-  - The `Found N symbols across M files` count differs (colby prunes the import
-    seed via RWR; the port keeps it → 7 vs 6). The blast-radius entries, section
-    headers, and every verbatim numbered source line are byte-identical.
+- **`codegraph_explore` follows colby's gather, ranking, Flow spine and
+  skeletons, with these differences of mechanism.** The port gathers the
+  subgraph as `findRelevantContext` walks it (the type hierarchy, a three-hop
+  breadth-first walk from each entry point with the per-file and
+  non-production caps, the edges among what was kept), adds `handleExplore`'s
+  glue and named-symbol seeds, and ranks the files as `handleExplore` does
+  (kind-weighted scores, the generated, ambient and low-value damping, the
+  relative floor, Random-Walk-with-Restart graph relevance, the relevance
+  gate, the #1064 buried-type rescue and the comparator with its multi-term
+  corroboration tier). It opens with the same Flow section, weighs the Flow's
+  spine in clusters and windows, and collapses off-spine polymorphic siblings
+  to signatures (`adaptiveExplore`). The `Found` line counts the files whose
+  source the response shows and their listed symbols (#1046), as colby's does.
+  - The entry points are the Rust search's eight best matches of colby's
+    high-value kinds; colby's multi-channel search in `findRelevantContext`
+    (its camelCase and compound-term channels, the low-confidence note) is not
+    ported.
+  - colby's CG-12 score-proportional allocation is not ported: a file's budget
+    is the per-file ceiling (`1.5 × maxCharsPerFile`), the skeleton view's
+    allowance is that ceiling, and a spine file the ceiling clipped renders
+    again into the unspent budget (#2068) where colby funds it first. CG-17/18
+    cross-call dedup and CG-21 carry are not ported either.
+  - Where colby's order falls to Map insertion order, the port decides by path
+    or id: tied candidate files, named-symbol candidates (generated files last,
+    where colby reads SQLite row order), skeleton symbols by start line, column
+    and id, and the random walk over the nodes sorted by id.
+  - The Flow builder's own dynamic-boundary and polymorphic-dispatch
+    announcements are not ported; the port's boundary scan over the explore
+    seeds runs instead.
+  - The low-value files are `b635dd46`'s `isLowValue` patterns; colby has since
+    moved explore onto its engine-wide test predicate (#2557).
+  - Left for the next round: #2557, #2655, #2783, #2750 and #2789, and the
+    dominant file's directory boost (#2575, #2785). `getTopRouteFile` is N/A:
+    nothing in explore reads it.
   - Within a `#### <file> — <symbols>` source header, the symbol list ordering
     can differ (the port sorts by start line; colby uses subgraph insertion
     order). Same symbols, same set.
   - The mini corpus lands in the <150-file tier (13000-char cap, files small
     enough to render whole, `includeRelationships/AdditionalFiles/Completeness/
-    BudgetNote` all off), so the budget produces output byte-identical to the
-    pre-budget whole-file render and colby itself emits none of the gated
-    sections.
-  - **Off-spine skeletonization is DEFERRED (follow-up).** The budget tiers,
-    whole-method-drop, clustering, and excluded-list (the core size-adaptive
-    value) ARE ported; colby's `adaptiveExplore` polymorphic-sibling
-    skeletonization (collapse off-spine sibling/god-file methods to signatures)
-    depends on the un-ported FLOW spine + supertype-implementer analysis and is
-    not yet reproduced. Files over the per-file cap fall to importance-ranked
-    cluster windowing (whole methods, never sliced) instead of signature
-    skeletons — a strictly larger-but-bounded response on sibling-heavy flows,
-    never a correctness change.
+    BudgetNote` all off), and colby itself emits none of the gated sections.
   - **DEFER: upstream's `shrinkCluster` member rule (CG-27).** When a
     protected member of a cluster overruns its room, the port's
     `shrink_to_members` gives up on the cluster and windows its head, while

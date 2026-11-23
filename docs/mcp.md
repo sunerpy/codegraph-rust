@@ -426,9 +426,73 @@ file header instead.
 
 Each file's source is held to a per-file ceiling of 1.5 × the tier's per-file
 budget. A file the query names (by path, by an exact target, or by a symbol it
-defines) that this ceiling clipped is rendered again into whatever budget the
-rest of the response left unspent, so a question about one file can use the
-whole response while every other file keeps exactly the section it was given.
+defines), or one holding a node of the Flow's chain, that this ceiling clipped
+is rendered again into whatever budget the rest of the response left unspent,
+so a question about one file can use the whole response while every other file
+keeps exactly the section it was given.
+
+**What explore gathers.** The entry points are the search's eight best matches
+among functions, methods, classes and the other declaration kinds, variables
+and constants included; imports, exports, files, properties and parameters
+are not entry points. From them explore walks the graph the way upstream's
+`findRelevantContext` does: the supertypes of a type entry point, then three
+hops in both directions from each entry point, which shares a 200-node budget
+evenly with the others, keeping at most 40 nodes from one file and 30 from
+test and other non-production files unless the query mentions tests or specs,
+and then the edges among what was kept. The entry
+points' callers and callees in the files already gathered join, and so does
+every definition a query token names: a camelCase, PascalCase, snake_case or
+qualified token always, a bare lowercase word only where another query token
+is defined in the same file, so an ordinary English word in a question does
+not seed its namesake.
+
+**How explore orders the files.** Each file scores by how its symbols reached
+the subgraph (named by the query, an entry point, one edge from one, or
+around them), weighted by kind: a function or class outweighs a field, and a
+variable or constant nothing uses counts as a name collision. Generated files,
+declaration-only shims and test, spec, icon and translation files are damped,
+and test files leave the ranking unless the query is about tests. A floor
+relative to the best file's score drops the weak files, and backfills to three
+when it leaves fewer. Graph relevance is a random walk with restart from the
+entry points over the subgraph's call, reference, type and import edges; a
+file stays when it holds a meaningful share of the top file's walk mass,
+holds an entry point, is one of the one or two most central files that match
+a query word, or matches two query words. A named callable's signature type
+is added when its file has next to no walk mass and matches fewer than two
+query words. Files named by path come first, then files defining a symbol the
+query named, then entry or central files that two query words corroborate,
+then the rest by walk mass. `CODEGRAPH_RANK_NO_MULTITERM=1` turns the
+corroboration tier off. The summary line counts the files whose source the
+response shows and their listed symbols.
+
+**The Flow's chain in the source.** A symbol the query named ranks its cluster
+above the gathered context around it, even when the gather missed its
+definition. A cluster holding a node of the Flow's chain ranks after exact
+targets and before the rest, its members are kept ahead of incidental ones,
+and a window of it reaches the line where it calls the next hop; a chain
+method longer than 200 lines renders as its signature head and a window on
+that call. The one or two most central files come back whole up to 280 lines,
+the others up to 220.
+
+**Skeletons.** When the Flow has a chain, a file that holds no node of it and
+is one of several interchangeable implementations (a type in it implements or
+extends a supertype that at least three types do) renders symbol by symbol,
+and so does a file the chain runs through once its chain and uniquely named
+bodies overrun its ceiling while it also holds a uniquely named method off the
+chain. A file holding a callable the query names uniquely (at most three
+definitions) is spared and renders as usual, unless it defines such a
+supertype itself, as a base class with its subclasses does. In this view every
+symbol is its signature line except the bodies the question is about, within
+the per-file ceiling: exact targets and named chain steps first, windowed
+rather than dropped when too long, then the chain's other steps, uniquely
+named methods, and in a supertype's own file the methods the query names. The
+header ends with `· skeleton (signatures only — codegraph_explore a name for
+its full body; do NOT Read)` when no body is kept, else with `· focused (the
+methods you named in full, the rest as signatures — codegraph_explore a
+signature by name for its body; do NOT Read)`. A windowed body names each hole
+with the `codegraph_explore` query that returns it, and signatures past a cap
+end in `… +N more (signatures elided)`. `CODEGRAPH_ADAPTIVE_EXPLORE=0` (or
+`false`) turns the view off.
 
 Explore also resolves prose and camelCase query segments against indexed symbol
 names, then merges the resulting callable, Variable, and Constant names as
@@ -789,10 +853,10 @@ drifted file at them. Instead:
   (`FILE_MODE_MAX_LINES`, the same ceiling normal file mode uses). Over the cap,
   the body is omitted with a notice; the location and signature are still shown,
   flagged as possibly shifted.
-- **`codegraph_explore`** flags a drifted file and disables adaptive, skeleton,
-  and cluster slicing for it. Whole-file rendering is correct by construction, so
-  a small file still comes back in full; a large one is omitted rather than
-  sliced.
+- **`codegraph_explore`** flags a drifted file and disables the per-symbol
+  skeleton view and cluster slicing for it. Whole-file rendering is correct by
+  construction, so a small file still comes back in full; a large one is
+  omitted rather than sliced.
 
 Byte size stays gated separately by `indexing.max_file_size` (1 MiB default) —
 a file over that limit was never extracted, so its text is not served either way.

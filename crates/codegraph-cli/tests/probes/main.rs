@@ -46112,3 +46112,353 @@ mod explore_spine {
         );
     }
 }
+
+mod explore_skeleton {
+    //! W7-25d: skeletons for off-spine polymorphic siblings (upstream
+    //! `handleExplore`'s per-symbol view, `tools.ts` b635dd46 6039-6288),
+    //! ported from upstream's `adaptive-explore-sizing` at `e8ddc4e2`: OkHttp's
+    //! interceptor chain in miniature. Upstream's sections are `**\`path\`**`
+    //! labels; this port's are `#### <path> — …` headers.
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::support::{Indexed, Project, bin};
+
+    const SKELETON_MARK: &str = "· skeleton (signatures only";
+    const QUERY: &str = "dispatch proceed handleLogging LoggingInterceptor BridgeInterceptor CacheInterceptor RetryInterceptor ResponseFormatter";
+    const SPARE_QUERY: &str = "dispatch proceed handleLogging LoggingInterceptor BridgeInterceptor CacheInterceptor RetryInterceptor ResponseFormatter authenticate encode AuthInterceptor Codec JsonCodec";
+
+    fn project() -> Indexed {
+        Project::new()
+            .file("src/interceptor.ts", "export interface Interceptor {\n  intercept(request: string): string;\n}\n")
+            .file(
+                "src/dispatcher.ts",
+                "import { LoggingInterceptor } from './logging-interceptor';\n\nexport class RequestDispatcher {\n  dispatch(): string {\n    const chain = new InterceptorChain();\n    return chain.proceed();\n  }\n}\n\nexport class InterceptorChain {\n  proceed(): string {\n    const exemplar = new LoggingInterceptor();\n    return exemplar.handleLogging();\n  }\n}\n",
+            )
+            .file(
+                "src/logging-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class LoggingInterceptor implements Interceptor {\n  handleLogging(): string {\n    const tag = 'LOGGING_BODY_MARKER';\n    return this.intercept(tag);\n  }\n  intercept(request: string): string {\n    return 'logged:' + request;\n  }\n}\n",
+            )
+            .file(
+                "src/bridge-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class BridgeInterceptor implements Interceptor {\n  intercept(request: string): string {\n    const detail = 'BRIDGE_BODY_MARKER';\n    return 'bridged:' + request + detail;\n  }\n}\n",
+            )
+            .file(
+                "src/cache-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class CacheInterceptor implements Interceptor {\n  intercept(request: string): string {\n    const detail = 'CACHE_BODY_MARKER';\n    return 'cached:' + request + detail;\n  }\n}\n",
+            )
+            .file(
+                "src/retry-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class RetryInterceptor implements Interceptor {\n  intercept(request: string): string {\n    const detail = 'RETRY_BODY_MARKER';\n    return 'retried:' + request + detail;\n  }\n}\n",
+            )
+            .file("src/formatter.ts", "export interface Formatter {\n  format(input: string): string;\n}\n")
+            .file(
+                "src/response-formatter.ts",
+                "import { Formatter } from './formatter';\nimport { JsonCodec } from './codec';\n\nexport class ResponseFormatter implements Formatter {\n  format(input: string): string {\n    const detail = 'FORMATTER_BODY_MARKER';\n    // Calls into the Codec family from OFF the dispatch spine, so codec.ts is\n    // gathered as relevant but stays off-spine (mirrors Django: compiler.py is\n    // referenced by the flow yet off the QuerySet-iteration spine).\n    return new JsonCodec().encode(input) + detail;\n  }\n}\n",
+            )
+            .file(
+                "src/auth-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class AuthInterceptor implements Interceptor {\n  authenticate(token: string): string {\n    const detail = 'AUTH_BODY_MARKER';\n    return 'auth:' + token + detail;\n  }\n  intercept(request: string): string {\n    return this.authenticate(request);\n  }\n}\n",
+            )
+            .file(
+                "src/codec.ts",
+                "export class Codec {\n  encode(input: string): string {\n    const detail = 'CODEC_BASE_MARKER';\n    return input + detail;\n  }\n}\nexport class JsonCodec extends Codec {\n  encode(input: string): string { return '{' + input + '}'; }\n}\nexport class XmlCodec extends Codec {\n  encode(input: string): string {\n    const detail = 'XML_BODY_MARKER';\n    return '<' + input + detail + '>';\n  }\n}\nexport class YamlCodec extends Codec {\n  encode(input: string): string { return '- ' + input; }\n}\n",
+            )
+            .index()
+    }
+
+    /// `codegraph explore` with `--max-files`, the adaptive switch set to
+    /// `adaptive` when given.
+    fn explore(root: &Path, query: &str, max_files: u32, adaptive: Option<&str>) -> String {
+        let mut command = Command::new(bin());
+        command
+            .args([
+                "explore",
+                query,
+                "-p",
+                ".",
+                "--max-files",
+                &max_files.to_string(),
+            ])
+            .current_dir(root)
+            .env("CODEGRAPH_NO_DAEMON", "1")
+            .env("CODEGRAPH_NO_WATCH", "1")
+            .env_remove("CODEGRAPH_ADAPTIVE_EXPLORE");
+        if let Some(value) = adaptive {
+            command.env("CODEGRAPH_ADAPTIVE_EXPLORE", value);
+        }
+        let output = command.output().expect("run codegraph explore");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8")
+    }
+
+    /// The section of `src/<file>`: its header through the line before the
+    /// next `#### ` header.
+    fn section_for(text: &str, file: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let head = format!("#### src/{file} — ");
+        let Some(start) = lines.iter().position(|l| l.starts_with(&head)) else {
+            return String::new();
+        };
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with("#### "))
+            .map_or(lines.len(), |at| start + 1 + at);
+        lines[start..end].join("\n")
+    }
+
+    fn implementers(project: &Indexed, name: &str) -> usize {
+        let graph = project.graph();
+        let Some(target) = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == name && n.kind == "interface")
+        else {
+            panic!("{name} is not indexed");
+        };
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.target == target.id && (e.kind == "implements" || e.kind == "extends"))
+            .count()
+    }
+
+    #[test]
+    fn fixture_sanity_interceptor_has_three_implementers_formatter_fewer() {
+        let project = project();
+        assert!(implementers(&project, "Interceptor") >= 3);
+        assert!(implementers(&project, "Formatter") < 3);
+    }
+
+    #[test]
+    fn skeletonizes_off_spine_polymorphic_siblings() {
+        let project = project();
+        let text = explore(project.root(), QUERY, 12, None);
+        assert!(
+            text.contains("**Flow (call path among the symbols you queried)"),
+            "{text}"
+        );
+        for (file, marker) in [
+            ("bridge-interceptor.ts", "BRIDGE_BODY_MARKER"),
+            ("cache-interceptor.ts", "CACHE_BODY_MARKER"),
+            ("retry-interceptor.ts", "RETRY_BODY_MARKER"),
+        ] {
+            let section = section_for(&text, file);
+            assert!(!section.is_empty(), "{file} is present\n{text}");
+            assert!(
+                section.contains(SKELETON_MARK),
+                "{file} is skeletonized\n{section}"
+            );
+            assert!(section.contains("intercept(request"), "{section}");
+            assert!(
+                !section.contains(marker),
+                "{file} body marker survives\n{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_on_spine_exemplar_full() {
+        let project = project();
+        let text = explore(project.root(), QUERY, 12, None);
+        let section = section_for(&text, "logging-interceptor.ts");
+        assert!(!section.is_empty(), "{text}");
+        assert!(!section.contains(SKELETON_MARK), "{section}");
+        assert!(section.contains("LOGGING_BODY_MARKER"), "{section}");
+    }
+
+    #[test]
+    fn keeps_a_distinct_step_full() {
+        let project = project();
+        let text = explore(project.root(), QUERY, 12, None);
+        let section = section_for(&text, "response-formatter.ts");
+        assert!(!section.is_empty(), "{text}");
+        assert!(!section.contains(SKELETON_MARK), "{section}");
+        assert!(section.contains("FORMATTER_BODY_MARKER"), "{section}");
+    }
+
+    #[test]
+    fn the_switch_turns_skeletons_off() {
+        let project = project();
+        for value in ["0", "false"] {
+            let text = explore(project.root(), QUERY, 12, Some(value));
+            assert!(
+                !text.contains(SKELETON_MARK),
+                "CODEGRAPH_ADAPTIVE_EXPLORE={value}\n{text}"
+            );
+            let section = section_for(&text, "bridge-interceptor.ts");
+            assert!(section.contains("BRIDGE_BODY_MARKER"), "{section}");
+        }
+    }
+
+    #[test]
+    fn spares_an_off_spine_sibling_holding_a_named_callable() {
+        let project = project();
+        let text = explore(project.root(), SPARE_QUERY, 15, None);
+        assert!(
+            text.contains("**Flow (call path among the symbols you queried)"),
+            "{text}"
+        );
+        let auth = section_for(&text, "auth-interceptor.ts");
+        assert!(!auth.is_empty(), "{text}");
+        assert!(!auth.contains(SKELETON_MARK), "{auth}");
+        assert!(auth.contains("AUTH_BODY_MARKER"), "{auth}");
+        let bridge = section_for(&text, "bridge-interceptor.ts");
+        assert!(bridge.contains(SKELETON_MARK), "{bridge}");
+        assert!(!bridge.contains("BRIDGE_BODY_MARKER"), "{bridge}");
+    }
+
+    #[test]
+    fn a_family_file_collapses_to_a_focused_view() {
+        let project = project();
+        let text = explore(project.root(), SPARE_QUERY, 15, None);
+        let codec = section_for(&text, "codec.ts");
+        assert!(!codec.is_empty(), "{text}");
+        assert!(codec.contains("· focused"), "{codec}");
+        assert!(codec.contains("CODEC_BASE_MARKER"), "{codec}");
+        assert!(!codec.contains("XML_BODY_MARKER"), "{codec}");
+    }
+
+    #[test]
+    fn naming_a_shared_method_does_not_spare_the_siblings() {
+        let project = project();
+        let text = explore(project.root(), &format!("{QUERY} intercept"), 12, None);
+        let bridge = section_for(&text, "bridge-interceptor.ts");
+        assert!(bridge.contains(SKELETON_MARK), "{bridge}");
+        assert!(!bridge.contains("BRIDGE_BODY_MARKER"), "{bridge}");
+    }
+
+    /// W7-25d: a file that defines the family's supertype collapses even when
+    /// the query names a unique callable in it (upstream: the family override
+    /// beats the named spare, b635dd46 6063-6075).
+    #[test]
+    fn a_family_file_with_a_uniquely_named_method_still_collapses() {
+        let mut project = project();
+        project.write(
+            "src/codec.ts",
+            "export class Codec {\n  encode(input: string): string {\n    const detail = 'CODEC_BASE_MARKER';\n    return input + detail;\n  }\n  decodeAll(input: string): string {\n    return input + 'DECODE_ALL_MARKER';\n  }\n}\nexport class JsonCodec extends Codec {\n  encode(input: string): string { return '{' + input + '}'; }\n}\nexport class XmlCodec extends Codec {\n  encode(input: string): string {\n    const detail = 'XML_BODY_MARKER';\n    return '<' + input + detail + '>';\n  }\n}\nexport class YamlCodec extends Codec {\n  encode(input: string): string { return '- ' + input; }\n}\n",
+        );
+        project.sync();
+        let text = explore(
+            project.root(),
+            &format!("{SPARE_QUERY} decodeAll"),
+            15,
+            None,
+        );
+        let codec = section_for(&text, "codec.ts");
+        assert!(codec.contains("· focused"), "{codec}");
+        assert!(codec.contains("DECODE_ALL_MARKER"), "{codec}");
+        assert!(!codec.contains("XML_BODY_MARKER"), "{codec}");
+    }
+
+    // --- Rust's own --------------------------------------------------------
+
+    /// W7-25d: a sibling the spine runs through stays whole even when the
+    /// spine node in it is an unnamed bridge, so no named callable spares it
+    /// (b635dd46 6096-6098: only a file with no spine node collapses).
+    #[test]
+    fn keeps_an_on_spine_sibling_full_through_an_unnamed_bridge() {
+        let project = Project::new()
+            .file("src/step.ts", "export interface Step {\n  run(input: string): string;\n}\n")
+            .file(
+                "src/start.ts",
+                "import { LoggingStep } from './logging-step';\n\nexport function startFlow(): string {\n  const step = new LoggingStep();\n  return step.relay();\n}\n",
+            )
+            .file(
+                "src/logging-step.ts",
+                "import { Step } from './step';\nimport { finishFlow } from './finish';\n\nexport class LoggingStep implements Step {\n  relay(): string {\n    return finishFlow() + 'LOG_STEP_MARKER';\n  }\n  run(input: string): string {\n    return input;\n  }\n}\n",
+            )
+            .file("src/finish.ts", "export function finishFlow(): string {\n  return 'done';\n}\n")
+            .file(
+                "src/a-step.ts",
+                "import { Step } from './step';\n\nexport class AStep implements Step {\n  run(input: string): string {\n    return 'a' + input;\n  }\n}\n",
+            )
+            .file(
+                "src/b-step.ts",
+                "import { Step } from './step';\n\nexport class BStep implements Step {\n  run(input: string): string {\n    return 'b' + input;\n  }\n}\n",
+            )
+            .index();
+        let text = explore(project.root(), "startFlow finishFlow LoggingStep", 12, None);
+        assert!(
+            text.contains("2. relay (src/logging-step.ts:"),
+            "relay bridges the Flow\n{text}"
+        );
+        let section = section_for(&text, "logging-step.ts");
+        assert!(!section.contains(SKELETON_MARK), "{section}");
+        assert!(
+            !section.contains("· focused"),
+            "the whole file, not the per-symbol view\n{section}"
+        );
+        assert!(section.contains("LOG_STEP_MARKER"), "{section}");
+        assert!(
+            section.contains("return input;"),
+            "the off-spine method's body too\n{section}"
+        );
+    }
+
+    /// W7-25d: a file changed on disk since the last sync renders as its
+    /// current text, never as a skeleton of stale line ranges.
+    #[test]
+    fn a_drifted_sibling_is_not_skeletonized() {
+        let mut project = project();
+        project.write(
+            "src/bridge-interceptor.ts",
+            "import { Interceptor } from './interceptor';\n\n// edited after the index\nexport class BridgeInterceptor implements Interceptor {\n  intercept(request: string): string {\n    const detail = 'BRIDGE_BODY_MARKER';\n    return 'bridged:' + request + detail;\n  }\n}\n",
+        );
+        let text = explore(project.root(), QUERY, 12, None);
+        let section = section_for(&text, "bridge-interceptor.ts");
+        assert!(!section.contains(SKELETON_MARK), "{section}");
+        assert!(
+            section.contains("changed since last index sync"),
+            "{section}"
+        );
+    }
+
+    /// W7-25d: past `SIG_MAX` signatures (12 at this tier) the view ends with
+    /// `… +N more (signatures elided)` (b635dd46 6152, 6246-6249).
+    #[test]
+    fn signatures_past_sig_max_collapse_into_a_tail() {
+        let mut methods = String::new();
+        for i in 0..20 {
+            methods.push_str(&format!(
+                "  probe{i}(request: string): string {{\n    return request + '{i}';\n  }}\n"
+            ));
+        }
+        let project = Project::new()
+            .file("src/interceptor.ts", "export interface Interceptor {\n  intercept(request: string): string;\n}\n")
+            .file(
+                "src/dispatcher.ts",
+                "import { LoggingInterceptor } from './logging-interceptor';\n\nexport class RequestDispatcher {\n  dispatch(): string {\n    const chain = new InterceptorChain();\n    return chain.proceed();\n  }\n}\n\nexport class InterceptorChain {\n  proceed(): string {\n    const exemplar = new LoggingInterceptor();\n    return exemplar.handleLogging();\n  }\n}\n",
+            )
+            .file(
+                "src/logging-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class LoggingInterceptor implements Interceptor {\n  handleLogging(): string {\n    return this.intercept('x');\n  }\n  intercept(request: string): string {\n    return 'logged:' + request;\n  }\n}\n",
+            )
+            .file(
+                "src/wide-interceptor.ts",
+                &format!("import {{ Interceptor }} from './interceptor';\n\nexport class WideInterceptor implements Interceptor {{\n  intercept(request: string): string {{\n    return request;\n  }}\n{methods}}}\n"),
+            )
+            .file(
+                "src/cache-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class CacheInterceptor implements Interceptor {\n  intercept(request: string): string {\n    return 'cached:' + request;\n  }\n}\n",
+            )
+            .file(
+                "src/retry-interceptor.ts",
+                "import { Interceptor } from './interceptor';\n\nexport class RetryInterceptor implements Interceptor {\n  intercept(request: string): string {\n    return 'retried:' + request;\n  }\n}\n",
+            )
+            .index();
+        let text = explore(
+            project.root(),
+            "dispatch proceed handleLogging WideInterceptor",
+            12,
+            None,
+        );
+        let section = section_for(&text, "wide-interceptor.ts");
+        assert!(section.contains(SKELETON_MARK), "{section}");
+        assert!(section.contains("more (signatures elided)"), "{section}");
+    }
+}

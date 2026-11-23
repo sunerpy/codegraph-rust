@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn tier_breakpoints_match_upstream() {
-        // <150: tight 13K cap, all meta gated off, low-value excluded.
+        // <150: tight 13K cap, all meta gated off.
         let tiny = get_explore_output_budget(3);
         assert_eq!(tiny.max_output_chars, 13000);
         assert_eq!(tiny.default_max_files, 4);

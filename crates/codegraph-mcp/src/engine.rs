@@ -89,6 +89,18 @@ const OVERSIZE_SPINE_LINES: usize = 200;
 /// Lines either side of that call (upstream `SPINE_WINDOW`, 5873).
 const SPINE_WINDOW: usize = 28;
 
+/// Implementers of one supertype that make a file one of many
+/// interchangeable siblings (upstream `MIN_SIBLINGS`, b635dd46 5304).
+const MIN_SIBLINGS: usize = 3;
+
+/// Whether off-spine siblings collapse to signatures: on unless
+/// `CODEGRAPH_ADAPTIVE_EXPLORE` is `0` or `false` (upstream
+/// `adaptiveExploreEnabled`, b635dd46 887-889).
+fn adaptive_explore_enabled() -> bool {
+    std::env::var("CODEGRAPH_ADAPTIVE_EXPLORE")
+        .map_or(true, |value| value != "0" && value != "false")
+}
+
 /// Lines either side of a single-line anchor that no callable encloses.
 const ANCHOR_LINE_CONTEXT: usize = 15;
 
@@ -1216,8 +1228,10 @@ impl CodeGraphEngine {
     /// relationships, dynamic boundaries, then per-file source grouped by file —
     /// under a SIZE-ADAPTIVE OUTPUT BUDGET (`getExploreOutputBudget`) scaled by
     /// the project's indexed file count. The files are ranked as upstream
-    /// ranks them, by graph relevance ([`explore_rank`]); off-spine
-    /// skeletonization is not ported (KNOWN_DIFFS.md).
+    /// ranks them, by graph relevance ([`explore_rank`]); the Flow's spine
+    /// weighs in their clusters and windows, and an off-spine polymorphic
+    /// sibling renders symbol by symbol ([`Self::render_per_symbol`]). The
+    /// differences of mechanism are in KNOWN_DIFFS.md.
     fn handle_explore(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let query = match require_string(args, "query") {
             Ok(q) => q,
@@ -1388,9 +1402,9 @@ impl CodeGraphEngine {
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
         // Every admitted section: `(line index, path, what it elided)`.
         let mut sections: Vec<(usize, &String, Vec<WantedSpan>)> = Vec::new();
-        // Named files whose per-file ceiling clipped them, with what a second
-        // render needs: `(line index, path, focuses, exact focus)`.
-        let mut named_clipped: Vec<(usize, &String, Vec<usize>, Vec<BodyFocus>)> = Vec::new();
+        // Named and spine files whose per-file ceiling clipped them, with what
+        // a second render needs.
+        let mut named_clipped: Vec<ClippedNamedFile<'_>> = Vec::new();
         let precise_tokens = precise_query_tokens(&match_query);
         // The symbols the question is about: its exact targets, the named ones
         // and the spine (upstream `questionIds`, `tools.ts` b635dd46 5209).
@@ -1433,6 +1447,15 @@ impl CodeGraphEngine {
                 &question_ids,
                 &flow.spine_call_sites,
             );
+            let spine_focus = self.body_focus(
+                subgraph
+                    .nodes
+                    .iter()
+                    .filter(|n| n.file_path == **file_path && flow.path_node_ids.contains(&n.id)),
+                &path_extraction.line_anchors,
+                &question_ids,
+                &flow.spine_call_sites,
+            );
             let available = effective_budget
                 .saturating_sub(total_chars)
                 .saturating_sub(1);
@@ -1451,6 +1474,7 @@ impl CodeGraphEngine {
                 focuses: &focuses,
                 exact_focus: &exact_focus,
                 flow: &flow,
+                spine_focus: &spine_focus,
                 lift_file_cap: false,
                 drifted: possibly_drifted,
             };
@@ -1480,7 +1504,7 @@ impl CodeGraphEngine {
                 || !focuses.is_empty()
                 || flow.path_files.contains(file_path.as_str());
             if rendered.clipped && named {
-                named_clipped.push((lines.len(), file_path, focuses, exact_focus));
+                named_clipped.push((lines.len(), file_path, focuses, exact_focus, spine_focus));
             }
             sections.push((lines.len(), file_path, rendered.elided));
             lines.push(rendered.section);
@@ -1517,7 +1541,7 @@ impl CodeGraphEngine {
         let mut spare = effective_budget
             .saturating_sub(total_chars)
             .saturating_sub(pointer_reserve);
-        for (line_index, file_path, focuses, exact_focus) in &named_clipped {
+        for (line_index, file_path, focuses, exact_focus, spine_focus) in &named_clipped {
             if spare == 0 {
                 break;
             }
@@ -1534,6 +1558,7 @@ impl CodeGraphEngine {
                 focuses,
                 exact_focus,
                 flow: &flow,
+                spine_focus,
                 lift_file_cap: true,
                 drifted: source.is_possibly_drifted(),
             };
@@ -2079,6 +2104,373 @@ impl CodeGraphEngine {
         diagnostics
     }
 
+    /// Upstream's per-symbol view (`tools.ts` b635dd46 6039-6288), for a file
+    /// that is one of many interchangeable implementations or that the spine
+    /// runs through among off-path named methods: the methods the question is
+    /// about in full, every other symbol as its signature line.
+    ///
+    /// It engages when the switch is on ([`adaptive_explore_enabled`]), the
+    /// Flow has a spine, no line span of the file is anchored, and either the
+    /// file is an on-spine god-file (it holds a spine node, its spine and
+    /// uniquely named bodies overrun the per-file ceiling, and it holds a
+    /// uniquely named callable off the spine), or it holds no spine node, it
+    /// is a polymorphic sibling (a type in it implements or extends one that
+    /// [`MIN_SIBLINGS`] types do) and it is not spared. A file holding a
+    /// uniquely named callable is spared unless it defines such a supertype
+    /// (a base class with its subclasses).
+    ///
+    /// Bodies go by tier within the per-file ceiling, less the signatures'
+    /// reserve: 0 an exact target, 1 a named spine step, 2 an unnamed spine
+    /// step, 3 a uniquely named callable, 4 a named method of the family's
+    /// base file; tiers 0 and 1 are windowed rather than dropped. Upstream's
+    /// `allowance` is this port's per-file ceiling (KEEP-RUST, no CG-12).
+    fn render_per_symbol(
+        &self,
+        subgraph: &ExploreSubgraph,
+        file_path: &str,
+        file_lines: &[&str],
+        lang: &str,
+        ctx: &RenderCtx<'_>,
+    ) -> Option<ExploreFileRender> {
+        let flow = ctx.flow;
+        if !adaptive_explore_enabled()
+            || flow.path_node_ids.is_empty()
+            || !subgraph.anchor_spans_in(file_path).is_empty()
+        {
+            return None;
+        }
+        let budget = ctx.budget;
+        let total_lines = file_lines.len();
+        let mut group: Vec<&Node> = subgraph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == file_path && is_listed_symbol(n) && n.kind != NodeKind::File)
+            .collect();
+        group.sort_by(|a, b| {
+            (a.start_line, a.start_column, a.id.as_str()).cmp(&(
+                b.start_line,
+                b.start_column,
+                b.id.as_str(),
+            ))
+        });
+        let callable = |n: &Node| {
+            matches!(
+                n.kind,
+                NodeKind::Method | NodeKind::Function | NodeKind::Component
+            )
+        };
+        let on_spine = |n: &Node| flow.path_node_ids.contains(&n.id);
+        let unique = |n: &Node| flow.unique_named_node_ids.contains(&n.id);
+        let defines_super = group.iter().any(|n| {
+            matches!(
+                n.kind,
+                NodeKind::Class
+                    | NodeKind::Interface
+                    | NodeKind::Struct
+                    | NodeKind::Union
+                    | NodeKind::Trait
+                    | NodeKind::Protocol
+                    | NodeKind::TypeAlias
+            ) && self.has_many_implementers(subgraph, &n.id)
+        });
+        let spared = group.iter().any(|n| unique(n)) && !defines_super;
+        let has_spine = group.iter().any(|n| on_spine(n));
+        let allowance = if ctx.lift_file_cap {
+            ctx.funded_headroom
+        } else {
+            (budget.max_chars_per_file as f64 * 1.5).round() as usize
+        };
+        let body_chars = |n: &Node| -> usize {
+            let start = (n.start_line as usize).clamp(1, total_lines.max(1));
+            let end = (n.end_line as usize).clamp(start, total_lines.max(1));
+            file_lines
+                .get(start - 1..end)
+                .map_or(0, |lines| lines.join("\n").len())
+        };
+        let named_body_chars: usize = group
+            .iter()
+            .filter(|n| callable(n) && (on_spine(n) || unique(n)))
+            .map(|n| body_chars(n))
+            .sum();
+        let on_spine_god_file = has_spine
+            && named_body_chars > allowance
+            && group
+                .iter()
+                .any(|n| callable(n) && unique(n) && !on_spine(n));
+        let sibling = || {
+            group.iter().any(|n| {
+                self.store
+                    .edges_by_source_kind(&n.id, None)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|e| {
+                        matches!(e.kind, EdgeKind::Implements | EdgeKind::Extends)
+                            && self.has_many_implementers(subgraph, &e.target)
+                    })
+            })
+        };
+        if !(on_spine_god_file || (!has_spine && !spared && sibling())) {
+            return None;
+        }
+
+        let syms: Vec<&Node> = group
+            .iter()
+            .copied()
+            .filter(|n| n.start_line > 0 && (n.start_line as usize) <= total_lines)
+            .collect();
+        let tier = |n: &Node| -> u8 {
+            if !callable(n) {
+                u8::MAX
+            } else if subgraph.is_exact(&n.id) {
+                0
+            } else if on_spine(n) {
+                if flow.named_node_ids.contains(&n.id) {
+                    1
+                } else {
+                    2
+                }
+            } else if unique(n) {
+                3
+            } else if defines_super && flow.named_node_ids.contains(&n.id) {
+                4
+            } else {
+                u8::MAX
+            }
+        };
+        const WINDOWED_TIER: u8 = 1;
+        let chain_at = |n: &Node| {
+            flow.path_order
+                .iter()
+                .position(|id| id == &n.id)
+                .unwrap_or(usize::MAX)
+        };
+        let span_cost = |start: usize, end: usize| rendered_range_cost(file_lines, start - 1, end);
+        let sig_max = 12.max(budget.max_symbols_in_file_header * 2);
+        let sig_reserve: usize = syms
+            .iter()
+            .take(sig_max)
+            .map(|n| span_cost(n.start_line as usize, n.start_line as usize) + 1)
+            .sum();
+        let body_cap = allowance
+            .min(ctx.funded_headroom)
+            .saturating_sub(sig_reserve);
+        let span_of = |n: &Node| {
+            let start = n.start_line as usize;
+            (start, (n.end_line as usize).clamp(start, total_lines))
+        };
+        let mut ranked: Vec<&Node> = syms
+            .iter()
+            .copied()
+            .filter(|n| tier(n) != u8::MAX && n.end_line >= n.start_line)
+            .collect();
+        ranked.sort_by_key(|n| {
+            (
+                tier(n),
+                chain_at(n),
+                n.start_line,
+                n.start_column,
+                n.id.clone(),
+            )
+        });
+        let mut bodies: HashSet<&str> = HashSet::new();
+        let mut windows_of: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+        let mut spent = 0usize;
+        let mut deferred: Vec<&Node> = Vec::new();
+        for n in ranked.iter().copied().filter(|n| tier(n) <= WINDOWED_TIER) {
+            let (start, end) = span_of(n);
+            let size = span_cost(start, end);
+            if spent + size <= body_cap {
+                bodies.insert(n.id.as_str());
+                spent += size;
+            } else {
+                deferred.push(n);
+            }
+        }
+        for n in deferred {
+            let (start, end) = span_of(n);
+            let room = body_cap.saturating_sub(spent);
+            let floor = span_cost(start, (start + MIN_WINDOW_LINES - 1).min(end));
+            if room < floor && bodies.len() + windows_of.len() > 0 {
+                continue;
+            }
+            let focus: Vec<usize> = ctx
+                .exact_focus
+                .iter()
+                .chain(ctx.spine_focus)
+                .find(|(s, e, _)| (*s, *e) == (start, n.end_line as usize))
+                .map(|(_, _, lines)| lines.clone())
+                .unwrap_or_default();
+            let (windows, _) = window_to_ceiling(file_lines, start - 1, end, room, &focus);
+            if windows.is_empty() {
+                continue;
+            }
+            spent += windows
+                .iter()
+                .map(|&(lo, hi)| rendered_range_cost(file_lines, lo, hi))
+                .sum::<usize>();
+            windows_of.insert(n.id.as_str(), windows);
+        }
+        for n in ranked.iter().copied().filter(|n| tier(n) > WINDOWED_TIER) {
+            let (start, end) = span_of(n);
+            let size = span_cost(start, end);
+            if spent + size > body_cap && bodies.len() + windows_of.len() > 0 {
+                continue;
+            }
+            bodies.insert(n.id.as_str());
+            spent += size;
+        }
+
+        // In line order: a chosen body whole, a windowed one as its windows
+        // with each hole named, every other symbol as its signature line.
+        let mut parts: Vec<(usize, usize, String)> = Vec::new();
+        let mut covered_until = 0usize;
+        let (mut sig_count, mut sig_dropped) = (0usize, 0usize);
+        for n in &syms {
+            let (start, end) = span_of(n);
+            if start <= covered_until {
+                continue;
+            }
+            if bodies.contains(n.id.as_str()) {
+                parts.push((
+                    start,
+                    end,
+                    number_source_lines_at(&file_lines[start - 1..end], start),
+                ));
+                covered_until = end;
+            } else if let Some(windows) = windows_of.get(n.id.as_str()) {
+                for (k, &(lo, hi)) in windows.iter().enumerate() {
+                    let hole_end = windows.get(k + 1).map_or(end + 1, |next| next.0 + 1) - 1;
+                    let mut text = number_source_lines_at(&file_lines[lo..hi], lo + 1);
+                    if hole_end > hi {
+                        text.push_str(&format!(
+                            "\n… lines {}-{hole_end} of `{}` elided — codegraph_explore `{file_path}:{}-{hole_end}` returns them",
+                            hi + 1,
+                            n.name,
+                            hi + 1
+                        ));
+                    }
+                    parts.push((lo + 1, hi, text));
+                }
+                covered_until = end;
+            } else {
+                // The stored line can be a decorator's: the signature is the
+                // first of four lines that names the symbol.
+                let line_no = (0..4)
+                    .map(|k| start + k)
+                    .find(|&line| {
+                        file_lines
+                            .get(line - 1)
+                            .is_some_and(|l| l.contains(n.name.as_str()))
+                    })
+                    .unwrap_or(start);
+                if line_no <= covered_until {
+                    continue;
+                }
+                if sig_count >= sig_max {
+                    sig_dropped += 1;
+                    continue;
+                }
+                let signature = file_lines[line_no - 1].trim();
+                if !signature.is_empty() {
+                    parts.push((line_no, line_no, format!("{line_no}\t{signature}")));
+                    sig_count += 1;
+                }
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for n in &group {
+            if !names.contains(&n.name.as_str()) {
+                names.push(n.name.as_str());
+            }
+        }
+        names.truncate(budget.max_symbols_in_file_header);
+        let tag = if bodies.len() + windows_of.len() > 0 {
+            "focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)"
+        } else {
+            "skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)"
+        };
+        let header = format!("#### {file_path} — {} · {tag}", names.join(", "));
+        let section_of = |parts: &[(usize, usize, String)], trimmed: usize| -> String {
+            let mut body: Vec<&str> = parts.iter().map(|p| p.2.as_str()).collect();
+            let dropped = sig_dropped + trimmed;
+            let tail = format!("… +{dropped} more (signatures elided)");
+            if dropped > 0 {
+                body.push(&tail);
+            }
+            format!("{header}\n\n```{lang}\n{}\n```\n", body.join("\n"))
+        };
+        // Fit the total budget's room (b635dd46 6271-6283): trailing
+        // signatures go first, then trailing bodies; the caller drops the file
+        // whole when not one part fits.
+        let mut trimmed = 0usize;
+        while parts.len() > 1 && section_of(&parts, trimmed).len() + 1 > ctx.funded_headroom {
+            match parts.iter().rposition(|p| p.0 == p.1) {
+                Some(k) => {
+                    parts.remove(k);
+                    trimmed += 1;
+                }
+                None => {
+                    parts.pop();
+                }
+            }
+        }
+        let wanted: Vec<WantedSpan> = syms
+            .iter()
+            .filter(|n| n.kind != NodeKind::File)
+            .map(|n| WantedSpan {
+                name: n.name.clone(),
+                kind: n.kind.as_str(),
+                start: n.start_line as usize,
+                end: n.end_line.max(n.start_line) as usize,
+                importance: if subgraph
+                    .roots
+                    .iter()
+                    .chain(&subgraph.named_seed_ids)
+                    .any(|id| id == &n.id)
+                {
+                    10
+                } else if flow.named_node_ids.contains(&n.id) {
+                    NAMED_IMPORTANCE
+                } else {
+                    1
+                },
+                qualified_name: Some(n.qualified_name.clone()),
+            })
+            .collect();
+        let delivered: Vec<(usize, usize)> = parts.iter().map(|p| (p.0, p.1)).collect();
+        Some(ExploreFileRender {
+            section: section_of(&parts, trimmed),
+            source_emitted: true,
+            // The per-symbol view elides bodies by construction.
+            clipped: true,
+            elided: elided_wanted_spans(&wanted, &delivered),
+        })
+    }
+
+    /// Whether at least [`MIN_SIBLINGS`] types implement or extend `id`, asked
+    /// once per explore.
+    fn has_many_implementers(&self, subgraph: &ExploreSubgraph, id: &str) -> bool {
+        if let Some(&known) = subgraph.implementer_cache.borrow().get(id) {
+            return known;
+        }
+        let many = self
+            .store
+            .edges_by_target_kind(id, None)
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| matches!(e.kind, EdgeKind::Implements | EdgeKind::Extends))
+            .count()
+            >= MIN_SIBLINGS;
+        subgraph
+            .implementer_cache
+            .borrow_mut()
+            .insert(id.to_string(), many);
+        many
+    }
+
     /// Render one file's source section under the per-file budget. Small files
     /// come back WHOLE; larger ones are clustered by `gapThreshold` and capped
     /// at `maxCharsPerFile`, dropping whole low-importance clusters (never
@@ -2123,6 +2515,12 @@ impl CodeGraphEngine {
                 // Nothing it set out to deliver was sent (#2077).
                 elided: elided_wanted_spans(&subgraph.wanted_spans_in(file_path), &[]),
             };
+        }
+
+        // Adaptive sizing: an off-spine polymorphic sibling, or an on-spine
+        // god-file, renders symbol by symbol (b635dd46 6039-6288).
+        if let Some(rendered) = self.render_per_symbol(subgraph, file_path, file_lines, lang, ctx) {
+            return rendered;
         }
 
         // Whole-file rule (`tools.ts:2645-2672`): a relevant file small enough to
@@ -2372,52 +2770,14 @@ impl CodeGraphEngine {
         // between neighbours. Summed rather than rendered, so growing a window
         // one line at a time stays linear instead of re-formatting the slice.
         let range_cost = |start_idx: usize, end_idx: usize| -> usize {
-            if end_idx <= start_idx {
-                return 0;
-            }
-            (start_idx..end_idx)
-                .map(|i| decimal_width(i + 1) + 1 + file_lines[i].len())
-                .sum::<usize>()
-                + (end_idx - start_idx - 1)
+            rendered_range_cost(file_lines, start_idx, end_idx)
         };
         let grow_head = |start_idx: usize, end_idx: usize, room: usize| -> (usize, usize) {
-            let floor = (start_idx + MIN_WINDOW_LINES).min(end_idx);
-            let mut end = (start_idx + 1).min(end_idx);
-            while end < end_idx && range_cost(start_idx, end + 1) <= room {
-                end += 1;
-            }
-            (start_idx, end.max(floor))
+            grow_window_head(file_lines, start_idx, end_idx, room)
         };
-        // Grow one line up, then one line down, alternating, so the emitted window
-        // is centred on the focus rather than biased to whichever side was tried
-        // first. Bounded by the span's own line count, so it always terminates.
         let grow_around =
             |focus_idx: usize, start_idx: usize, end_idx: usize, room: usize| -> (usize, usize) {
-                let focus_idx = focus_idx.clamp(start_idx, end_idx - 1);
-                let (mut lo, mut hi) = (focus_idx, focus_idx + 1);
-                let mut up = true;
-                for _ in 0..(end_idx - start_idx) * 2 {
-                    let can_up = lo > start_idx && range_cost(lo - 1, hi) <= room;
-                    let can_down = hi < end_idx && range_cost(lo, hi + 1) <= room;
-                    if !can_up && !can_down {
-                        break;
-                    }
-                    if (up && can_up) || !can_down {
-                        lo -= 1;
-                    } else {
-                        hi += 1;
-                    }
-                    up = !up;
-                }
-                let want = MIN_WINDOW_LINES.min(end_idx - start_idx);
-                if hi - lo < want {
-                    let lo2 = focus_idx
-                        .saturating_sub(want / 2)
-                        .max(start_idx)
-                        .min(end_idx - want);
-                    return (lo2, lo2 + want);
-                }
-                (lo, hi)
+                grow_window_around(file_lines, focus_idx, start_idx, end_idx, room)
             };
         // Only the focuses inside THIS cluster's span may claim its reserve;
         // clamping an out-of-span focus in would spend the reserve re-emitting
@@ -2442,55 +2802,11 @@ impl CodeGraphEngine {
             lines
         };
         // CG-30: a cluster too big for its room is emitted as WHOLE-LINE windows
-        // instead of being taken whole (which then costs the entire file) or
-        // skipped whole. Returns the rendered body and whether it was windowed,
-        // so the caller can add the `... (gap) ...` honesty marker.
+        // ([`window_to_ceiling`]).
         let window_cluster =
             |c: &Cluster, room: usize, focuses: &[usize]| -> (Vec<(usize, usize)>, bool) {
                 let (start_idx, end_idx) = span_of(c);
-                if range_cost(start_idx, end_idx) <= room {
-                    return (vec![(start_idx, end_idx)], false);
-                }
-                // Upstream `windowToCeiling` (CG-38): the whole room goes to the
-                // head first, and 40% of it is held back for focus windows only
-                // when that head leaves a focus uncovered — then only the focuses
-                // the smaller head misses take a share of it.
-                let full = grow_head(start_idx, end_idx, room);
-                let covers = |w: (usize, usize), line: usize| line > w.0 && line <= w.1;
-                if focuses.iter().all(|&line| covers(full, line)) {
-                    return (vec![full], full != (start_idx, end_idx));
-                }
-                let head_room = room * 60 / 100;
-                let head = grow_head(start_idx, end_idx, head_room);
-                let pending: Vec<usize> = focuses
-                    .iter()
-                    .copied()
-                    .filter(|&line| !covers(head, line))
-                    .collect();
-                let mut windows: Vec<(usize, usize)> = vec![head];
-                // Even shares with carry-forward, never greedy: upstream measured
-                // that a greedy split let an early focus eat the whole reserve and
-                // re-lose the target. One integer division, so the same input
-                // cannot drift by a char across platforms.
-                let reserve = room - head_room;
-                let base = reserve / pending.len();
-                let mut carry = reserve - base * pending.len();
-                for &line in &pending {
-                    let allot = base + carry;
-                    let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
-                    carry = allot.saturating_sub(range_cost(w.0, w.1));
-                    windows.push(w);
-                }
-                windows.sort_unstable();
-                let mut merged: Vec<(usize, usize)> = Vec::new();
-                for w in windows {
-                    match merged.last_mut() {
-                        Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
-                        _ => merged.push(w),
-                    }
-                }
-                let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
-                (merged, !covers_all)
+                window_to_ceiling(file_lines, start_idx, end_idx, room, focuses)
             };
         // What windows cost with bare gap markers, the price selection uses.
         let bare_len = |windows: &[(usize, usize)]| -> usize {
@@ -3501,12 +3817,30 @@ impl CodeGraphEngine {
         question_ids: &HashSet<String>,
         spine_call_sites: &HashMap<String, i64>,
     ) -> Vec<BodyFocus> {
+        self.body_focus(
+            subgraph
+                .exact_ids
+                .iter()
+                .filter_map(|id| subgraph.node(id))
+                .filter(|n| n.file_path == file_path),
+            anchors,
+            question_ids,
+            spine_call_sites,
+        )
+    }
+
+    /// [`Self::exact_body_focus`] for any `nodes`: per node, its span and the
+    /// lines a window of its body must reach.
+    fn body_focus<'n>(
+        &self,
+        nodes: impl Iterator<Item = &'n Node>,
+        anchors: &[QueryLineAnchor],
+        question_ids: &HashSet<String>,
+        spine_call_sites: &HashMap<String, i64>,
+    ) -> Vec<BodyFocus> {
         let mut out = Vec::new();
-        for id in &subgraph.exact_ids {
-            let Some(n) = subgraph.node(id) else {
-                continue;
-            };
-            if n.file_path != file_path || n.start_line < 1 || n.end_line < n.start_line {
+        for n in nodes {
+            if n.start_line < 1 || n.end_line < n.start_line {
                 continue;
             }
             let (start, end) = (n.start_line as usize, n.end_line as usize);
@@ -4416,6 +4750,9 @@ impl GodotHonesty {
 /// ordering for the source section.
 #[derive(Default)]
 struct ExploreSubgraph {
+    /// Type id → whether at least [`MIN_SIBLINGS`] types implement or extend
+    /// it, asked once per explore (upstream's `siblingSuper` and `superMany`).
+    implementer_cache: RefCell<HashMap<String, bool>>,
     nodes: Vec<Node>,
     index: HashMap<String, usize>,
     edges: Vec<codegraph_core::types::Edge>,
@@ -4692,6 +5029,9 @@ struct RenderCtx<'a> {
     exact_focus: &'a [BodyFocus],
     /// The Flow's spine and named symbols, which rank this file's clusters.
     flow: &'a FlowSection,
+    /// This file's spine nodes as `(start, end, body focus lines)`, the
+    /// windows of the per-symbol view.
+    spine_focus: &'a [BodyFocus],
     /// Bound the section by `funded_headroom` alone, not also by the per-file
     /// ceiling: set only when a named file is re-rendered into the budget the
     /// rest of the response left unspent (#2068).
@@ -4803,6 +5143,137 @@ impl Cluster {
     }
 }
 
+/// What [`number_source_lines_at`] renders for `file_lines[start_idx..end_idx]`
+/// costs: each line's `"{n}\t{line}"` plus one separator between neighbours.
+/// Summed rather than rendered, so growing a window one line at a time stays
+/// linear instead of re-formatting the slice.
+fn rendered_range_cost(file_lines: &[&str], start_idx: usize, end_idx: usize) -> usize {
+    if end_idx <= start_idx {
+        return 0;
+    }
+    (start_idx..end_idx)
+        .map(|i| decimal_width(i + 1) + 1 + file_lines[i].len())
+        .sum::<usize>()
+        + (end_idx - start_idx - 1)
+}
+
+/// The window from `start_idx` grown while it fits `room`, never shorter than
+/// [`MIN_WINDOW_LINES`] (0-based, exclusive end).
+fn grow_window_head(
+    file_lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    room: usize,
+) -> (usize, usize) {
+    let floor = (start_idx + MIN_WINDOW_LINES).min(end_idx);
+    let mut end = (start_idx + 1).min(end_idx);
+    while end < end_idx && rendered_range_cost(file_lines, start_idx, end + 1) <= room {
+        end += 1;
+    }
+    (start_idx, end.max(floor))
+}
+
+/// A window around `focus_idx`: grow one line up, then one line down,
+/// alternating, so the emitted window is centred on the focus rather than
+/// biased to whichever side was tried first. Bounded by the span's own line
+/// count, so it always terminates.
+fn grow_window_around(
+    file_lines: &[&str],
+    focus_idx: usize,
+    start_idx: usize,
+    end_idx: usize,
+    room: usize,
+) -> (usize, usize) {
+    let range_cost = |lo: usize, hi: usize| rendered_range_cost(file_lines, lo, hi);
+    let focus_idx = focus_idx.clamp(start_idx, end_idx - 1);
+    let (mut lo, mut hi) = (focus_idx, focus_idx + 1);
+    let mut up = true;
+    for _ in 0..(end_idx - start_idx) * 2 {
+        let can_up = lo > start_idx && range_cost(lo - 1, hi) <= room;
+        let can_down = hi < end_idx && range_cost(lo, hi + 1) <= room;
+        if !can_up && !can_down {
+            break;
+        }
+        if (up && can_up) || !can_down {
+            lo -= 1;
+        } else {
+            hi += 1;
+        }
+        up = !up;
+    }
+    let want = MIN_WINDOW_LINES.min(end_idx - start_idx);
+    if hi - lo < want {
+        let lo2 = focus_idx
+            .saturating_sub(want / 2)
+            .max(start_idx)
+            .min(end_idx - want);
+        return (lo2, lo2 + want);
+    }
+    (lo, hi)
+}
+
+/// CG-30: `[start_idx, end_idx)` (0-based, exclusive end) too big for `room`
+/// is emitted as WHOLE-LINE windows instead of being taken whole or skipped
+/// whole. Upstream `windowToCeiling` (CG-38): the whole room goes to the head
+/// first, and 40% of it is held back for focus windows only when that head
+/// leaves a 1-based focus line uncovered; then only the focuses the smaller
+/// head misses take a share of it. Returns the windows and whether they leave
+/// lines out, so the caller can add the `... (gap) ...` honesty marker.
+fn window_to_ceiling(
+    file_lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    room: usize,
+    focuses: &[usize],
+) -> (Vec<(usize, usize)>, bool) {
+    let range_cost = |lo: usize, hi: usize| rendered_range_cost(file_lines, lo, hi);
+    if range_cost(start_idx, end_idx) <= room {
+        return (vec![(start_idx, end_idx)], false);
+    }
+    let full = grow_window_head(file_lines, start_idx, end_idx, room);
+    let covers = |w: (usize, usize), line: usize| line > w.0 && line <= w.1;
+    if focuses.iter().all(|&line| covers(full, line)) {
+        return (vec![full], full != (start_idx, end_idx));
+    }
+    let head_room = room * 60 / 100;
+    let head = grow_window_head(file_lines, start_idx, end_idx, head_room);
+    let pending: Vec<usize> = focuses
+        .iter()
+        .copied()
+        .filter(|&line| !covers(head, line))
+        .collect();
+    let mut windows: Vec<(usize, usize)> = vec![head];
+    // Even shares with carry-forward, never greedy: upstream measured that a
+    // greedy split let an early focus eat the whole reserve and re-lose the
+    // target. One integer division, so the same input cannot drift by a char
+    // across platforms.
+    let reserve = room - head_room;
+    let base = reserve / pending.len();
+    let mut carry = reserve - base * pending.len();
+    for &line in &pending {
+        let allot = base + carry;
+        let w = grow_window_around(
+            file_lines,
+            line.saturating_sub(1),
+            start_idx,
+            end_idx,
+            allot,
+        );
+        carry = allot.saturating_sub(range_cost(w.0, w.1));
+        windows.push(w);
+    }
+    windows.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for w in windows {
+        match merged.last_mut() {
+            Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+            _ => merged.push(w),
+        }
+    }
+    let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+    (merged, !covers_all)
+}
+
 /// Cuts each oversize spine method among `ranges` (sorted by start) to its
 /// signature head and a window on its next-hop call (upstream `oversizeSpine`
 /// and `spineWindowOf`, `tools.ts` b635dd46 6622-6663): a method on the Flow
@@ -4877,11 +5348,21 @@ fn window_oversize_spine_methods(ranges: &mut Vec<ClusterRange>) -> bool {
     true
 }
 
+/// A file whose per-file ceiling clipped it and that renders again into the
+/// unspent budget (#2068): `(line index, path, focuses, exact focus, spine
+/// focus)`.
+type ClippedNamedFile<'a> = (
+    usize,
+    &'a String,
+    Vec<usize>,
+    Vec<BodyFocus>,
+    Vec<BodyFocus>,
+);
+
 /// What the Flow builder hands the rest of explore (upstream
 /// `buildFlowFromNamedSymbols`' return value, `tools.ts` b635dd46 3471-3684):
 /// the section's text, the rendered chain (the spine), every symbol the query
-/// named, and where each spine node calls the next hop. Upstream's
-/// `uniqueNamedNodeIds` joins with the skeleton view that reads it.
+/// named, and where each spine node calls the next hop.
 #[derive(Debug, Default)]
 struct FlowSection {
     text: String,
@@ -4889,6 +5370,10 @@ struct FlowSection {
     /// The files the spine runs through.
     path_files: HashSet<String>,
     named_node_ids: HashSet<String>,
+    /// Named ids whose token picked out at most three definitions.
+    unique_named_node_ids: HashSet<String>,
+    /// The spine in call order.
+    path_order: Vec<String>,
     spine_call_sites: HashMap<String, i64>,
 }
 
@@ -4900,8 +5385,16 @@ impl FlowSection {
     /// With fewer than two named callables there is no spine (3560).
     fn of(flow: &NamedSymbolFlow, text: String) -> Self {
         if text.is_empty() {
+            let named = flow.precise_named_ids.clone();
+            let unique = flow
+                .unique_named_node_ids
+                .iter()
+                .filter(|id| named.contains(*id))
+                .cloned()
+                .collect();
             return Self {
-                named_node_ids: flow.precise_named_ids.clone(),
+                named_node_ids: named,
+                unique_named_node_ids: unique,
                 ..Self::default()
             };
         }
@@ -4913,13 +5406,16 @@ impl FlowSection {
                 .chain(flow.dyn_named.keys())
                 .cloned()
                 .collect(),
+            unique_named_node_ids: flow.unique_named_node_ids.clone(),
             ..Self::default()
         };
         if flow.named.len() >= 2
             && let Some(chain) = flow.chains.first()
         {
             for step in &chain.steps {
-                section.path_node_ids.insert(step.node.id.clone());
+                if section.path_node_ids.insert(step.node.id.clone()) {
+                    section.path_order.push(step.node.id.clone());
+                }
                 section.path_files.insert(step.node.file_path.clone());
             }
             section.spine_call_sites = chain.call_sites.clone();
@@ -6701,6 +7197,7 @@ mod tests {
             focuses,
             exact_focus: &[],
             flow: &NO_FLOW,
+            spine_focus: &[],
             lift_file_cap: false,
             drifted: false,
         }
@@ -7551,6 +8048,7 @@ mod tests {
             focuses: &[],
             exact_focus: &[],
             flow: &NO_FLOW,
+            spine_focus: &[],
             lift_file_cap: false,
             drifted: false,
         };
@@ -14656,5 +15154,122 @@ mod tests {
             (300..=360).all(|line| w725c_rendered(&section, line)),
             "{section}"
         );
+    }
+
+    // === W7-25d: the per-symbol view =========================================
+
+    /// `class {class} implements Interceptor` in `file` with `methods`
+    /// three-line methods, in the store with its `implements` edge; returns
+    /// the file's lines and its nodes, the class first.
+    fn w725d_sibling(
+        engine: &mut CodeGraphEngine,
+        file: &str,
+        class: &str,
+        methods: usize,
+        iface: &Node,
+    ) -> (Vec<String>, Vec<Node>) {
+        let mut lines = vec![format!("export class {class} implements Interceptor {{")];
+        let mut nodes = Vec::new();
+        for i in 0..methods {
+            let start = lines.len() as i64 + 1;
+            lines.push(format!("  step{i}(request: string): string {{"));
+            lines.push(format!("    return request + '{i}';"));
+            lines.push("  }".to_string());
+            nodes.push(node_lang(
+                &format!("step{i}"),
+                &format!("{class}::step{i}"),
+                file,
+                start,
+                start + 2,
+                NodeKind::Method,
+                Language::TypeScript,
+            ));
+        }
+        lines.push("}".to_string());
+        let class_node = node_lang(
+            class,
+            class,
+            file,
+            1,
+            lines.len() as i64,
+            NodeKind::Class,
+            Language::TypeScript,
+        );
+        put_nodes(engine, std::slice::from_ref(&class_node));
+        put_nodes(engine, &nodes);
+        put_edges(
+            engine,
+            &[mk_edge(&class_node.id, &iface.id, EdgeKind::Implements)],
+        );
+        nodes.insert(0, class_node);
+        (lines, nodes)
+    }
+
+    /// W7-25d: a per-symbol section that overruns what the response can still
+    /// pay for drops its trailing signatures first, counted in the tail
+    /// (b635dd46 6271-6283).
+    #[test]
+    fn w725d_a_skeleton_trims_trailing_signatures_to_fit_the_room() {
+        let mut engine = test_engine();
+        let iface = node_lang(
+            "Interceptor",
+            "Interceptor",
+            "src/interceptor.ts",
+            1,
+            3,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&iface));
+        for (i, other) in ["CacheInterceptor", "RetryInterceptor"].iter().enumerate() {
+            let n = node_lang(
+                other,
+                other,
+                &format!("src/other{i}.ts"),
+                1,
+                5,
+                NodeKind::Class,
+                Language::TypeScript,
+            );
+            put_nodes(&mut engine, std::slice::from_ref(&n));
+            put_edges(
+                &mut engine,
+                &[mk_edge(&n.id, &iface.id, EdgeKind::Implements)],
+            );
+        }
+        let file = "src/wide.ts";
+        let (owned, nodes) = w725d_sibling(&mut engine, file, "WideInterceptor", 10, &iface);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let sg = subgraph_with(nodes.clone(), vec![nodes[0].id.clone()]);
+        let flow = FlowSection {
+            path_node_ids: ["elsewhere".to_string()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let roomy = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let full = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &roomy)
+            .section;
+        assert!(full.contains("· skeleton (signatures only"), "{full}");
+        assert!(full.contains("step9(request"), "{full}");
+        let room = full.len() - 40;
+        let tight = RenderCtx {
+            flow: &flow,
+            funded_headroom: room,
+            ..render_ctx(&budget, &[])
+        };
+        let trimmed = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &tight)
+            .section;
+        assert!(trimmed.len() < room, "{} of {room}", trimmed.len());
+        assert!(
+            trimmed.contains("1\texport class WideInterceptor"),
+            "{trimmed}"
+        );
+        assert!(!trimmed.contains("step9(request"), "{trimmed}");
+        assert!(trimmed.contains("more (signatures elided)"), "{trimmed}");
     }
 }
