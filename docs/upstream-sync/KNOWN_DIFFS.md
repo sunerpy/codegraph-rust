@@ -436,6 +436,15 @@ regex engine), is not listed.
   `.concat`'s arguments at every comma, and matches an unread constant's
   placeholder as a literal segment, which any hole of a destination fits
   and a destination written the same way names (`angular_router.rs`).
+- **Angular workspace markers follow a sync (W7-23c).** An app's root is
+  the nearest directory above a routes file holding an `angular.json` or an
+  `nx.json`, here as in colby. Here both markers, in each directory above a
+  JavaScript-family file, are JavaScript control inputs, recorded
+  whether or not the project uses Angular, so a sync that adds, removes or
+  edits one re-resolves the JavaScript family and the routerLink edges are
+  drawn again; colby's sync and watcher do not follow them, so a library's
+  calls keep the apps they had until a full index (`control_inputs.rs`,
+  `angular_router.rs`).
 - **A path two SvelteKit pages of one app serve (W7-12).** A navigation
   call matches only the pages of its own app, as in colby, and a path two
   pages of that app serve (`(a)/x/+page.svelte` beside `(b)/x/+page.svelte`,
@@ -1257,3 +1266,28 @@ leaves both where they were. One shape stays different (OD-B37): a Rust
 module that gains `util.rs` beside its `util/mod.rs` without the leaf a `use`
 names keeps the edge into `util/mod.rs` through a sync, where a fresh index
 leaves the use unresolved; rustc rejects a module with both files (E0761).
+
+A route's module reference and a navigation call name no symbol a changed
+file declares either (W7-23). colby's sync parks a route's module reference
+under `module:<stem>` and retries it for an added or changed module
+(#2422), reopens the references under the module keys of the barrels above
+an added or changed page along import edges (#2560), reopens the routes that render a
+same-file lazy value whose module changed (`reopenRouteModuleReaders`, the
+sync half of #2452), and reopens the navigation calls a route that
+appeared, went or was renamed may answer (`reopenNavigationsFor`, #2425).
+This port does the same work with four differences of mechanism: it stores
+no name tail (a tail is computed when it is read, so no schema change
+rewrites old ones); none of its lanes has a ceiling (colby skips a key or a
+name more than 500 references share); a reference is re-resolved at its
+site rather than put back in the pending set for the sync's sweep; and the
+barrels come from the module-surface rows, since an `export … from` makes
+no import edge here. Beyond colby: Vue Router's and Angular's module
+references wait under their stems as React Router's do; a resolved route or
+value reference whose barrel re-points goes back; the static JSX tag edge to
+a lazy value, which colby draws in its jsx-render pass, follows the module
+like the route; Vue Router reads a route's name and Angular a redirect from
+the routes file's text, so a routes file a sync rewrites counts its routes
+as changed, and an Angular file that only lazy-loads routes files scopes its
+app's calls; and Angular's and React Router's calls whose destination reads
+a constant in a rewritten file go back (`route_modules.rs`,
+`navigation.rs`).

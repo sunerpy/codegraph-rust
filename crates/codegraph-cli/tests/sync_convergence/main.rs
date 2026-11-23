@@ -59,7 +59,8 @@ pub enum Change {
     /// A project control file changes: one resolution reads (`package.json`,
     /// `tsconfig.json`, `jsconfig.json` or a config it extends, a workspace
     /// member's manifest, a `.csproj` or `.props`, a `Cargo.toml`, a `go.mod`,
-    /// a Tauri config), the root `.gitignore`, `.git/info/exclude`, the index root's
+    /// a Tauri config, an Angular workspace's `angular.json` or `nx.json`),
+    /// the root `.gitignore`, `.git/info/exclude`, the index root's
     /// `config.toml` or `codegraph.json`, or a Shopify theme marker
     /// (`layout/theme.liquid`, `config/settings_schema.json`).
     ControlFile,
@@ -2190,6 +2191,12 @@ matrix! {
     jsx_react_router_parameter_route_took_the_call,
     jsx_react_router_tie_goes_away,
     tsx_react_router_layout_default_import_moves,
+    // W7-23c: angular.json and nx.json are JavaScript control inputs.
+    typescript_angular_workspace_marker_appears,
+    typescript_angular_cli_workspace_marker_appears,
+    typescript_angular_workspace_marker_goes,
+    typescript_angular_router_link_workspace_marker_appears,
+    typescript_angular_workspace_marker_appears_in_a_subfolder,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold

@@ -17059,7 +17059,8 @@ pub fn typescript_react_router_dependency_appears_in_package_json() -> Case {
 /// W7-09b: the constant a route's path is built from changes (upstream
 /// #2165 and `postExtract`): the route, whose own file did not change, is
 /// renamed in place before anything resolves. (A navigation call in another
-/// file bound to the old name is retried by the sync navigation pass, W7-23.)
+/// file goes back by the sync's navigation lane, W7-23b:
+/// `tsx_react_router_route_constant_rename_rebinds_navigation`.)
 pub fn typescript_react_router_route_constant_renames_the_route() -> Case {
     Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
         .file(
@@ -17133,7 +17134,8 @@ pub fn tsx_react_router_routes_file_edit_names_its_route_before_resolving() -> C
 /// `react-router-barrel-imports.test.ts`, sync): the parked `lazy-import:`
 /// reference waits under its path's last segment, which the new page's
 /// folder is, so the sync retries it. (A page appearing deeper under the
-/// barrel is #2560's, W7-23.)
+/// barrel follows the barrels the module-surface rows record, W7-23a:
+/// `tsx_react_router_barrel_pages_appear_below_their_barrels`.)
 pub fn tsx_react_router_lazy_barrel_page_appears() -> Case {
     Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
         .file(
@@ -17274,7 +17276,9 @@ pub fn tsx_react_router_picked_default_export_moves() -> Case {
 /// the sync retries it because a file in a new folder moves the JS control
 /// inputs (the manifests framework detection reads), which re-resolves every
 /// JavaScript-family file whole. The same module appearing beside the route
-/// file, and an edit that gives the module the export, stay W7-23's.
+/// file, and an edit that gives the module the export, are the route-module
+/// lane's (W7-23a: `tsx_react_router_picked_export_module_appears_beside_the_router`,
+/// `tsx_react_router_picked_export_gains_its_export`).
 pub fn tsx_react_router_picked_export_module_appears() -> Case {
     Case::new(
         Change::AddImportTarget,
@@ -17400,8 +17404,9 @@ pub fn jsx_react_router_consumer_stops_handing_its_table() -> Case {
 }
 
 /// W7-09d (upstream #2400): a file starts handing the router a table. No
-/// navigation names its routes before they exist: a call parked then is
-/// W7-23's (#2425).
+/// navigation names its routes before they exist: a call parked then binds
+/// through the sync's navigation lane (W7-23b, #2425:
+/// `jsx_react_router_table_route_appears_for_a_parked_navigation`).
 pub fn jsx_react_router_consumer_starts_handing_a_table() -> Case {
     Case::new(Change::BodyEdit, &[Language::JavaScript, Language::Jsx])
         .file("package.json", REACT_ROUTER_PACKAGE)
@@ -27076,5 +27081,110 @@ pub fn javascript_sveltekit_upstream_page_appears() -> Case {
             "function load @src/routes/settings/+page.server.js",
             "navigates",
             "route src/routes/login/+page.svelte::route:/login",
+        )
+}
+
+// =============================================================================
+// W7-23c: angular.json and nx.json are JavaScript control inputs
+// =============================================================================
+//
+// An Angular app's root is the nearest directory above a file that holds an
+// `angular.json` or an `nx.json`; without one each app folder is an app of
+// its own. So a shared library's call reaches a route of one app only while
+// a workspace marker holds the apps together, and a marker is no source
+// file: the JavaScript control inputs record it, present or not.
+
+/// App `x`'s routes: `/x`.
+const W723_NX_X_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { AuthComponent } from './auth.component';\nexport const routes: Routes = [{ path: 'x', component: AuthComponent }];\n";
+/// App `y`'s routes: `/y`.
+const W723_NX_Y_ROUTES: &str = "import { Routes } from '@angular/router';\nimport { AuthComponent } from '../../../x/src/app/auth.component';\nexport const routes: Routes = [{ path: 'y', component: AuthComponent }];\n";
+/// A shared library's call to `/x`, which only app `x` serves.
+const W723_NX_NAV: &str = "export function go(router) {\n  router.navigate(['/x']);\n}\n";
+
+/// The two apps of W7-13b's workspace seed, and the library's call.
+fn w723_angular_workspace(case: Case) -> Case {
+    case.file("package.json", ANGULAR_PACKAGE)
+        .file("apps/x/src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("apps/x/src/app/x.routes.ts", W723_NX_X_ROUTES)
+        .file("apps/y/src/app/y.routes.ts", W723_NX_Y_ROUTES)
+        .file("libs/shared/src/nav.ts", W723_NX_NAV)
+}
+
+/// W7-23c (W7-13b's seed 5, KEEP-RUST): an `nx.json` appears at the root,
+/// the apps are one workspace, and the library's call reaches `/x`.
+pub fn typescript_angular_workspace_marker_appears() -> Case {
+    w723_angular_workspace(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .write("nx.json", "{}\n")
+        .edge_after(
+            "function go @libs/shared/src/nav.ts",
+            "navigates",
+            "route apps/x/src/app/x.routes.ts::route:/x",
+        )
+}
+
+/// W7-23c: the same with the Angular CLI's `angular.json`.
+pub fn typescript_angular_cli_workspace_marker_appears() -> Case {
+    w723_angular_workspace(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .write("angular.json", "{\"version\":1,\"projects\":{}}\n")
+        .edge_after(
+            "function go @libs/shared/src/nav.ts",
+            "navigates",
+            "route apps/x/src/app/x.routes.ts::route:/x",
+        )
+}
+
+/// W7-23c (g05): the other direction: the `nx.json` goes, and the call
+/// loses the route it reached.
+pub fn typescript_angular_workspace_marker_goes() -> Case {
+    w723_angular_workspace(Case::new(Change::ControlFile, &[Language::TypeScript]))
+        .file("nx.json", "{}\n")
+        .remove("nx.json")
+        .edge_before(
+            "function go @libs/shared/src/nav.ts",
+            "navigates",
+            "route apps/x/src/app/x.routes.ts::route:/x",
+        )
+        .no_edge_after(
+            "function go @libs/shared/src/nav.ts",
+            "navigates",
+            "route apps/x/src/app/x.routes.ts::route:/x",
+        )
+}
+
+/// W7-23c (n23, W7-18d's routerLink): a library component's template links
+/// to `/x`; the synthesized link appears with the marker, since every sync
+/// that changes the index recomputes the stage.
+pub fn typescript_angular_router_link_workspace_marker_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("apps/x/src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("apps/x/src/app/x.routes.ts", W723_NX_X_ROUTES)
+        .file("apps/y/src/app/y.routes.ts", W723_NX_Y_ROUTES)
+        .file(
+            "libs/shared/src/menu.component.ts",
+            "import { Component } from '@angular/core';\n@Component({ selector: 'lib-menu', template: '<a routerLink=\"/x\">x</a>' })\nexport class MenuComponent {}\n",
+        )
+        .write("nx.json", "{}\n")
+        .edge_after(
+            "class MenuComponent",
+            "navigates",
+            "route apps/x/src/app/x.routes.ts::route:/x",
+        )
+}
+
+/// W7-23c: the workspace sits in a folder below the root, so its marker is
+/// no root file: each directory above a file is read.
+pub fn typescript_angular_workspace_marker_appears_in_a_subfolder() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("ws/apps/x/src/app/auth.component.ts", ANGULAR_AUTH)
+        .file("ws/apps/x/src/app/x.routes.ts", W723_NX_X_ROUTES)
+        .file("ws/apps/y/src/app/y.routes.ts", W723_NX_Y_ROUTES)
+        .file("ws/libs/shared/src/nav.ts", W723_NX_NAV)
+        .write("ws/nx.json", "{}\n")
+        .edge_after(
+            "function go @ws/libs/shared/src/nav.ts",
+            "navigates",
+            "route ws/apps/x/src/app/x.routes.ts::route:/x",
         )
 }

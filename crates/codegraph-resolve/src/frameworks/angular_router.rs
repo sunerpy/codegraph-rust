@@ -1749,6 +1749,43 @@ fn navigable_arms(href: &HrefLiteral) -> Option<HrefLiteral> {
     Some(first)
 }
 
+/// The files that make the directory holding one an Angular workspace's
+/// root (an app root, [`angular_app_root`]).
+const WORKSPACE_MARKERS: [&str; 2] = ["angular.json", "nx.json"];
+
+/// The project paths [`angular_app_root`] probes for `files` (project
+/// paths): each workspace marker in each directory from a file's up to the
+/// root, a missing one included, sorted, each once. A marker is no source
+/// file, so a sync records them as JavaScript control inputs to know when
+/// one came, went or changed (W7-23c).
+pub fn app_marker_inputs(files: &[String]) -> Vec<String> {
+    let mut dirs: BTreeSet<&str> = BTreeSet::new();
+    for file in files {
+        let mut dir = file.rfind('/').map_or("", |slash| &file[..slash]);
+        loop {
+            dirs.insert(dir);
+            if dir.is_empty() {
+                break;
+            }
+            dir = dir.rfind('/').map_or("", |slash| &dir[..slash]);
+        }
+    }
+    let mut out: Vec<String> = dirs
+        .iter()
+        .flat_map(|dir| {
+            WORKSPACE_MARKERS.map(|marker| {
+                if dir.is_empty() {
+                    marker.to_string()
+                } else {
+                    format!("{dir}/{marker}")
+                }
+            })
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The app a routes file belongs to (`angularAppRoot`): the nearest
 /// directory above it holding an `angular.json` or an Nx `nx.json`, so a
 /// workspace whose screens are split across `libs/*` is one app; else the
@@ -1770,8 +1807,9 @@ fn angular_app_root(
                 } else {
                     format!("{d}/")
                 };
-                if context.file_exists(&format!("{at}angular.json"))
-                    || context.file_exists(&format!("{at}nx.json"))
+                if WORKSPACE_MARKERS
+                    .iter()
+                    .any(|marker| context.file_exists(&format!("{at}{marker}")))
                 {
                     found = Some(at);
                     break;
@@ -3832,5 +3870,32 @@ mod tests {
             navigation.scopes_read_from("apps/y/src/app/y.routes.ts", &two),
             None
         );
+    }
+
+    /// W7-23c: the paths an app root is probed at for `files`, the markers
+    /// in each directory from a file's up to the root, sorted, each once.
+    #[test]
+    fn the_app_markers_are_read_in_every_directory_above_a_file() {
+        let files = [
+            "apps/x/src/main.ts".to_string(),
+            "apps/x/src/app/app.routes.ts".to_string(),
+            "main.ts".to_string(),
+        ];
+        assert_eq!(
+            app_marker_inputs(&files),
+            [
+                "angular.json",
+                "apps/angular.json",
+                "apps/nx.json",
+                "apps/x/angular.json",
+                "apps/x/nx.json",
+                "apps/x/src/angular.json",
+                "apps/x/src/app/angular.json",
+                "apps/x/src/app/nx.json",
+                "apps/x/src/nx.json",
+                "nx.json",
+            ]
+        );
+        assert!(app_marker_inputs(&[]).is_empty());
     }
 }

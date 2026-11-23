@@ -922,7 +922,39 @@ unit's include walk takes each include's first indexed candidate and decides
 by what it reads whether a call is a macro expansion, so when the index holds
 a function-like macro, the files whose `#include` spells the name or stem of
 a file the sync added, removed or carried across the size limit go down the
-lane as well, with every file whose include spells one of those in turn. Framework nodes (a React Router route) are made
+lane as well, with every file whose include spells one of those in turn. A
+route's reference to the module it lazily loads (React Router's
+`lazy-import:./pages/Team`, the `import:./pages/Team#TeamPage` a loader
+picks, Vue Router's and Angular's `import:<path>#<export>`, each also behind
+`layout:`) and a navigation call (`navigate('/login')`, `history.push`) name
+no symbol a changed file declares, so they have lanes of their own, read once
+the sync's files and framework nodes are written (W7-23). A parked module
+reference goes back when its module path's stem is an import path key of a
+module file the sync added, re-extracted or removed (a file of a language
+with a module surface), or of a barrel forwarding one, found through the
+module-surface rows since an `export … from` makes no import edge; a
+resolved one when its module now resolves into those files. A `references`
+reference naming a module-level constant or variable of its own file
+(`const Docs = lazy(() => import('./pages/Docs'))`, rendered by a route's
+`element` or a JSX tag), in a file holding a dynamic `import(…)`, goes back
+when the files React's lookup reads through the value
+(`FrameworkResolver::lazy_modules`: the module and each barrel on the way,
+read after the change) include a changed file. The route nodes of the
+navigation routers' languages are read before the sync's first mutation and
+compared with those after its framework passes, by file and path: each
+detected router that binds navigation (`FrameworkResolver::navigation`)
+scopes a changed route to the calls of its app, Vue Router and Angular count
+each route of a routes file the sync re-extracted or removed as changed
+(their tables read a route's name or a redirect from the file's text), and
+Angular adds the app of a rewritten file that only lazy-loads routes files;
+the parked calls with the routers' method tails and the `navigates` edges
+their resolvers drew, in that scope and claimed by the router, go back.
+Angular and React Router read a destination through constants another file
+holds, so their calls in the files whose references into a rewritten file
+the sync refreshes go back too. Each goes back at its site, with no ceiling;
+a file the sync re-extracted is left out, and a sync that re-resolves the
+JavaScript family whole (a framework change, a JavaScript control-input
+change, a module-surface bootstrap) runs none of these lanes. Framework nodes (a React Router route) are made
 by passes that run after a file's re-extraction, so comparing a
 changed file's stored nodes with its re-extracted ones touches their names; when
 that comparison is all that touched names in a sync, and once the passes have
@@ -946,7 +978,9 @@ source files: the JS/TS path-alias configs along their `extends` chains (the
 root's, and those in each directory above a JavaScript-family file), the
 workspace manifests and the folders a workspace glob lists, the `package.json`
 and Deno manifests above each JavaScript-family file and the `package.json`
-files framework detection reads, the C# project files
+files framework detection reads, the `angular.json` and `nx.json` in each
+directory above a JavaScript-family file (an Angular app's root is the
+nearest one holding either), the C# project files
 above each C# file, the `Cargo.toml` files above each Rust file, and the
 `go.mod` files at the root and above each Go file; the root files Django,
 Flask and FastAPI are detected by (`requirements.txt`, `setup.py`, `pyproject.toml`,

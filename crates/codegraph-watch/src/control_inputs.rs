@@ -338,6 +338,16 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
             }
+            // The Angular workspace markers an app root is found by
+            // (W7-23c), recorded whether or not the project uses Angular
+            // (OD-B44), in the directories the manifests are read in: above
+            // each JavaScript-family file, which holds every Angular routes
+            // file, so a file that comes or goes moves them only where it
+            // moves the manifests too.
+            for relative in codegraph_resolve::frameworks::angular_router::app_marker_inputs(&js) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
             // The manifests framework detection reads (upstream #2395): the
             // root's, the ones one or two directories down from any indexed
             // file, and the ones deeper above JavaScript-family code.
@@ -1043,6 +1053,66 @@ mod tests {
             Some(hash_content(manifest)),
         ));
         assert_eq!(held, expected);
+    }
+
+    /// W7-23c (KEEP-RUST, OD-B44): the JS kind reads the Angular workspace
+    /// markers an app root is found by, `angular.json` and `nx.json` in each
+    /// directory from a JavaScript-family file's up to the root (where it
+    /// reads the manifests), a missing one as `None`, whether or not the
+    /// project uses Angular. Other languages' files add none.
+    #[test]
+    fn the_js_kind_digests_the_angular_workspace_markers_above_each_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-angular-markers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        std::fs::write(dir.join("ws/nx.json"), "{}\n").unwrap();
+        let record = |path: &str, language: Language| FileRecord {
+            path: path.to_string(),
+            content_hash: String::new(),
+            language,
+            size: 0,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count: 0,
+            errors: Vec::new(),
+            generated: false,
+        };
+        let files = [
+            record("ws/apps/x/main.ts", Language::TypeScript),
+            record("ws/libs/nav.js", Language::JavaScript),
+            record("web/App.vue", Language::Vue),
+            record("tools/build.py", Language::Python),
+        ];
+        let markers: Vec<(String, Option<String>)> = digests_of(ControlKind::Js, &dir, &files)
+            .into_iter()
+            .filter(|(key, _)| key.ends_with("angular.json") || key.ends_with("nx.json"))
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        let mut expected: Vec<(String, Option<String>)> = [
+            "angular.json",
+            "nx.json",
+            "ws/angular.json",
+            "ws/apps/angular.json",
+            "ws/apps/nx.json",
+            "ws/apps/x/angular.json",
+            "ws/apps/x/nx.json",
+            "ws/libs/angular.json",
+            "ws/libs/nx.json",
+            "web/angular.json",
+            "web/nx.json",
+        ]
+        .iter()
+        .map(|key| (key.to_string(), None))
+        .collect();
+        expected.push(("ws/nx.json".to_string(), Some(hash_content("{}\n"))));
+        expected.sort();
+        assert_eq!(markers, expected);
     }
 
     /// The files the synthesis stage last read beside the index, and the
