@@ -43361,8 +43361,130 @@ mod mobile_bridges {
 /// W7-24: ArkTS modules, ohpm packages and the ArkUI bridges (upstream
 /// #1186, `arkts-resolution.test.ts` and `extraction.test.ts`'s ArkTS
 /// block at `e8ddc4e2`).
+/// OD-B57: upstream #2644 (`b860b214`), the class a call on an imported
+/// value reaches when several classes share its name: the one the value's
+/// file imports under that name, or else the one it declares.
+mod ts_imported_value_types {
+    use super::support::{Project, assert_edge, assert_no_edge};
+
+    /// Upstream `ts-imported-type-receivers.test.ts`'s `STORES`: two classes
+    /// named `Store`, each with the same methods.
+    fn stores() -> Project {
+        Project::new()
+            .file("package.json", "{\"name\":\"app\"}")
+            .file(
+                "src/one/store.ts",
+                "export class Base {\n  reset() { return 1; }\n}\nexport class Store extends Base {\n  add(v: number) { return v; }\n}\n",
+            )
+            .file(
+                "src/two/store.ts",
+                "export class Base {\n  reset() { return 2; }\n}\nexport class Store extends Base {\n  add(v: number) { return -v; }\n}\n",
+            )
+            .file("src/two/index.ts", "export { Store } from './store';\n")
+    }
+
+    /// Upstream `ts-imported-type-receivers.test.ts` 183-197.
+    #[test]
+    fn upstream_2644_a_value_reaches_the_class_its_file_imports() {
+        let project = stores()
+            .file(
+                "src/state-one.ts",
+                "import { Store } from './one/store';\nexport const store = new Store();\n",
+            )
+            .file(
+                "src/state-two.ts",
+                "import { Store } from './two/store';\nexport const store: Store = new Store();\n",
+            )
+            .file(
+                "src/use-one.ts",
+                "import { store } from './state-one';\nexport function a() {\n  return store.add(1);\n}\n",
+            )
+            .file(
+                "src/use-two.ts",
+                "import { store } from './state-two';\nexport function b() {\n  return store.add(2);\n}\n",
+            )
+            .index();
+        assert_edge!(project, "function a" => calls => "method Store::add @src/one/store.ts");
+        assert_no_edge!(project, "function a" => calls => "method Store::add @src/two/store.ts");
+        assert_edge!(project, "function b" => calls => "method Store::add @src/two/store.ts");
+        assert_no_edge!(project, "function b" => calls => "method Store::add @src/one/store.ts");
+    }
+
+    /// Upstream `ts-imported-type-receivers.test.ts` 199-213.
+    #[test]
+    fn upstream_2644_a_value_reaches_the_class_its_file_declares() {
+        let own = |n: u32| {
+            format!(
+                "export class Store {{\n  add(v: number) {{ return v * {n}; }}\n}}\nexport const store = new Store();\n"
+            )
+        };
+        let project = stores()
+            .file("src/own-a.ts", &own(3))
+            .file("src/own-b.ts", &own(4))
+            .file(
+                "src/use-a.ts",
+                "import { store } from './own-a';\nexport function a() {\n  return store.add(1);\n}\n",
+            )
+            .file(
+                "src/use-b.ts",
+                "import { store } from './own-b';\nexport function b() {\n  return store.add(2);\n}\n",
+            )
+            .index();
+        assert_edge!(project, "function a" => calls => "method Store::add @src/own-a.ts");
+        assert_edge!(project, "function b" => calls => "method Store::add @src/own-b.ts");
+        assert_no_edge!(project, "function b" => calls => "method Store::add @src/own-a.ts");
+    }
+
+    /// Upstream `ts-imported-type-receivers.test.ts` 216-234: in a Vue
+    /// component's script too.
+    #[test]
+    fn upstream_2644_a_vue_component_reaches_the_class_the_value_file_imports() {
+        let vue = |state: &str| {
+            format!(
+                "<template><button @click=\"go\">go</button></template>\n<script setup lang=\"ts\">\nimport {{ store }} from './{state}';\nfunction go() {{\n  return store.add(1);\n}}\n</script>\n"
+            )
+        };
+        let project = stores()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"vue\":\"^3.4.0\"}}",
+            )
+            .file(
+                "src/state-one.ts",
+                "import { Store } from './one/store';\nexport const store = new Store();\n",
+            )
+            .file(
+                "src/state-two.ts",
+                "import { Store } from './two/store';\nexport const store = new Store();\n",
+            )
+            .file("src/One.vue", &vue("state-one"))
+            .file("src/Two.vue", &vue("state-two"))
+            .index();
+        assert_edge!(project, "function go @src/One.vue" => calls => "method Store::add @src/one/store.ts");
+        assert_edge!(project, "function go @src/Two.vue" => calls => "method Store::add @src/two/store.ts");
+        assert_no_edge!(project, "function go @src/Two.vue" => calls => "method Store::add @src/one/store.ts");
+    }
+
+    /// The hint names a file only for a class it holds: a value whose file
+    /// neither imports nor declares the class keeps the old order.
+    #[test]
+    fn w724_b57_a_value_whose_file_names_no_class_keeps_the_order() {
+        let project = stores()
+            .file(
+                "src/state.ts",
+                "export const store = new Store();\n",
+            )
+            .file(
+                "src/use.ts",
+                "import { store } from './state';\nexport function a() {\n  return store.add(1);\n}\n",
+            )
+            .index();
+        assert_edge!(project, "function a" => calls => "method Store::add @src/one/store.ts");
+    }
+}
+
 mod arkui {
-    use super::support::{Project, assert_edge, assert_unresolved};
+    use super::support::{Project, assert_edge, assert_no_edge, assert_unresolved};
 
     /// `core/data` of upstream's ohpm test: a JSON5 manifest naming its
     /// `Index.ets` entry, which re-exports the repository class.
@@ -43408,6 +43530,49 @@ mod arkui {
         assert_unresolved!(
             project,
             "file:feature/goods/src/main/ets/GoodsViewModel.ets" => imports => "data"
+        );
+    }
+
+    /// OD-B57 on OrangeShopping's shape: `logger` comes through an ohpm
+    /// member's `Index.ets` from `export let logger = new Logger(…)`, and
+    /// the entry module's test tree has another class `Logger`. The call
+    /// reaches the class the value's file declares (upstream #2644), not the
+    /// first `Logger` by path.
+    #[test]
+    fn w724_b57_an_ohpm_value_reaches_the_class_its_file_declares() {
+        let project = Project::new()
+            .file(
+                "entry/oh-package.json5",
+                "{\n  \"name\": \"entry\",\n  \"dependencies\": {\n    \"@ohos/hsp\": \"file:../feature/hsp\",\n  },\n}\n",
+            )
+            .file(
+                "feature/hsp/oh-package.json5",
+                "{\n  \"name\": \"hsp\",\n  \"main\": \"Index.ets\",\n}\n",
+            )
+            .file(
+                "feature/hsp/Index.ets",
+                "export { logger } from './src/main/ets/utils/Logger';\n",
+            )
+            .file(
+                "feature/hsp/src/main/ets/utils/Logger.ets",
+                "class Logger {\n  info(...args: string[]) {\n    console.log(args);\n  }\n}\n\nexport let logger = new Logger('[hsp]')\n",
+            )
+            .file(
+                "entry/src/ohosTest/ets/utils/Logger.ts",
+                "class Logger {\n  info(...args: string[]): void {\n    console.log(args);\n  }\n}\n\nexport default new Logger('[test]')\n",
+            )
+            .file(
+                "entry/src/main/ets/WorkAbility.ets",
+                "import { logger } from '@ohos/hsp';\n\nexport class Work {\n  start(): void {\n    logger.info('start');\n  }\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "method Work::start" => calls => "method Logger::info @feature/hsp/src/main/ets/utils/Logger.ets"
+        );
+        assert_no_edge!(
+            project,
+            "method Work::start" => calls => "method Logger::info @entry/src/ohosTest/ets/utils/Logger.ts"
         );
     }
 

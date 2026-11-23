@@ -152,7 +152,11 @@ translation unit's own classes), never by the strategies below:
    namespace alone, a namespace import's `z.core.fn()` continues into it, and
    `import { default as X }` is the default import; a Python name imported
    from a package follows the package's named and star re-exports to its
-   definition, three modules deep; an import, an include or a module path
+   definition, three modules deep; a call on a value another file exports
+   (`store.add()` after `import { store }`, with `export const store = new
+Store()` there) reaches the method of the class that file imports or
+   declares when several classes share the name, in a component's script too
+   (upstream #2644); an import, an include or a module path
    takes the first of its candidates, in its language's order, that the index
    holds, never a file only on disk, such as one the configuration excludes,
    nor a directory);

@@ -3703,7 +3703,25 @@ pub(crate) fn resolve_method_on_type(
         return None;
     }
 
-    if matches.len() > 1 && reference.language != Language::Go {
+    // TS/JS and their components' scripts: `preferred_fqn` is the file
+    // declaring the class the caller means (upstream #2641's branch as #2644
+    // widens it to Vue, Svelte and Astro; OD-B57), so a value's file can name
+    // which of several same-named classes it holds.
+    let es_import = crate::import_resolver::is_esm_import_language(reference.language);
+    if matches.len() > 1
+        && es_import
+        && let Some(file) = preferred_fqn
+        && let Some(chosen) = matches.iter().find(|m| m.file_path == file)
+    {
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            chosen.id.clone(),
+            confidence,
+            resolved_by,
+        ));
+    }
+
+    if matches.len() > 1 && reference.language != Language::Go && !es_import {
         if let Some(fqn) = preferred_fqn {
             let ext = if reference.language == Language::Kotlin {
                 ".kt"
@@ -3736,6 +3754,64 @@ pub(crate) fn resolve_method_on_type(
         confidence,
         resolved_by,
     ))
+}
+
+/// The file declaring the type `file_path` imports under the name `written`
+/// starts with (`Store`, `async.Delayer`), or `None` when that file imports
+/// no such name or the import names a file or the file itself (upstream
+/// `tsImportedTypeFile`, #2641, as #2644 asks it for an imported value's
+/// file; OD-B57). The import is resolved as resolution resolves it, from
+/// `file_path`. Upstream's merged-ambient exclusion is not ported: the port
+/// has no ambient-module scan.
+pub(crate) fn ts_imported_type_file(
+    written: &str,
+    file_path: &str,
+    language: Language,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<String> {
+    let name = leading_dotted_identifier(written.trim())?;
+    let binding = name.split('.').next()?;
+    if !context
+        .get_import_mappings(file_path, language)
+        .iter()
+        .any(|mapping| mapping.local_name == binding)
+    {
+        return None;
+    }
+    let view = RefView {
+        row_id: None,
+        reference_name: name.to_string(),
+        reference_kind: EdgeKind::References,
+        file_path: file_path.to_string(),
+        language,
+        ..reference.clone()
+    };
+    let imported = crate::import_resolver::resolve_via_import(&view, context)?;
+    let node = context.get_node_by_id_shared(&imported.target_node_id)?;
+    (node.kind != NodeKind::File && node.file_path != file_path).then(|| node.file_path.clone())
+}
+
+/// The longest leading `a.b.c` run of JavaScript identifiers in `text`
+/// (upstream's `/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/`), or `None`.
+fn leading_dotted_identifier(text: &str) -> Option<&str> {
+    let is_start = |c: u8| c.is_ascii_alphabetic() || c == b'_' || c == b'$';
+    let is_part = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let bytes = text.as_bytes();
+    if !bytes.first().copied().is_some_and(is_start) {
+        return None;
+    }
+    let mut end = 1;
+    while end < bytes.len() && is_part(bytes[end]) {
+        end += 1;
+    }
+    while end + 1 < bytes.len() && bytes[end] == b'.' && is_start(bytes[end + 1]) {
+        end += 2;
+        while end < bytes.len() && is_part(bytes[end]) {
+            end += 1;
+        }
+    }
+    Some(&text[..end])
 }
 
 /// Last `::`-separated segment of a C++ name (`cppLastSegment`,
@@ -9531,6 +9607,22 @@ mod tests {
     use crate::types::ImportMapping;
     use codegraph_core::types::ReferenceSubkind;
     use std::collections::HashMap;
+
+    /// OD-B57: the type name `tsImportedTypeFile` reads, upstream's
+    /// `/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*/`.
+    #[test]
+    fn w724_b57_leading_dotted_identifier_reads_upstreams_pattern() {
+        assert_eq!(leading_dotted_identifier("Store"), Some("Store"));
+        assert_eq!(
+            leading_dotted_identifier("async.Delayer<T>"),
+            Some("async.Delayer")
+        );
+        assert_eq!(leading_dotted_identifier("a."), Some("a"));
+        assert_eq!(leading_dotted_identifier("a.1b"), Some("a"));
+        assert_eq!(leading_dotted_identifier("$x_1.y$"), Some("$x_1.y$"));
+        assert_eq!(leading_dotted_identifier("1x"), None);
+        assert_eq!(leading_dotted_identifier(""), None);
+    }
 
     // ---- Configurable in-memory ResolutionContext ---------------------------
 

@@ -8,7 +8,7 @@
 
 use crate::name_matcher::{
     local_receiver_type_patterns, normalize_inferred_type_name, regex_escape,
-    resolve_method_on_type, resolve_object_literal_member,
+    resolve_method_on_type, resolve_object_literal_member, ts_imported_type_file,
 };
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
@@ -2646,7 +2646,7 @@ pub(crate) fn is_js_family_file(file_path: &str) -> bool {
 }
 
 /// Languages with ES import semantics (upstream `ESM_IMPORT_LANGUAGES`).
-fn is_esm_import_language(language: Language) -> bool {
+pub(crate) fn is_esm_import_language(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
@@ -3086,6 +3086,19 @@ fn resolve_imported_instance_member(
         let Some(type_name) = normalize_inferred_type_name(captured.as_str()) else {
             continue;
         };
+        // Several classes may share the name. The value's file says which
+        // one: the class it imports under that name, or else the one it
+        // declares (upstream #2644, OD-B57).
+        let declaring = is_esm_import_language(value.language).then(|| {
+            ts_imported_type_file(
+                captured.as_str(),
+                &value.file_path,
+                value.language,
+                reference,
+                context,
+            )
+            .unwrap_or_else(|| value.file_path.clone())
+        });
         if let Some(resolved) = resolve_method_on_type(
             &type_name,
             member,
@@ -3093,7 +3106,7 @@ fn resolve_imported_instance_member(
             context,
             0.85,
             ResolvedBy::InstanceMethod,
-            None,
+            declaring.as_deref(),
             0,
         ) {
             return Some(resolved);
