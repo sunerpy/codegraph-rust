@@ -9,6 +9,7 @@ pub mod graph;
 pub mod hierarchy;
 pub mod named_symbol_flow;
 pub mod query;
+pub mod relevance;
 pub mod segment_match;
 pub mod segments;
 pub mod symbol_lookup;

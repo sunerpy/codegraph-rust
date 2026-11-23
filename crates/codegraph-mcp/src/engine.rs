@@ -34,6 +34,7 @@ use serde_json::Value;
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::explore_gather::{self, HIGH_VALUE_KINDS};
+use crate::explore_rank;
 use crate::protocol::ToolResult;
 use crate::query_paths::{
     QueryLineAnchor, extract_query_paths_with_probes, query_might_contain_paths,
@@ -102,35 +103,6 @@ const SECTION_FENCE_CHARS: usize = 11;
 /// dropped or windowed. Reserved unconditionally in `section_frame`, since
 /// whether it is emitted is only known after cluster selection.
 const SECTION_GAP_TAIL_CHARS: usize = 17;
-
-/// Callable node kinds whose signature (parameter/return) types the #1064
-/// change-surface pass follows. Mirrors upstream `CALLABLE_KINDS`
-/// (`tools.ts:2620`); `constructor` has no Rust NodeKind (ctors are `method`).
-const CALLABLE_KINDS: [NodeKind; 4] = [
-    NodeKind::Method,
-    NodeKind::Function,
-    NodeKind::Component,
-    NodeKind::Class,
-];
-
-/// Type node kinds a signature edge may point at — the rescue only surfaces
-/// these. Mirrors upstream `TYPE_KINDS` (`tools.ts:2621`).
-const TYPE_KINDS: [NodeKind; 8] = [
-    NodeKind::Class,
-    NodeKind::Struct,
-    NodeKind::Union,
-    NodeKind::Interface,
-    NodeKind::Trait,
-    NodeKind::Protocol,
-    NodeKind::Enum,
-    NodeKind::TypeAlias,
-];
-
-/// Signature edge kinds: what a callable emits toward its parameter/return
-/// types. Mirrors upstream `SIG_EDGE` (`tools.ts:2622`). This project emits TS
-/// type annotations as `References` today (`TypeOf`/`Returns` are accepted too
-/// for forward-compatibility, but extraction-widening is DEFERRED per the plan).
-const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, EdgeKind::Returns];
 
 /// Upstream's `GLUE_NODE_CAP` (`tools.ts` b635dd46 4363): entry-point
 /// neighbours glued into the subgraph at most.
@@ -1228,9 +1200,9 @@ impl CodeGraphEngine {
     /// DETERMINISTIC structure the upstream renders — header, blast radius,
     /// relationships, dynamic boundaries, then per-file source grouped by file —
     /// under a SIZE-ADAPTIVE OUTPUT BUDGET (`getExploreOutputBudget`) scaled by
-    /// the project's indexed file count. The relevance-ranking heuristics
-    /// (RWR/PageRank, flow detection, off-spine skeletonization) are NOT ported;
-    /// see KNOWN_DIFFS.md.
+    /// the project's indexed file count. The files are ranked as upstream
+    /// ranks them, by graph relevance ([`explore_rank`]); off-spine
+    /// skeletonization is not ported (KNOWN_DIFFS.md).
     fn handle_explore(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let query = match require_string(args, "query") {
             Ok(q) => q,
@@ -1306,15 +1278,15 @@ impl CodeGraphEngine {
         // The Flow section opens the response (upstream prepends it to the
         // header), so everything below spends against it too.
         let flow_text = self.build_flow_section(&match_query);
-        let file_count = subgraph.file_order.len();
+        // The summary is written once the final cut is known (#1046): it
+        // counts the files whose source the response shows. This placeholder
+        // holds the raw gather, never shorter than the line that replaces it.
+        let raw_summary = found_line(subgraph.nodes.len(), subgraph.file_order.len());
 
         let mut lines = vec![
             format!("## Exploration: {query}"),
             String::new(),
-            format!(
-                "Found {} symbols across {file_count} files.",
-                subgraph.nodes.len()
-            ),
+            raw_summary.clone(),
         ];
         if !path_extraction.pinned_files.is_empty() {
             lines.push(format!(
@@ -1384,20 +1356,9 @@ impl CodeGraphEngine {
         lines.push("> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.".to_string());
         lines.push(String::new());
 
-        // `excludeLowValueFiles` (`tools.ts:2219-2235`): hard-drop test/spec/
-        // icon/i18n files unless the query mentions tests, and only when >=2
-        // non-low-value files remain (else tests are the only signal here).
-        let mut file_order: Vec<&String> = subgraph.file_order.iter().collect();
-        if budget.exclude_low_value_files && !query_mentions_tests(&match_query) {
-            let non_low: Vec<&String> = file_order
-                .iter()
-                .filter(|f| !is_low_value_file(f) || subgraph.is_pinned(f))
-                .copied()
-                .collect();
-            if non_low.len() >= 2 {
-                file_order = non_low;
-            }
-        }
+        // The ranking already left out the test files a query not about
+        // tests does not need (b635dd46 4846-4868, every tier).
+        let file_order: Vec<&String> = subgraph.file_order.iter().collect();
 
         // Step through ranked files under the total + per-file budget. A file's
         // source is rendered WHOLE when small enough, else clustered; an
@@ -1639,11 +1600,45 @@ impl CodeGraphEngine {
             .collect();
         let (output, kept_prefix_len) =
             cut_at_section_boundary(&output, hard_ceiling, &trimmed_paths);
-        self.mark_surviving_explore_citations(
-            &lines,
-            &rendered_sources,
-            kept_prefix_len.saturating_sub(flow_text.len()),
-        );
+        let kept_in_lines = kept_prefix_len.saturating_sub(flow_text.len());
+        self.mark_surviving_explore_citations(&lines, &rendered_sources, kept_in_lines);
+        // Upstream's curated summary (`tools.ts` b635dd46 7568-7586): the files
+        // whose section survived the cut, and their listed symbols (no
+        // import or export); the raw gather when none did.
+        let survivors: Vec<&str> = rendered_sources
+            .iter()
+            .filter(|(_, at)| section_survives(&lines, *at, kept_in_lines))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let summary = if survivors.is_empty() {
+            let grouped: HashSet<&str> = subgraph
+                .nodes
+                .iter()
+                .filter(|n| is_listed_symbol(n))
+                .map(|n| n.file_path.as_str())
+                .collect();
+            found_line(subgraph.nodes.len(), grouped.len())
+        } else {
+            let shown = subgraph
+                .nodes
+                .iter()
+                .filter(|n| is_listed_symbol(n) && survivors.contains(&n.file_path.as_str()))
+                .count();
+            found_line(shown, survivors.len())
+        };
+        let at = flow_text.len() + lines[0].len() + 1 + lines[1].len() + 1;
+        let output = if output
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with(&raw_summary))
+        {
+            format!(
+                "{}{summary}{}",
+                &output[..at],
+                &output[at + raw_summary.len()..]
+            )
+        } else {
+            output
+        };
         Ok(ToolResult::text(output))
     }
 
@@ -3448,7 +3443,6 @@ impl CodeGraphEngine {
         exact: &ExactTargets,
     ) -> anyhow::Result<ExploreSubgraph> {
         let mut sub = ExploreSubgraph::default();
-        let traverser = GraphTraverser::new(&self.store);
 
         let results = if query.trim().is_empty() {
             Vec::new()
@@ -3490,8 +3484,7 @@ impl CodeGraphEngine {
         for edge in walked.gathered.edges {
             sub.add_edge(edge);
         }
-        let seed_ids = walked.roots;
-        sub.roots = seed_ids.clone();
+        sub.roots = walked.roots;
         for file_path in pinned_files {
             sub.pin_file(file_path);
             let mut file_nodes = self.store.nodes_by_file_path(file_path)?;
@@ -3525,8 +3518,6 @@ impl CodeGraphEngine {
             self.seed_named_symbols(&mut sub, query)?;
         }
 
-        self.rescue_change_surface(&mut sub, &seed_ids, query, &traverser)?;
-
         // The stored half of the generated signal, in ONE batch query. Sorted and
         // deduped first, so no `HashSet` iteration order can reach output — the
         // same discipline `rescue_change_surface` applies to its candidates.
@@ -3546,7 +3537,43 @@ impl CodeGraphEngine {
             .cloned()
             .collect();
 
-        sub.finalize();
+        // Upstream `handleExplore`'s file ranking (`tools.ts` b635dd46
+        // 4625-5134), which also rescues a named callable's buried signature
+        // type (#1064).
+        let multiterm_off = std::env::var("CODEGRAPH_RANK_NO_MULTITERM").is_ok_and(|v| v == "1");
+        let ranked = explore_rank::rank_files(
+            &self.store,
+            &explore_rank::RankInput {
+                nodes: &sub.nodes,
+                edges: &sub.edges,
+                roots: &sub.roots,
+                named_seed_ids: &sub.named_seed_ids,
+                tier_seed_ids: &sub.tier_seed_ids,
+                exact_files: &sub.exact_files,
+                pinned_files: &sub.pinned_files,
+                generated_files: &sub.generated_files,
+                ambient_files: &sub.ambient_files,
+                deprioritized_files: &sub.deprioritized_files,
+                query,
+                multiterm_off,
+            },
+        )?;
+        for node in ranked.rescued {
+            sub.insert(node);
+        }
+        sub.rescued_files.extend(ranked.rescued_files);
+        sub.central_files = ranked.central_files;
+        sub.connected_ids = ranked.connected;
+        // A query-named file leads in the query's order; one with no symbol
+        // to rank still gets its section (the ranking only sees grouped files).
+        let mut order: Vec<String> = sub.pinned_files.clone();
+        order.extend(
+            ranked
+                .file_order
+                .into_iter()
+                .filter(|path| !sub.pinned_files.contains(path)),
+        );
+        sub.file_order = order;
         Ok(sub)
     }
 
@@ -3592,8 +3619,9 @@ impl CodeGraphEngine {
     /// names are recorded for the declaration-only exemption.
     ///
     /// Upstream sorts the definitions by body size over its row order; ties
-    /// here go by file, line, column and id first (KEEP-RUST), so a synced
-    /// index and a fresh one seed alike.
+    /// here go generated-last, then by file, line, column and id (KEEP-RUST):
+    /// a synced index and a fresh one seed alike, and of two equal
+    /// definitions the hand-written one earns the named tier.
     fn seed_named_symbols(&self, sub: &mut ExploreSubgraph, query: &str) -> anyhow::Result<()> {
         let tokens = exact_symbol_tokens(query);
         let project = self.project_name_tokens();
@@ -3623,14 +3651,20 @@ impl CodeGraphEngine {
                 .into_iter()
                 .filter(|n| is_seedable_kind(n.kind) && !is_seeder_test_path(&n.file_path))
                 .collect();
+            let paths: Vec<String> = candidates.iter().map(|n| n.file_path.clone()).collect();
+            let flagged = self.store.generated_paths_among(&paths)?;
+            let generated =
+                |n: &Node| flagged.contains(&n.file_path) || is_generated_file(&n.file_path);
             candidates.sort_by(|a, b| {
                 (
+                    generated(a),
                     a.file_path.as_str(),
                     a.start_line,
                     a.start_column,
                     a.id.as_str(),
                 )
                     .cmp(&(
+                        generated(b),
                         b.file_path.as_str(),
                         b.start_line,
                         b.start_column,
@@ -3886,127 +3920,6 @@ impl CodeGraphEngine {
             }
         }
         Ok(ambient)
-    }
-
-    /// #1064 change-surface rescue (ports `2b256b9` `tools.ts:2585-2860`, adapted
-    /// to this deterministic explore).
-    ///
-    /// A named callable's signature types — its parameter and return types — are
-    /// part of what you'd edit to "add a parameter to X", yet they can be
-    /// lexically dissimilar to the query ("add a parameter to `newClient`" shares
-    /// no words with `options.ts`, which defines `DialOption`) and sit a hop away
-    /// as a `References` edge. Explore's search + budget then buries that answer
-    /// file under incidental roots that merely share query words, so the agent
-    /// falls back to grep. This pass surfaces the buried signature type.
-    ///
-    /// Two deterministic halves:
-    /// 1. **Tier de-noise**: among same-named callable seeds only the top pick
-    ///    plus any seed with caller-count ≥ 25% of the max seed caller-count is
-    ///    TIERED — a low-centrality namesake (Go's test-fake `NewClient`) can't
-    ///    fill the tier and crowd out the answer.
-    /// 2. **Buried rescue**: from each TIERED callable seed, follow outgoing
-    ///    signature edges to TYPE-kind nodes; a type whose file is BURIED (not
-    ///    already a seed file AND < 2 query-term hits) is inserted + marked
-    ///    `rescued_files` so `finalize` floats it to the top tier. A
-    ///    well-connected type (already a seed / term-matched) is left alone, so
-    ///    ordinary flow queries are unchanged.
-    ///
-    /// Determinism: the tiered-seed list preserves search-rank order; the rescue
-    /// candidates are collected then SORTED by `(file_path, start_line, id)` and
-    /// deduped before insertion — no `HashMap`/`HashSet` iteration reaches output.
-    fn rescue_change_surface(
-        &self,
-        sub: &mut ExploreSubgraph,
-        seed_ids: &[String],
-        query: &str,
-        traverser: &GraphTraverser,
-    ) -> anyhow::Result<()> {
-        // Tier de-noise: rank callable seeds by caller-count, tier the top pick
-        // plus any seed within 25% of the max. Iterated in search-rank order.
-        let mut callable_seeds: Vec<(String, usize)> = Vec::new();
-        for id in seed_ids {
-            let Some(node) = sub.node(id) else { continue };
-            if !CALLABLE_KINDS.contains(&node.kind) {
-                continue;
-            }
-            let caller_count = traverser.get_callers(id, CALL_DEPTH)?.len();
-            callable_seeds.push((id.clone(), caller_count));
-        }
-        if callable_seeds.is_empty() {
-            return Ok(());
-        }
-        let max_callers = callable_seeds.iter().map(|(_, c)| *c).max().unwrap_or(0);
-        let threshold = max_callers / 4;
-        let tiered_seed_ids: Vec<String> = callable_seeds
-            .iter()
-            .enumerate()
-            .filter(|(i, (_, c))| *i == 0 || *c >= threshold)
-            .map(|(_, (id, _))| id.clone())
-            .collect();
-
-        // Seed files are NOT buried: a type already defined in one is on-screen.
-        let seed_files: HashSet<String> = seed_ids
-            .iter()
-            .filter_map(|id| sub.node(id).map(|n| n.file_path.clone()))
-            .collect();
-        let terms = query_terms(query);
-
-        // Collect candidate signature-type nodes from every tiered callable seed.
-        let mut candidates: Vec<Node> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for seed_id in &tiered_seed_ids {
-            for kind in SIG_EDGE_KINDS {
-                for edge in self.store.edges_by_source_kind(seed_id, Some(kind))? {
-                    let Ok(targets) = self.store.nodes_by_ids(std::slice::from_ref(&edge.target))
-                    else {
-                        continue;
-                    };
-                    let Some(target) = targets.get(&edge.target) else {
-                        continue;
-                    };
-                    if !TYPE_KINDS.contains(&target.kind) {
-                        continue;
-                    }
-                    if seed_ids.iter().any(|s| s == &target.id) {
-                        continue;
-                    }
-                    if seen.insert(target.id.clone()) {
-                        candidates.push(target.clone());
-                    }
-                }
-            }
-        }
-
-        // Deterministic order for the rescue set (no HashSet iteration reaches
-        // output): sort by file, then line, then id.
-        candidates.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.id.cmp(&b.id))
-        });
-
-        for target in candidates {
-            let fp = target.file_path.clone();
-            // Buried: not already an on-screen seed file, and the query barely
-            // touches it lexically (< 2 term hits on its file path / node name).
-            if seed_files.contains(&fp) {
-                continue;
-            }
-            let term_hits = terms
-                .iter()
-                .filter(|t| {
-                    fp.to_ascii_lowercase().contains(*t)
-                        || target.name.to_ascii_lowercase().contains(*t)
-                })
-                .count();
-            if term_hits >= 2 {
-                continue;
-            }
-            sub.insert(target);
-            sub.rescued_files.insert(fp);
-        }
-        Ok(())
     }
 
     /// Ports `buildDynamicBoundaries` (`tools.ts:1717-1760`): scan the explored
@@ -4436,6 +4349,12 @@ struct ExploreSubgraph {
     tier_seed_ids: Vec<String>,
     /// Files declaring a type a precise token names (`namedTypeFiles`).
     named_type_files: HashSet<String>,
+    /// The one or two graph-central files that match the query's words
+    /// (upstream `centralFiles`).
+    central_files: HashSet<String>,
+    /// Nodes one edge from an entry point or a named seed
+    /// (`connectedToEntry`).
+    connected_ids: HashSet<String>,
 }
 
 impl ExploreSubgraph {
@@ -4534,111 +4453,6 @@ impl ExploreSubgraph {
 
     fn node(&self, id: &str) -> Option<&Node> {
         self.index.get(id).map(|i| &self.nodes[*i])
-    }
-
-    fn finalize(&mut self) {
-        for n in &self.nodes {
-            if !self.file_order.contains(&n.file_path) {
-                self.file_order.push(n.file_path.clone());
-            }
-        }
-        // Relevance-aware file ranking (lightweight RWR approximation): a file
-        // scores by whether it hosts a query seed/root (definition site), then
-        // its graph proximity to those seeds, then its relevant-symbol count.
-        // This floats the definition + sibling-API files to the top so a single
-        // explore call covers the answer, instead of ranking incidental
-        // high-symbol-count files first. Deterministic: ties break on the file
-        // path, keeping output byte-stable.
-        let root_files: HashSet<&str> = self
-            .roots
-            .iter()
-            .filter_map(|id| self.node(id).map(|n| n.file_path.as_str()))
-            .collect();
-        // Files one graph hop from a seed (edge source or target is a seed).
-        let mut neighbor_files: HashSet<&str> = HashSet::new();
-        for e in &self.edges {
-            if self.roots.iter().any(|r| r == &e.source)
-                && let Some(n) = self.node(&e.target)
-            {
-                neighbor_files.insert(n.file_path.as_str());
-            }
-            if self.roots.iter().any(|r| r == &e.target)
-                && let Some(n) = self.node(&e.source)
-            {
-                neighbor_files.insert(n.file_path.as_str());
-            }
-        }
-        let scores: HashMap<String, (u8, u8, u8, usize)> = self
-            .file_order
-            .iter()
-            .map(|fp| {
-                // A rescued change-surface file (#1064) is the lexically-
-                // dissimilar answer — give it the TOP tier so it outranks
-                // incidental roots that merely share query words and survives
-                // the output file budget. A file holding an exact target
-                // (#2063) is the answer by the same argument, and upstream sorts
-                // the two into one named-file tier.
-                let tier = if self.rescued_files.contains(fp.as_str())
-                    || self.exact_files.contains(fp.as_str())
-                {
-                    3
-                } else if root_files.contains(fp.as_str()) {
-                    2
-                } else if neighbor_files.contains(fp.as_str()) {
-                    1
-                } else {
-                    0
-                };
-                // Generated-path and ambient-declaration demotion sit INSIDE the
-                // tier, so they only ever reorder files of equal query relevance: a
-                // protobuf stub or a shim nothing depends on loses to the
-                // implementation it shadows, never falls behind an unrelated
-                // incidental file, and still ranks first in its tier when it is the
-                // only match. The sort is descending, so real code must carry the
-                // HIGHER value. `find_symbol_matches` and `find_all_symbols` apply
-                // the same generated signal.
-                //
-                // The two signals combine by `min`, upstream's rule, so a file that
-                // is BOTH is damped exactly as much as a generated-only one and no
-                // more. That is why this is one 3-valued integer and not a second
-                // boolean key: appending `not_damped_ambient` to the tuple would
-                // rank generated+ambient strictly BELOW generated-only, which is
-                // the double penalty `min` exists to prevent. For any non-ambient
-                // file the values are order-isomorphic to the old
-                // `not_generated` boolean (10 > 3 exactly where 1 > 0), so no
-                // ranking can move unless the ambient predicate actually fires.
-                let generated = is_generated_file(fp) || self.generated_files.contains(fp);
-                let weight = u8::min(
-                    if generated { 3 } else { 10 },
-                    if self.ambient_files.contains(fp) {
-                        5
-                    } else {
-                        10
-                    },
-                );
-                let sym_count = self
-                    .nodes
-                    .iter()
-                    .filter(|n| &n.file_path == fp && n.kind != NodeKind::File)
-                    .count();
-                let first_party = u8::from(!self.deprioritized_files.contains(fp));
-                (fp.clone(), (tier, first_party, weight, sym_count))
-            })
-            .collect();
-        let pin_order = self
-            .pinned_files
-            .iter()
-            .enumerate()
-            .map(|(index, path)| (path.as_str(), index))
-            .collect::<HashMap<_, _>>();
-        self.file_order.sort_by(|a, b| {
-            match (pin_order.get(a.as_str()), pin_order.get(b.as_str())) {
-                (Some(a_index), Some(b_index)) => a_index.cmp(b_index),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => scores[b].cmp(&scores[a]).then_with(|| a.cmp(b)),
-            }
-        });
     }
 
     fn file_language(&self, file_path: &str) -> String {
@@ -5289,6 +5103,38 @@ fn truncate_output(text: &str) -> String {
     format!("{}\n\n... (output truncated)", &truncated[..cut])
 }
 
+/// Explore's summary line, `Found N symbols across M files.`, singular for
+/// one (upstream `tools.ts` b635dd46 7585).
+fn found_line(symbols: usize, files: usize) -> String {
+    format!(
+        "Found {symbols} symbol{} across {files} file{}.",
+        if symbols == 1 { "" } else { "s" },
+        if files == 1 { "" } else { "s" }
+    )
+}
+
+/// Whether `lines[at]` lies wholly inside the first `kept` bytes of
+/// `lines.join("\n")`.
+fn section_survives(lines: &[String], at: usize, kept: usize) -> bool {
+    let Some(section) = lines.get(at) else {
+        return false;
+    };
+    let start = lines[..at].iter().map(String::len).sum::<usize>() + at;
+    start + section.len() <= kept
+}
+
+/// A node explore lists for its file (upstream `isListedSymbol`, without
+/// the COBOL include case): anything but an import or an export, and not a
+/// YAML or properties key, whose line can hold a secret (#383).
+fn is_listed_symbol(node: &Node) -> bool {
+    !matches!(node.kind, NodeKind::Import | NodeKind::Export)
+        && !(node.kind == NodeKind::Constant
+            && matches!(
+                node.language,
+                codegraph_core::types::Language::Yaml | codegraph_core::types::Language::Properties
+            ))
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -5906,15 +5752,16 @@ fn explore_file_header(
     format!("#### {file_path} — {}", cap_header_names(&ranked, cap))
 }
 
-/// Test/spec/icon/i18n detector for explore's `excludeLowValueFiles` and
-/// the order of its dynamic-dispatch links: upstream `isLowValue` as
+/// Test/spec/icon/i18n detector for explore's ranking (the hard filter and
+/// the rank penalty, on every budget tier) and the order of its
+/// dynamic-dispatch links: upstream `isLowValue` as
 /// `b635dd46` wrote it (`tools.ts:4782-4797`), on the lowercased path.
 /// JavaScript's `\b` is an ASCII word boundary, so `lexicon.ts` is no icon
 /// file. Not [`is_test_file`], which the blast radius and the indirect-test
 /// note keep: that one also reads `e2e/` and `_unittest.` as tests. Upstream
 /// later moved explore onto its engine-wide test predicate (#2557); that is
 /// not ported yet.
-fn is_low_value_file(path: &str) -> bool {
+pub(crate) fn is_low_value_file(path: &str) -> bool {
     LOW_VALUE_FILE.is_match(&path.to_lowercase())
 }
 
@@ -5937,20 +5784,6 @@ static LOW_VALUE_FILE: LazyLock<regex::RegexSet> = LazyLock::new(|| {
     ])
     .expect("low-value file patterns are valid")
 });
-
-/// Lowercased, ≥3-char alphanumeric query terms used by the #1064 buried check.
-/// Deterministic: a stable, deduped, order-preserving token set (short/stop-ish
-/// tokens are dropped so a 1-char "x" never counts as a term hit).
-fn query_terms(query: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for tok in query.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let t = tok.to_ascii_lowercase();
-        if t.len() >= 3 && !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
 
 /// Whether a query token is SHAPE-PRECISE enough to name a symbol rather than
 /// describe one (upstream `89c53dd`'s `isPreciseToken`): at least 3 chars, and
@@ -5999,7 +5832,7 @@ fn precise_query_tokens(query: &str) -> Vec<String> {
 
 /// Whether the query itself is about tests — keeps the legitimate "explore the
 /// tests" case (`tools.ts:2228`).
-fn query_mentions_tests(query: &str) -> bool {
+pub(crate) fn query_mentions_tests(query: &str) -> bool {
     let q = query.to_lowercase();
     q.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
         matches!(
@@ -10682,16 +10515,97 @@ mod tests {
         }
     }
 
+    /// Ranks `files` (one entry-point interface each, unless `hub` is set) with
+    /// the CG-28 sets of the combination-rule tests: `c_both` and
+    /// `d_generated` generated, `b_ambient` and `c_both` ambient.
+    fn rank_cg28_files(hub: bool) -> Vec<String> {
+        let mut sg = ExploreSubgraph::default();
+        let mut roots = Vec::new();
+        // Distinct symbol names, because `node`'s synthetic id is derived from
+        // kind+name+line and identical ones would collide into one node.
+        if hub {
+            // One plain entry point whose walk reaches four interfaces in each
+            // other file alike, so the three hold the same graph mass and the
+            // same score before their penalties.
+            let center = node("SharedNameHub", "src/a_plain.ts", 1, 3, NodeKind::Function);
+            roots.push(center.id.clone());
+            sg.insert(center.clone());
+            for (i, stem) in ["b_ambient", "c_both", "d_generated"]
+                .into_iter()
+                .enumerate()
+            {
+                for j in 0..4 {
+                    let path = format!("src/{stem}.ts");
+                    let leaf = node(
+                        &format!("SharedName{i}{j}"),
+                        &path,
+                        1 + 5 * j as i64,
+                        3 + 5 * j as i64,
+                        NodeKind::Interface,
+                    );
+                    sg.edges.push(mk_edge(
+                        &center.id,
+                        &leaf.id,
+                        codegraph_core::types::EdgeKind::References,
+                    ));
+                    sg.insert(leaf);
+                }
+            }
+        } else {
+            for (i, stem) in ["a_plain", "b_ambient", "c_both", "d_generated"]
+                .into_iter()
+                .enumerate()
+            {
+                let path = format!("src/{stem}.ts");
+                let n = node(&format!("SharedName{i}"), &path, 1, 3, NodeKind::Interface);
+                roots.push(n.id.clone());
+                sg.insert(n);
+            }
+        }
+        sg.roots = roots;
+        sg.generated_files.insert("src/c_both.ts".to_string());
+        sg.generated_files.insert("src/d_generated.ts".to_string());
+        sg.ambient_files.insert("src/b_ambient.ts".to_string());
+        sg.ambient_files.insert("src/c_both.ts".to_string());
+        let engine = test_engine();
+        explore_rank::rank_files(
+            &engine.store,
+            &explore_rank::RankInput {
+                nodes: &sg.nodes,
+                edges: &sg.edges,
+                roots: &sg.roots,
+                named_seed_ids: &[],
+                tier_seed_ids: &[],
+                exact_files: &HashSet::new(),
+                pinned_files: &[],
+                generated_files: &sg.generated_files,
+                ambient_files: &sg.ambient_files,
+                deprioritized_files: &HashSet::new(),
+                query: "SharedName",
+                multiterm_off: false,
+            },
+        )
+        .unwrap()
+        .file_order
+    }
+
     /// Tier 5 item 14 (CG-28), the combination rule. Given four files equal in
-    /// `tier` AND in `sym_count`, differing only in the generated and ambient
-    /// signals, When `finalize` ranks them, Then generated-only and
-    /// generated+ambient produce the SAME key, so their order falls through to the
-    /// path tie-break.
+    /// every other ranking input, differing only in the generated and ambient
+    /// signals, When the ranking orders them (W7-25b: upstream's `rankPenalty`,
+    /// the stronger of the two, `tools.ts` b635dd46 4829-4839), Then
+    /// generated-only and generated+ambient carry the SAME penalty, so their
+    /// order falls through to the path tie-break.
     ///
     /// Holding both other components fixed is the whole point: a four-boolean key
     /// would rank generated+ambient strictly below generated-only and still satisfy
     /// any assertion that let `tier` or `sym_count` vary. No weight may be 0
     /// either, or damping would cross a tier.
+    ///
+    /// W7-25b: `finalize` is gone, and the four lone entry points of the old
+    /// fixture no longer hold mass alike (a damped file does not seed the walk;
+    /// that fixture is `ambient_files_do_not_seed_the_walk`). Here one plain
+    /// entry point in `a_plain.ts` reaches the other three files alike, which
+    /// keeps the old assertion.
     #[test]
     fn ambient_and_generated_weight_ties_with_generated_only() {
         // The two generated paths are named so that PATH order puts the
@@ -10700,30 +10614,8 @@ mod tests {
         // order as `min` and the assertion would discriminate nothing. Here the
         // two disagree — `min` ties and the path tie-break wins (`c_both` first),
         // while a fourth boolean ranks `d_generated` strictly higher.
-        let mut sg = ExploreSubgraph::default();
-        let mut roots = Vec::new();
-        // Distinct symbol names, because `node`'s synthetic id is derived from
-        // kind+name+line and four identical ones would collide into a single
-        // inserted node. Each file still contributes exactly one, so `sym_count`
-        // stays equal across all four.
-        for (i, stem) in ["a_plain", "b_ambient", "c_both", "d_generated"]
-            .into_iter()
-            .enumerate()
-        {
-            let path = format!("src/{stem}.ts");
-            let n = node(&format!("SharedName{i}"), &path, 1, 3, NodeKind::Interface);
-            roots.push(n.id.clone());
-            sg.insert(n);
-        }
-        sg.roots = roots;
-        sg.generated_files.insert("src/c_both.ts".to_string());
-        sg.generated_files.insert("src/d_generated.ts".to_string());
-        sg.ambient_files.insert("src/b_ambient.ts".to_string());
-        sg.ambient_files.insert("src/c_both.ts".to_string());
-        sg.finalize();
-
         assert_eq!(
-            sg.file_order,
+            rank_cg28_files(true),
             vec![
                 "src/a_plain.ts",
                 "src/b_ambient.ts",
@@ -10731,6 +10623,26 @@ mod tests {
                 "src/d_generated.ts",
             ],
             "plain > ambient > {{generated, generated+ambient TIED, ordered by path}}"
+        );
+    }
+
+    /// W7-25b, the original fixture of
+    /// `ambient_and_generated_weight_ties_with_generated_only`: four lone entry
+    /// points. Upstream's walk does not start in a damped declaration file
+    /// (`tools.ts` b635dd46 4941-4952, CG-28), so the two ambient files hold no
+    /// graph mass, the comparator's primary key, and rank below the generated
+    /// one; between them the generated backstop puts the plain-ambient file
+    /// first. Before W7-25b the order was plain, ambient, both, generated.
+    #[test]
+    fn ambient_files_do_not_seed_the_walk() {
+        assert_eq!(
+            rank_cg28_files(false),
+            vec![
+                "src/a_plain.ts",
+                "src/d_generated.ts",
+                "src/b_ambient.ts",
+                "src/c_both.ts",
+            ],
         );
     }
 
@@ -11989,6 +11901,33 @@ mod tests {
 
     // --- Round B (#1064): explore change-surface rescue ------------------
 
+    /// Spends `seed`'s share of the explore walk (W7-25a: at most ⌈200 / entry
+    /// points⌉ nodes per entry, structural `calls` before `references`) on
+    /// `count` callees in one file, so a signature type the seed references
+    /// stays outside the subgraph: upstream's #1064 rescue fires only for a
+    /// type the walk did not reach or that has next to no graph mass.
+    fn fill_walk_budget(engine: &mut CodeGraphEngine, seed: &Node, count: i64) {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..count {
+            let callee = node_lang(
+                &format!("budgetStep{i}"),
+                &format!("budgetStep{i}"),
+                "src/budget.ts",
+                1 + 2 * i,
+                2 + 2 * i,
+                NodeKind::Function,
+                Language::TypeScript,
+            );
+            let mut edge = mk_edge(&seed.id, &callee.id, codegraph_core::types::EdgeKind::Calls);
+            edge.line = Some(seed.start_line);
+            edges.push(edge);
+            nodes.push(callee);
+        }
+        put_nodes(engine, &nodes);
+        put_edges(engine, &edges);
+    }
+
     /// Build the proven B repro in a store: `newClient(opt: DialOption)` in
     /// `client.ts` (the seed the query hits) + `interface DialOption` in
     /// `options.ts` (the buried signature type, reachable via a `References`
@@ -11996,6 +11935,11 @@ mod tests {
     /// terms outrank `options.ts` as search seeds and push it past the file
     /// budget — so pre-fix the answer file is dropped (the live #1064 bug),
     /// exactly the buried condition the rescue must undo.
+    ///
+    /// W7-25b: since the walk (W7-25a) gathers `DialOption` one `references`
+    /// edge out, with that edge, its file holds graph mass and is no longer
+    /// buried by upstream's test; [`setup_buried_change_surface_repro`] is the
+    /// shape that still is.
     fn setup_change_surface_repro(engine: &mut CodeGraphEngine) -> (Node, Node) {
         let client = node_lang(
             "newClient",
@@ -12063,13 +12007,25 @@ mod tests {
         (client, dial)
     }
 
+    /// W7-25b: [`setup_change_surface_repro`] with the seed's walk share spent
+    /// on 210 callees first, so `DialOption` stays outside the subgraph with no
+    /// mass, buried as grpc's `dialoptions.go` is (deviations D4).
+    fn setup_buried_change_surface_repro(engine: &mut CodeGraphEngine) -> (Node, Node) {
+        let (client, dial) = setup_change_surface_repro(engine);
+        fill_walk_budget(engine, &client, 210);
+        (client, dial)
+    }
+
     /// #1064 CORE: explore for a plain-language "add a parameter" query surfaces
     /// the seed's buried signature type. Pre-fix `options.ts`/`DialOption` was
     /// absent (0 hits — the proven bug); post-fix it is rescued into the output.
+    ///
+    /// W7-25b: on the buried shape (deviations D4); the original fixture is
+    /// `ext_explore_does_not_rescue_a_gathered_signature_type`.
     #[test]
     fn ext_explore_rescues_buried_signature_type() {
         let mut engine = test_engine();
-        setup_change_surface_repro(&mut engine);
+        setup_buried_change_surface_repro(&mut engine);
         let tr = engine.execute(
             "codegraph_explore",
             &serde_json::json!({"query": "newClient add parameter"}),
@@ -12085,15 +12041,45 @@ mod tests {
         );
     }
 
+    /// W7-25b, the original #1064 fixture: `DialOption` is one `references`
+    /// edge from `newClient`, so the walk gathers it with that edge and its file
+    /// holds graph mass. Upstream rescues a signature type only when its file is
+    /// buried, under 6% of the top file's mass with fewer than two word hits
+    /// (`tools.ts` b635dd46 5001-5014, #1064), so nothing is rescued, and
+    /// `options.ts` (3 points, one edge from an entry) stays under the floor
+    /// that the named seed (50) raises to 10. Before W7-25b the Rust rescue had
+    /// no mass test and rendered `options.ts`.
+    #[test]
+    fn ext_explore_does_not_rescue_a_gathered_signature_type() {
+        let mut engine = test_engine();
+        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.node(&dial.id).is_some(), "the walk gathers the type");
+        assert!(sub.rescued_files.is_empty(), "{:?}", sub.rescued_files);
+        let txt = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "newClient add parameter"}),
+        ));
+        assert!(
+            !txt.contains("#### src/options.ts"),
+            "a gathered type file with mass is not rescued into a section: {txt}"
+        );
+    }
+
     /// #1064 CORE (subgraph-level): `find_relevant_context` inserts the buried
     /// signature type node + its file into the subgraph AND ranks its file
     /// within the top-4 (the tiny-tier `default_max_files`) so it survives the
     /// output budget. Pre-fix the wall of padding roots outrank `options.ts`,
     /// pushing it past position 4 and out of the rendered output.
+    ///
+    /// W7-25b: on the buried shape (deviations D4); the original fixture is
+    /// `ext_find_relevant_context_gathers_a_one_hop_type_without_rescue`.
     #[test]
     fn ext_find_relevant_context_rescues_buried_type_into_subgraph() {
         let mut engine = test_engine();
-        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let (_client, dial) = setup_buried_change_surface_repro(&mut engine);
         let sub = engine
             .find_relevant_context("newClient add parameter")
             .unwrap();
@@ -12109,6 +12095,34 @@ mod tests {
         assert!(
             pos < 4,
             "rescued type file must rank within the top-4 budget, got position {pos} in {:?}",
+            sub.file_order
+        );
+    }
+
+    /// W7-25b, the original #1064 fixture at the subgraph level: the walk
+    /// gathers `DialOption` with its edge, so its file has graph mass, is not
+    /// buried and is not rescued (`tools.ts` b635dd46 5001-5014, #1064); under
+    /// the floor it leaves the file order. Before W7-25b it was rescued into
+    /// the top four.
+    #[test]
+    fn ext_find_relevant_context_gathers_a_one_hop_type_without_rescue() {
+        let mut engine = test_engine();
+        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.node(&dial.id).is_some(), "the walk gathers the type");
+        assert!(
+            sub.edges
+                .iter()
+                .any(|e| e.target == dial.id
+                    && e.kind == codegraph_core::types::EdgeKind::References),
+            "with its edge, so it holds graph mass"
+        );
+        assert!(!sub.rescued_files.contains("src/options.ts"));
+        assert!(
+            !sub.file_order.iter().any(|f| f == "src/options.ts"),
+            "{:?}",
             sub.file_order
         );
     }
@@ -12181,10 +12195,41 @@ mod tests {
     }
 
     /// #1064 determinism: repeated explore runs produce byte-identical output.
+    ///
+    /// W7-25b: on the original fixture nothing is rescued any more (the type
+    /// is gathered with mass, `tools.ts` b635dd46 5001-5014); the rescue's own
+    /// determinism is `ext_explore_rescue_is_deterministic_when_buried`.
     #[test]
     fn ext_explore_rescue_is_deterministic() {
         let mut engine = test_engine();
         setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.rescued_files.is_empty(), "{:?}", sub.rescued_files);
+        let run = || {
+            text_of(&engine.execute(
+                "codegraph_explore",
+                &serde_json::json!({"query": "newClient add parameter"}),
+            ))
+        };
+        let a = run();
+        let b = run();
+        let c = run();
+        assert_eq!(a, b, "explore output must be byte-identical across runs");
+        assert_eq!(b, c, "explore output must be byte-identical across runs");
+    }
+
+    /// W7-25b: the determinism test on the buried shape (deviations D4),
+    /// where the rescue fires.
+    #[test]
+    fn ext_explore_rescue_is_deterministic_when_buried() {
+        let mut engine = test_engine();
+        setup_buried_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.rescued_files.contains("src/options.ts"));
         let run = || {
             text_of(&engine.execute(
                 "codegraph_explore",
@@ -12386,12 +12431,19 @@ mod tests {
     /// sorted by `(file, line, id)` — exercises the sort comparator. Two sig
     /// types in files that sort in reverse of insertion order both rescue, in
     /// stable order.
+    ///
+    /// W7-25b: the seed is `wireUp` and its walk share is spent first
+    /// (deviations D4); the original fixture is
+    /// `ext_explore_a_bare_word_seeds_no_rescue`.
     #[test]
     fn ext_explore_rescue_sorts_multiple_candidates() {
         let mut engine = test_engine();
+        // W7-25b: a camelCase name, because upstream's NL-stopword guard keeps
+        // a bare lowercase word ("wire") from seeding, and the rescue follows
+        // only the named tier's callables.
         let f = node_lang(
-            "wire",
-            "wire",
+            "wireUp",
+            "wireUp",
             "src/wire.ts",
             3,
             3,
@@ -12429,16 +12481,73 @@ mod tests {
                 mk_edge(&f.id, &alpha.id, codegraph_core::types::EdgeKind::Returns),
             ],
         );
-        let sub = engine.find_relevant_context("wire").unwrap();
+        // W7-25b: keep both types outside the walk, or they are not buried.
+        fill_walk_budget(&mut engine, &f, 210);
+        let sub = engine.find_relevant_context("wireUp").unwrap();
         assert!(sub.rescued_files.contains("src/zeta.ts"));
         assert!(sub.rescued_files.contains("src/alpha.ts"));
         // The comparator runs over both candidates; the resulting ranked
         // file_order is deterministic across repeated runs.
-        let again = engine.find_relevant_context("wire").unwrap();
+        let again = engine.find_relevant_context("wireUp").unwrap();
         assert_eq!(
             sub.file_order, again.file_order,
             "multi-candidate rescue ordering must be deterministic"
         );
+    }
+
+    /// W7-25b, the original fixture of `ext_explore_rescue_sorts_multiple_candidates`:
+    /// `wire` is a bare lowercase word that no other query token corroborates,
+    /// so upstream's NL-stopword guard does not seed it (`tools.ts` b635dd46
+    /// 4466-4480) and the rescue, which follows only the named tier's callables
+    /// (4705-4720, #1064), has nothing to follow. Both types are one edge from
+    /// the entry point and gathered with it. Before W7-25b both were rescued.
+    #[test]
+    fn ext_explore_a_bare_word_seeds_no_rescue() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "wire",
+            "wire",
+            "src/wire.ts",
+            3,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let zeta = node_lang(
+            "Zeta",
+            "Zeta",
+            "src/zeta.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        let alpha = node_lang(
+            "Alpha",
+            "Alpha",
+            "src/alpha.ts",
+            1,
+            1,
+            NodeKind::Struct,
+            Language::TypeScript,
+        );
+        for rel in ["src/wire.ts", "src/zeta.ts", "src/alpha.ts"] {
+            put_indexed_source(&engine, rel, "// stub\n", Language::TypeScript, 1);
+        }
+        put_nodes(&mut engine, &[f.clone(), zeta.clone(), alpha.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&f.id, &zeta.id, codegraph_core::types::EdgeKind::References),
+                mk_edge(&f.id, &alpha.id, codegraph_core::types::EdgeKind::Returns),
+            ],
+        );
+        let sub = engine.find_relevant_context("wire").unwrap();
+        assert!(sub.roots.contains(&f.id), "the search still finds it");
+        assert!(sub.named_seed_ids.is_empty(), "{:?}", sub.named_seed_ids);
+        assert!(sub.tier_seed_ids.is_empty(), "{:?}", sub.tier_seed_ids);
+        assert!(sub.rescued_files.is_empty(), "{:?}", sub.rescued_files);
+        assert!(sub.node(&zeta.id).is_some() && sub.node(&alpha.id).is_some());
     }
 
     /// #1064 buried check: a signature type whose file the query hits ≥2 times
@@ -13723,5 +13832,295 @@ mod tests {
             ],
             "calls first; in-edges by source; out-edges by kind, then target"
         );
+    }
+
+    // === W7-25b: the file ranking (upstream `handleExplore`) ================
+
+    fn w725_type(name: &str, kind: NodeKind, file: &str, line: i64) -> Node {
+        node_lang(name, name, file, line, line + 3, kind, Language::TypeScript)
+    }
+
+    /// W7-25b: a named definition's file ranks first; the types its signature
+    /// uses are not rescued, because their file has graph mass (#1064 rescues
+    /// only a buried one). Before, the rescue had no mass test and put the
+    /// shared types file first (`ReferenceResolver resolve_via_import`).
+    #[test]
+    fn w725b_ranks_the_named_definition_before_the_types_it_uses() {
+        let mut engine = test_engine();
+        let seed = w725_fn("resolveViaImport", "src/import_resolver.ts", 10);
+        let types = [
+            w725_type("RefView", NodeKind::Struct, "src/types.ts", 1),
+            w725_type("ResolvedRef", NodeKind::Struct, "src/types.ts", 10),
+            w725_type("EdgeKind", NodeKind::Enum, "src/types.ts", 20),
+        ];
+        let mut nodes = vec![seed.clone()];
+        nodes.extend(types.iter().cloned());
+        let mut edges = Vec::new();
+        for (at, ty) in types.iter().enumerate() {
+            edges.push(w725_edge_at(
+                &seed,
+                ty,
+                EdgeKind::References,
+                11 + at as i64,
+            ));
+        }
+        for i in 0..20 {
+            let user = w725_fn(
+                &format!("consumer{i}"),
+                &format!("src/consumers/c{i}.ts"),
+                1,
+            );
+            for (at, ty) in types.iter().enumerate() {
+                edges.push(w725_edge_at(&user, ty, EdgeKind::References, 2 + at as i64));
+            }
+            nodes.push(user);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("resolveViaImport").unwrap();
+        assert_eq!(
+            sub.file_order.first().map(String::as_str),
+            Some("src/import_resolver.ts"),
+            "{:?}",
+            sub.file_order
+        );
+        assert!(
+            !sub.rescued_files.contains("src/types.ts"),
+            "a types file with graph mass is not rescued"
+        );
+    }
+
+    /// The gate fixture: an entry point with ten neighbours in their own
+    /// files, and a five-node file three hops out behind one of them.
+    fn w725_gate_fixture(engine: &mut CodeGraphEngine, reverse: bool) {
+        let root = w725_fn("rootStep", "src/root.ts", 1);
+        let mut nodes = vec![root.clone()];
+        let mut edges = Vec::new();
+        for i in 0..10 {
+            let x = w725_fn(&format!("neighbour{i}"), &format!("src/n{i}.ts"), 1);
+            edges.push(w725_edge_at(&root, &x, EdgeKind::Calls, 2 + i));
+            nodes.push(x);
+        }
+        let y = w725_fn("bridgeStep", "src/bridge.ts", 1);
+        edges.push(w725_edge_at(&nodes[1], &y, EdgeKind::Calls, 2));
+        for j in 0..5 {
+            let z = w725_fn(&format!("farLeaf{j}"), "src/far.ts", 1 + 5 * j);
+            edges.push(w725_edge_at(&y, &z, EdgeKind::Calls, 3 + j));
+            nodes.push(z);
+        }
+        nodes.push(y);
+        if reverse {
+            nodes.reverse();
+            edges.reverse();
+        }
+        put_nodes(engine, &nodes);
+        put_edges(engine, &edges);
+    }
+
+    /// W7-25b: the relevance gate (`tools.ts` b635dd46 5028-5040) drops a file
+    /// that cleared the floor but holds under 6% of the top file's graph mass,
+    /// is no entry, not central and matches fewer than two query words.
+    #[test]
+    fn w725b_the_gate_drops_a_file_far_from_the_entry_points() {
+        let mut engine = test_engine();
+        w725_gate_fixture(&mut engine, false);
+        // The named seed scores 50, so the floor is 10 and no neighbour
+        // (3 each) clears it; the backfill takes the best two of the rest,
+        // `far.ts` (five peripheral nodes, 5) and `n0.ts`, and the gate then
+        // drops `far.ts`, which holds under 6% of the top file's mass.
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        assert_eq!(sub.file_order, ["src/root.ts", "src/n0.ts"]);
+    }
+
+    /// W7-25b: the ranking does not depend on the order the rows were written.
+    #[test]
+    fn w725b_file_order_ignores_row_order() {
+        let mut forward = test_engine();
+        w725_gate_fixture(&mut forward, false);
+        let mut backward = test_engine();
+        w725_gate_fixture(&mut backward, true);
+        assert_eq!(
+            forward
+                .find_relevant_context("rootStep")
+                .unwrap()
+                .file_order,
+            backward
+                .find_relevant_context("rootStep")
+                .unwrap()
+                .file_order
+        );
+    }
+
+    /// W7-25b: when the relative floor leaves fewer than three files, the
+    /// best of the rest with a score of at least 1 fill up to three
+    /// (`tools.ts` b635dd46 4870-4897).
+    #[test]
+    fn w725b_the_floor_backfills_to_three_files() {
+        let mut engine = test_engine();
+        let root = w725_fn("rootStep", "src/a.ts", 1);
+        let x = w725_fn("middleStep", "src/b.ts", 1);
+        let y1 = w725_fn("leafOne", "src/c.ts", 1);
+        let y2 = w725_fn("leafTwo", "src/d.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[root.clone(), x.clone(), y1.clone(), y2.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&root, &x, EdgeKind::Calls, 2),
+                w725_edge_at(&x, &y1, EdgeKind::Calls, 2),
+                w725_edge_at(&x, &y2, EdgeKind::Calls, 3),
+            ],
+        );
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        assert_eq!(sub.file_order, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+    }
+
+    /// W7-25b: test files leave the ranking whatever the project's size when
+    /// the query is not about tests and two other files remain (b635dd46
+    /// 4846-4868); the per-tier switch it used to read is gone upstream.
+    #[test]
+    fn w725b_test_files_leave_the_ranking_on_every_tier() {
+        let mut engine = test_engine();
+        let dispatch = w725_fn("dispatchRoute", "lib/dispatch.ts", 1);
+        let parse = w725_fn("parseRoute", "lib/router.ts", 1);
+        let spec = w725_fn("parsesARoute", "test/router.test.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[dispatch.clone(), parse.clone(), spec.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&dispatch, &parse, EdgeKind::Calls, 2),
+                w725_edge_at(&spec, &parse, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine
+            .find_relevant_context("dispatchRoute parseRoute")
+            .unwrap();
+        assert!(
+            !sub.file_order.iter().any(|f| f.starts_with("test/")),
+            "{:?}",
+            sub.file_order
+        );
+        assert_eq!(sub.file_order.len(), 2, "{:?}", sub.file_order);
+    }
+
+    /// W7-25b: a weak-kind match nothing uses scores as a collision
+    /// (`ISOLATED_WEAK_KIND_WEIGHT`, b635dd46 453): an unused `dispatch`
+    /// local scores 0.8 as an entry point, under the floor (2.6 here) and
+    /// the backfill's minimum of 1, so its file leaves the ranking.
+    #[test]
+    fn w725b_an_unused_local_scores_as_a_collision() {
+        let mut engine = test_engine();
+        let dispatch = w725_fn("dispatch", "src/dispatcher.ts", 1);
+        let helper = w725_fn("runHandler", "src/dispatcher.ts", 10);
+        let local = node_lang(
+            "dispatch",
+            "dispatch",
+            "scripts/report.ts",
+            1,
+            1,
+            NodeKind::Variable,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[dispatch.clone(), helper.clone(), local]);
+        put_edges(
+            &mut engine,
+            &[w725_edge_at(&dispatch, &helper, EdgeKind::Calls, 2)],
+        );
+        let sub = engine.find_relevant_context("dispatch").unwrap();
+        assert!(
+            sub.roots.iter().any(|id| id.contains("scripts/report.ts")),
+            "the local is an entry point: {:?}",
+            sub.roots
+        );
+        assert_eq!(sub.file_order, ["src/dispatcher.ts"]);
+    }
+
+    /// W7-25b: the generated penalty damps the graph mass, the comparator's
+    /// primary key, and not only the score (`rankPenalty`, b635dd46 4953-4965,
+    /// #1500): a generated twin whose calls stay in its own file holds more raw
+    /// mass than the hand-written file whose callee lives next door, and still
+    /// ranks below both.
+    #[test]
+    fn w725b_the_generated_penalty_damps_graph_mass() {
+        let mut engine = test_engine();
+        let hand = w725_fn("invoice", "src/billing/ledger.ts", 1);
+        let tax = w725_fn("computeTax", "src/billing/tax.ts", 1);
+        let twin = w725_fn("invoice", "src/gen/ledger.generated.ts", 1);
+        let mut nodes = vec![hand.clone(), tax.clone(), twin.clone()];
+        let mut edges = vec![w725_edge_at(&hand, &tax, EdgeKind::Calls, 2)];
+        for i in 0..5 {
+            let step = w725_fn(
+                &format!("buildRow{i}"),
+                "src/gen/ledger.generated.ts",
+                10 + 5 * i,
+            );
+            edges.push(w725_edge_at(&twin, &step, EdgeKind::Calls, 2 + i));
+            nodes.push(step);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        // The test ids carry the path, which the FTS reads: no path holds the
+        // query word, so the two `invoice` functions are the only entry points.
+        let sub = engine.find_relevant_context("invoice").unwrap();
+        assert_eq!(sub.roots.len(), 2, "{:?}", sub.roots);
+        assert_eq!(
+            sub.file_order,
+            [
+                "src/billing/ledger.ts",
+                "src/billing/tax.ts",
+                "src/gen/ledger.generated.ts"
+            ]
+        );
+    }
+
+    /// W7-25b: upstream's `RELEVANCE_KIND_WEIGHT` (b635dd46 418-431).
+    #[test]
+    fn w725b_kind_weights_rank_callables_over_members_over_locals() {
+        use crate::explore_rank::kind_weight;
+        for kind in [
+            NodeKind::Function,
+            NodeKind::Method,
+            NodeKind::Class,
+            NodeKind::Struct,
+            NodeKind::Interface,
+            NodeKind::Route,
+            NodeKind::Component,
+        ] {
+            assert_eq!(kind_weight(kind), 1.0, "{kind:?}");
+        }
+        for member in [NodeKind::Property, NodeKind::Field, NodeKind::EnumMember] {
+            assert!(kind_weight(member) < kind_weight(NodeKind::Function));
+            assert!(kind_weight(member) > kind_weight(NodeKind::Parameter));
+        }
+        for weak in [NodeKind::Constant, NodeKind::Variable, NodeKind::Parameter] {
+            assert!(kind_weight(weak) < 0.5, "{weak:?}");
+        }
+        assert!(kind_weight(NodeKind::Parameter) < kind_weight(NodeKind::Variable));
+        assert_eq!(kind_weight(NodeKind::Namespace), 0.8);
+        assert_eq!(kind_weight(NodeKind::File), 0.5);
+        assert_eq!(
+            kind_weight(NodeKind::Import),
+            0.5,
+            "an unlisted kind takes the default"
+        );
+    }
+
+    /// W7-25b: upstream's `rankPenalty` (b635dd46 4829-4839): generated and
+    /// ambient take the stronger of the two, never the product (CG-28); a
+    /// low-value file is damped on top.
+    #[test]
+    fn w725b_rank_penalty_takes_the_stronger_structural_penalty() {
+        use crate::explore_rank::rank_penalty;
+        assert_eq!(rank_penalty(false, false, false), 1.0);
+        assert_eq!(rank_penalty(false, true, false), 0.5);
+        assert_eq!(rank_penalty(true, false, false), 0.3);
+        assert_eq!(rank_penalty(true, true, false), 0.3, "not 0.15");
+        assert_eq!(rank_penalty(false, false, true), 0.5);
+        assert_eq!(rank_penalty(true, true, true), 0.15);
     }
 }
