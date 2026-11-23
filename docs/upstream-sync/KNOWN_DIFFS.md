@@ -808,6 +808,13 @@ regex engine), is not listed.
   macros then decide whether a call is a macro expansion. Such a file comes
   and goes without changing the index, so no sync would resolve the import
   again (`import_resolver.rs`, `c_macro_visibility.rs`).
+- **ohpm workspace members (W7-24a1).** The walk for `oh-package.json5` lists
+  each directory in name order, where colby reads `readdir` order, which
+  decides what its directory budget cuts; it follows no link to a directory
+  or a manifest; a manifest over the file-size limit is not read; and a
+  manifest that does not parse once its comments and trailing commas are
+  stripped reads as none, where colby's `jsonc-parser` recovers a partial
+  value (`workspace_packages.rs`).
 
 ### Synthesis
 

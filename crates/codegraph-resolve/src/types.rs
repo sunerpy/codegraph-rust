@@ -19,14 +19,16 @@ use std::sync::Arc;
 /// sound visibility oracle here and nowhere else: a package- or namespace-scoped
 /// language (Go, Java, Kotlin, C#, Rust, Scala, Dart) makes a sibling-file type
 /// visible with no import at all, so the same predicate would delete real edges
-/// there.
-pub const ESM_LANGUAGES: [Language; 6] = [
+/// there. ArkTS is in it (W7-24a1): its modules import as TypeScript's do, as
+/// upstream's `ESM_FAMILY` has it (`name-matcher.ts`, `b635dd46` 1360).
+pub const ESM_LANGUAGES: [Language; 7] = [
     Language::TypeScript,
     Language::Tsx,
     Language::JavaScript,
     Language::Jsx,
     Language::Svelte,
     Language::Vue,
+    Language::ArkTs,
 ];
 
 /// Is `language` in the [`ESM_LANGUAGES`] family?
@@ -1016,6 +1018,21 @@ mod tests {
             assert!(kind_is_eligible_target(EdgeKind::Calls, target));
             assert!(kind_is_eligible_target(EdgeKind::References, target));
         }
+    }
+
+    /// W7-24a1: ArkTS reads its imports through `extract_js_imports`, so it
+    /// is in the family, as in upstream's `ESM_FAMILY` (`name-matcher.ts`,
+    /// `b635dd46` 1360) that the #1566 receiver gate reads.
+    #[test]
+    fn w724a1_arkts_is_an_esm_language() {
+        assert!(is_esm_language(Language::ArkTs));
+        assert!(
+            !crate::import_resolver::extract_import_mappings(
+                "import { a } from './a';\n",
+                Language::ArkTs
+            )
+            .is_empty()
+        );
     }
 
     #[test]

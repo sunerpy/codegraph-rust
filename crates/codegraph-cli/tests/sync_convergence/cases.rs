@@ -27188,3 +27188,108 @@ pub fn typescript_angular_workspace_marker_appears_in_a_subfolder() -> Case {
             "route ws/apps/x/src/app/x.routes.ts::route:/x",
         )
 }
+
+/// W7-24a1: the ohpm member `data` of upstream's test, entry `Index.ets`.
+const OHPM_DATA_MANIFEST: &str = "{\n  \"name\": \"data\",\n  \"main\": \"Index.ets\",\n}\n";
+const OHPM_DATA_INDEX: &str = "export { CartRepository } from './src/main/ets/CartRepository';\n";
+const OHPM_CART: &str = "export class CartRepository {\n  addToCart(id: string): void {\n    console.log(id);\n  }\n}\n";
+const OHPM_CONSUMER_FILE: &str = "feature/goods/src/main/ets/GoodsViewModel.ets";
+const OHPM_CONSUMER: &str = "import { CartRepository } from \"data\";\n\nexport function make(): CartRepository {\n  return new CartRepository();\n}\n";
+const OHPM_GOODS_WITH_DATA: &str = "{\n  \"name\": \"goods\",\n  \"dependencies\": {\n    \"data\": \"file:../../core/data\", // local\n  },\n}\n";
+const OHPM_GOODS_WITHOUT_DATA: &str = "{\n  \"name\": \"goods\",\n  \"dependencies\": {},\n}\n";
+/// The consumer's file node: its import binding is the edge each case
+/// watches (a bare specifier's module reference names no path and stays
+/// unresolved, as upstream's does).
+const OHPM_CONSUMER_NODE: &str = "file:feature/goods/src/main/ets/GoodsViewModel.ets";
+/// The class `data`'s entry re-exports.
+const OHPM_DATA_CLASS: &str = "class CartRepository @core/data/src/main/ets/CartRepository.ets:1";
+
+/// An ohpm project with the member `data` and its consumer, whose manifest
+/// the case writes.
+fn ohpm_case(goods_manifest: Option<&'static str>) -> Case {
+    let case = Case::new(Change::ControlFile, &[Language::ArkTs])
+        .file("core/data/oh-package.json5", OHPM_DATA_MANIFEST)
+        .file("core/data/Index.ets", OHPM_DATA_INDEX)
+        .file("core/data/src/main/ets/CartRepository.ets", OHPM_CART)
+        .file(OHPM_CONSUMER_FILE, OHPM_CONSUMER);
+    match goods_manifest {
+        Some(manifest) => case.file("feature/goods/oh-package.json5", manifest),
+        None => case,
+    }
+}
+
+/// W7-24a1: a `file:` dependency appears in the consumer's ohpm manifest,
+/// which is no source file; the bare import comes to name the member.
+pub fn arkts_ohpm_dependency_appears() -> Case {
+    ohpm_case(Some(OHPM_GOODS_WITHOUT_DATA))
+        .write("feature/goods/oh-package.json5", OHPM_GOODS_WITH_DATA)
+        .edge_after(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+}
+
+/// W7-24a1: the dependency leaves the manifest: `data` is an npm package
+/// again and the binding names nothing.
+pub fn arkts_ohpm_dependency_goes() -> Case {
+    ohpm_case(Some(OHPM_GOODS_WITH_DATA))
+        .write("feature/goods/oh-package.json5", OHPM_GOODS_WITHOUT_DATA)
+        .edge_before(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+        .no_edge_after(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+}
+
+/// W7-24a1: the dependency comes to point at another member directory,
+/// whose class has the same name: only the import tells them apart.
+pub fn arkts_ohpm_dependency_retargets() -> Case {
+    let data2_class = "class CartRepository @core/data2/src/main/ets/CartRepository.ets:1";
+    ohpm_case(Some(OHPM_GOODS_WITH_DATA))
+        .file("core/data2/oh-package.json5", OHPM_DATA_MANIFEST)
+        .file("core/data2/Index.ets", OHPM_DATA_INDEX)
+        .file("core/data2/src/main/ets/CartRepository.ets", OHPM_CART)
+        .write(
+            "feature/goods/oh-package.json5",
+            "{\n  \"name\": \"goods\",\n  \"dependencies\": {\n    \"data\": \"file:../../core/data2\",\n  },\n}\n",
+        )
+        .edge_before(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+        .edge_after(OHPM_CONSUMER_NODE, "imports", data2_class)
+        .no_edge_after(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+}
+
+/// W7-24a1: the member's own manifest changes the entry its `main` names,
+/// and the new entry re-exports another same-named class.
+pub fn arkts_ohpm_main_changes() -> Case {
+    let other_class = "class CartRepository @core/data/src/other/CartRepository.ets:1";
+    ohpm_case(Some(OHPM_GOODS_WITH_DATA))
+        .file("core/data/src/other/CartRepository.ets", OHPM_CART)
+        .file(
+            "core/data/src/entry.ets",
+            "export { CartRepository } from './other/CartRepository';\n",
+        )
+        .write(
+            "core/data/oh-package.json5",
+            "{\n  \"name\": \"data\",\n  \"main\": \"src/entry.ets\",\n}\n",
+        )
+        .edge_before(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+        .edge_after(OHPM_CONSUMER_NODE, "imports", other_class)
+        .no_edge_after(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+}
+
+/// W7-24a1: the consumer's manifest appears where there was none.
+pub fn arkts_ohpm_manifest_appears() -> Case {
+    ohpm_case(None)
+        .write("feature/goods/oh-package.json5", OHPM_GOODS_WITH_DATA)
+        .edge_after(OHPM_CONSUMER_NODE, "imports", OHPM_DATA_CLASS)
+}
+
+/// W7-24a1: the module an ArkTS relative import names appears; the import
+/// and its binding come to name it.
+pub fn arkts_relative_import_target_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::ArkTs])
+        .file(
+            "pages/Home.ets",
+            "import { helper } from './util';\n\nexport function run(): number {\n  return helper();\n}\n",
+        )
+        .write(
+            "pages/util.ets",
+            "export function helper(): number {\n  return 1;\n}\n",
+        )
+        .edge_after("file:pages/Home.ets", "imports", "file:pages/util.ets")
+        .edge_after("function run", "calls", "function helper @pages/util.ets:1")
+}

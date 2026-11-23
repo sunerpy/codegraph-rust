@@ -572,6 +572,19 @@ fn register_new_dirs_with(
     }
 }
 
+/// The ohpm manifests directly in `dirs`, directories a move or a `mkdir -p`
+/// brought in, by project path: regular files only, as the ohpm walk reads
+/// them (W7-24a1).
+fn ohpm_manifests_in(dirs: &[PathBuf], policy: &WatchPolicy) -> Vec<String> {
+    dirs.iter()
+        .map(|dir| dir.join(codegraph_resolve::workspace_packages::OHPM_MANIFEST))
+        .filter(|manifest| {
+            fs::symlink_metadata(manifest).is_ok_and(|meta| meta.file_type().is_file())
+        })
+        .filter_map(|manifest| policy.normalize_relative(&manifest))
+        .collect()
+}
+
 /// Register a NonRecursive watch for the newly-created directory `dir` alone,
 /// an ignored one watched for a Shopify theme marker (W4-LIQ-01), on
 /// per-directory backends; a no-op on the recursive ones.
@@ -1819,6 +1832,19 @@ fn event_loop(ctx: EventLoopCtx) {
                                     .iter()
                                     .filter_map(|dir| runtime_scope.policy.normalize_relative(dir)),
                             );
+                            // An ohpm manifest moved in with its directory
+                            // sends no event of its own, yet the JavaScript
+                            // kind's walk reads every one (W7-24a1).
+                            let now = epoch_millis();
+                            for manifest in ohpm_manifests_in(&new_dirs, &runtime_scope.policy) {
+                                pending
+                                    .entry(manifest)
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
                             if saw_link {
                                 // The directory may add no pending file, yet the
                                 // full sync it owes must still run on the deadline.
@@ -4985,6 +5011,48 @@ mod tests {
         assert!(
             scheduled,
             "a moved-in directory holding a link schedules a full sync"
+        );
+    }
+
+    /// W7-24a1: an ohpm manifest moved into the project with its directory
+    /// sends no event of its own, yet the JavaScript kind's walk reads every
+    /// one, at any depth: the watcher hands each to the sync, and no other
+    /// file the directory brings for it.
+    #[test]
+    fn w724a1_ohpm_manifests_moved_in_with_their_directory_reach_the_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-ohpm-moved-in");
+        fs::create_dir_all(dir.path().join("feature")).unwrap();
+        let staging = crate::sync::tests::TestDir::new("watch-ohpm-moved-in-staging");
+        for (relative, text) in [
+            ("goods/oh-package.json5", "{ \"dependencies\": {} }\n"),
+            ("goods/nested/deep/oh-package.json5", "{}\n"),
+            ("goods/nested/notes.json5", "{}\n"),
+        ] {
+            let path = staging.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        let (watcher, synced, _) = recording_watcher(dir.path());
+        fs::rename(
+            staging.path().join("goods"),
+            dir.path().join("feature/goods"),
+        )
+        .unwrap();
+        let reached = wait_until(|| {
+            saw_path(&synced, "feature/goods/oh-package.json5")
+                && saw_path(&synced, "feature/goods/nested/deep/oh-package.json5")
+        });
+        // A fence written after the move, which every earlier event precedes.
+        fs::write(dir.path().join("fence.ets"), "export const f = 1;\n").unwrap();
+        let fenced = wait_until(|| saw_path(&synced, "fence.ets"));
+        watcher.stop();
+        assert!(reached, "{:?}", synced.lock().unwrap());
+        assert!(fenced, "{:?}", synced.lock().unwrap());
+        assert!(
+            !saw_path(&synced, "feature/goods/nested/notes.json5"),
+            "{:?}",
+            synced.lock().unwrap()
         );
     }
 

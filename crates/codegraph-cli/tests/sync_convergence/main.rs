@@ -2197,6 +2197,12 @@ matrix! {
     typescript_angular_workspace_marker_goes,
     typescript_angular_router_link_workspace_marker_appears,
     typescript_angular_workspace_marker_appears_in_a_subfolder,
+    arkts_ohpm_dependency_appears,
+    arkts_ohpm_dependency_goes,
+    arkts_ohpm_dependency_retargets,
+    arkts_ohpm_main_changes,
+    arkts_ohpm_manifest_appears,
+    arkts_relative_import_target_appears,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold

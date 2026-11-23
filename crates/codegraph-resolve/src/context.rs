@@ -1177,8 +1177,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         // Re-key on the BARREL file's own extension (index.ts:489-498).
         let re_exports = match content {
             Some(text) => {
-                let is_js_family = is_js_family_path(file_path);
-                let lang = if is_js_family {
+                let lang = if reads_re_exports_as_typescript(file_path) {
                     Language::TypeScript
                 } else {
                     language
@@ -1198,6 +1197,13 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 /// Shares [`is_js_family_path`] with the snapshot context.
 pub(crate) fn is_js_family_path_pub(file_path: &str) -> bool {
     is_js_family_path(file_path)
+}
+
+/// Whether a barrel at `file_path` has its re-exports read as TypeScript,
+/// whatever the importer's language: every JavaScript-family file and an
+/// ArkTS `.ets` one (upstream `b635dd46` index.ts:982, #1186).
+pub(crate) fn reads_re_exports_as_typescript(file_path: &str) -> bool {
+    is_js_family_path(file_path) || file_path.to_ascii_lowercase().ends_with(".ets")
 }
 
 /// Shares [`load_go_module`] with the snapshot context.
@@ -1441,6 +1447,27 @@ mod tests {
         assert!(is_js_family_path("A.TS"));
         assert!(!is_js_family_path("a.py"));
         assert!(!is_js_family_path("a.rs"));
+    }
+
+    /// W7-24a1: an `.ets` barrel has its re-exports read as TypeScript, as
+    /// the JavaScript family's are (upstream `b635dd46` index.ts:982); `.ets`
+    /// stays out of the JavaScript family itself, whose other readers (the
+    /// module surface, the Vue router) key on it.
+    #[test]
+    fn w724a1_ets_barrels_read_re_exports_as_typescript() {
+        for path in [
+            "core/Index.ets",
+            "core/INDEX.ETS",
+            "a.ts",
+            "a.d.ts",
+            "a.mjs",
+        ] {
+            assert!(reads_re_exports_as_typescript(path), "{path}");
+        }
+        for path in ["a.py", "a.vue", "a.ets.bak"] {
+            assert!(!reads_re_exports_as_typescript(path), "{path}");
+        }
+        assert!(!is_js_family_path("core/Index.ets"));
     }
 
     #[test]

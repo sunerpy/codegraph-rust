@@ -43357,3 +43357,181 @@ mod mobile_bridges {
         );
     }
 }
+
+/// W7-24: ArkTS modules, ohpm packages and the ArkUI bridges (upstream
+/// #1186, `arkts-resolution.test.ts` and `extraction.test.ts`'s ArkTS
+/// block at `e8ddc4e2`).
+mod arkui {
+    use super::support::{Project, assert_edge, assert_unresolved};
+
+    /// `core/data` of upstream's ohpm test: a JSON5 manifest naming its
+    /// `Index.ets` entry, which re-exports the repository class.
+    const DATA_MANIFEST: &str =
+        "{\n  // ohpm module manifest\n  \"name\": \"data\",\n  \"main\": \"Index.ets\",\n}\n";
+    const DATA_INDEX: &str = "export { CartRepository } from './src/main/ets/CartRepository';\n";
+    const CART_REPOSITORY: &str = "export class CartRepository {\n  addToCart(id: string): void {\n    console.log(id);\n  }\n}\n";
+    const GOODS_MANIFEST: &str = "{\n  \"name\": \"goods\",\n  \"dependencies\": {\n    \"data\": \"file:../../core/data\", // local module\n  },\n}\n";
+
+    /// Upstream `arkts-resolution.test.ts:113-172`: a bare import of an ohpm
+    /// member follows the consumer's `file:` dependency to the member's
+    /// entry. Upstream asserts the `add -> addToCart` call, which this port
+    /// already reaches through the property's type; what ohpm adds is the
+    /// binding, by import through the entry's re-export. The module
+    /// reference names no path, so it stays unresolved, as upstream's
+    /// `isJsPathSpecifier` leaves a bare specifier (#2263).
+    #[test]
+    fn w724a1_ohpm_bare_import_resolves_to_the_members_entry() {
+        let project = Project::new()
+            .file("core/data/oh-package.json5", DATA_MANIFEST)
+            .file("core/data/Index.ets", DATA_INDEX)
+            .file("core/data/src/main/ets/CartRepository.ets", CART_REPOSITORY)
+            .file("feature/goods/oh-package.json5", GOODS_MANIFEST)
+            .file(
+                "feature/goods/src/main/ets/GoodsViewModel.ets",
+                "import { CartRepository } from \"data\";\n\nexport class GoodsViewModel {\n  private cart: CartRepository = new CartRepository();\n\n  add(id: string): void {\n    this.cart.addToCart(id);\n  }\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "file:feature/goods/src/main/ets/GoodsViewModel.ets" => imports => "class CartRepository",
+            resolved_by = "import"
+        );
+        assert_edge!(
+            project,
+            "property GoodsViewModel::cart" => references => "class CartRepository",
+            resolved_by = "import"
+        );
+        assert_edge!(
+            project,
+            "method GoodsViewModel::add" => calls => "method CartRepository::addToCart"
+        );
+        assert_unresolved!(
+            project,
+            "file:feature/goods/src/main/ets/GoodsViewModel.ets" => imports => "data"
+        );
+    }
+
+    /// Upstream `arkts-resolution.test.ts:378-445`: a member's own `main`
+    /// names its entry, and the `.ets` consumer binds through it. The `.ts`
+    /// consumer reaches the entry too, but follows its re-export of an
+    /// `.ets` module with TypeScript's extensions, which have no `.ets`
+    /// (upstream's `EXTENSION_RESOLUTION.typescript`), so its binding falls
+    /// to the name matcher, as upstream's does; upstream asserts only that
+    /// the type reaches the class. Before the member was known, `data` was
+    /// an npm package and the binding stayed unresolved.
+    #[test]
+    fn w724a1_ohpm_custom_main_serves_ets_and_ts_consumers() {
+        let project = Project::new()
+            .file(
+                "core/data/oh-package.json5",
+                "{\n  \"name\": \"data\",\n  \"main\": \"src/entry.ets\",\n}\n",
+            )
+            .file(
+                "core/data/src/entry.ets",
+                "export { CartRepository } from './CartRepository';\n",
+            )
+            .file("core/data/src/CartRepository.ets", CART_REPOSITORY)
+            .file(
+                "feature/goods/oh-package.json5",
+                "{\n  \"name\": \"goods\",\n  \"dependencies\": {\n    \"data\": \"file:../../core/data\",\n  },\n}\n",
+            )
+            .file(
+                "feature/goods/src/GoodsVm.ets",
+                "import { CartRepository } from \"data\";\nexport class GoodsVm {\n  private cart: CartRepository = new CartRepository();\n  add(id: string): void {\n    this.cart.addToCart(id);\n  }\n}\n",
+            )
+            .file(
+                "feature/goods/src/report.ts",
+                "import { CartRepository } from \"data\";\nexport function report(cart: CartRepository): string {\n  return typeof cart;\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "file:feature/goods/src/GoodsVm.ets" => imports => "class CartRepository",
+            resolved_by = "import"
+        );
+        assert_edge!(
+            project,
+            "file:feature/goods/src/report.ts" => imports => "class CartRepository",
+            resolved_by = "exact-match"
+        );
+        assert_edge!(project, "function report" => references => "class CartRepository");
+    }
+
+    /// An ArkTS relative import binds what the module it names exports, by
+    /// import, not by a same-named symbol elsewhere.
+    #[test]
+    fn w724a1_ets_relative_import_binds_through_the_module() {
+        let project = Project::new()
+            .file(
+                "pages/util.ets",
+                "export function helper(): number {\n  return 1;\n}\n",
+            )
+            .file(
+                "other/util.ets",
+                "export function helper(): number {\n  return 2;\n}\n",
+            )
+            .file(
+                "pages/Home.ets",
+                "import { helper } from './util';\n\nexport function run(): number {\n  return helper();\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "file:pages/Home.ets" => imports => "file:pages/util.ets",
+            resolved_by = "import"
+        );
+        assert_edge!(
+            project,
+            "function run" => calls => "function helper @pages/util.ets:1",
+            resolved_by = "import"
+        );
+    }
+
+    /// An `.ets` barrel's re-export forwards to the class it names, read
+    /// with the TypeScript rules (upstream `resolution/index.ts`, `b635dd46`
+    /// 982).
+    #[test]
+    fn w724a1_ets_barrel_reexport_reaches_the_class() {
+        let project = Project::new()
+            .file("core/Index.ets", "export { Repo } from './src/Repo';\n")
+            .file("core/src/Repo.ets", "export class Repo {\n  save(): void {}\n}\n")
+            .file("decoy/Repo.ets", "export class Repo {\n  save(): void {}\n}\n")
+            .file(
+                "app/App.ets",
+                "import { Repo } from '../core';\n\nexport function make(): Repo {\n  return new Repo();\n}\n",
+            )
+            .index();
+        assert_edge!(
+            project,
+            "function make" => instantiates => "class Repo @core/src/Repo.ets:1",
+            resolved_by = "import"
+        );
+    }
+
+    /// Upstream's precision rule: two manifests that point one dependency
+    /// name at different directories make it no member, so the binding of
+    /// the bare import stays unresolved instead of naming either member's
+    /// function (the module reference names no path and stays unresolved
+    /// whatever the members are; the call itself is the name matcher's, as
+    /// any call bound to a package outside the project is).
+    #[test]
+    fn w724a1_ohpm_ambiguous_dependency_stays_unresolved() {
+        let project = Project::new()
+            .file(
+                "app1/oh-package.json5",
+                "{ \"dependencies\": { \"common\": \"file:../libs/common1\" } }",
+            )
+            .file(
+                "app2/oh-package.json5",
+                "{ \"dependencies\": { \"common\": \"file:../libs/common2\" } }",
+            )
+            .file("libs/common1/Index.ets", "export function c1(): void {}\n")
+            .file("libs/common2/Index.ets", "export function c2(): void {}\n")
+            .file(
+                "app1/src/A.ets",
+                "import { c1 } from \"common\";\nexport function a(): void {\n  c1();\n}\n",
+            )
+            .index();
+        assert_unresolved!(project, "file:app1/src/A.ets" => imports => "c1");
+    }
+}

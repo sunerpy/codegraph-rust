@@ -4279,9 +4279,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             _ => {}
         }
+        // ArkTS declares variables as TypeScript does (upstream `b635dd46`
+        // tree-sitter.ts:3309-3312, #1186).
         if !matches!(
             self.spec.language(),
-            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::ArkTs
         ) {
             return;
         }
@@ -5998,9 +6004,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if !info.handled_refs {
             self.push_ref(&parent_id, &info.module_name, EdgeKind::Imports, node);
         }
+        // ArkTS binds imports as TypeScript does (upstream `b635dd46`
+        // tree-sitter.ts:4115-4118, #1186).
         if matches!(
             self.spec.language(),
-            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::ArkTs
         ) {
             self.emit_import_binding_refs(node, &parent_id);
         }
@@ -9565,12 +9577,13 @@ fn property_or_field_signature(node: SyntaxNode<'_>, name: &str, source: &str) -
 }
 
 /// Languages whose declarations' annotated types are `references` from them
-/// (upstream `TYPE_ANNOTATION_LANGUAGES`, G3).
+/// (upstream `TYPE_ANNOTATION_LANGUAGES`, G3; ArkTS since #1186).
 fn has_type_annotation_refs(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
             | Language::Tsx
+            | Language::ArkTs
             | Language::Rust
             | Language::Go
             | Language::Java
@@ -10181,6 +10194,46 @@ class Model {}
         assert!(has_node(&nodes, NodeKind::Import, "../foo"));
         assert!(has_ref(&refs, EdgeKind::Imports, "../foo"));
         assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    /// W7-24a1: each binding an ArkTS import statement makes is an `imports`
+    /// reference, as in TypeScript (upstream `tree-sitter.ts`, `b635dd46`
+    /// 4113-4121, lists arkts).
+    #[test]
+    fn w724a1_arkts_import_bindings_are_references() {
+        let src = "import { Foo, Bar as Baz } from '../foo';\nimport Def from './def';\nimport * as ns from './ns';\n";
+        let (_nodes, refs) = run("src/component.ets", src, Language::ArkTs);
+        for binding in ["Foo", "Baz", "Def", "ns"] {
+            assert!(
+                has_ref(&refs, EdgeKind::Imports, binding),
+                "{binding}: {refs:?}"
+            );
+        }
+        assert!(!has_ref(&refs, EdgeKind::Imports, "Bar"));
+    }
+
+    /// W7-24a1: ArkTS module-level `const`/`let` declarations are constants
+    /// and variables (upstream `tree-sitter.ts`, `b635dd46` 3309-3312).
+    #[test]
+    fn w724a1_arkts_module_declarations_are_constants_and_variables() {
+        let src = "export const ROUTE: string = 'pages/Detail';\nlet counter: number = 0;\n";
+        let (nodes, _refs) = run("src/routes.ets", src, Language::ArkTs);
+        assert!(has_node(&nodes, NodeKind::Constant, "ROUTE"), "{nodes:?}");
+        assert!(has_node(&nodes, NodeKind::Variable, "counter"), "{nodes:?}");
+    }
+
+    /// W7-24a1: an ArkTS declaration's annotated types are references from
+    /// it (upstream `TYPE_ANNOTATION_LANGUAGES`, `b635dd46` 7367-7369).
+    #[test]
+    fn w724a1_arkts_annotated_types_are_references() {
+        let src =
+            "export function report(cart: CartRepository): Summary {\n  return new Summary();\n}\n";
+        let (_nodes, refs) = run("src/report.ets", src, Language::ArkTs);
+        assert!(
+            has_ref(&refs, EdgeKind::References, "CartRepository"),
+            "{refs:?}"
+        );
+        assert!(has_ref(&refs, EdgeKind::References, "Summary"), "{refs:?}");
     }
 
     // ---- Solidity (.sol) extraction tier (#1170) ----

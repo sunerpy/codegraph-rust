@@ -182,7 +182,12 @@ framework's virtual module (`$app/…`, `astro:…`); an alias the resolver does
 not follow (`$lib/…`, `~/…`) stays the project's. A JS-family import's path
 alias comes from the `tsconfig.json` or `jsconfig.json` nearest the importing
 file below the root that declares `paths` (a monorepo app's own `@/*`, upstream
-#2165), then from the root's. Calls in Vue, Svelte and
+#2165), then from the root's. An ArkTS import resolves as a TypeScript one,
+with ArkTS's own extensions and ohpm's `Index.ets` entry, and a bare name an
+`oh-package.json5` `file:` dependency declares is the workspace member it
+names, which resolves to the member's `main`: a bounded walk reads every
+`oh-package.json5` of the project, and a name two manifests point at different
+directories, or a target or entry outside the project, is no member. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -976,7 +981,8 @@ that file's row rather than its source; the `class_heads_version` marker is
 withdrawn and restored with the others. Resolution also reads control files, which are no
 source files: the JS/TS path-alias configs along their `extends` chains (the
 root's, and those in each directory above a JavaScript-family file), the
-workspace manifests and the folders a workspace glob lists, the `package.json`
+workspace manifests and the folders a workspace glob lists, the
+`oh-package.json5` manifests the ohpm walk reads, the `package.json`
 and Deno manifests above each JavaScript-family file and the `package.json`
 files framework detection reads, the `angular.json` and `nx.json` in each
 directory above a JavaScript-family file (an Angular app's root is the

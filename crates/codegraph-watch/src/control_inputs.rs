@@ -139,6 +139,8 @@ impl ControlKind {
     /// Whether a file named `name` is a control file of this kind.
     fn names_file(self, name: &str) -> bool {
         match self {
+            // `oh-package.json5`: the ohpm manifests whose `file:`
+            // dependencies are workspace members (W7-24a1).
             Self::Js => matches!(
                 name,
                 "package.json"
@@ -148,6 +150,7 @@ impl ControlKind {
                     | "tsconfig.json"
                     | "jsconfig.json"
                     | "tsconfig.base.json"
+                    | "oh-package.json5"
             ),
             Self::Csharp => {
                 let lower = name.to_ascii_lowercase();
@@ -706,6 +709,46 @@ pub(crate) fn files_of(store: &Store, changed: &BTreeSet<ControlKind>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W7-24a1: an ohpm manifest is a JavaScript control file wherever it
+    /// sits, and each one the workspace walk reads is a Js input.
+    #[test]
+    fn w724a1_ohpm_manifests_are_js_control_inputs() {
+        assert!(is_control_file("oh-package.json5"));
+        assert!(is_control_file("feature/goods/oh-package.json5"));
+        assert!(!is_control_file("feature/goods/oh-package-lock.json5"));
+        let dir = std::env::temp_dir().join(format!(
+            "cg-ctl-ohpm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("core/data")).unwrap();
+        std::fs::create_dir_all(dir.join("feature/goods")).unwrap();
+        std::fs::write(
+            dir.join("core/data/oh-package.json5"),
+            "{ \"name\": \"data\", \"main\": \"Index.ets\" }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("feature/goods/oh-package.json5"),
+            "{ \"dependencies\": { \"data\": \"file:../../core/data\" } }",
+        )
+        .unwrap();
+        let digests = digests_of(ControlKind::Js, &dir, &[]);
+        for manifest in [
+            "core/data/oh-package.json5",
+            "feature/goods/oh-package.json5",
+        ] {
+            assert!(
+                digests.get(manifest).is_some_and(Option::is_some),
+                "{manifest} missing from {digests:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn control_files_are_named_by_kind() {

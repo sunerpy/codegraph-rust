@@ -381,6 +381,16 @@ take turns by the named symbol they hang from, so one long fan-out cannot fill
 the list, and the graph's edge order settles the rest, so a synced index and a
 fresh one list the same lines.
 
+A **Dynamic boundaries** section lists the sites in the bodies of the symbols
+the query picks out whose call target is chosen at runtime (a computed member call, a
+dynamic import, a `send`, reflective or `Proxy` dispatch, a string-keyed or
+typed message dispatch, an Objective-C selector, Python's `getattr`): the
+symbol, its file and line, the form and the site's source line, and, for a
+site whose key the source spells, the candidates the key suggests. Each body
+is read with its comments and string contents blanked, in its language's
+forms, an ArkTS body as a TypeScript one; a file that changed since it was
+indexed is not read.
+
 Explicit source paths in the query are resolved before fuzzy search and pinned
 to the front of the result. Quoted/backticked paths, `./`, and Windows
 separators are normalized; exact matches precede segment-aligned suffix

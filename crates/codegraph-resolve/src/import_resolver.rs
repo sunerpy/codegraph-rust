@@ -65,6 +65,19 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
             "/index.js",
         ],
         Language::Jsx => &[".jsx", ".js", "/index.jsx", "/index.js"],
+        // ArkTS imports `.ets` components and plain `.ts` logic modules;
+        // `/Index.ets` is ohpm's module entry (upstream #1186,
+        // `import-resolver.ts`, `b635dd46` line 35).
+        Language::ArkTs => &[
+            ".ets",
+            ".ts",
+            ".d.ts",
+            ".js",
+            "/Index.ets",
+            "/index.ets",
+            "/index.ts",
+            "/index.js",
+        ],
         Language::Svelte => &[
             ".ts",
             ".js",
@@ -100,14 +113,19 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
 }
 
 /// The first of `base_path`'s candidates the index holds (see
-/// [`resolve_import_path`]): a TypeScript `.js`-family specifier's own
-/// sources, then `language`'s extensions, then the path as written.
+/// [`resolve_import_path`]): a TypeScript or ArkTS `.js`-family specifier's
+/// own sources (ArkTS in TypeScript's order, upstream
+/// `EMITTED_SPECIFIER_LANGUAGES`, `b635dd46` 615-617), then `language`'s
+/// extensions, then the path as written.
 fn resolve_source_candidate(
     base_path: &str,
     language: Language,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let substitution = if matches!(language, Language::TypeScript | Language::Tsx) {
+    let substitution = if matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::ArkTs
+    ) {
         if let Some(stem) = base_path.strip_suffix(".mjs") {
             Some((stem, &[".mts", ".d.mts"][..]))
         } else if let Some(stem) = base_path.strip_suffix(".cjs") {
@@ -349,8 +367,8 @@ fn c_cpp_stdlib_headers() -> &'static BTreeSet<&'static str> {
 ///
 /// Wider than [`crate::types::ESM_LANGUAGES`] on purpose: that set is about
 /// VISIBILITY (which needs an import-mapping channel), this one is about
-/// SPECIFIER SHAPE, which Astro and ArkTS share even though they have no mapping
-/// channel yet.
+/// SPECIFIER SHAPE, which Astro shares even though it has no mapping channel
+/// yet (ArkTS has had one since W7-24a1).
 fn is_js_specifier_language(language: Language) -> bool {
     matches!(
         language,
@@ -410,8 +428,8 @@ fn is_external_import_with(
     // (#1537/#1536). `extract_import_mappings` already routes Svelte and Vue
     // through `extract_js_imports`, so an npm specifier in an SFC reached here and
     // was answered "not external" — which let an out-of-repo supertype bind an
-    // in-repo class. Astro and ArkTS carry the same specifier grammar; they have
-    // no import-mapping channel yet, so for them only import PATH resolution
+    // in-repo class. Astro and ArkTS carry the same specifier grammar; Astro has
+    // no import-mapping channel yet, so for it only import PATH resolution
     // changes, in the same correct direction.
     if is_js_specifier_language(language) {
         const NODE_BUILTINS: [&str; 12] = [
@@ -745,10 +763,12 @@ fn js_require_regex() -> &'static Regex {
 /// `import-resolver.ts:576-608`).
 pub fn extract_import_mappings(content: &str, language: Language) -> Vec<ImportMapping> {
     match language {
+        // ArkTS imports as TypeScript does (upstream #1186, `b635dd46` 983).
         Language::TypeScript
         | Language::JavaScript
         | Language::Tsx
         | Language::Jsx
+        | Language::ArkTs
         | Language::Svelte
         | Language::Vue => extract_js_imports(content),
         Language::Python => extract_python_imports(content),
@@ -1491,11 +1511,16 @@ fn rust_use_path_is_out_of_repo(
 const JS_IDENTIFIER: &str = r"[\p{ID_Start}_$][\p{ID_Continue}$\x{200C}\x{200D}]*";
 
 /// Extract JS/TS cross-file re-exports and explicit local export aliases
-/// (`extractReExports`, `import-resolver.ts:989-1042`).
+/// (`extractReExports`, `import-resolver.ts:989-1042`), ArkTS's too (upstream
+/// #1186, `b635dd46` 1443).
 pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     if !matches!(
         language,
-        Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
+        Language::TypeScript
+            | Language::JavaScript
+            | Language::Tsx
+            | Language::Jsx
+            | Language::ArkTs
     ) {
         return Vec::new();
     }
@@ -2141,7 +2166,8 @@ pub fn resolve_via_import(
         }
     }
 
-    // Whole-module / namespace imports → file→file edge (import-resolver.ts:1260-1269).
+    // Whole-module / namespace imports → file→file edge (import-resolver.ts:1260-1269),
+    // ArkTS's too (upstream #1186, `b635dd46` 1925-1929).
     if matches!(
         reference.language,
         Language::Python
@@ -2149,6 +2175,7 @@ pub fn resolve_via_import(
             | Language::Tsx
             | Language::JavaScript
             | Language::Jsx
+            | Language::ArkTs
     ) {
         if let Some(module_file) = resolve_module_import_to_file(reference, &imports, context) {
             return Some(module_file);
@@ -5114,9 +5141,15 @@ export default defaultTarget;
 "#;
 
         for language in Language::ALL {
+            // ArkTS reads re-exports as TypeScript does (W7-24a1, upstream
+            // #1186, `b635dd46` 1443).
             if matches!(
                 language,
-                Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
+                Language::TypeScript
+                    | Language::JavaScript
+                    | Language::Tsx
+                    | Language::Jsx
+                    | Language::ArkTs
             ) {
                 continue;
             }
@@ -5177,7 +5210,10 @@ export default defaultTarget;
         let mut by_name = BTreeMap::new();
         by_name.insert("@scope/ui".to_string(), "packages/ui".to_string());
         let ctx = TestContext {
-            workspace_packages: Some(WorkspacePackages { by_name }),
+            workspace_packages: Some(WorkspacePackages {
+                by_name,
+                entry_by_name: BTreeMap::new(),
+            }),
             ..Default::default()
         };
         assert!(!is_external_import(
@@ -5472,10 +5508,12 @@ export default defaultTarget;
             );
         }
 
+        // ArkTS substitutes as TypeScript does (W7-24a1, upstream
+        // `EMITTED_SPECIFIER_LANGUAGES`, `b635dd46` 615-617).
         for language in Language::ALL {
             if !matches!(
                 language,
-                Language::TypeScript | Language::Tsx | Language::Python
+                Language::TypeScript | Language::Tsx | Language::ArkTs | Language::Python
             ) {
                 assert_eq!(
                     resolve_import_path("./foo.js", "src/a.ts", language, &ctx),
@@ -5483,7 +5521,10 @@ export default defaultTarget;
                     "relative TS substitution leaked into {language:?}"
                 );
             }
-            if !matches!(language, Language::TypeScript | Language::Tsx) {
+            if !matches!(
+                language,
+                Language::TypeScript | Language::Tsx | Language::ArkTs
+            ) {
                 assert_eq!(
                     resolve_import_path("@/foo.js", "src/a.ts", language, &ctx),
                     None,
@@ -5627,7 +5668,10 @@ export default defaultTarget;
         let ctx = TestContext {
             project_root: "/proj".to_string(),
             existing_files: existing,
-            workspace_packages: Some(WorkspacePackages { by_name }),
+            workspace_packages: Some(WorkspacePackages {
+                by_name,
+                entry_by_name: BTreeMap::new(),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -7511,5 +7555,93 @@ export default defaultTarget;
             resolved.target_node_id, "constant:reproStore",
             "the line-6 local must not type the line-9 constant"
         );
+    }
+
+    /// W7-24a1: an ArkTS module tries upstream's ArkTS extensions
+    /// (`import-resolver.ts`, `b635dd46` line 35): `.ets` components first,
+    /// then plain `.ts` logic modules, and ohpm's `Index.ets` entry.
+    #[test]
+    fn w724a1_arkts_resolves_with_upstreams_extensions() {
+        assert_eq!(
+            extension_resolution(Language::ArkTs),
+            [
+                ".ets",
+                ".ts",
+                ".d.ts",
+                ".js",
+                "/Index.ets",
+                "/index.ets",
+                "/index.ts",
+                "/index.js",
+            ]
+        );
+        let ctx = TestContext {
+            existing_files: [
+                "pages/Home.ets",
+                "pages/util.ets",
+                "pages/model.ts",
+                "common/Index.ets",
+                "lib/emit.ts",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..TestContext::default()
+        };
+        let resolve =
+            |spec: &str| resolve_import_path(spec, "pages/Home.ets", Language::ArkTs, &ctx);
+        assert_eq!(resolve("./util").as_deref(), Some("pages/util.ets"));
+        assert_eq!(resolve("./model").as_deref(), Some("pages/model.ts"));
+        assert_eq!(resolve("../common").as_deref(), Some("common/Index.ets"));
+        // An emitted `.js` specifier names its TypeScript source, as for
+        // TypeScript (`EMITTED_SPECIFIER_LANGUAGES`, `b635dd46` 615-617).
+        assert_eq!(resolve("../lib/emit.js").as_deref(), Some("lib/emit.ts"));
+    }
+
+    /// W7-24a1: ArkTS reads its import statements and its re-exports the way
+    /// TypeScript does (`extractImportMappings` and `extractReExports`,
+    /// `b635dd46` 983 and 1443, both list arkts).
+    #[test]
+    fn w724a1_arkts_import_mappings_and_re_exports_read_like_typescript() {
+        let module =
+            "import { CartRepository } from \"data\";\nimport Def, { a as b } from './x';\n";
+        let mappings = extract_import_mappings(module, Language::ArkTs);
+        assert!(!mappings.is_empty(), "no ArkTS import mappings");
+        assert_eq!(
+            mappings,
+            extract_import_mappings(module, Language::TypeScript)
+        );
+        let barrel = "export { CartRepository } from './src/main/ets/CartRepository';\nexport * from './more';\n";
+        let re_exports = extract_re_exports(barrel, Language::ArkTs);
+        assert!(!re_exports.is_empty(), "no ArkTS re-exports");
+        assert_eq!(re_exports, extract_re_exports(barrel, Language::TypeScript));
+    }
+
+    /// W7-24a1: an ArkTS namespace import links the importing file to the
+    /// module file, as TypeScript's does (upstream #1186, `b635dd46`
+    /// 1925-1929).
+    #[test]
+    fn w724a1_arkts_namespace_import_links_the_module_file() {
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/a.ets".to_string(),
+            vec![ImportMapping {
+                local_name: "ns".to_string(),
+                exported_name: "*".to_string(),
+                source: "./ns".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from(["src/ns.ets".to_string()]),
+            import_mappings,
+            nodes: vec![file_node("src/ns.ets", Language::ArkTs)],
+            ..Default::default()
+        };
+        let r = reference("ns", EdgeKind::Imports, "src/a.ets", Language::ArkTs);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:src/ns.ets");
     }
 }

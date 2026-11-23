@@ -38,7 +38,7 @@ use std::sync::Arc;
 use codegraph_core::types::{Language, Node, NodeKind};
 
 use super::stage::View;
-use crate::context::{StoreResolutionContext, is_js_family_path_pub};
+use crate::context::{StoreResolutionContext, reads_re_exports_as_typescript};
 use crate::frameworks::route_href::RouteTables;
 use crate::import_resolver::{extract_import_mappings, extract_re_exports};
 use crate::name_matcher::{FileCallables, FileMethods, NameMatcherTables, PatternCheck};
@@ -129,9 +129,10 @@ impl ResolutionContext for ViewContext<'_, '_> {
     }
 
     /// Read as [`StoreResolutionContext`] reads it: in the barrel file's own
-    /// language, TypeScript for every file of the JavaScript family.
+    /// language, TypeScript for every file of the JavaScript family and every
+    /// ArkTS `.ets` one.
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
-        let language = if is_js_family_path_pub(file_path) {
+        let language = if reads_re_exports_as_typescript(file_path) {
             Language::TypeScript
         } else {
             language

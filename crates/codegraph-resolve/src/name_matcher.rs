@@ -4614,7 +4614,12 @@ impl PatternCheck {
 fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Regex, PatternCheck)> {
     let build = |src: String| Regex::new(&src).ok().map(|re| (re, PatternCheck::None));
     let pats: Vec<String> = match language {
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => vec![
+        // ArkTS reads as TypeScript (upstream `b635dd46` 9762, #1186).
+        Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::Jsx
+        | Language::ArkTs => vec![
             format!(r"\b{r}\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)"),
             format!(r"\b{r}\b\s*:\s*([A-Z][\w.$]*)"),
         ],
@@ -4961,7 +4966,11 @@ fn line_may_declare(language: Language, line: &str, receiver: &str) -> bool {
         }),
         // `svc = new T` and `svc: T`: the receiver followed, past
         // whitespace, by `=` and `new`, or by `:` and an uppercase letter.
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => {
+        Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::Jsx
+        | Language::ArkTs => {
             writes_assignment_of(line, receiver, "new")
                 || occurrences(line, receiver).any(|at| {
                     line[at + receiver.len()..]
@@ -5008,6 +5017,7 @@ fn has_receiver_patterns(language: Language) -> bool {
             | Language::Tsx
             | Language::JavaScript
             | Language::Jsx
+            | Language::ArkTs
             | Language::Python
             | Language::ObjC
             | Language::Java
@@ -8776,8 +8786,8 @@ pub fn match_function_ref(
         return Some(resolved);
     }
 
-    // A bare identifier cannot be a method value in JS/TS/C++/Python/PHP
-    // (methods need a receiver). Those match FUNCTIONS; Python additionally
+    // A bare identifier cannot be a method value in JS/TS/ArkTS/C++/Python/
+    // PHP (methods need a receiver). Those match FUNCTIONS; Python additionally
     // accepts CLASS targets through the shared predicate, but still not METHODS.
     let bare_fn_only = matches!(
         reference.language,
@@ -8785,6 +8795,7 @@ pub fn match_function_ref(
             | Language::Tsx
             | Language::JavaScript
             | Language::Jsx
+            | Language::ArkTs
             | Language::Cpp
             | Language::Python
             | Language::Php
@@ -11743,6 +11754,64 @@ mod tests {
         assert!(match_function_ref(&r, &ctx).is_none());
     }
 
+    /// W7-24a1: ArkTS is one of the languages whose bare identifier can only
+    /// be a function value (upstream `matchFunctionRef`'s `bareFnOnly`,
+    /// `name-matcher.ts`, `b635dd46` 1054-1058).
+    #[test]
+    fn w724a1_function_ref_bare_fn_only_excludes_methods_in_arkts() {
+        let m = mk(
+            "method:m",
+            NodeKind::Method,
+            "handler",
+            "Page::handler",
+            "pages/Page.ets",
+            Language::ArkTs,
+        );
+        let ctx = Ctx::default().name("handler", vec![m]);
+        let r = refv(
+            "handler",
+            EdgeKind::References,
+            "pages/Page.ets",
+            Language::ArkTs,
+            1,
+        );
+        assert!(match_function_ref(&r, &ctx).is_none());
+    }
+
+    /// W7-24a1: an ArkTS local's `= new T()` and `: T` type its receiver, as
+    /// TypeScript's do (upstream `localReceiverTypePatterns`, `case
+    /// 'arkts'`, `b635dd46` 9757-9765).
+    #[test]
+    fn w724a1_infer_local_receiver_type_reads_arkts() {
+        let source =
+            "function f() {\n  const repo = new CartRepository();\n  repo.addToCart();\n}\n";
+        let mut fn_node = mk(
+            "function:s",
+            NodeKind::Function,
+            "f",
+            "f",
+            "a.ets",
+            Language::ArkTs,
+        );
+        fn_node.start_line = 1;
+        fn_node.end_line = 4;
+        let ctx = Ctx::default()
+            .file("a.ets", source)
+            .nodes_in_file("a.ets", vec![fn_node]);
+        let r = refv(
+            "repo.addToCart",
+            EdgeKind::Calls,
+            "a.ets",
+            Language::ArkTs,
+            3,
+        );
+        assert_eq!(
+            infer_local_receiver_type("repo", &r, &ctx).as_deref(),
+            Some("CartRepository")
+        );
+        assert!(has_receiver_patterns(Language::ArkTs));
+    }
+
     #[test]
     fn function_ref_bare_class_target_matrix() {
         let cases = [
@@ -14419,6 +14488,37 @@ mod tests {
             "repo"
         ));
         assert!(writes_assignment_of("    aaa = new X();", "aa", "new"));
+    }
+
+    /// W7-24a1: an ArkTS line is prefiltered as a TypeScript one, since
+    /// ArkTS takes TypeScript's patterns: it admits every line a pattern
+    /// matches, and no plain assignment the other languages' check admits.
+    #[test]
+    fn w724a1_arkts_line_prefilter_is_typescripts() {
+        let lines = [
+            "    const repo = new CartRepository();",
+            "    repo=new Repo()",
+            "  private repo: CartRepository = new CartRepository();",
+            "    const repo = load();",
+            "    repo.addToCart(id);",
+            "    let repo, other;",
+        ];
+        let patterns = local_receiver_type_patterns_tagged(Language::ArkTs, "repo");
+        for line in lines {
+            assert_eq!(
+                line_may_declare(Language::ArkTs, line, "repo"),
+                line_may_declare(Language::TypeScript, line, "repo"),
+                "{line}"
+            );
+            if patterns.iter().any(|(re, _)| re.is_match(line)) {
+                assert!(line_may_declare(Language::ArkTs, line, "repo"), "{line}");
+            }
+        }
+        assert!(!line_may_declare(
+            Language::ArkTs,
+            "    const repo = load();",
+            "repo"
+        ));
     }
 
     #[test]

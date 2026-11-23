@@ -998,8 +998,9 @@ impl ResolutionContext for SnapshotResolutionContext {
                 Arc::new(match self.read_file_cached(file_path) {
                     Some(text) => {
                         // Re-key on the BARREL file's own extension (matches the
-                        // store context: js-family files parse as TypeScript).
-                        let lang = if crate::context::is_js_family_path_pub(file_path) {
+                        // store context: js-family and `.ets` files parse as
+                        // TypeScript).
+                        let lang = if crate::context::reads_re_exports_as_typescript(file_path) {
                             Language::TypeScript
                         } else {
                             language
