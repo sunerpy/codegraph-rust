@@ -2221,6 +2221,14 @@ matrix! {
     erlang_callback_added,
     erlang_app_src_appears,
     erlang_app_src_goes,
+    // W7-28: a JSX tag in a `.js` file renders as in `.jsx`.
+    javascript_rendered_component_appears,
+    javascript_rendered_component_file_deleted,
+    javascript_tag_removed,
+    javascript_tag_becomes_a_parameter_body_edit,
+    javascript_jsx_tag_forwarding_index_re_points,
+    javascript_react_lazy_value_module_gains_its_default,
+    javascript_react_lazy_value_tag_after_a_namesake_reference,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -2425,7 +2433,7 @@ fn tier_passes_recompute_an_index_of_the_last_synthesis_version() {
         }
         assert_eq!(
             support::project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "22".to_string())],
+            [("synthesis_version".to_string(), "23".to_string())],
             "[{driver}]"
         );
     }

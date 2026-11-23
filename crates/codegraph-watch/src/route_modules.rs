@@ -122,31 +122,15 @@ pub(crate) fn route_module_sites(
             .into_iter()
             .filter(|file| !reindexed.contains(file))
             .collect();
-        // One lookup a value, a language and whether a route names it: every
-        // reference so alike reads the same files.
-        type ValueKey = (String, String, &'static str, bool);
+        // One lookup a value, a language, whether a route names it and
+        // whether it is a JavaScript file's tag, the one JavaScript
+        // reference React's lookup reads (W7-28): every reference so alike
+        // reads the same files.
+        type ValueKey = (String, String, &'static str, bool, bool);
         let mut by_value: BTreeMap<ValueKey, Vec<FileReferenceSite>> = BTreeMap::new();
         let mut views: BTreeMap<ValueKey, RefView> = BTreeMap::new();
         for reference in store.same_file_value_references(&files)? {
-            let from_route = reference.from_node_id.starts_with("route:");
-            let key: ValueKey = (
-                reference.file_path.clone(),
-                reference.reference_name.clone(),
-                reference.language.as_str(),
-                from_route,
-            );
-            by_value
-                .entry(key.clone())
-                .or_default()
-                .push(FileReferenceSite {
-                    file_path: reference.file_path.clone(),
-                    site: Some(ReferenceSite {
-                        from_node_id: reference.from_node_id.clone(),
-                        line: reference.line,
-                        col: reference.col,
-                    }),
-                });
-            views.entry(key).or_insert_with(|| RefView {
+            let view = RefView {
                 row_id: reference.id,
                 from_node_id: reference.from_node_id,
                 reference_name: reference.reference_name,
@@ -157,7 +141,26 @@ pub(crate) fn route_module_sites(
                 language: reference.language,
                 is_function_ref: reference.is_function_ref,
                 reference_subkind: reference.reference_subkind,
-            });
+            };
+            let key: ValueKey = (
+                view.file_path.clone(),
+                view.reference_name.clone(),
+                view.language.as_str(),
+                view.from_node_id.starts_with("route:"),
+                resolver.is_javascript_tag(&view, &context),
+            );
+            by_value
+                .entry(key.clone())
+                .or_default()
+                .push(FileReferenceSite {
+                    file_path: view.file_path.clone(),
+                    site: Some(ReferenceSite {
+                        from_node_id: view.from_node_id.clone(),
+                        line: view.line,
+                        col: view.column,
+                    }),
+                });
+            views.entry(key).or_insert(view);
         }
         for (key, view) in &views {
             let back = resolver

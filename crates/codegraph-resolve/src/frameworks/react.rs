@@ -100,14 +100,16 @@ impl FrameworkResolver for ReactResolver {
             });
         }
         // Pattern 1 reads a component USED in markup, which only parses in
-        // .tsx/.jsx. Without this gate every PascalCase TYPE in a plain .ts
-        // file went through component resolution: in a monorepo with
+        // .tsx/.jsx/.js. Without this gate every PascalCase TYPE in a plain
+        // .ts file went through component resolution: in a monorepo with
         // same-named classes per package (#764, amplication), a GraphQL-types
         // file's own `Account` type lost to an arbitrary `Account` class in
-        // another package.
-        let component = matches!(reference.language, Language::Tsx | Language::Jsx)
-            && is_pascal_case(name)
-            && !is_built_in_type(name);
+        // another package. In a JavaScript file only a tag takes it (W7-28,
+        // OD-B61): colby's Pattern 1 reads tsx and jsx references alone, and
+        // its jsx-render pass finds a `.js` tag's child by these rules.
+        let markup = matches!(reference.language, Language::Tsx | Language::Jsx)
+            || crate::jsx_tags::is_javascript_tag(reference, context);
+        let component = markup && is_pascal_case(name) && !is_built_in_type(name);
         let hook = name.starts_with("use") && name.len() > 3;
         let provided = name.ends_with("Context") || name.ends_with("Provider");
         if !(component || hook || provided) {
@@ -210,8 +212,8 @@ impl FrameworkResolver for ReactResolver {
     /// inside, loads (`declaredComponent`), with every barrel the lookup
     /// reads on the way. KEEP-RUST: a JSX tag's static reference to such a
     /// value reads the same files (upstream draws that edge in its
-    /// jsx-render pass), so a tsx or jsx `references` reference is read the
-    /// same way.
+    /// jsx-render pass), so a tsx or jsx `references` reference, and a
+    /// JavaScript file's tag (W7-28), is read the same way.
     fn lazy_modules(&self, reference: &RefView, context: &dyn ResolutionContext) -> Vec<String> {
         let reads = RefCell::new(BTreeSet::new());
         let name = reference.reference_name.as_str();
@@ -226,7 +228,8 @@ impl FrameworkResolver for ReactResolver {
             lazy_route_component(spec, &reference.file_path, context, Some(&reads));
         } else if (route
             || (matches!(reference.language, Language::Tsx | Language::Jsx)
-                && reference.reference_kind == EdgeKind::References))
+                && reference.reference_kind == EdgeKind::References)
+            || crate::jsx_tags::is_javascript_tag(reference, context))
             && is_pascal_case(own)
             && !is_built_in_type(own)
             && let Some(declaration) = declared_value(own, &reference.file_path, context)
@@ -1893,6 +1896,76 @@ mod tests {
                 .resolve(&elsewhere, &ctx)
                 .map(|r| r.target_node_id),
             Some("function:src/components/Home.tsx:Home:1".to_string())
+        );
+    }
+
+    /// W7-28 (OD-B61): in a JavaScript file only a JSX tag takes the
+    /// component rules, as colby reads tags there in its jsx-render pass and
+    /// no JavaScript reference in its Pattern 1: the tag `<Panel />` renders
+    /// what the file's own `observer(function PanelInner…)` value wraps,
+    /// while the value's call, its `new`, a function value of the name and a
+    /// name written after `< ` (no tag by its text) take no React rule. A
+    /// `.jsx` file's call of the value takes the rule.
+    #[test]
+    fn in_a_javascript_file_only_a_tag_takes_the_component_rules() {
+        let source = "import { observer } from 'mobx-react';\n\
+                      const Panel = observer(function PanelInner() {\n\
+                      \x20 return <div />;\n\
+                      });\n\
+                      export function App() {\n\
+                      \x20 Panel();\n\
+                      \x20 new Panel();\n\
+                      \x20 register(Panel);\n\
+                      \x20 return [<Panel />, < Panel />];\n\
+                      }\n";
+        let mut ctx = Ctx::default();
+        for (file, language) in [
+            ("src/App.js", Language::JavaScript),
+            ("src/App.jsx", Language::Jsx),
+        ] {
+            ctx = ctx.file(file, source);
+            for (kind, name, lines, columns) in [
+                (NodeKind::Constant, "Panel", (2, 4), (6, 2)),
+                (NodeKind::Function, "Panel::PanelInner", (2, 4), (23, 1)),
+            ] {
+                ctx = ctx.node(Node {
+                    language,
+                    ..placed(kind, name, file, lines, columns)
+                });
+            }
+        }
+        let at = |kind: EdgeKind, (line, column): (i64, i64), is_function_ref: bool| RefView {
+            line,
+            column,
+            is_function_ref,
+            ..a_ref("Panel", kind, "src/App.js", Language::JavaScript)
+        };
+        let tag = at(EdgeKind::References, (9, 11), false);
+        assert_eq!(
+            ReactResolver.resolve(&tag, &ctx).map(|r| r.target_node_id),
+            Some("function:src/App.js:Panel::PanelInner:2".to_string())
+        );
+        for reference in [
+            at(EdgeKind::Calls, (6, 2), false),
+            at(EdgeKind::Instantiates, (7, 6), false),
+            at(EdgeKind::References, (8, 11), true),
+            at(EdgeKind::References, (9, 23), false),
+        ] {
+            assert!(
+                ReactResolver.resolve(&reference, &ctx).is_none(),
+                "{reference:?}"
+            );
+        }
+        let jsx_call = RefView {
+            line: 6,
+            column: 2,
+            ..a_ref("Panel", EdgeKind::Calls, "src/App.jsx", Language::Jsx)
+        };
+        assert_eq!(
+            ReactResolver
+                .resolve(&jsx_call, &ctx)
+                .map(|r| r.target_node_id),
+            Some("function:src/App.jsx:Panel::PanelInner:2".to_string())
         );
     }
 

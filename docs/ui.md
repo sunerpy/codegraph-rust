@@ -243,12 +243,6 @@ Rust graph holds different facts, the viewer shows what this index holds:
   screen's chain of conditions. Upstream reuses one site object for every
   screen and rewrites its `when` for each, so its second screen repeats the
   chain's conditions and every link holding the site shows the last value.
-- JSX in a `.js` file renders nothing here: the extractor reads a JSX component
-  reference in `tsx` and `jsx` files only (see JSX render in
-  [`KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md)). In a React app written in
-  `.js`, a way that runs through a rendered component is lost: a header's link
-  is drawn from the header, as an origin, rather than from every screen, and a
-  screen's Steps miss the screens its child components link to.
 - A component wrapped where it is declared (`memo(Capture)`,
   `styled(Button)`) has no edge from the wrapper to what it wraps, upstream's
   `wrapped` edge, and the reference to the wrapped component is made by the

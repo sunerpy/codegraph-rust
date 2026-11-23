@@ -9095,8 +9095,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// Whether this file's capitalized JSX tags are component references:
+    /// a tsx or jsx file's, and a JavaScript file's own (W7-28, OD-B46;
+    /// colby's jsx-render pass reads the tags of every language that can
+    /// write JSX). A Vue or Svelte `<script>` block is extracted as
+    /// JavaScript under its component's path, and colby folds the block
+    /// into the component's language, whose tags it does not read: a file
+    /// an embedded extractor reads records none.
+    fn reads_jsx_tags(&self) -> bool {
+        match self.spec.language() {
+            Language::Tsx | Language::Jsx => true,
+            Language::JavaScript => {
+                crate::embedded::detect_embedded_language(self.file_path).is_none()
+            }
+            _ => false,
+        }
+    }
+
     fn extract_jsx_component_ref(&mut self, node: SyntaxNode<'tree>) {
-        if !matches!(self.spec.language(), Language::Tsx | Language::Jsx) {
+        if !self.reads_jsx_tags() {
             return;
         }
         let Some(from_id) = self.node_stack.last().cloned() else {
@@ -11584,6 +11601,48 @@ impl Base for u32 { fn id(&self) -> u32 { 3 } }
         );
         assert_eq!(super::normalize_parenthesized_go_conversion("plain"), None);
         assert_eq!(super::normalize_parenthesized_go_conversion("(123)"), None);
+    }
+
+    /// W7-28 (OD-B46): a JavaScript file records its capitalized JSX tags
+    /// as `References` at the tag's name, as a `.jsx` file does, whatever
+    /// its extension. A Vue or Svelte script block, extracted as JavaScript
+    /// under its component's path, records none: colby folds a block into
+    /// its component's language, whose tags it does not read.
+    #[test]
+    fn a_javascript_file_records_its_jsx_tags_and_a_script_block_does_not() {
+        let source = "import { Card } from './Card';\nexport function App() {\n  return <div><Card title=\"x\" /></div>;\n}\n";
+        for file in ["src/App.js", "src/App.mjs", "src/App.cjs"] {
+            let result = extract_source(file, source, None);
+            assert!(result.errors.is_empty(), "{file}: {:?}", result.errors);
+            let tags: Vec<&UnresolvedRef> = result
+                .unresolved_references
+                .iter()
+                .filter(|r| r.reference_kind == EdgeKind::References && r.reference_name == "Card")
+                .collect();
+            assert_eq!(tags.len(), 1, "{file}: {:?}", result.unresolved_references);
+            assert_eq!(tags[0].language, Language::JavaScript, "{file}");
+            assert_eq!((tags[0].line, tags[0].col), (3, 15), "{file}");
+        }
+        for (file, source) in [
+            (
+                "src/Comp.vue",
+                "<template><div /></template>\n<script lang=\"jsx\">\nimport Card from './Card';\nexport default {\n  render() {\n    return <Card />;\n  },\n};\n</script>\n",
+            ),
+            (
+                "src/Comp.svelte",
+                "<script>\n  import Card from './Card';\n  const view = () => <Card />;\n</script>\n<div />\n",
+            ),
+        ] {
+            let result = extract_source(file, source, None);
+            assert!(
+                !result
+                    .unresolved_references
+                    .iter()
+                    .any(|r| r.reference_kind == EdgeKind::References && r.reference_name == "Card"),
+                "{file}: {:?}",
+                result.unresolved_references
+            );
+        }
     }
 
     #[test]

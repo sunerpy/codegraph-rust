@@ -596,7 +596,7 @@ at another version rebuilds every row and re-resolves every JavaScript-family,
 Swift and Objective-C file of a project a bridge resolver is detected in.
 They are not a canonical surface.
 
-`synthesis_version` (22) vouches that the synthesized edges are the synthesis
+`synthesis_version` (23) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the

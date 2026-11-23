@@ -251,30 +251,14 @@ async fn react_router_draws_a_layouts_links_on_every_screen_inside_it_and_only_t
 
 /// Upstream `react-router.test.ts:1676-1684`: the header's link is drawn from
 /// every screen, a guard's redirect from the screens it guards.
-///
-/// This port's graph keeps no render edge for JSX in a `.js` file (the
-/// fixture's `App.js` renders `<Header />`), so the header reaches no screen
-/// and its link starts from the `Header` origin, not from each screen: a
-/// graph difference this endpoint does not change. The guards' half holds.
 #[tokio::test]
 async fn react_router_draws_the_headers_link_from_every_screen_and_a_guards_redirect_from_its_screens()
  {
     let project = Project::indexed(fixtures::RR_PROSHOP_V2);
     let screens = screens_of(&project).await;
     for from in ["/", "/login", "/shipping", "/admin/orderlist"] {
-        assert!(!linked(&screens, from, "/cart"), "{from}: {screens}");
+        assert!(linked(&screens, from, "/cart"), "{from}: {screens}");
     }
-    let header = items(&screens["origins"])
-        .iter()
-        .find(|origin| origin["node"]["name"] == "Header")
-        .unwrap_or_else(|| panic!("{screens}"));
-    let cart = at(&screens, "/cart");
-    assert!(
-        items(&screens["links"])
-            .iter()
-            .any(|link| link["from"] == header["id"] && link["to"] == cart),
-        "{screens}"
-    );
     assert!(linked(&screens, "/shipping", "/login"));
     assert!(linked(&screens, "/admin/orderlist", "/login"));
     assert!(!linked(&screens, "/cart", "/login"));

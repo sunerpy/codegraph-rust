@@ -1699,6 +1699,14 @@ impl ReferenceResolver {
         files.into_iter().collect()
     }
 
+    /// Whether `reference` is a JSX tag of a JavaScript file, the one
+    /// JavaScript reference React's component rules and its lookup through a
+    /// lazy value read (W7-28): a sync asks [`Self::lazy_modules`] of a tag
+    /// apart from a reference of the name that is none.
+    pub fn is_javascript_tag(&self, reference: &RefView, context: &dyn ResolutionContext) -> bool {
+        crate::jsx_tags::is_javascript_tag(reference, context)
+    }
+
     /// The file a route's module path names from `from_file`, read the way
     /// React reads a lazy route's module (`lazyModuleFile`): by the route
     /// file's own extensions, else by TypeScript's (W7-23a).

@@ -952,10 +952,14 @@ regex engine), is not listed.
   `references` edge reaches, a component, function, class or value, never
   a method. colby scans a file's text for `<Name` and finds the child by
   name (`jsxChild`, `declaredComponent` and its local-binding and export
-  lookups). The tags are the ones the syntax tree gives in tsx and jsx
-  files, so JSX in a `.js` file renders nothing here: the walker's
-  `extract_jsx_component_ref` records a tag's `references` edge for the
-  `tsx` and `jsx` languages only (`walker.rs`). A type argument
+  lookups). The tags are the ones the syntax tree gives in tsx, jsx and
+  JavaScript files (`extract_jsx_component_ref`, `walker.rs`, W7-28); a
+  Vue or Svelte `<script>` block's are none, as in colby, which folds a
+  block into its component's language and reads no tag of it. In a
+  JavaScript file only a tag takes React's component rules (the file's
+  own value, the module a project import names, a local's tag), as
+  colby's Pattern 1 reads tsx and jsx references alone
+  (`jsx_tags::is_javascript_tag`). A type argument
   (`Array<Box>`, `useState<Box>()`) is no tag, where colby's pattern reads
   one. A tag outside every function renders from the value or the file
   the syntax tree gives it to; colby decides by line, and a line a value
@@ -965,7 +969,12 @@ regex engine), is not listed.
   (`synthesis/jsx.rs`). colby's default-import fallback (#2137) takes the
   imported file's component only when that file declares exactly one; a
   default import here binds the first component the file exports
-  (`import_resolver.rs`).
+  (`import_resolver.rs`). React's Pattern 1 takes the first component of
+  a tag's name in the file's directory (`resolve_component`,
+  `frameworks/react.rs`), so a file that declares the component itself
+  can render a namesake from another file there; colby's `jsxChild`
+  takes the file's own declaration first. This holds for tsx, jsx and
+  JavaScript tags alike and is left for the next round (OD-B67).
 - **A file that drifted since it was indexed (W7-14).** The stage reads a
   file only while its size and modification time, or its content hash, are
   the ones its file row records, the MCP engine's freshness probe; a drifted
@@ -1047,7 +1056,11 @@ regex engine), is not listed.
 ### Extraction
 
 - **Value references (#897, OD-8).** Always on: colby's
-  `CODEGRAPH_VALUE_REFS=0` switch is not ported (`value_refs.rs`).
+  `CODEGRAPH_VALUE_REFS=0` switch is not ported (`value_refs.rs`). The
+  languages are colby's but for jsx: a `.jsx` file records no value
+  reference where the same code in a `.js` or `.tsx` file does
+  (`has_value_refs`). Adding jsx changes every `.jsx` file's graph and is
+  left for the next round (OD-B68).
 - **Property types (W2-03d, owner 2026-10-11, OD-8).** A Kotlin or PHP
   property's declared type is a `references` edge from its field; colby reads
   none. A Swift property's type annotation is a reference too (W2-03c), which in

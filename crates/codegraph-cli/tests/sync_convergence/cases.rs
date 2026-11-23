@@ -27658,3 +27658,156 @@ pub fn erlang_app_src_goes() -> Case {
             "namespace sample_app",
         )
 }
+
+// ----- W7-28 (OD-B46): a JSX tag in a `.js` file renders as in `.jsx` -----
+
+/// [`JSX_APP`] written in `.js`.
+const JS_JSX_APP: &str =
+    "import { Card } from './card';\nexport function App() {\n  return <Card />;\n}\n";
+
+/// W7-28 ([`tsx_rendered_component_appears`] in `.js`): the component a
+/// `.js` file's tag imports appears in a new file; the unchanged parent
+/// renders it.
+pub fn javascript_rendered_component_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript])
+        .file("src/app.js", JS_JSX_APP)
+        .write("src/card.js", JSX_CARD)
+        .edge_metadata_after(
+            ("function App", "calls", "function Card"),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-28 ([`tsx_rendered_component_file_deleted`] in `.js`): one component
+/// a `.js` file renders has its file deleted; the parent keeps rendering
+/// the other.
+pub fn javascript_rendered_component_file_deleted() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::JavaScript])
+        .file(
+            "src/app.js",
+            "import { Card } from './card';\nimport { Badge } from './badge';\nexport function App() {\n  return (\n    <div>\n      <Card />\n      <Badge />\n    </div>\n  );\n}\n",
+        )
+        .file("src/card.js", JSX_CARD)
+        .file(
+            "src/badge.js",
+            "export function Badge() {\n  return <span />;\n}\n",
+        )
+        .remove("src/card.js")
+        .edge_before("function App", "calls", "function Card")
+        .edge_metadata_after(
+            ("function App", "calls", "function Badge"),
+            "synthesizedBy",
+            "jsx-render",
+        )
+}
+
+/// W7-28 ([`tsx_tag_removed`] in `.js`): the tag is edited out of the
+/// `.js` parent; its edge goes with it.
+pub fn javascript_tag_removed() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("src/app.js", JS_JSX_APP)
+        .file("src/card.js", JSX_CARD)
+        .write(
+            "src/app.js",
+            "import { Card } from './card';\nexport function App() {\n  return null;\n}\n",
+        )
+        .edge_before("function App", "calls", "function Card")
+        .no_edge_after("function App", "calls", "function Card")
+}
+
+/// W7-28 ([`tsx_tag_becomes_a_parameter_body_edit`] in `.js`, upstream
+/// #2442): a `.js` tag whose name the component comes to bind as a
+/// parameter renders that local, so the edge to another file's component
+/// of the name goes.
+pub fn javascript_tag_becomes_a_parameter_body_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", "{\"dependencies\":{\"react\":\"^18.0.0\"}}\n")
+        .file(
+            "src/Widget.js",
+            "export function Widget() {\n  return <div />;\n}\n",
+        )
+        .file(
+            "src/Widgets.js",
+            "export function Widgets({ widgets }) {\n  return <div>{widgets.map((item, index) => <Widget key={index} />)}</div>;\n}\n",
+        )
+        .write(
+            "src/Widgets.js",
+            "export function Widgets({ widgets }) {\n  return <div>{widgets.map((Widget, index) => <Widget key={index} />)}</div>;\n}\n",
+        )
+        .edge_before("function Widgets", "references", "function Widget @src/Widget.js")
+        .no_edge_after("function Widgets", "references", "function Widget @src/Widget.js")
+}
+
+/// W7-28 ([`tsx_jsx_tag_forwarding_index_re_points`] in `.js`, upstream
+/// #2563): only the index changes which module it forwards; the `.js` page
+/// that renders the tag is untouched and draws it to the other module's
+/// component.
+pub fn javascript_jsx_tag_forwarding_index_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::JavaScript])
+        .file("package.json", MOBX_REACT_PACKAGE)
+        .file("src/components/Sidebar/Aside.js", ASIDE_SIDEBAR)
+        .file("src/components/Sidebar/App.js", APP_SIDEBAR)
+        .file("src/components/Sidebar/Shared.js", SHARED_SIDEBAR)
+        .file("src/components/Sidebar/index.js", INDEX_FORWARDS_APP)
+        .file("src/scenes/Home.js", HOME_RENDERS_SIDEBAR)
+        .write(
+            "src/components/Sidebar/index.js",
+            "import Sidebar from './Shared';\n\nexport default Sidebar;\n",
+        )
+        .edge_before("function Home", "references", "function AppSidebar")
+        .edge_after("function Home", "references", "function SharedSidebar")
+        .no_edge_after("function Home", "references", "function AppSidebar")
+}
+
+/// W7-28 ([`tsx_react_lazy_value_module_gains_its_default`] in `.js`, lane
+/// V): the module a `.js` file's lazy value loads gains its default
+/// export; the route and the app's `<Docs />` both reach the page.
+pub fn javascript_react_lazy_value_module_gains_its_default() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/App.js", W723_LAZY_VALUE_APP)
+        .file(
+            "src/pages/Team.js",
+            "export default function Team() { return null; }\n",
+        )
+        .file(
+            "src/pages/Docs.js",
+            "export function DocsPage() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs.js",
+            "export function DocsPage() { return null; }\nexport default DocsPage;\n",
+        )
+        .edge_after(
+            "route src/App.js::route:/docs",
+            "references",
+            "function DocsPage",
+        )
+        .edge_after("function App", "references", "function DocsPage")
+}
+
+/// W7-28 (lane V's key): the `.js` file also names its lazy value in
+/// `< Docs />`, a space after the `<`, before the app's `<Docs />`. Only a
+/// tag takes React's component rules in a JavaScript file, so only the
+/// app's `<Docs />` comes to reach the page the module now exports; the
+/// other stays the value. One lookup for both references, by name, would
+/// ask the first, which reads no module, and the tag would never go back.
+pub fn javascript_react_lazy_value_tag_after_a_namesake_reference() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file(
+            "src/App.js",
+            "import { lazy } from 'react';\nconst Docs = lazy(() => import('./pages/Docs'));\nexport function Preview() {\n  return < Docs />;\n}\nexport function App() {\n  return <Docs />;\n}\n",
+        )
+        .file(
+            "src/pages/Docs.js",
+            "export function DocsPage() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs.js",
+            "export function DocsPage() { return null; }\nexport default DocsPage;\n",
+        )
+        .edge_after("function App", "references", "function DocsPage")
+        .no_edge_after("function Preview", "references", "function DocsPage")
+}

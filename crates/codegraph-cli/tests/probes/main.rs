@@ -29268,7 +29268,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "22".to_string())]
+            [("synthesis_version".to_string(), "23".to_string())]
         );
     }
 
@@ -30985,7 +30985,8 @@ mod synthesis {
     /// What renders nothing: an intrinsic or member tag, a type argument, a
     /// tag with a space after `<`, a tag of a declared package (#2475), a
     /// component rendering itself, a tag whose reference reaches a method, and
-    /// any tag of a `.ts` or `.js` file.
+    /// any tag of a `.ts` file. A `.js` file's tag renders (W7-28,
+    /// `w728_a_javascript_component_renders_its_tags`).
     #[test]
     fn w714e_what_renders_nothing() {
         let project = Project::new()
@@ -31006,7 +31007,6 @@ mod synthesis {
                 "src/helpers.tsx",
                 "export class Helpers {\n  Helper() {\n    return 1;\n  }\n}\nexport function Uses() {\n  return <Helper />;\n}\n",
             )
-            .file("src/plain.js", "import { Button } from './button';\nexport function Plain() {\n  return <Button />;\n}\n")
             .file("src/plain.ts", "import { Button } from './button';\nexport class Box {}\nexport function Typed(raw: unknown) {\n  const v = <Box>raw;\n  return [Button, v];\n}\nexport const LIMIT_MAX = 3;\nexport function Check(count: number) {\n  return count <LIMIT_MAX ;\n}\n")
             .index();
         let graph = graph_of(&project);
@@ -31110,6 +31110,446 @@ mod synthesis {
                 && !link.contains("Holder")
                 && !link.contains("Widget")),
             "{links:?}"
+        );
+    }
+
+    // ----- W7-28 (OD-B46): a JSX tag in a `.js` file renders as in `.jsx` --
+
+    /// The package of the W7-28 app.
+    const W728_PACKAGE: &str = "{\"name\":\"probe\",\"private\":true,\"dependencies\":{\"react\":\"18\",\"react-dom\":\"18\",\"react-router-dom\":\"6\"}}\n";
+
+    /// A React app written in `.js`: an entry file, an app rendering
+    /// imported, unimported, member and parameter tags and a package's, a
+    /// top-level value's tag, and a class component.
+    const W728_APP: [(&str, &str); 7] = [
+        (
+            "src/index.js",
+            "import React from 'react';\nimport ReactDOM from 'react-dom';\nimport App from './App';\nReactDOM.render(<App />, document.getElementById('root'));\n",
+        ),
+        (
+            "src/App.js",
+            "import { Routes, Route } from 'react-router-dom';\nimport Header from './components/Header';\nimport { Card } from './components/Card';\nimport * as UI from './components/ui';\n\nconst ICONS = { home: <HomeIcon /> };\n\nfunction HomeIcon() {\n  return <svg />;\n}\n\nexport default function App({ items }) {\n  const renderRow = (Widget) => <Widget />;\n  return (\n    <>\n      <Header />\n      <UI.Panel />\n      <Footer />\n      <Routes>\n        <Route path=\"/\" element={<Card title=\"x\" />} />\n      </Routes>\n      {items.map(renderRow)}\n    </>\n  );\n}\n\nexport class Legacy extends React.Component {\n  render() {\n    return <Card title=\"legacy\" />;\n  }\n}\n",
+        ),
+        (
+            "src/components/Card.js",
+            "export function Card({ title }) {\n  return <div>{title}</div>;\n}\n",
+        ),
+        (
+            "src/components/Footer.js",
+            "export default function Footer() {\n  return <footer />;\n}\n",
+        ),
+        (
+            "src/components/Header.js",
+            "import { Link } from 'react-router-dom';\nexport default function Header() {\n  return <header><Link to=\"/cart\">Cart</Link></header>;\n}\n",
+        ),
+        (
+            "src/components/ui.js",
+            "export function Panel() {\n  return <section />;\n}\n",
+        ),
+        (
+            "src/components/Widget.js",
+            "export function Widget() {\n  return <span />;\n}\n",
+        ),
+    ];
+
+    /// React's component rules in `.js`: a tag imported through an index
+    /// that forwards a module's wrapped default export (#2563), a tag of the
+    /// file's own lazy value (#2420), a tag two same-named components match,
+    /// and a Vue component whose JSX script block renders a tag.
+    const W728_RULES: [(&str, &str); 11] = [
+        (
+            "src/Ambiguous.js",
+            "export function Amb() {\n  return <Widget />;\n}\n",
+        ),
+        (
+            "src/Card.js",
+            "export default function Card() {\n  return <div />;\n}\n",
+        ),
+        (
+            "src/components/Sidebar/App.js",
+            "import { observer } from 'mobx-react';\n\nfunction AppSidebar() {\n  return <nav />;\n}\n\nexport default observer(AppSidebar);\n",
+        ),
+        (
+            "src/components/Sidebar/Aside.js",
+            "export function Sidebar() {\n  return <aside />;\n}\n",
+        ),
+        (
+            "src/components/Sidebar/index.js",
+            "import Sidebar from './App';\n\nexport default Sidebar;\n",
+        ),
+        (
+            "src/Comp.vue",
+            "<template><div /></template>\n<script lang=\"jsx\">\nimport Card from './Card';\nexport default {\n  render() {\n    return <Card />;\n  },\n};\n</script>\n",
+        ),
+        (
+            "src/Lazy.js",
+            "import { lazy } from 'react';\nconst Docs = lazy(() => import('./pages/Docs'));\nexport function Shell() {\n  return <Docs />;\n}\n",
+        ),
+        (
+            "src/one/Widget.js",
+            "export function Widget() {\n  return <i />;\n}\n",
+        ),
+        (
+            "src/pages/Docs.js",
+            "export function DocsPage() { return null; }\nexport default DocsPage;\n",
+        ),
+        (
+            "src/scenes/Home.js",
+            "import Sidebar from '../components/Sidebar';\n\nexport function Home() {\n  return <main><Sidebar /></main>;\n}\n",
+        ),
+        (
+            "src/two/Widget.js",
+            "export function Widget() {\n  return <b />;\n}\n",
+        ),
+    ];
+
+    /// A project of `package` and `files`.
+    fn w728_project(package: &str, files: &[(&str, &str)]) -> Project {
+        files.iter().fold(
+            Project::new().file("package.json", package),
+            |project, (path, text)| project.file(path, text),
+        )
+    }
+
+    /// The `references` edges written at a JSX tag of `files` (right after a
+    /// `<`) and the `jsx-render` edges, each end as its file without the
+    /// extension and its qualified name, sorted: what a twin of the tree in
+    /// another extension draws alike.
+    fn rendered_rows(graph: &Graph, files: &[(String, String)]) -> Vec<String> {
+        let stem = |path: &str| {
+            path.rsplit_once('.')
+                .map_or(path, |(stem, _)| stem)
+                .to_string()
+        };
+        let end = |id: &str| {
+            graph.node(id).map_or_else(
+                || id.to_string(),
+                |node| {
+                    if node.kind == "file" {
+                        format!("file:{}", stem(&node.file_path))
+                    } else {
+                        format!("{}::{}", stem(&node.file_path), node.qualified_name)
+                    }
+                },
+            )
+        };
+        let at_tag = |edge: &EdgeRow| {
+            let (Some(line), Some(col)) = (edge.line, edge.col) else {
+                return false;
+            };
+            let Some(text) = graph.node(&edge.source).and_then(|source| {
+                files
+                    .iter()
+                    .find(|(path, _)| *path == source.file_path)
+                    .map(|(_, text)| text)
+            }) else {
+                return false;
+            };
+            usize::try_from(line - 1)
+                .ok()
+                .and_then(|row| text.lines().nth(row))
+                .zip(usize::try_from(col).ok().and_then(|col| col.checked_sub(1)))
+                .and_then(|(row, before)| row.as_bytes().get(before).copied())
+                == Some(b'<')
+        };
+        let mut rows: Vec<String> = graph
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                if edge.kind == "references" && at_tag(edge) {
+                    Some(format!(
+                        "references {} -> {} {}",
+                        end(&edge.source),
+                        end(&edge.target),
+                        edge.resolved_by().unwrap_or("-")
+                    ))
+                } else if edge.kind == "calls" && edge.metadata["synthesizedBy"] == "jsx-render" {
+                    Some(format!(
+                        "jsx-render {} -> {} via {}",
+                        end(&edge.source),
+                        end(&edge.target),
+                        edge.metadata["via"].as_str().unwrap_or("-")
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// W7-28 (OD-B46): a `.js` file's JSX tags are component references, as
+    /// a `.jsx` file's are, so its components render what their tags reach:
+    /// a function its tags, a top-level value and the file theirs, a class
+    /// component its `render` method's, each `via` the tag at the parent's
+    /// first line, a `.tsx` file's component too. A member tag is a
+    /// reference that renders nothing; a tag naming the component's own
+    /// parameter (#2442) and a declared package's tags stay unresolved.
+    #[test]
+    fn w728_a_javascript_component_renders_its_tags() {
+        let project = w728_project(W728_PACKAGE, &W728_APP)
+            .file("src/button.tsx", BUTTON)
+            .file(
+                "src/plain.js",
+                "import { Button } from './button';\nexport function Plain() {\n  return <Button />;\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(
+            jsx_links(graph),
+            [
+                "App -> Card",
+                "App -> Footer",
+                "App -> Header",
+                "ICONS -> HomeIcon",
+                "Legacy::render -> Card",
+                "Plain -> Button",
+                "src/index.js -> App",
+            ],
+            "{}",
+            graph.report()
+        );
+        for (parent, child, line) in [
+            ("App", "Header", 12),
+            ("Legacy::render", "Card", 28),
+            ("ICONS", "HomeIcon", 6),
+            ("file:src/index.js", "App", 1),
+            ("Plain", "Button", 2),
+        ] {
+            let edge = assert_synthesized(graph, parent, child, "jsx-render", &[("via", child)]);
+            assert_eq!((edge.line, edge.col), (Some(line), None), "{edge:?}");
+        }
+        for (parent, child, resolved_by) in [
+            ("App", "Header", Some("import")),
+            ("App", "Card", Some("import")),
+            ("App", "Footer", None),
+            ("App", "Panel", None),
+            ("Legacy::render", "Card", Some("import")),
+            ("ICONS", "HomeIcon", None),
+            ("file:src/index.js", "App", Some("import")),
+            // An import of a `.tsx` module binds by name, as from a `.jsx` file.
+            ("Plain", "Button", None),
+        ] {
+            let tags: Vec<&EdgeRow> = graph
+                .edges_matching(parent, "references", child)
+                .into_iter()
+                .filter(|edge| edge.line.is_some())
+                .collect();
+            assert_eq!(tags.len(), 1, "{parent} -> {child}:\n{}", graph.report());
+            if let Some(resolved_by) = resolved_by {
+                assert_eq!(tags[0].resolved_by(), Some(resolved_by), "{:?}", tags[0]);
+            }
+        }
+        for (from, name) in [
+            ("App::renderRow", "Widget"),
+            ("App", "Routes"),
+            ("App", "Route"),
+            ("Header", "Link"),
+        ] {
+            assert_eq!(
+                graph.unresolved_matching(from, "references", name).len(),
+                1,
+                "{from} -> {name}:\n{}",
+                graph.report()
+            );
+        }
+    }
+
+    /// W7-28: one tree written in `.js` and in `.jsx` draws the same tag
+    /// references, resolved the same way, and the same `jsx-render` edges,
+    /// the extension aside. A `.js` file's value references (`valueRef`),
+    /// which a `.jsx` file's symbols lack, are no tags.
+    #[test]
+    fn w728_a_javascript_twin_draws_what_its_jsx_twin_draws() {
+        let package = "{\"name\":\"probe\",\"private\":true,\"dependencies\":{\"react\":\"18\",\"react-dom\":\"18\",\"react-router-dom\":\"6\",\"mobx-react\":\"^9\",\"vue\":\"^3\"}}\n";
+        let twin = |extension: &str| {
+            let files: Vec<(String, String)> = W728_APP
+                .iter()
+                .chain(W728_RULES.iter())
+                .map(|(path, text)| {
+                    let path = path
+                        .strip_suffix(".js")
+                        .map_or_else(|| path.to_string(), |stem| format!("{stem}.{extension}"));
+                    (path, text.to_string())
+                })
+                .collect();
+            let project = files
+                .iter()
+                .fold(
+                    Project::new().file("package.json", package),
+                    |project, (path, text)| project.file(path, text),
+                )
+                .index();
+            let rows = rendered_rows(graph_of(&project), &files);
+            (project, rows)
+        };
+        let (js, js_rows) = twin("js");
+        let (_jsx, jsx_rows) = twin("jsx");
+        assert!(
+            jsx_rows.iter().any(|row| row.starts_with("jsx-render ")),
+            "{jsx_rows:#?}"
+        );
+        assert_eq!(js_rows, jsx_rows, "{}", graph_of(&js).report());
+    }
+
+    /// W7-28: a `.js` file's tags take React's component rules as tsx and
+    /// jsx tags do: a tag imported through an index that forwards a
+    /// module's wrapped default export renders the component the module
+    /// wraps (#2563), and a tag of the file's own lazy value renders the
+    /// component its module exports (#2420), both bound by React.
+    #[test]
+    fn w728_javascript_tags_take_reacts_component_rules() {
+        let project = w728_project(
+            "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"mobx-react\":\"^9\"}}\n",
+            &W728_RULES,
+        )
+        .index();
+        let graph = graph_of(&project);
+        for (parent, child, via) in [
+            ("Home", "AppSidebar", "Sidebar"),
+            ("Shell", "DocsPage", "Docs"),
+        ] {
+            let tags = graph.edges_matching(parent, "references", child);
+            assert_eq!(tags.len(), 1, "{parent} -> {child}:\n{}", graph.report());
+            assert_eq!(tags[0].resolved_by(), Some("framework"), "{:?}", tags[0]);
+            assert_synthesized(graph, parent, child, "jsx-render", &[("via", via)]);
+        }
+    }
+
+    /// W7-28: what a `.js` file still does not render, each rule as it holds
+    /// for tsx and jsx tags: a tag naming the component's own parameter does
+    /// not reach another file's component of the name (#2442), a declared
+    /// package's tag binds no project component of the name (#2475), and a
+    /// member tag renders nothing. A Vue or Svelte script block's tags are
+    /// no references, as colby folds a block into its component's language;
+    /// a `.ts` file's `<Box>raw` is a type assertion. Only a tag takes
+    /// React's component rules: the file's call of its own `observer(function
+    /// Inner…)` value stays the value's, as colby's Pattern 1 reads no
+    /// JavaScript reference.
+    #[test]
+    fn w728_what_a_javascript_file_does_not_render() {
+        let project = Project::new()
+            .file(
+                "package.json",
+                "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"antd\":\"5.0.0\",\"mobx-react\":\"^9\",\"vue\":\"^3\",\"svelte\":\"^4\"}}\n",
+            )
+            .file(
+                "src/components/Widget.js",
+                "export function Widget() {\n  return <span />;\n}\n",
+            )
+            .file(
+                "src/Rows.js",
+                "export function Rows({ items }) {\n  return <ul>{items.map((Widget, index) => <Widget key={index} />)}</ul>;\n}\n",
+            )
+            .file(
+                "src/Button.js",
+                "export function Button() {\n  return <button />;\n}\n",
+            )
+            .file(
+                "src/Shop.js",
+                "import { Button } from 'antd';\nexport function Shop() {\n  return <Button />;\n}\n",
+            )
+            .file(
+                "src/components/ui.js",
+                "export function Panel() {\n  return <section />;\n}\n",
+            )
+            .file(
+                "src/Panels.js",
+                "import * as UI from './components/ui';\nexport function Panels() {\n  return <UI.Panel />;\n}\n",
+            )
+            .file(
+                "src/Card.js",
+                "export default function Card() {\n  return <div />;\n}\n",
+            )
+            .file(
+                "src/Comp.vue",
+                "<template><div /></template>\n<script lang=\"jsx\">\nimport Card from './Card';\nexport default {\n  render() {\n    return <Card />;\n  },\n};\n</script>\n",
+            )
+            .file(
+                "src/Comp.svelte",
+                "<script>\n  import Card from './Card';\n  const view = () => <Card />;\n</script>\n<div />\n",
+            )
+            .file(
+                "src/plain.ts",
+                "export class Box {}\nexport function Typed(raw: unknown) {\n  const v = <Box>raw;\n  return v;\n}\n",
+            )
+            .file(
+                "src/Own.js",
+                "import { observer } from 'mobx-react';\nconst Foo = observer(function Inner() {\n  return null;\n});\nexport function Own() {\n  Foo();\n  return null;\n}\n",
+            )
+            .index();
+        let graph = graph_of(&project);
+        assert_eq!(jsx_links(graph), Vec::<String>::new(), "{}", graph.report());
+        assert!(
+            graph
+                .edges_matching("Rows", "references", "Widget @src/components/Widget.js")
+                .is_empty(),
+            "{}",
+            graph.report()
+        );
+        assert!(
+            graph
+                .edges_matching("Shop", "references", "Button @src/Button.js")
+                .is_empty(),
+            "{}",
+            graph.report()
+        );
+        // A script block's tag: no edge and no parked reference of the name.
+        let named_from = |file: &str, name: &str| -> Vec<String> {
+            graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == "references"
+                        && graph
+                            .node(&edge.source)
+                            .is_some_and(|node| node.file_path == file)
+                        && graph
+                            .node(&edge.target)
+                            .is_some_and(|node| node.name == name)
+                })
+                .map(|edge| graph.describe_edge(edge))
+                .chain(
+                    graph
+                        .unresolved
+                        .iter()
+                        .filter(|reference| {
+                            reference.file_path == file
+                                && reference.reference_kind == "references"
+                                && reference.reference_name == name
+                        })
+                        .map(|reference| graph.describe_ref(reference)),
+                )
+                .collect()
+        };
+        for (file, name) in [
+            ("src/Comp.vue", "Card"),
+            ("src/Comp.svelte", "Card"),
+            ("src/plain.ts", "Box"),
+        ] {
+            assert_eq!(
+                named_from(file, name),
+                Vec::<String>::new(),
+                "{file}:\n{}",
+                graph.report()
+            );
+        }
+        let own = graph.edges_matching("Own", "calls", "constant Foo");
+        assert_eq!(own.len(), 1, "{}", graph.report());
+        assert_eq!(own[0].resolved_by(), Some("exact-match"), "{:?}", own[0]);
+        assert!(
+            !graph.edges.iter().any(|edge| {
+                edge.kind == "calls"
+                    && graph
+                        .node(&edge.source)
+                        .is_some_and(|node| node.qualified_name == "Own")
+                    && graph
+                        .node(&edge.target)
+                        .is_some_and(|node| node.name == "Inner")
+            }),
+            "{}",
+            graph.report()
         );
     }
 
@@ -42301,10 +42741,9 @@ mod mobile_bridges {
         assert_eq!(rendered, ["App"], "{}", graph.report());
     }
 
-    /// Upstream `fabric-view.test.ts` 142-196 (segmented-control, `6f798dce`),
-    /// written `.jsx` (Rust renders no JSX of a `.js` file, KNOWN_DIFFS): a
-    /// Paper module's `requireNativeComponent` component, rendered under its
-    /// default import's name, reaches its native view class.
+    /// Upstream `fabric-view.test.ts` 142-196 (segmented-control, `6f798dce`):
+    /// a Paper module's `requireNativeComponent` component, rendered under
+    /// its default import's name, reaches its native view class.
     #[test]
     fn w721_a_paper_component_reaches_its_native_view() {
         let project = index(&[
@@ -42313,11 +42752,11 @@ mod mobile_bridges {
                 "{\"dependencies\":{\"react-native\":\"^0.73\"}}",
             ),
             (
-                "js/RNCSegmentedControlNativeComponent.jsx",
+                "js/RNCSegmentedControlNativeComponent.js",
                 "import { requireNativeComponent } from 'react-native';\nmodule.exports = requireNativeComponent('RNCSegmentedControl');\n",
             ),
             (
-                "js/SegmentedControl.jsx",
+                "js/SegmentedControl.js",
                 "import * as React from 'react';\nimport RNCSegmentedControlNativeComponent from './RNCSegmentedControlNativeComponent';\nexport default function SegmentedControl(props) {\n  return <RNCSegmentedControlNativeComponent {...props} />;\n}\n",
             ),
             (
@@ -42330,7 +42769,7 @@ mod mobile_bridges {
             ),
         ]);
         let graph = project.graph();
-        let control = node(graph, "SegmentedControl", "js/SegmentedControl.jsx");
+        let control = node(graph, "SegmentedControl", "js/SegmentedControl.js");
         let component = out_of(graph, control, "calls")
             .into_iter()
             .filter_map(|edge| graph.node(&edge.target))
@@ -42338,7 +42777,7 @@ mod mobile_bridges {
             .unwrap_or_else(|| panic!("the rendered component:\n{}", graph.report()));
         assert_eq!(
             component.file_path,
-            "js/RNCSegmentedControlNativeComponent.jsx"
+            "js/RNCSegmentedControlNativeComponent.js"
         );
         let native: Vec<String> = out_of(graph, component, "calls")
             .into_iter()

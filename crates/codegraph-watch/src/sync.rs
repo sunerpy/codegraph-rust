@@ -12040,6 +12040,46 @@ pub(crate) mod tests {
         );
     }
 
+    /// W7-28 (lane V's key): a `.js` file's `<Docs />` and a reference of
+    /// the name that is no tag (`< Docs />`, a space after the `<`) ask
+    /// React's lookup apart. Only the tag reads the module its lazy value
+    /// loads, so that module's change sends back the tag's site alone; one
+    /// lookup for both would ask the first, which reads no module.
+    #[test]
+    fn a_javascript_tag_and_a_namesake_that_is_no_tag_ask_the_lookup_apart() {
+        let (dir, db) = fully_indexed(
+            "lane-v-javascript-tag",
+            &[
+                (
+                    "package.json",
+                    "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\"}}\n",
+                ),
+                (
+                    "src/App.js",
+                    "import { lazy } from 'react';\nconst Docs = lazy(() => import('./pages/Docs'));\nexport function Preview() {\n  return < Docs />;\n}\nexport function App() {\n  return <Docs />;\n}\n",
+                ),
+                (
+                    "src/pages/Docs.js",
+                    "export function DocsPage() { return null; }\n",
+                ),
+            ],
+        );
+        let store = Store::open(&db).unwrap();
+        let resolver = w723_resolver(dir.path(), &store);
+        let changed: BTreeSet<String> = ["src/pages/Docs.js".to_string()].into();
+        let sites: BTreeSet<FileReferenceSite> = crate::route_modules::route_module_sites(
+            &store,
+            &resolver,
+            &changed,
+            || Ok(BTreeSet::new()),
+            &HashSet::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(w723_lines(&sites), [("src/App.js".to_string(), 7)]);
+    }
+
     // W7-23b: the navigation calls a sync sends back when a route a call
     // may name appears, goes or moves (upstream #2425's
     // `reopenNavigationsFor`, `sync-navigation-retry.test.ts`).

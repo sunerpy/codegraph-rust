@@ -359,12 +359,6 @@ async fn a_handler_bound_inside_a_dialogs_buttons_arrives_from_the_dialog() {
 
 /// Upstream `react-router.test.ts:312-330`: the payment screen's picture
 /// draws the pages it leads to, not just its store write.
-///
-/// Upstream also reaches `/cart/:id?` and `/login` through the checkout
-/// nav the screen renders. The fixture writes it in `.js` files, where this
-/// port's graph keeps no render edge (`<CheckoutSteps …/>`), so the picture
-/// holds the screen's own two pushes: a graph difference this endpoint does
-/// not change.
 #[tokio::test]
 async fn react_router_the_payment_screens_steps_draw_the_pages_it_leads_to() {
     let project = Project::indexed(fixtures::RR_APP);
@@ -383,13 +377,15 @@ async fn react_router_the_payment_screens_steps_draw_the_pages_it_leads_to() {
             .contains("localStorage.setItem('paymentMethod'"),
         "{store}"
     );
+    // Its own two pushes, plus the link back to sign-in its checkout nav
+    // renders.
     let mut to: Vec<&str> = items(&payload["steps"])
         .iter()
         .filter(|step| step["kind"] == "screen" && step["anchor"] != true)
         .map(|step| step["screen"]["path"].as_str().unwrap())
         .collect();
     to.sort();
-    assert_eq!(to, ["/placeorder", "/shipping"]);
+    assert_eq!(to, ["/cart/:id?", "/login", "/placeorder", "/shipping"]);
     let placeorder = items(&payload["steps"])
         .iter()
         .find(|step| step["screen"]["path"] == "/placeorder")

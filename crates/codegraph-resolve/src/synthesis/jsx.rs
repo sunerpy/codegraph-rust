@@ -2,7 +2,8 @@
 //! on the base graph as OD-A4 decided): a function, method or component
 //! that renders `<Child />` links to what the tag's static `references` edge
 //! reaches (`jsx-render`). The tags and their targets are the base graph's;
-//! only a tag's position is checked against the file text.
+//! only a tag's position is checked against the file text. The pass reads
+//! tsx, jsx and JavaScript files, upstream's `JSX_FAMILY` (W7-28).
 
 use std::collections::{HashMap, HashSet};
 
@@ -63,12 +64,22 @@ pub(super) fn jsx_render_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut targets: HashMap<String, Option<Node>> = HashMap::new();
-    // Only tsx and jsx files have JSX tags (`extract_jsx_component_ref`).
-    for file in view.files_of_languages(&[Language::Tsx, Language::Jsx])? {
-        let nodes = view.nodes_in_file(&file)?;
+    // The files that can write JSX (upstream `JSX_FAMILY`): tsx, jsx and
+    // JavaScript, whose tags the walker records (`extract_jsx_component_ref`,
+    // W7-28).
+    for file in view.files_of_languages(&[Language::Tsx, Language::Jsx, Language::JavaScript])? {
         let Some(content) = view.text(&file) else {
             continue;
         };
+        // Upstream's JSX-file gate: no JSX element is written without a `</`
+        // or a `/>`, so a file holding neither has no tag, and its nodes and
+        // edges go unread (most of a large project's `.js` files).
+        if !(content.contains("</") || content.contains("/>")) {
+            continue;
+        }
+        #[cfg(test)]
+        tests::note_read(&file);
+        let nodes = view.nodes_in_file(&file)?;
         let starts = line_starts(&content);
         let mut tags = Vec::new();
         for node in &nodes {
@@ -209,7 +220,19 @@ fn tag_at<'t>(content: &'t str, starts: &[usize], line: i64, col: i64) -> Option
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        /// The files whose nodes the pass read on this thread.
+        static READ: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Record that the pass read `file`'s nodes.
+    pub(super) fn note_read(file: &str) {
+        READ.with(|read| read.borrow_mut().push(file.to_string()));
+    }
 
     fn at(content: &str, line: i64, col: i64) -> Option<&str> {
         tag_at(content, &line_starts(content), line, col)
@@ -236,5 +259,127 @@ mod tests {
         // `é` is two bytes.
         assert_eq!(at("é <Card />", 1, 4), Some("Card"));
         assert_eq!(at("é <Card />", 1, 3), None);
+    }
+
+    /// A store and a project directory holding `files`, each a JavaScript
+    /// file recorded with its current stat, with a function node `id` that
+    /// spans its first three lines.
+    fn javascript_files(
+        name: &str,
+        files: &[(&str, &str, &str)],
+    ) -> (codegraph_store::Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-jsx-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = codegraph_store::Store::open(&dir.join("index.db")).unwrap();
+        let mut nodes = Vec::new();
+        for (path, id, text) in files {
+            let on_disk = dir.join(path);
+            std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+            std::fs::write(&on_disk, text).unwrap();
+            let metadata = std::fs::metadata(&on_disk).unwrap();
+            store
+                .upsert_file(&codegraph_core::types::FileRecord {
+                    path: path.to_string(),
+                    content_hash: codegraph_core::node_id::hash_content(text),
+                    language: Language::JavaScript,
+                    size: metadata.len() as i64,
+                    modified_at: metadata
+                        .modified()
+                        .unwrap()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    indexed_at: 0,
+                    node_count: 1,
+                    errors: Vec::new(),
+                    generated: false,
+                })
+                .unwrap();
+            nodes.push(Node {
+                id: id.to_string(),
+                kind: NodeKind::Function,
+                name: id.to_string(),
+                qualified_name: id.to_string(),
+                file_path: path.to_string(),
+                language: Language::JavaScript,
+                start_line: 1,
+                end_line: 3,
+                start_column: 0,
+                end_column: 1,
+                docstring: None,
+                signature: None,
+                visibility: None,
+                is_exported: true,
+                is_async: false,
+                is_static: false,
+                is_abstract: false,
+                decorators: Vec::new(),
+                type_parameters: Vec::new(),
+                return_type: None,
+                updated_at: 0,
+            });
+        }
+        store.upsert_nodes(&nodes).unwrap();
+        (store, dir)
+    }
+
+    /// W7-28: the pass reads a JavaScript file's tags as a tsx or jsx
+    /// file's, and skips a file whose text holds neither `</` nor `/>`
+    /// (colby's JSX-file gate): no JSX element is written without one, so
+    /// the gate drops no tag. `B`'s reference sits at a `<Card>` a file
+    /// without either holds, which a pass without the gate would read.
+    #[test]
+    fn a_javascript_file_renders_and_one_without_a_closing_tag_is_skipped() {
+        let (mut store, dir) = javascript_files(
+            "gate",
+            &[
+                (
+                    "src/card.js",
+                    "Card",
+                    "export function Card() {\n  return null;\n}\n",
+                ),
+                (
+                    "src/tagged.js",
+                    "A",
+                    "export function A() {\n  return <Card />;\n}\n",
+                ),
+                (
+                    "src/untagged.js",
+                    "B",
+                    "export function B() {\n  return <Card>;\n}\n",
+                ),
+            ],
+        );
+        let tag = |source: &str| Edge {
+            id: None,
+            source: source.to_string(),
+            target: "Card".to_string(),
+            kind: EdgeKind::References,
+            metadata: None,
+            line: Some(2),
+            col: Some(10),
+            provenance: None,
+        };
+        store.insert_edges(&[tag("A"), tag("B")]).unwrap();
+        let view = View::new(&store, &dir, 1 << 20);
+        READ.with(|read| read.borrow_mut().clear());
+        let edges = jsx_render_edges(&view).unwrap();
+        let ends: Vec<(&str, &str)> = edges
+            .iter()
+            .map(|edge| (edge.source.as_str(), edge.target.as_str()))
+            .collect();
+        assert_eq!(ends, [("A", "Card")]);
+        // The gate comes before the file's nodes are read.
+        assert_eq!(READ.with(|read| read.borrow().clone()), ["src/tagged.js"]);
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
