@@ -78,6 +78,7 @@ src/
   lib/hierarchy-model.ts  the type hierarchy's tree geometry (pure)
   lib/entry-model.ts      the entry-points panel: rows, file groups, flow arming (pure)
   lib/screens-model.ts    the Screens view: layering by distance from the entry, edge labels, pill lanes (pure)
+  lib/steps-fit.ts        where the Steps picture is fitted: beside the open key or on the whole canvas (pure)
   lib/export-svg.ts       the Flow strip and the Map as a standalone SVG (pure)
   lib/export-image.ts     rasterising that SVG to PNG, clipboard and download
   lib/live.svelte.ts      /api/events: two counters every screen refreshes from
@@ -159,9 +160,9 @@ without a second read.
    context, so one page reads one project. `<CodegraphUi>` installs them during
    initialisation, once — swapping projects means re-mounting the subtree
    (`{#key project}`), not swapping the prop.
-3. **Geometry is not themable.** 44px callee rows, the 288/320px rails, the 20px
-   code line: the Symbol view measures these against each other to put a callee
-   row beside the line that calls it.
+3. **Geometry is not themable.** 44px callee rows (taller by a line per
+   condition), the 288/320px rails, the 20px code line: the Symbol view measures
+   these against each other to put a callee row beside the line that calls it.
 
 ### Navigation
 

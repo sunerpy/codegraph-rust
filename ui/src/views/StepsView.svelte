@@ -14,6 +14,7 @@
   or a Flow strip between two steps.
 -->
 <script lang="ts">
+  import { untrack } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import { SvelteFlow, Controls, type Node, type Edge, type Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
@@ -53,6 +54,7 @@
     type StepsModel,
   } from '../lib/steps-model';
   import { buildOrderModel } from '../lib/program-model';
+  import { stepsFitOptions } from '../lib/steps-fit';
 
   interface Props {
     anchor: string | null;
@@ -107,20 +109,29 @@
 
   const LEGEND_KEY = 'codegraph-ui:steps-legend';
   let legendOpen = $state(readLegendOpen());
+  /**
+   * Whether the key starts open. Below 1024 px — §10's tablet and phone, the
+   * inspector under the canvas — it starts closed whatever was stored: there
+   * the key is taller than the canvas it explains. From 1024 px up it is the
+   * reader's last choice, open when there is none.
+   */
   function readLegendOpen(): boolean {
+    if (globalThis.matchMedia?.('(max-width: 1023px)').matches) return false;
     try {
       return localStorage.getItem(LEGEND_KEY) !== 'closed';
     } catch {
       return true;
     }
   }
-  $effect(() => {
+  /** The reader opened or closed the key: kept for next time. Only a choice is stored, so a narrow screen's closed start never overwrites it. */
+  function toggleLegend(next: boolean): void {
+    legendOpen = next;
     try {
-      localStorage.setItem(LEGEND_KEY, legendOpen ? 'open' : 'closed');
+      localStorage.setItem(LEGEND_KEY, next ? 'open' : 'closed');
     } catch {
       // Storage refused (private mode): the key simply reopens next time.
     }
-  });
+  }
 
   const nodeTypes = { step: StepNode, region: RegionCaption, fork: ForkPoint, decision: DecisionCaption, stubs: StepStubs };
 
@@ -208,25 +219,40 @@
   const orderReadable = $derived(payload?.program != null);
 
   /**
-   * The fit. A picture of a few boxes is centred — and the key, bottom left,
-   * would sit on its second row; it is fitted to the right of the key instead.
-   * A picture of many boxes is fitted to the whole stage, as the Screens view's
-   * — and a picture laid out by region may fit far out: the regions and their
-   * captions are the overview, and the reader zooms into one, where a 0.4
-   * floor on a big screen's picture opened on a window torn out of its middle.
+   * The fit (`steps-fit.ts`): a picture of a few boxes beside the open key
+   * when it fits there whole, else on the whole stage; a picture of many as
+   * the Screens view's.
    *
-   * Declared AFTER the model it reads: `$derived` is lazy, so the forward
-   * reference ran, but it is a forward reference all the same and the checker
-   * was right to say so. The per-side padding keeps its literal types (`as
-   * const`), because the canvas types a side as `` `${number}px` `` — widened
-   * to `string` it silently fails to typecheck against the very option it is
-   * written for.
+   * Decided when the canvas FITS, not when it mounts. The canvas is created
+   * before the inspector beside it (under it, on a narrow screen), and until
+   * the inspector is on the page the stage has the inspector's room as well
+   * (`.steps:not(:has(.side))`): measured then, a row too wide for the key's
+   * real room would be put beside the key and run off the right edge. So the
+   * options are getters, read with the stage as it is at that moment. This
+   * relies on `@xyflow/svelte` 1.6.5: the store keeps the object it is given
+   * (`initial-store.svelte.js:195`) and reads it only in `fitViewport`
+   * (`@xyflow/system` 0.0.81), once the boxes are measured — the moment it
+   * reads its own size. A version that copied the options at mount would read
+   * the stage early again.
+   *
+   * Declared AFTER the model it reads, which it reads only when called.
    */
-  const fitOptions = $derived(
-    model !== null && model.layout.nodes.length <= 24 && legendOpen
-      ? { padding: { left: '440px', top: '32px', right: '32px', bottom: '32px' } as const, maxZoom: 1, minZoom: 0.4 }
-      : { padding: 0.1, maxZoom: 1, minZoom: model !== null && model.regions !== null ? 0.2 : 0.4 }
-  );
+  function fitNow(): ReturnType<typeof stepsFitOptions> {
+    return untrack(() =>
+      stepsFitOptions(model, legendOpen, stage === null ? null : { width: stage.clientWidth, height: stage.clientHeight })
+    );
+  }
+  const fitOptions = {
+    get padding() {
+      return fitNow().padding;
+    },
+    get minZoom() {
+      return fitNow().minZoom;
+    },
+    get maxZoom() {
+      return fitNow().maxZoom;
+    },
+  };
 
   /** The selection with the decision points it touches — what the edge filter and the dimming reason over. */
   const reach = $derived(model === null || selected === null ? null : selectionReach(model, selected));
@@ -636,7 +662,7 @@
         regions={model.regions !== null}
         flow={false}
         open={legendOpen}
-        onToggle={(next) => (legendOpen = next)}
+        onToggle={toggleLegend}
       />
     {/if}
   </div>

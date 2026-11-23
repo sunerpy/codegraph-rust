@@ -50,6 +50,7 @@ import {
   type WireStats,
   type WireStepsPayload,
   type WireHierarchy,
+  type WireScreensPayload,
   type WireSymbolPayload,
 } from '../src/index';
 
@@ -683,6 +684,215 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     flushSync();
     expect(getGraphAdapter()).toBe(adapter);
     expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * Run `body` under a `matchMedia` that answers `(max-width: 1023px)` the way a
+ * phone or a tablet does (`narrow`) or a desktop does, then put the harness's
+ * stub back. jsdom lays nothing out, so a width is only ever this answer.
+ */
+async function atWidth(narrow: boolean, body: () => Promise<void>): Promise<void> {
+  const harness = window.matchMedia;
+  const media = (query: string): MediaQueryList =>
+    ({ ...harness(query), matches: narrow && query === '(max-width: 1023px)' }) as MediaQueryList;
+  const globals = globalThis as Record<string, unknown>;
+  Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: media });
+  globals.matchMedia = media;
+  try {
+    await body();
+  } finally {
+    Object.defineProperty(window, 'matchMedia', { configurable: true, writable: true, value: harness });
+    globals.matchMedia = harness;
+  }
+}
+
+/** An empty `Storage` of its own: one per test, so nothing one stores reaches the next. */
+function freshStorage(): Storage {
+  const items = new Map<string, string>();
+  return {
+    get length() {
+      return items.size;
+    },
+    clear: () => items.clear(),
+    getItem: (key: string) => items.get(key) ?? null,
+    key: (index: number) => [...items.keys()][index] ?? null,
+    removeItem: (key: string) => void items.delete(key),
+    setItem: (key: string, value: string) => void items.set(key, String(value)),
+  };
+}
+
+/** A one-step picture read as a tree, so the Steps key and canvas are drawn. */
+async function renderSteps(): Promise<void> {
+  const { adapter } = mockAdapter();
+  const anchor = nodeRef();
+  const lone: WireStepsPayload = {
+    anchor,
+    ambiguous: [],
+    project: 'web',
+    steps: [{ id: anchor.id, kind: 'anchor', anchor: true, node: anchor, label: 'parseToken', sub: '', depth: 0, cut: null }],
+    links: [],
+    program: null,
+    defaultView: 'tree',
+    depth: 8,
+    limit: 120,
+    through: false,
+    truncated: { steps: 0, hubs: 0, chrome: 0 },
+    index: { lastIndexedAt: null, edges: 0, files: 1 },
+    timing: { elapsedMs: 1 },
+  };
+  setGraphAdapter({ ...adapter, steps: () => Promise.resolve(lone) });
+  const { default: StepsView } = await import('../src/views/StepsView.svelte');
+  await render(StepsView, { anchor: anchor.id, symbol: null, depth: null, through: false, reading: null });
+}
+
+describe('the Steps and Screens keys', () => {
+  const STEPS_KEY = 'codegraph-ui:steps-legend';
+  const SCREENS_KEY = 'codegraph-ui:screens-legend';
+
+  // Node 25 and later define a `localStorage` of their own that is undefined
+  // without `--localstorage-file`, and it hides jsdom's: these tests install
+  // a storage explicitly, and put back whatever was there.
+  let before: PropertyDescriptor | undefined;
+  beforeEach(() => {
+    before = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, writable: true, value: freshStorage() });
+  });
+
+  afterEach(() => {
+    if (before) Object.defineProperty(globalThis, 'localStorage', before);
+    else delete (globalThis as Record<string, unknown>).localStorage;
+  });
+
+  /** An app with one screen, its entry, so the Screens canvas and its key are drawn. */
+  async function renderScreens(): Promise<void> {
+    const { adapter } = mockAdapter();
+    const component = nodeRef({
+      id: 'function:Index@src/app/index.tsx:1',
+      name: 'Index',
+      qualifiedName: 'Index',
+      file: 'src/app/index.tsx',
+      line: 1,
+      endLine: 9,
+    });
+    const routed: WireScreensPayload = {
+      routed: true,
+      entry: 'route:/',
+      screens: [{ id: 'route:/', path: '/', file: 'src/app/index.tsx', line: 1, component, incoming: 0, outgoing: 0 }],
+      origins: [],
+      links: [],
+      dropped: 0,
+      index: { lastIndexedAt: null, edges: 0, files: 1 },
+      timing: { elapsedMs: 1 },
+    };
+    setGraphAdapter({ ...adapter, screens: () => Promise.resolve(routed) });
+    const { default: ScreensView } = await import('../src/views/ScreensView.svelte');
+    await render(ScreensView, {});
+  }
+
+  function keyButton(): HTMLButtonElement {
+    const button = host.querySelector<HTMLButtonElement>('.legend-h');
+    expect(button, 'the key is drawn').not.toBeNull();
+    return button!;
+  }
+
+  for (const [view, draw, storageKey] of [
+    ['StepsView', renderSteps, STEPS_KEY],
+    ['ScreensView', renderScreens, SCREENS_KEY],
+  ] as const) {
+    it(`${view} starts with its key closed below 1024 px`, async () => {
+      await atWidth(true, async () => {
+        await draw();
+        expect(keyButton().getAttribute('aria-expanded')).toBe('false');
+        expect(host.querySelector('.legend-body')).toBeNull();
+      });
+    });
+
+    it(`${view} opens its key at 1024 px and up when nothing is stored`, async () => {
+      await atWidth(false, async () => {
+        await draw();
+        expect(keyButton().getAttribute('aria-expanded')).toBe('true');
+        expect(host.querySelector('.legend-body')).not.toBeNull();
+      });
+    });
+
+    it(`${view} stores the key only when the reader toggles it`, async () => {
+      await atWidth(false, async () => {
+        await draw();
+        expect(localStorage.getItem(storageKey)).toBeNull();
+        keyButton().click();
+        flushSync();
+        expect(keyButton().getAttribute('aria-expanded')).toBe('false');
+        expect(localStorage.getItem(storageKey)).toBe('closed');
+      });
+    });
+
+    it(`a stored open does not open the ${view === 'StepsView' ? 'Steps' : 'Screens'} key on a narrow screen`, async () => {
+      localStorage.setItem(storageKey, 'open');
+      await atWidth(true, async () => {
+        await draw();
+        expect(keyButton().getAttribute('aria-expanded')).toBe('false');
+        expect(host.querySelector('.legend-body')).toBeNull();
+      });
+    });
+  }
+});
+
+describe('the Steps fit', () => {
+  it('StepsView never measures its stage for the fit while the inspector is missing', async () => {
+    // The canvas is created before the inspector beside it, and until the
+    // inspector is on the page the stage has its room as well
+    // (`.steps:not(:has(.side))`). The fit is decided when the canvas fits,
+    // after its boxes are measured; jsdom measures nothing, so its canvas
+    // never fits, and the browser checks show the fit itself. What is pinned
+    // here: nothing reads the stage's size before the inspector is there.
+    const early: string[] = [];
+    const spied = ['clientWidth', 'clientHeight'] as const;
+    for (const name of spied) {
+      const original = Object.getOwnPropertyDescriptor(Element.prototype, name)!;
+      Object.defineProperty(HTMLElement.prototype, name, {
+        configurable: true,
+        get(this: HTMLElement) {
+          if (this.classList.contains('stage') && this.parentElement?.classList.contains('steps')) {
+            if (this.parentElement.querySelector(':scope > .side') === null) early.push(name);
+          }
+          return original.get!.call(this);
+        },
+      });
+    }
+    try {
+      await atWidth(false, renderSteps);
+      expect(host.querySelector('.steps > .side'), 'the inspector is drawn').not.toBeNull();
+      expect(early).toEqual([]);
+    } finally {
+      for (const name of spied) delete (HTMLElement.prototype as unknown as Record<string, unknown>)[name];
+    }
+  });
+});
+
+describe('the Calls rail', () => {
+  it('the Calls rail writes a condition out in full', async () => {
+    const { adapter } = mockAdapter();
+    const when = 'isAuthenticated && !this.profile.following';
+    const outgoing = SYMBOL.outgoing.items[0]!;
+    const conditioned: WireSymbolPayload = {
+      ...SYMBOL,
+      outgoing: {
+        ...SYMBOL.outgoing,
+        items: [{ ...outgoing, edges: outgoing.edges.map((edge) => ({ ...edge, when })) }],
+      },
+    };
+    setGraphAdapter({ ...adapter, node: () => Promise.resolve(conditioned) });
+
+    await render(SymbolView, { id: SYMBOL.node.id, line: null });
+
+    const row = [...host.querySelectorAll<HTMLElement>(`.rrow[data-target="${CALLEE.id}"]`)];
+    expect(row, 'one Calls row for the callee').toHaveLength(1);
+    const whens = row[0]!.querySelector('.whens');
+    expect(whens, 'the row has a block of its own for its conditions').not.toBeNull();
+    expect(whens!.textContent?.replace(/\s+/g, ' ').trim()).toBe(`when ${when}`);
+    // Not on the meta line, whose one line cuts whatever does not fit.
+    expect(row[0]!.querySelector('.meta')?.textContent ?? '').not.toContain('isAuthenticated');
   });
 });
 

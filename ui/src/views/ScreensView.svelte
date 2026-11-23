@@ -54,22 +54,28 @@
 
   // The key stays open until the reader closes it; the choice survives a
   // reload but is per browser — a preference, not a fact about the project.
+  // Below 1024 px — §10's tablet and phone, the inspector under the canvas —
+  // it starts closed whatever was stored, because there it covers most of the
+  // canvas it explains.
   const LEGEND_KEY = 'codegraph-ui:screens-legend';
   let legendOpen = $state(readLegendOpen());
   function readLegendOpen(): boolean {
+    if (globalThis.matchMedia?.('(max-width: 1023px)').matches) return false;
     try {
       return localStorage.getItem(LEGEND_KEY) !== 'closed';
     } catch {
       return true;
     }
   }
-  $effect(() => {
+  /** The reader opened or closed the key: kept for next time. Only a choice is stored, so a narrow screen's closed start never overwrites it. */
+  function toggleLegend(next: boolean): void {
+    legendOpen = next;
     try {
-      localStorage.setItem(LEGEND_KEY, legendOpen ? 'open' : 'closed');
+      localStorage.setItem(LEGEND_KEY, next ? 'open' : 'closed');
     } catch {
       // Storage refused (private mode): the key simply reopens next time.
     }
-  });
+  }
 
   const FIT = { fitViewOptions: { padding: 0.1, maxZoom: 1, minZoom: 0.4 } };
   /** Two clicks on one box closer than this are a double-click. */
@@ -339,7 +345,7 @@
            stroke or box, not a word for it — a reader matches shapes, not
            descriptions. Collapsible, remembered per browser. -->
       <div class="legend" class:open={legendOpen}>
-        <button class="legend-h" onclick={() => (legendOpen = !legendOpen)} aria-expanded={legendOpen}>
+        <button class="legend-h" onclick={() => toggleLegend(!legendOpen)} aria-expanded={legendOpen}>
           Key <span class="dim">{legendOpen ? '▾' : '▸'}</span>
         </button>
         {#if legendOpen}
@@ -607,12 +613,17 @@
     background: var(--primary-soft);
     color: var(--primary-ink);
   }
+  /* Never taller than the canvas: 16 under it, 16 over it, and the rows
+     scroll under the button that closes it. */
   .legend {
     position: absolute;
     bottom: 16px;
     left: 16px;
     z-index: 4;
+    display: flex;
+    flex-direction: column;
     max-width: 380px;
+    max-height: calc(100% - 32px);
     overflow: hidden;
     border: 1px solid var(--line);
     border-radius: 10px;
@@ -633,6 +644,8 @@
     text-align: left;
   }
   .legend-body {
+    min-height: 0;
+    overflow-y: auto;
     padding: 4px 12px 10px;
     border-top: 1px solid var(--line-faint);
   }

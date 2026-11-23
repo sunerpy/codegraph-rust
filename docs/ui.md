@@ -273,17 +273,35 @@ Rust graph holds different facts, the viewer shows what this index holds:
 - An exported Map writes each box's label, the text the canvas draws and sized
   the box for. Upstream's export writes the id, cut to fit, so a Maven package
   reads `src/main/java/com/ac…` in the image.
+- A Steps picture of 24 boxes or fewer is drawn whole: beside the open key when
+  it fits there at a zoom of 0.2 or more, else on the whole canvas, at a zoom of
+  no less than 0.2 either way; one too wide even for that is centred. Upstream
+  (`e8ddc4e2`, the same code at its main `461a5d87`) keeps the key's room at a
+  0.4 floor, so a wide row of effects runs off the canvas's right edge, and a
+  canvas narrower than the key's room pushes the whole picture off it.
+- The Steps and Screens keys never run past their canvas: the rows scroll under
+  the key's button. Upstream's keys have no height limit, so on a canvas shorter
+  than the Steps key the top of the key is cut off, with the button that closes
+  it.
+- The Symbol view's two rails write each condition in full, wrapping a long one:
+  a Calls row grows a line per condition, and a Called by condition wraps inside
+  its card. Upstream cuts a condition at the row's right edge, with no ellipsis,
+  and its Calls row prints the whole file path before it.
 
 ## Look and themes
 
 The viewer is drawn in direction D of [`design/viewer-d.md`](design/viewer-d.md):
 an icon nav rail on the left, a command bar with the `⌘K` / `Ctrl+K` search
 palette, the trail ribbon under it while a trail exists, and each view as
-rounded islands 8 px apart. Below 1024 px wide the rail narrows and the Symbol
-view's Called by rail becomes a drawer behind a header button; below 600 px a
-bottom tab bar (Start, Map, Symbol, Flow, More) replaces the rail, the Symbol
-view shows one pane at a time (Code, Called by, Calls), and tapping a call in
-the code opens a sheet with that line's calls.
+rounded islands 8 px apart. Below 1024 px wide the rail narrows, the Symbol
+view's Called by rail becomes a drawer behind a header button, and the Steps and
+Screens keys start closed whatever the reader last chose; below 600 px a bottom
+tab bar (Start, Map, Symbol, Flow, More) replaces the rail, the Symbol view
+shows one pane at a time (Code, Called by, Calls), and tapping a call in the
+code opens a sheet with that line's calls. At any width an open Steps or Screens
+key stays inside its canvas: its rows scroll under the button that closes it.
+Those two keys store their open or closed state only when the reader opens or
+closes one, so a narrow screen's closed start never changes the desktop's.
 
 There are two themes with the same token names: **Nebula** (dark, §3.1 of the
 spec) and **Daylight** (light, §3.6). The viewer follows the operating system's
@@ -303,29 +321,31 @@ written. The icons are Lucide (ISC) geometry, copied into
 
 ### Direction D as built — 偏离（画板 vs 落地，供 owner 复核）
 
-| item                     | board                                          | landed                                                                                                                                                             |
-| ------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| project switch           | name, chevron and a `main · <sha>` branch pill | the name alone: one project per viewer, and the API carries no git branch                                                                                          |
-| rail foot                | keyboard and settings                          | the theme switch above them; keyboard opens the shortcut sheet, settings a panel of what this viewer reads (port, read-only and watching are command-line choices) |
-| Saved trails destination | a trails screen                                | opens Entry points, which lists saved trails first                                                                                                                 |
-| Start, entry card        | "Entry functions" with Flow buttons            | "Where it starts" — routes when the project is routed, else the files that run something at their top level — opening the row; a flow starts from Entry points     |
-| Flow                     | 190 × 168 step cards and a step-detail panel   | upstream's cards opened at each call window, restyled; Every hop table below; its Runs when column reads each hop's condition, "—" for a call that always runs     |
-| Map toolbar              | zoom readout and an Include tests switch       | the zoom controls; Include tests lives in the inspector's View section; Open crate is Open first file                                                              |
-| Map key                  | the one-line legend                            | the same, opening to upstream's full key on request (upstream opened the full key by default)                                                                      |
-| File, This file          | edges in and out, prod and test files          | how many files depend on it and it on them, its symbols, its size — no edge totals in the payload                                                                  |
-| hierarchy                | a supertrait outside the index drawn at 50 %   | not drawn: the payload carries no outside-index supertypes                                                                                                         |
-| code lines               | a long line ends in `…`                        | a long line scrolls sideways, as upstream's did                                                                                                                    |
-| trail hops               | qualified names                                | the symbol's name, as upstream labels a hop                                                                                                                        |
-| SVG export               | — (upstream: always light)                     | the theme on screen                                                                                                                                                |
-| ligatures                | the boards show `->` as an arrow               | off (§13 left it open; source fidelity decides)                                                                                                                    |
-| tablet Symbol            | blast radius as two stat tiles under the code  | the four tiles stay at the foot of the Called by drawer                                                                                                            |
-| Screens (D-08)           | cyan focus path, the rest dimmed, amber band   | upstream's canvas in D's colours: thin route frames, dashed origins on top, grey ways lit when a screen is selected; the key opens over the lower left             |
-| Steps (D-09)             | amber fork chip, green/red arms, step list     | upstream's canvas in D's colours: a framed decision box with neutral yes/no pills, dashed boxes for calls leaving the index; the key opens on the left             |
+| item                     | board                                          | landed                                                                                                                                                                                     |
+| ------------------------ | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| project switch           | name, chevron and a `main · <sha>` branch pill | the name alone: one project per viewer, and the API carries no git branch                                                                                                                  |
+| rail foot                | keyboard and settings                          | the theme switch above them; keyboard opens the shortcut sheet, settings a panel of what this viewer reads (port, read-only and watching are command-line choices)                         |
+| Saved trails destination | a trails screen                                | opens Entry points, which lists saved trails first                                                                                                                                         |
+| Start, entry card        | "Entry functions" with Flow buttons            | "Where it starts" — routes when the project is routed, else the files that run something at their top level — opening the row; a flow starts from Entry points                             |
+| Flow                     | 190 × 168 step cards and a step-detail panel   | upstream's cards opened at each call window, restyled; Every hop table below; its Runs when column reads each hop's condition, "—" for a call that always runs                             |
+| Map toolbar              | zoom readout and an Include tests switch       | the zoom controls; Include tests lives in the inspector's View section; Open crate is Open first file                                                                                      |
+| Map key                  | the one-line legend                            | the same, opening to upstream's full key on request (upstream opened the full key by default)                                                                                              |
+| File, This file          | edges in and out, prod and test files          | how many files depend on it and it on them, its symbols, its size — no edge totals in the payload                                                                                          |
+| hierarchy                | a supertrait outside the index drawn at 50 %   | not drawn: the payload carries no outside-index supertypes                                                                                                                                 |
+| code lines               | a long line ends in `…`                        | a long line scrolls sideways, as upstream's did                                                                                                                                            |
+| trail hops               | qualified names                                | the symbol's name, as upstream labels a hop                                                                                                                                                |
+| SVG export               | — (upstream: always light)                     | the theme on screen                                                                                                                                                                        |
+| ligatures                | the boards show `->` as an arrow               | off (§13 left it open; source fidelity decides)                                                                                                                                            |
+| tablet Symbol            | blast radius as two stat tiles under the code  | the four tiles stay at the foot of the Called by drawer                                                                                                                                    |
+| Screens (D-08)           | cyan focus path, the rest dimmed, amber band   | upstream's canvas in D's colours: thin route frames, dashed origins on top, grey ways lit when a screen is selected; the key opens over the lower left, and below 1024 px it starts closed |
+| Steps (D-09)             | amber fork chip, green/red arms, step list     | upstream's canvas in D's colours: a framed decision box with neutral yes/no pills, dashed boxes for calls leaving the index; the key opens on the left, and below 1024 px it starts closed |
 
 Layout constants the components measure against moved with the design; the
 suites pin them by name: hierarchy rows 24 → 26 and indent 22 → 28; file
 outline rows at a 30 px pitch; map nodes 40 → 52 high, layers 74 → 44 and boxes
-34 → 28 apart; callee rows 34 → 44 high with a 52 px pitch. Character advances
+34 → 28 apart; callee rows 34 → 44 high with a 52 px pitch, except that a row
+that carries conditions grows a line for each, and the next row keeps 8 px under
+it (D-02 draws every row 44 high). Character advances
 were re-measured in Chrome against the bundled fonts: the map label (12 px
 JetBrains Mono 500) 7.81 → 7.2, the map meta line (11 px Inter) 5.9 → 5.5, the
 flow link label (11 px mono) 6.65 → 6.6, the Screens pill (10.5 px mono) 6.3,

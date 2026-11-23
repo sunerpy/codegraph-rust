@@ -8,7 +8,9 @@
   top to bottom even where the geometry cannot be exact.
 
   The tops are computed by the view, which is the only thing that can measure
-  where a line ended up. This component draws what it is told.
+  where a line ended up, and how tall each row came out (`data-rail-row`: a
+  row that carries conditions grows a line for each). This component draws
+  what it is told.
 -->
 <script lang="ts">
   import Icon from '../Icon.svelte';
@@ -88,7 +90,7 @@
     <div class="leaves">
       <div class="lh"><span class="micro">Leaves the index</span><span class="dim">not followed</span></div>
       <div class="pills">
-        {#each leaving as name (name)}<span class="pill bordered mono">{name}</span>{/each}
+        {#each leaving as name (name)}<span class="pill bordered mono" title={name}><span class="pill-name">{name}</span></span>{/each}
       </div>
     </div>
   {/if}
@@ -104,6 +106,7 @@
     class:unplaced={!placed}
     style:top={`${tops[i] ?? 0}px`}
     data-target={node.id}
+    data-rail-row
     role="button"
     tabindex="0"
     title={rowTitle(row)}
@@ -129,10 +132,17 @@
         {#if row.via}<span class="tag" title="A synthesized edge — dynamic dispatch the parser cannot see"
             >via {row.via}</span
           >{/if}
-        {#each row.when as w (w)}<span class="tag when" title="The call runs only under this condition — read from the source as it is now"
-            >when {w}</span
-          >{/each}
       </div>
+      <!-- The conditions under the meta line, each whole on a line of its own:
+           the meta line cuts what does not fit, and two conditions often
+           differ only in their tails. -->
+      {#if row.when.length > 0}
+        <div class="whens">
+          {#each row.when as w (w)}<span class="tag when" title="The call runs only under this condition — read from the source as it is now"
+              >when {w}</span
+            >{/each}
+        </div>
+      {/if}
     </div>
   </div>
 {/each}
@@ -281,13 +291,30 @@
     gap: 6px;
   }
 
+  /* A name longer than the card ends in an ellipsis; its title is the whole
+     name. The 2px inset, given back by the margin, keeps the clip off the ink
+     of a name that fits: a glyph can spill a pixel past its advance. */
+  .pills .pill {
+    max-width: 100%;
+  }
+
+  .pill-name {
+    min-width: 0;
+    margin: 0 -2px;
+    padding: 0 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   /* Positioned by measurement, so it must not paint before it is measured. */
   .unplaced {
     visibility: hidden;
   }
 
   /* §7 callee row: 44 high, r 10, inset 12, `card` + `line-faint`; tile 22
-     at 11,11, the name `mono-500` at 42,6, the meta `caption` at 42,24. */
+     at 11,11, the name `mono-500` at 42,6, the meta `caption` at 42,24. A row
+     that carries conditions grows a line for each under the meta; the 5px
+     insets leave a row without one at exactly 44, its parts where they were. */
   .rrow {
     position: absolute;
     right: 12px;
@@ -296,8 +323,8 @@
     grid-template-columns: 22px minmax(0, 1fr);
     gap: 9px;
     align-items: center;
-    height: 44px;
-    padding: 0 10px;
+    min-height: 44px;
+    padding: 5px 10px;
     border: 1px solid var(--line-faint);
     border-radius: 10px;
     background: var(--card);
@@ -306,6 +333,13 @@
       background-color 120ms,
       border-color 120ms,
       box-shadow 120ms;
+  }
+
+  /* The tile stays beside the name, at 11 from the top, however many lines
+     the row grows. */
+  .rrow:not(.static) > :global(:first-child) {
+    align-self: start;
+    margin-top: 5px;
   }
 
   /* Inside the uncertain fold the rows are a list again — nothing to line up
@@ -388,6 +422,21 @@
   .tag.when {
     background: var(--amber-soft);
     color: var(--amber);
+  }
+
+  /* One condition a line, each whole: a long one wraps inside its tag. */
+  .whens {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 3px;
+    margin-top: 4px;
+  }
+
+  .whens .tag {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .rfold {

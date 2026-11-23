@@ -180,12 +180,17 @@
 </div>
 
 <style>
+/* Never taller than the canvas: 12 under it, 12 over it, and the rows scroll
+   under the button that closes it. */
 .legend {
   position: absolute;
   left: 12px;
   bottom: 12px;
   z-index: 4;
+  display: flex;
+  flex-direction: column;
   max-width: 400px;
+  max-height: calc(100% - 24px);
   border: 1px solid var(--rule);
   background: var(--paper);
   font-size: 11.5px;
@@ -203,6 +208,8 @@
   cursor: pointer;
 }
 .legend-body {
+  min-height: 0;
+  overflow-y: auto;
   padding: 2px 10px 8px;
   border-top: 1px solid var(--rule-soft);
 }
@@ -273,5 +280,6 @@
     position: static;
     margin: 28px 0 0;
     max-width: 520px;
+    max-height: none;
   }
 </style>

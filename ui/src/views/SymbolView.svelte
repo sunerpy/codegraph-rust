@@ -465,12 +465,19 @@
     };
 
     const start = headerHeight + 12;
+    // A row that carries conditions grows a line for each, so every row is
+    // measured: the next one keeps 8 under it and the connector meets its
+    // middle. Unmeasured (0) is the recipe's 44.
+    const rowEls = rail.querySelectorAll<HTMLElement>('[data-rail-row]');
+    const heights = rows.map((_, index) => rowEls[index]?.offsetHeight || CALLEE_ROW_HEIGHT);
     const nextTops = calleeRowTops(
       rows.map((row) => (row.anchor !== null ? lineCentre(row.anchor) : null)),
-      start
+      start,
+      heights
     );
-    const rowCentres = nextTops.map((top) => top + CALLEE_ROW_HEIGHT / 2);
-    let y = nextTops.length > 0 ? (nextTops[nextTops.length - 1] as number) + CALLEE_ROW_HEIGHT + CALLEE_ROW_GAP : start;
+    const rowCentres = nextTops.map((top, index) => top + (heights[index] ?? CALLEE_ROW_HEIGHT) / 2);
+    const last = nextTops.length - 1;
+    let y = last >= 0 ? (nextTops[last] as number) + (heights[last] ?? CALLEE_ROW_HEIGHT) + CALLEE_ROW_GAP : start;
 
     const nextFoldTop = y + 8;
     if ((callees?.uncertain.length ?? 0) > 0) {

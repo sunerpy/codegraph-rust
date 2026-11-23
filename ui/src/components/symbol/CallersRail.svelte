@@ -406,15 +406,22 @@
     font: var(--t-caption);
   }
 
+  /* A condition longer than the card wraps inside its tag rather than
+     running past the card. */
   .tag {
-    flex: 0 0 auto;
-    height: 18px;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
+    height: auto;
+    min-height: 18px;
     padding: 0 7px;
     border-radius: 9px;
     background: var(--amber-soft);
     color: var(--amber);
     font: var(--t-mono-sm);
     line-height: 18px;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .kindlbl {
