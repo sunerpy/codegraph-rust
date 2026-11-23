@@ -1272,6 +1272,31 @@ impl Store {
         }
     }
 
+    /// The edges of `kinds` whose two ends are both among `ids` (upstream
+    /// `findEdgesBetweenNodes`, the edge recovery at the end of
+    /// `findRelevantContext`): each id's own rows of `idx_edges_source_kind`,
+    /// the target tested against the same list unindexed (`+e.target`, or
+    /// the planner probes the identity index once per id and kind for every
+    /// target). Ordered by `(source, target, kind, line, col)`.
+    pub fn edges_among(&self, ids: &[String], kinds: &[EdgeKind]) -> rusqlite::Result<Vec<Edge>> {
+        if ids.is_empty() || kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: BTreeSet<&str> = ids.iter().map(String::as_str).collect();
+        let ids = serde_json::to_string(&ids)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(ids)];
+        for kind in kinds {
+            params.push(Box::new(kind.as_str()));
+        }
+        let mut stmt = self.conn.prepare(&edges_among_sql(kinds.len()))?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params.iter().map(|param| param.as_ref())),
+            row_to_edge,
+        )?;
+        rows.collect()
+    }
+
     /// The edges of `kind` into any of `targets`: what
     /// [`Self::edges_by_target_kind`] returns for each, read with one query
     /// a chunk of [`SQLITE_PARAM_CHUNK_SIZE`] distinct targets (W7-15b). The
@@ -4212,6 +4237,22 @@ impl StoredEdge {
             && self.provenance == edge.provenance
             && self.metadata.as_deref() == metadata
     }
+}
+
+/// [`Store::edges_among`]'s query for `kinds` edge kinds: the id list is
+/// `?1`, the kinds `?2…`.
+fn edges_among_sql(kinds: usize) -> String {
+    let kind_slots = (0..kinds)
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "SELECT e.* FROM json_each(?1) AS s \
+         CROSS JOIN edges AS e ON e.source = s.value \
+         WHERE e.kind IN ({kind_slots}) \
+           AND +e.target IN (SELECT value FROM json_each(?1)) \
+         ORDER BY e.source, e.target, e.kind, e.line, e.col"
+    )
 }
 
 /// The query of [`Store::reference_sites_of_edges_to_folded_targets`] for
@@ -8247,6 +8288,88 @@ mod tests {
                 .calls_into_from_languages(&targets, &[])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// W7-25a: the edges among an explore subgraph's nodes (upstream
+    /// `findEdgesBetweenNodes`, `context/index.ts` e8ddc4e2 1295-1306): only
+    /// the asked kinds, only edges whose two ends are both in the set, in a
+    /// total order, read from each source's rows of `idx_edges_source_kind`.
+    #[test]
+    fn edges_among_reads_each_sources_edges_of_the_asked_kinds() {
+        let mut store = store("edges-among");
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "src/a.rs"),
+                node("function:b", "b", "src/b.rs"),
+                node("function:c", "c", "src/c.rs"),
+                node("function:out", "out", "src/out.rs"),
+            ])
+            .unwrap();
+        let mut late = edge("function:a", "function:b", EdgeKind::Calls);
+        late.line = Some(9);
+        let mut early = edge("function:a", "function:b", EdgeKind::Calls);
+        early.line = Some(2);
+        store
+            .insert_edges(&[
+                late,
+                edge("function:b", "function:a", EdgeKind::References),
+                edge("function:c", "function:a", EdgeKind::Contains),
+                edge("function:a", "function:out", EdgeKind::Calls),
+                early,
+                edge("function:c", "function:b", EdgeKind::Extends),
+            ])
+            .unwrap();
+        let ids = ["function:c", "function:a", "function:b"].map(String::from);
+        let found: Vec<(String, String, EdgeKind, Option<i64>)> = store
+            .edges_among(
+                &ids,
+                &[EdgeKind::Calls, EdgeKind::References, EdgeKind::Extends],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.source, e.target, e.kind, e.line))
+            .collect();
+        let s = |v: &str| v.to_string();
+        assert_eq!(
+            found,
+            [
+                (s("function:a"), s("function:b"), EdgeKind::Calls, Some(2)),
+                (s("function:a"), s("function:b"), EdgeKind::Calls, Some(9)),
+                (s("function:b"), s("function:a"), EdgeKind::References, None),
+                (s("function:c"), s("function:b"), EdgeKind::Extends, None),
+            ],
+            "only edges inside the set, of the asked kinds, in (source, target, kind, line, col) order"
+        );
+        assert!(
+            store
+                .edges_among(&[], &[EdgeKind::Calls])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.edges_among(&ids, &[]).unwrap().is_empty());
+
+        let ids_json = serde_json::to_string(&ids).unwrap();
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", edges_among_sql(3)))
+            .unwrap();
+        let steps = stmt
+            .query_map(params![ids_json, "calls", "references", "extends"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.starts_with("SEARCH e USING INDEX idx_edges_source_kind")),
+            "the sources' rows of idx_edges_source_kind are not what drives it: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|step| step.contains("SCAN e")),
+            "the edges table is scanned: {steps:?}"
         );
     }
 }

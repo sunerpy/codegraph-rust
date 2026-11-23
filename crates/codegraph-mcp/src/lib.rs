@@ -13,6 +13,7 @@
 pub mod dynamic_boundaries;
 pub mod engine;
 pub mod explore_budget;
+pub(crate) mod explore_gather;
 pub mod instructions;
 pub mod project_services;
 pub mod protocol;

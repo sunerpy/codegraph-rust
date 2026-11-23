@@ -23,6 +23,7 @@ use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge, group_definit
 use codegraph_graph::named_symbol_flow::{
     FlowStep, NamedSymbolFlow, NamedSymbolFlowOptions, resolve_named_symbol_flow,
 };
+use codegraph_graph::query::scoring::normalize_name_token;
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::segment_match::get_segment_matches;
 use codegraph_graph::segments::extract_segment_search_words;
@@ -32,6 +33,7 @@ use serde_json::Value;
 
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
+use crate::explore_gather::{self, HIGH_VALUE_KINDS};
 use crate::protocol::ToolResult;
 use crate::query_paths::{
     QueryLineAnchor, extract_query_paths_with_probes, query_might_contain_paths,
@@ -129,6 +131,10 @@ const TYPE_KINDS: [NodeKind; 8] = [
 /// type annotations as `References` today (`TypeOf`/`Returns` are accepted too
 /// for forward-compatibility, but extraction-widening is DEFERRED per the plan).
 const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, EdgeKind::Returns];
+
+/// Upstream's `GLUE_NODE_CAP` (`tools.ts` b635dd46 4363): entry-point
+/// neighbours glued into the subgraph at most.
+const GLUE_NODE_CAP: usize = 60;
 
 /// Holds one request-scoped project store. Its retained shared lease remains
 /// live until the request has produced its final result.
@@ -3423,13 +3429,13 @@ impl CodeGraphEngine {
         out
     }
 
-    /// Build the explore subgraph. Ports the deterministic spine of
-    /// `findRelevantContext` (`context/index.ts:900-940`): the entry points
-    /// (`roots`) are the FTS search results for the query (`searchLimit: 8`,
-    /// `tools.ts:1597-1602`), in search-rank order. We then pull each root's
-    /// callers/callees + `contains` children into the subgraph so the blast
-    /// radius, relationship map, and source section have content. The RWR
-    /// relevance re-ranking / file gating is NOT ported (see KNOWN_DIFFS.md).
+    /// Build the explore subgraph. The entry points (`roots`) are the Rust
+    /// search's top 8 hits of upstream's high-value kinds, in rank order
+    /// (upstream's multi-channel search is not ported, KNOWN_DIFFS). From
+    /// them the subgraph is walked as `findRelevantContext` walks it
+    /// ([`explore_gather::walk`]); then come the query's pinned files and
+    /// exact targets, upstream's glue and its named-symbol seeds
+    /// (`tools.ts` b635dd46 4352-4626).
     #[cfg(test)]
     fn find_relevant_context(&self, query: &str) -> anyhow::Result<ExploreSubgraph> {
         self.find_relevant_context_with_pins(query, &[], &ExactTargets::default())
@@ -3444,7 +3450,6 @@ impl CodeGraphEngine {
         let mut sub = ExploreSubgraph::default();
         let traverser = GraphTraverser::new(&self.store);
 
-        let mut seed_ids: Vec<String> = Vec::new();
         let results = if query.trim().is_empty() {
             Vec::new()
         } else {
@@ -3457,6 +3462,7 @@ impl CodeGraphEngine {
                 &self.store,
                 query,
                 &SearchOptions {
+                    kinds: HIGH_VALUE_KINDS.to_vec(),
                     limit: Some(8),
                     seed_names,
                     deprioritize: Some(Arc::clone(&self.deprioritize)),
@@ -3465,12 +3471,27 @@ impl CodeGraphEngine {
                 &self.project_name_tokens(),
             )?
         };
+        let mut entries: Vec<Node> = Vec::new();
         for r in results {
-            if sub.insert(r.node.clone()) {
-                seed_ids.push(r.node.id.clone());
-                sub.roots.push(r.node.id.clone());
+            if !entries.iter().any(|seen| seen.id == r.node.id) {
+                entries.push(r.node);
             }
         }
+        // Upstream's walk from the entry points (`findRelevantContext`,
+        // `context/index.ts` 1111-1306): hierarchy, breadth-first walk, trims,
+        // caps and the edges among what was kept. `isTestQuery` is a plain
+        // substring test there (713).
+        let lowered = query.to_lowercase();
+        let test_query = lowered.contains("test") || lowered.contains("spec");
+        let walked = explore_gather::walk(&self.store, &entries, test_query)?;
+        for node in walked.gathered.nodes {
+            sub.insert(node);
+        }
+        for edge in walked.gathered.edges {
+            sub.add_edge(edge);
+        }
+        let seed_ids = walked.roots;
+        sub.roots = seed_ids.clone();
         for file_path in pinned_files {
             sub.pin_file(file_path);
             let mut file_nodes = self.store.nodes_by_file_path(file_path)?;
@@ -3496,18 +3517,12 @@ impl CodeGraphEngine {
         }
         sub.anchor_spans = exact.spans.clone();
 
-        for root_id in seed_ids.clone() {
-            for c in traverser.get_callers(&root_id, CALL_DEPTH)? {
-                sub.add_edge(c.edge.clone());
-                sub.insert(c.node);
-            }
-            for c in traverser.get_callees(&root_id, CALL_DEPTH)? {
-                sub.add_edge(c.edge.clone());
-                sub.insert(c.node);
-            }
-            for child in traverser.get_children(&root_id)? {
-                sub.insert(child);
-            }
+        // `handleExplore`'s gather after the walk (`tools.ts` b635dd46
+        // 4352-4626), run only when something was found (upstream answers an
+        // empty gather before it): glue, then the named-symbol seeds.
+        if !sub.nodes.is_empty() {
+            self.glue_entry_neighbours(&mut sub)?;
+            self.seed_named_symbols(&mut sub, query)?;
         }
 
         self.rescue_change_surface(&mut sub, &seed_ids, query, &traverser)?;
@@ -3533,6 +3548,245 @@ impl CodeGraphEngine {
 
         sub.finalize();
         Ok(sub)
+    }
+
+    /// Upstream's glue (`tools.ts` b635dd46 4352-4381): each entry point's
+    /// callers and callees join the subgraph when they live in a file it
+    /// already holds, at most [`GLUE_NODE_CAP`]; the walk skips some of them
+    /// for their kind (a file node calling at the top level). Nodes only, as
+    /// upstream: the edge recovery ran before.
+    fn glue_entry_neighbours(&self, sub: &mut ExploreSubgraph) -> anyhow::Result<()> {
+        let gathered_files: HashSet<String> =
+            sub.nodes.iter().map(|n| n.file_path.clone()).collect();
+        for root in sub.roots.clone() {
+            if sub.glue_ids.len() >= GLUE_NODE_CAP {
+                break;
+            }
+            let mut neighbours = explore_gather::callers(&self.store, &root)?;
+            neighbours.extend(explore_gather::callees(&self.store, &root)?);
+            for neighbour in neighbours {
+                if sub.glue_ids.len() >= GLUE_NODE_CAP {
+                    break;
+                }
+                if sub.node(&neighbour.id).is_some()
+                    || !gathered_files.contains(&neighbour.file_path)
+                {
+                    continue;
+                }
+                sub.glue_ids.insert(neighbour.id.clone());
+                sub.insert(neighbour);
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream's named-symbol seeding (`tools.ts` b635dd46 4384-4626): every
+    /// symbol-shaped token of the query resolves to its substantive
+    /// definitions, which join the subgraph as named seeds. A token with at
+    /// most three definitions seeds all of them, and the ones within a quarter
+    /// of the busiest's caller count earn the named tier; one with more seeds
+    /// the definitions in a type or file the query also names (at most four),
+    /// else the most substantive. A bare lowercase word seeds only where
+    /// another query token is defined in the same file. An interface's method
+    /// seeds but never earns the tier. Files declaring a type a precise token
+    /// names are recorded for the declaration-only exemption.
+    ///
+    /// Upstream sorts the definitions by body size over its row order; ties
+    /// here go by file, line, column and id first (KEEP-RUST), so a synced
+    /// index and a fresh one seed alike.
+    fn seed_named_symbols(&self, sub: &mut ExploreSubgraph, query: &str) -> anyhow::Result<()> {
+        let tokens = exact_symbol_tokens(query);
+        let project = self.project_name_tokens();
+        let type_tokens: Vec<String> = tokens
+            .iter()
+            .filter(|t| NAMED_TYPE_TOKEN.is_match(t) && !project.contains(&normalize_name_token(t)))
+            .map(|t| t.to_lowercase())
+            .collect();
+        let lowered: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+        let mut file_names: HashMap<String, HashSet<String>> = HashMap::new();
+        for token in &tokens {
+            let qualified = token.contains(['.', '/']) || token.contains("::");
+            let raw: Vec<Node> = if qualified {
+                self.find_all_symbols(token)?.nodes
+            } else {
+                self.store.nodes_by_name(token)?
+            };
+            if is_precise_query_token(token) {
+                for n in &raw {
+                    if is_declaration_kind(n.kind) && n.name.to_lowercase() == token.to_lowercase()
+                    {
+                        sub.named_type_files.insert(n.file_path.clone());
+                    }
+                }
+            }
+            let mut candidates: Vec<Node> = raw
+                .into_iter()
+                .filter(|n| is_seedable_kind(n.kind) && !is_seeder_test_path(&n.file_path))
+                .collect();
+            candidates.sort_by(|a, b| {
+                (
+                    a.file_path.as_str(),
+                    a.start_line,
+                    a.start_column,
+                    a.id.as_str(),
+                )
+                    .cmp(&(
+                        b.file_path.as_str(),
+                        b.start_line,
+                        b.start_column,
+                        b.id.as_str(),
+                    ))
+            });
+            candidates.sort_by_key(|n| {
+                let lines = body_lines(n);
+                (std::cmp::Reverse(lines > 1), std::cmp::Reverse(lines))
+            });
+            if candidates.is_empty() && !qualified && has_camel_hump(token) {
+                candidates = self.camel_infix_definers(token)?;
+            }
+            if !is_precise_query_token(token) {
+                let mut kept = Vec::new();
+                for n in candidates {
+                    if self.co_named_in_file(token, &n.file_path, &lowered, &mut file_names)? {
+                        kept.push(n);
+                    }
+                }
+                candidates = kept;
+            }
+            let (picks, tier_picks): (Vec<Node>, Vec<Node>) = if candidates.len() <= 3 {
+                let mut counts = Vec::with_capacity(candidates.len());
+                for n in &candidates {
+                    counts.push(explore_gather::callers(&self.store, &n.id)?.len());
+                }
+                let busiest = counts.iter().copied().max().unwrap_or(0).max(1) as f64;
+                let tier = candidates
+                    .iter()
+                    .zip(&counts)
+                    .enumerate()
+                    .filter(|(at, (_, count))| *at == 0 || **count as f64 >= busiest * 0.25)
+                    .map(|(_, (n, _))| n.clone())
+                    .collect();
+                (candidates, tier)
+            } else {
+                let in_context: Vec<Node> = candidates
+                    .iter()
+                    .filter(|n| {
+                        type_tokens.iter().any(|t| {
+                            n.file_path.to_lowercase().contains(t.as_str())
+                                || n.qualified_name.to_lowercase().contains(t.as_str())
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                let picks: Vec<Node> = if in_context.is_empty() {
+                    candidates.into_iter().take(1).collect()
+                } else {
+                    in_context.into_iter().take(4).collect()
+                };
+                (picks.clone(), picks)
+            };
+            for n in picks {
+                if !sub.named_seed_ids.contains(&n.id) {
+                    sub.named_seed_ids.push(n.id.clone());
+                }
+                sub.insert(n);
+            }
+            for n in tier_picks {
+                if !self.is_interface_owned_method(&n)? && !sub.tier_seed_ids.contains(&n.id) {
+                    sub.tier_seed_ids.push(n.id.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream's field-name fallback (#1196): a camelCase token naming no
+    /// definition seeds up to three seedable symbols it sits in at a hump or
+    /// as a prefix, shortest first. The candidates come from
+    /// `Store::seedable_nodes_by_name_infix` (shortest first, then name, path
+    /// and line), upstream's `getNodesByNameSubstring` bounded the same way.
+    fn camel_infix_definers(&self, token: &str) -> anyhow::Result<Vec<Node>> {
+        let needle = token.to_lowercase();
+        let mut found: Vec<Node> = self
+            .store
+            .seedable_nodes_by_name_infix(&needle, 60)?
+            .into_iter()
+            .filter(|n| is_seedable_kind(n.kind) && !is_seeder_test_path(&n.file_path))
+            .filter(|n| {
+                let lowered = n.name.to_lowercase();
+                let Some(at) = lowered.find(&needle) else {
+                    return false;
+                };
+                if at == 0 {
+                    return n.name.chars().count() > token.chars().count();
+                }
+                let chars_before = lowered[..at].chars().count();
+                n.name
+                    .chars()
+                    .nth(chars_before)
+                    .is_some_and(|c| c.is_ascii_uppercase())
+            })
+            .collect();
+        found.sort_by_key(|n| n.name.chars().count());
+        found.truncate(3);
+        Ok(found)
+    }
+
+    /// Whether another token of the query names a symbol defined in
+    /// `file_path` (upstream `coNamedInFile`). An interface's members describe
+    /// a shape, not a definition, and do not count.
+    fn co_named_in_file(
+        &self,
+        token: &str,
+        file_path: &str,
+        lowered: &[String],
+        cache: &mut HashMap<String, HashSet<String>>,
+    ) -> anyhow::Result<bool> {
+        if !cache.contains_key(file_path) {
+            let nodes = self.store.nodes_by_file_path(file_path)?;
+            let interfaces: Vec<(i64, i64)> = nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Interface)
+                .map(|n| (n.start_line, n.end_line))
+                .collect();
+            let names = nodes
+                .iter()
+                .filter(|n| {
+                    !(matches!(n.kind, NodeKind::Property | NodeKind::Method)
+                        && interfaces
+                            .iter()
+                            .any(|(start, end)| n.start_line >= *start && n.end_line <= *end))
+                })
+                .map(|n| n.name.to_lowercase())
+                .collect();
+            cache.insert(file_path.to_string(), names);
+        }
+        let names = &cache[file_path];
+        let own = token.to_lowercase();
+        Ok(lowered
+            .iter()
+            .any(|other| *other != own && names.contains(other)))
+    }
+
+    /// A member an interface declares, a signature without a body (#1638):
+    /// a `method` that an `interface` contains.
+    fn is_interface_owned_method(&self, node: &Node) -> anyhow::Result<bool> {
+        if node.kind != NodeKind::Method {
+            return Ok(false);
+        }
+        for edge in self
+            .store
+            .edges_by_target_kind(&node.id, Some(EdgeKind::Contains))?
+        {
+            if self
+                .store
+                .node_by_id(&edge.source)?
+                .is_some_and(|owner| owner.kind == NodeKind::Interface)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The ambient declaration files among `candidate_paths`, minus any this query
@@ -4174,6 +4428,14 @@ struct ExploreSubgraph {
     exact_files: HashSet<String>,
     /// Anchored line spans to render as written, `(file, start, end)`.
     anchor_spans: Vec<(String, usize, usize)>,
+    /// Entry-point neighbours the glue step added (upstream `glueNodeIds`).
+    glue_ids: HashSet<String>,
+    /// Definitions a query token named, in seeding order (`namedSeedIds`).
+    named_seed_ids: Vec<String>,
+    /// The named seeds that earn the named tier (`tierSeedIds`).
+    tier_seed_ids: Vec<String>,
+    /// Files declaring a type a precise token names (`namedTypeFiles`).
+    named_type_files: HashSet<String>,
 }
 
 impl ExploreSubgraph {
@@ -5359,6 +5621,52 @@ fn is_exact_target_kind(kind: NodeKind) -> bool {
 /// deciding whether a qualified name is specific enough to be exact.
 fn is_seedable_kind(kind: NodeKind) -> bool {
     is_exact_target_kind(kind) || matches!(kind, NodeKind::Variable | NodeKind::Constant)
+}
+
+/// A token naming a type or file the query also names (upstream's
+/// `typeTokens`, `/^[A-Z][A-Za-z0-9]{3,}/`).
+static NAMED_TYPE_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Z][A-Za-z0-9]{3,}").expect("named type token regex is valid")
+});
+
+/// The seeder's test-path test (upstream `isTestPath`, `tools.ts` b635dd46
+/// 4441): a tests, specs, `__tests__`, testdata, mocks or fixtures directory,
+/// or a `.test.`/`.spec.` file name, case-insensitively.
+static SEEDER_TEST_PATH: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new([
+        r"(?i)(^|/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)/",
+        r"(?i)\.(test|spec)\.[a-z]+$",
+    ])
+    .expect("seeder test-path patterns are valid")
+});
+
+fn is_seeder_test_path(path: &str) -> bool {
+    SEEDER_TEST_PATH.is_match(path)
+}
+
+/// Upstream's `DECLARATION_KINDS` (`tools.ts` b635dd46 523).
+fn is_declaration_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Interface
+            | NodeKind::TypeAlias
+            | NodeKind::Enum
+            | NodeKind::EnumMember
+            | NodeKind::Namespace
+    )
+}
+
+/// Upstream's `bodyLines`: the lines after a node's first.
+fn body_lines(node: &Node) -> i64 {
+    (node.end_line - node.start_line).max(0)
+}
+
+/// A lowercase letter followed by an uppercase one (`/[a-z][A-Z]/`).
+fn has_camel_hump(token: &str) -> bool {
+    token
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
 }
 
 /// File extensions the seeder strips from a token (upstream `FILE_EXT`), so
@@ -12983,6 +13291,437 @@ mod tests {
                  3. finish (src/r.ts:1)\n\n\
                  {HEAD}- drain → flush   [dynamic: interface → impl @src/x.ts:1]\n\n{AFTER_FLOW}"
             )
+        );
+    }
+
+    // === W7-25a: the subgraph walk (upstream `findRelevantContext`) =========
+
+    /// A function node in `file` for the W7-25 walk fixtures.
+    fn w725_fn(name: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            name,
+            file,
+            line,
+            line + 2,
+            NodeKind::Function,
+            Language::TypeScript,
+        )
+    }
+
+    fn w725_edge_at(source: &Node, target: &Node, kind: EdgeKind, line: i64) -> Edge {
+        let mut edge = mk_edge(&source.id, &target.id, kind);
+        edge.line = Some(line);
+        edge
+    }
+
+    /// W7-25a: the walk goes three hops out, so a type the seed's callee
+    /// references is gathered; one hop of callers and callees did not reach it.
+    #[test]
+    fn w725a_explore_walks_to_a_type_two_hops_out() {
+        let mut engine = test_engine();
+        let run = w725_fn("runThing", "src/run.ts", 1);
+        let helper = w725_fn("prepareStep", "src/helper.ts", 1);
+        let payload = node_lang(
+            "Payload",
+            "Payload",
+            "src/types.ts",
+            1,
+            4,
+            NodeKind::Struct,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[run.clone(), helper.clone(), payload.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&run, &helper, EdgeKind::Calls, 2),
+                w725_edge_at(&helper, &payload, EdgeKind::References, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("runThing").unwrap();
+        assert!(sub.node(&helper.id).is_some(), "the callee is gathered");
+        assert!(
+            sub.node(&payload.id).is_some(),
+            "the type two hops out is gathered: {:?}",
+            sub.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// W7-25a: explore's search takes upstream's kinds (`HIGH_VALUE_NODE_KINDS`,
+    /// `context/index.ts` 168-171): a property or an import the query's words
+    /// match is not a seed.
+    #[test]
+    fn w725a_explore_seeds_only_high_value_kinds() {
+        let mut engine = test_engine();
+        let counter = node_lang(
+            "Counter",
+            "Counter",
+            "src/math.ts",
+            5,
+            12,
+            NodeKind::Class,
+            Language::TypeScript,
+        );
+        let value = node_lang(
+            "value",
+            "Counter.value",
+            "src/math.ts",
+            6,
+            6,
+            NodeKind::Property,
+            Language::TypeScript,
+        );
+        let mut import = node_lang(
+            "./math",
+            "./math",
+            "src/app.ts",
+            1,
+            1,
+            NodeKind::Import,
+            Language::TypeScript,
+        );
+        import.signature = Some("import { Counter, value } from './math'".to_string());
+        put_nodes(
+            &mut engine,
+            &[counter.clone(), value.clone(), import.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[mk_edge(&counter.id, &value.id, EdgeKind::Contains)],
+        );
+        let sub = engine.find_relevant_context("Counter value").unwrap();
+        assert!(sub.roots.contains(&counter.id), "the class is a seed");
+        for id in &sub.roots {
+            let kind = sub.node(id).map(|n| n.kind);
+            assert!(
+                !matches!(kind, Some(NodeKind::Property | NodeKind::Import)),
+                "a {kind:?} became a seed: {:?}",
+                sub.roots
+            );
+        }
+        assert!(
+            sub.node(&value.id).is_none(),
+            "a property is not walked into the subgraph"
+        );
+    }
+
+    /// W7-25a: at most ⌈200 × 0.2⌉ = 40 nodes of one file stay in the
+    /// subgraph (`context/index.ts` 1235-1266). The leaves sit two hops out:
+    /// glue re-adds an entry point's own callees from a gathered file, as
+    /// upstream's does.
+    #[test]
+    fn w725a_explore_caps_one_files_share_of_the_subgraph() {
+        let mut engine = test_engine();
+        let hub = w725_fn("hubEntry", "src/hub.ts", 1);
+        let mid = w725_fn("middleStep", "src/mid.ts", 1);
+        let mut nodes = vec![hub.clone(), mid.clone()];
+        let mut edges = vec![w725_edge_at(&hub, &mid, EdgeKind::Calls, 2)];
+        for i in 0..60 {
+            let leaf = w725_fn(&format!("leaf{i}"), "src/big.ts", 1 + 4 * i);
+            edges.push(w725_edge_at(&mid, &leaf, EdgeKind::Calls, 2));
+            nodes.push(leaf);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("hubEntry").unwrap();
+        let in_big = sub
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == "src/big.ts")
+            .count();
+        assert_eq!(in_big, 40, "one file keeps at most 40 nodes");
+    }
+
+    /// W7-25a: test and other non-production files hold at most
+    /// ⌈200 × 0.15⌉ = 30 nodes when the query is not about tests
+    /// (`context/index.ts` 1267-1283).
+    #[test]
+    fn w725a_explore_caps_non_production_nodes() {
+        let mut engine = test_engine();
+        let hub = w725_fn("hubEntry", "src/hub.ts", 1);
+        let mut nodes = vec![hub.clone()];
+        let mut edges = Vec::new();
+        for i in 0..50 {
+            let file = format!("tests/t{}.test.ts", i / 5);
+            let callee = w725_fn(&format!("probe{i}"), &file, 1 + 4 * (i % 5));
+            edges.push(w725_edge_at(&callee, &hub, EdgeKind::Calls, 2));
+            nodes.push(callee);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("hubEntry").unwrap();
+        let in_tests = sub
+            .nodes
+            .iter()
+            .filter(|n| n.file_path.starts_with("tests/"))
+            .count();
+        assert_eq!(in_tests, 30, "non-production nodes are capped at 30");
+        // `hubEntryTest` holds `test`, so the query is about tests: no cap.
+        let mut about = test_engine();
+        let hub_test = w725_fn("hubEntryTest", "src/hub.ts", 1);
+        let mut nodes = vec![hub_test.clone()];
+        let mut edges = Vec::new();
+        for i in 0..50 {
+            let file = format!("tests/t{}.test.ts", i / 5);
+            let callee = w725_fn(&format!("probe{i}"), &file, 1 + 4 * (i % 5));
+            edges.push(w725_edge_at(&callee, &hub_test, EdgeKind::Calls, 2));
+            nodes.push(callee);
+        }
+        put_nodes(&mut about, &nodes);
+        put_edges(&mut about, &edges);
+        let about_tests = about.find_relevant_context("hubEntryTest").unwrap();
+        assert_eq!(
+            about_tests
+                .nodes
+                .iter()
+                .filter(|n| n.file_path.starts_with("tests/"))
+                .count(),
+            50,
+            "a query about tests keeps them"
+        );
+    }
+
+    /// W7-25a: the edges among the gathered nodes are recovered, also the
+    /// ones between two nodes at the walk's last depth, which it never expands
+    /// (`context/index.ts` 1295-1306).
+    #[test]
+    fn w725a_explore_recovers_edges_among_the_last_layer() {
+        let mut engine = test_engine();
+        let root = w725_fn("rootStep", "src/a.ts", 1);
+        let x = w725_fn("secondStep", "src/b.ts", 1);
+        let y = w725_fn("thirdStep", "src/c.ts", 1);
+        let z1 = w725_fn("fourthOne", "src/d.ts", 1);
+        let z2 = w725_fn("fourthTwo", "src/e.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[root.clone(), x.clone(), y.clone(), z1.clone(), z2.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&root, &x, EdgeKind::Calls, 2),
+                w725_edge_at(&x, &y, EdgeKind::Calls, 2),
+                w725_edge_at(&y, &z1, EdgeKind::Calls, 2),
+                w725_edge_at(&y, &z2, EdgeKind::Calls, 3),
+                w725_edge_at(&z1, &z2, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        assert!(
+            sub.edges
+                .iter()
+                .any(|e| e.source == z1.id && e.target == z2.id && e.kind == EdgeKind::Calls),
+            "the edge between the last layer's nodes is recovered: {:?}",
+            sub.edges
+                .iter()
+                .map(|e| (&e.source, &e.target))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// W7-25a: glue (`tools.ts` b635dd46 4352-4381) adds a seed's caller of a
+    /// kind the walk skips only from a file the subgraph already holds.
+    #[test]
+    fn w725a_explore_glue_adds_callers_only_from_gathered_files() {
+        let mut engine = test_engine();
+        let demo = w725_fn("runDemo", "src/app.ts", 3);
+        let own_file = node_lang(
+            "app.ts",
+            "app.ts",
+            "src/app.ts",
+            1,
+            9,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        let other_file = node_lang(
+            "other.ts",
+            "other.ts",
+            "src/other.ts",
+            1,
+            9,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[demo.clone(), own_file.clone(), other_file.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&own_file, &demo, EdgeKind::Calls, 9),
+                w725_edge_at(&other_file, &demo, EdgeKind::Calls, 4),
+            ],
+        );
+        let sub = engine.find_relevant_context("runDemo").unwrap();
+        assert!(
+            sub.node(&own_file.id).is_some(),
+            "the caller in the seed's own file is glued in"
+        );
+        assert!(
+            sub.node(&other_file.id).is_none(),
+            "a caller of a skipped kind in a file the subgraph does not hold stays out"
+        );
+    }
+
+    /// W7-25a: the gathered subgraph does not depend on the order the rows
+    /// were written in (a synced index and a fresh one store them differently).
+    #[test]
+    fn w725a_explore_subgraph_ignores_row_order() {
+        fn build(reverse: bool) -> (Vec<String>, Vec<(String, String, String)>) {
+            let mut engine = test_engine();
+            let root = w725_fn("rootStep", "src/a.ts", 1);
+            let mut nodes = vec![root.clone()];
+            let mut edges = Vec::new();
+            for i in 0..30 {
+                let callee = w725_fn(&format!("callee{i}"), &format!("src/f{}.ts", i % 7), 1 + i);
+                let deeper = w725_fn(&format!("deeper{i}"), &format!("src/g{}.ts", i % 5), 1 + i);
+                edges.push(w725_edge_at(&root, &callee, EdgeKind::Calls, 1 + i));
+                edges.push(w725_edge_at(&callee, &deeper, EdgeKind::References, 1));
+                nodes.push(callee);
+                nodes.push(deeper);
+            }
+            if reverse {
+                nodes.reverse();
+                edges.reverse();
+            }
+            put_nodes(&mut engine, &nodes);
+            put_edges(&mut engine, &edges);
+            let sub = engine.find_relevant_context("rootStep").unwrap();
+            (
+                sub.nodes.iter().map(|n| n.id.clone()).collect(),
+                sub.edges
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.source.clone(),
+                            e.target.clone(),
+                            e.kind.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(
+            forward.0.len(),
+            61,
+            "the root, its 30 callees and their 30 types: {:?}",
+            forward.0
+        );
+        assert_eq!(forward, backward, "the gather depends on row order");
+    }
+
+    fn w725_class(name: &str, file: &str) -> Node {
+        node_lang(
+            name,
+            name,
+            file,
+            1,
+            5,
+            NodeKind::Class,
+            Language::TypeScript,
+        )
+    }
+
+    /// W7-25a: a class entry point's ancestors come in through its type
+    /// hierarchy (`context/index.ts` 1111-1137) even past the walk's depth.
+    #[test]
+    fn w725a_explore_takes_a_class_entrys_ancestors_past_the_walk() {
+        let mut engine = test_engine();
+        let chain: Vec<Node> = [
+            "Quokka", "Narwhal", "Pangolin", "Axolotl", "Capybara", "Okapi",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| w725_class(name, &format!("src/l{i}.ts")))
+        .collect();
+        put_nodes(&mut engine, &chain);
+        let edges: Vec<Edge> = chain
+            .windows(2)
+            .map(|pair| mk_edge(&pair[0].id, &pair[1].id, EdgeKind::Extends))
+            .collect();
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("Quokka").unwrap();
+        assert!(
+            sub.node(&chain[5].id).is_some(),
+            "the ancestor five hops up is gathered: {:?}",
+            sub.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// W7-25a: past `maxNodes` (200) the subgraph is trimmed, the entry point
+    /// and its neighbours first (`context/index.ts` 1197-1233).
+    #[test]
+    fn w725a_explore_trims_the_subgraph_to_two_hundred_nodes() {
+        let mut engine = test_engine();
+        let chain: Vec<Node> = (0..250)
+            .map(|i| w725_class(&format!("Tier{i}Kind"), &format!("src/t{i}.ts")))
+            .collect();
+        put_nodes(&mut engine, &chain);
+        let edges: Vec<Edge> = chain
+            .windows(2)
+            .map(|pair| mk_edge(&pair[0].id, &pair[1].id, EdgeKind::Extends))
+            .collect();
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("Tier0Kind").unwrap();
+        assert_eq!(sub.nodes.len(), 200, "the subgraph holds at most 200 nodes");
+        assert!(sub.node(&chain[0].id).is_some(), "the entry point stays");
+        assert!(sub.node(&chain[1].id).is_some(), "its neighbour stays");
+    }
+
+    /// W7-25a: the walk reads a node's edges in upstream's order: out-edges
+    /// by kind then target, in-edges by kind then source, structural kinds
+    /// first (`contains`, then `calls`). The store's own order differs: the
+    /// identity index sorts out-edges by target first, and in-edges of one
+    /// kind come in row order.
+    #[test]
+    fn w725a_explore_walks_edges_in_upstream_order() {
+        let mut engine = test_engine();
+        let root = w725_fn("rootStep", "src/root.ts", 1);
+        let zeta = w725_fn("zetaTarget", "src/y.ts", 1);
+        let alpha = w725_fn("alphaTarget", "src/a.ts", 1);
+        let built = w725_fn("betaTarget", "src/b.ts", 1);
+        let late_caller = w725_fn("zuluCaller", "src/z.ts", 1);
+        let early_caller = w725_fn("echoCaller", "src/e.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                root.clone(),
+                zeta.clone(),
+                alpha.clone(),
+                built.clone(),
+                late_caller.clone(),
+                early_caller.clone(),
+            ],
+        );
+        // Written in the reverse of upstream's order, kind by kind.
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&root, &zeta, EdgeKind::References, 2),
+                w725_edge_at(&root, &alpha, EdgeKind::References, 3),
+                w725_edge_at(&root, &built, EdgeKind::Instantiates, 4),
+                w725_edge_at(&late_caller, &root, EdgeKind::Calls, 2),
+                w725_edge_at(&early_caller, &root, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        let order: Vec<&str> = sub.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "rootStep",
+                "echoCaller",
+                "zuluCaller",
+                "betaTarget",
+                "alphaTarget",
+                "zetaTarget"
+            ],
+            "calls first; in-edges by source; out-edges by kind, then target"
         );
     }
 }
