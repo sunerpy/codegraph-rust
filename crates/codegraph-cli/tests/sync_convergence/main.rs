@@ -2221,6 +2221,23 @@ matrix! {
     erlang_callback_added,
     erlang_app_src_appears,
     erlang_app_src_goes,
+    // W7-24 (OD-B57, OD-B58): an imported value's call reaches the class its
+    // file means; an Erlang macro use binds only a `-define` of its name.
+    #[ignore = "W7-31: an edit that re-points the value's class import in its module re-resolves no call through the imported value in another file (OD-B57)"]
+    typescript_imported_value_class_import_re_points,
+    #[ignore = "W7-31: an edit that changes the class the value's module makes it from re-resolves no call through the imported value in another file (pre-existing since #1292)"]
+    typescript_imported_value_class_changes,
+    typescript_imported_value_file_comes_to_declare_its_class,
+    typescript_imported_value_declaring_module_appears,
+    typescript_imported_value_declaring_module_goes,
+    #[ignore = "W7-31: an edit that re-points the value's class import in its module re-resolves no call through the imported value in another file (OD-B57)"]
+    javascript_imported_value_class_import_re_points,
+    javascript_imported_value_declaring_module_appears,
+    javascript_imported_value_declaring_module_goes,
+    erlang_macro_use_binds_a_define_its_module_gains,
+    erlang_macro_use_loses_its_header_define,
+    erlang_macro_use_second_header_define_appears,
+    erlang_parked_macro_use_ignores_an_added_type_alias,
     // W7-28: a JSX tag in a `.js` file renders as in `.jsx`.
     javascript_rendered_component_appears,
     javascript_rendered_component_file_deleted,

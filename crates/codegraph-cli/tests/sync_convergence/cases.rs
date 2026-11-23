@@ -27659,6 +27659,238 @@ pub fn erlang_app_src_goes() -> Case {
         )
 }
 
+// ----- W7-24 (OD-B57, OD-B58): an imported value's call, an Erlang macro use --
+
+/// OD-B57: a class `Logger` with the member the call names. A test helper,
+/// first by path, holds one too, and so does every module that declares the
+/// class the value is made from.
+const B57_LOGGER: &str =
+    "export class Logger {\n  info(message: string) {\n    return message;\n  }\n}\n";
+/// The test helper: a call on a value whose file names no class of the name
+/// reaches its `Logger`, the first by path.
+const B57_HELPER: &str = "export class Logger {\n  info(message: string) {\n    return message;\n  }\n}\n\nexport class Auditor {\n  info(message: string) {\n    return message;\n  }\n}\n";
+const B57_HELPER_INFO: &str = "method Logger::info @src/__tests__/helpers/logger.ts";
+const B57_CONSOLE_INFO: &str = "method Logger::info @src/log/console.ts";
+const B57_FILE_INFO: &str = "method Logger::info @src/log/file.ts";
+/// The module exporting the value, made from the class it imports.
+const B57_VALUE_OF_CONSOLE: &str =
+    "import { Logger } from './log/console';\n\nexport const logger = new Logger();\n";
+const B57_VALUE_OF_FILE: &str =
+    "import { Logger } from './log/file';\n\nexport const logger = new Logger();\n";
+/// The unchanged file calling a member of the imported value.
+const B57_APP: &str =
+    "import { logger } from './logging';\n\nexport function run() {\n  logger.info('start');\n}\n";
+
+/// OD-B57's project without the module the value's import names first:
+/// the test helper, a second `Logger` module, the value and its caller.
+fn b57_project(change: Change, value: &'static str) -> Case {
+    Case::new(change, &[Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file("src/logging.ts", value)
+        .file("src/app.ts", B57_APP)
+}
+
+/// W7-24 (OD-B57, upstream #2644): the value's file re-points the import of
+/// its class to another module, which declares a namesake: the call in the
+/// unchanged caller follows the import, though no method changed.
+pub fn typescript_imported_value_class_import_re_points() -> Case {
+    b57_project(Change::ReexportEdit, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .write("src/logging.ts", B57_VALUE_OF_FILE)
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_FILE_INFO)
+        .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-24 (OD-B57): the value comes to be made from another imported class,
+/// which the test helper declares too: the call reaches the class of the
+/// module the value's file imports it from.
+pub fn typescript_imported_value_class_changes() -> Case {
+    b57_project(
+        Change::BodyEdit,
+        "import { Logger } from './log/console';\nimport { Auditor } from './log/audit';\n\nexport const logger = new Logger();\n",
+    )
+    .file("src/log/console.ts", B57_LOGGER)
+    .file(
+        "src/log/audit.ts",
+        "export class Auditor {\n  info(message: string) {\n    return message;\n  }\n}\n",
+    )
+    .write(
+        "src/logging.ts",
+        "import { Logger } from './log/console';\nimport { Auditor } from './log/audit';\n\nexport const logger = new Auditor();\n",
+    )
+    .edge_before("function run", "calls", B57_CONSOLE_INFO)
+    .edge_after("function run", "calls", "method Auditor::info @src/log/audit.ts")
+    .no_edge_after(
+        "function run",
+        "calls",
+        "method Auditor::info @src/__tests__/helpers/logger.ts",
+    )
+}
+
+/// W7-24 (OD-B57): the value's file comes to declare the class it makes the
+/// value from instead of importing it: the call reaches the class the
+/// value's own file declares.
+pub fn typescript_imported_value_file_comes_to_declare_its_class() -> Case {
+    b57_project(Change::AddCompetitor, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .write(
+            "src/logging.ts",
+            "export class Logger {\n  info(message: string) {\n    return message;\n  }\n}\n\nexport const logger = new Logger();\n",
+        )
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", "method Logger::info @src/logging.ts")
+        .no_edge_after("function run", "calls", B57_HELPER_INFO)
+}
+
+/// W7-24 (OD-B57): the module the value's file imports its class from
+/// appears: the call leaves the test helper's namesake for its class.
+pub fn typescript_imported_value_declaring_module_appears() -> Case {
+    b57_project(Change::AddImportTarget, B57_VALUE_OF_CONSOLE)
+        .write("src/log/console.ts", B57_LOGGER)
+        .edge_before("function run", "calls", B57_HELPER_INFO)
+        .edge_after("function run", "calls", B57_CONSOLE_INFO)
+        .no_edge_after("function run", "calls", B57_HELPER_INFO)
+}
+
+/// W7-24 (OD-B57): the module the value's file imports its class from
+/// goes: the file names no class any more, and the call falls back to the
+/// first namesake by path, the test helper's.
+pub fn typescript_imported_value_declaring_module_goes() -> Case {
+    b57_project(Change::DeleteImportedModule, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .remove("src/log/console.ts")
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_HELPER_INFO)
+        .no_edge_after("function run", "calls", B57_FILE_INFO)
+}
+
+/// [`B57_LOGGER`] in JavaScript.
+const B57_JS_LOGGER: &str =
+    "export class Logger {\n  info(message) {\n    return message;\n  }\n}\n";
+const B57_JS_HELPER_INFO: &str = "method Logger::info @src/__tests__/helpers/logger.js";
+const B57_JS_CONSOLE_INFO: &str = "method Logger::info @src/log/console.js";
+const B57_JS_FILE_INFO: &str = "method Logger::info @src/log/file.js";
+
+/// [`b57_project`] in JavaScript.
+fn b57_js_project(change: Change, value: &'static str) -> Case {
+    Case::new(change, &[Language::JavaScript])
+        .file("src/__tests__/helpers/logger.js", B57_JS_LOGGER)
+        .file("src/log/file.js", B57_JS_LOGGER)
+        .file("src/logging.js", value)
+        .file(
+            "src/app.js",
+            "import { logger } from './logging';\n\nexport function run() {\n  logger.info('start');\n}\n",
+        )
+}
+
+/// W7-24 (OD-B57, [`typescript_imported_value_class_import_re_points`] in
+/// JavaScript): the value's file re-points the import of its class.
+pub fn javascript_imported_value_class_import_re_points() -> Case {
+    b57_js_project(Change::ReexportEdit, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.js", B57_JS_LOGGER)
+        .write("src/logging.js", B57_VALUE_OF_FILE)
+        .edge_before("function run", "calls", B57_JS_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_JS_FILE_INFO)
+        .no_edge_after("function run", "calls", B57_JS_CONSOLE_INFO)
+}
+
+/// W7-24 (OD-B57, [`typescript_imported_value_declaring_module_appears`] in
+/// JavaScript): the module the value's file imports its class from appears.
+pub fn javascript_imported_value_declaring_module_appears() -> Case {
+    b57_js_project(Change::AddImportTarget, B57_VALUE_OF_CONSOLE)
+        .write("src/log/console.js", B57_JS_LOGGER)
+        .edge_before("function run", "calls", B57_JS_HELPER_INFO)
+        .edge_after("function run", "calls", B57_JS_CONSOLE_INFO)
+        .no_edge_after("function run", "calls", B57_JS_HELPER_INFO)
+}
+
+/// W7-24 (OD-B57, [`typescript_imported_value_declaring_module_goes`] in
+/// JavaScript): the module the value's file imports its class from goes.
+pub fn javascript_imported_value_declaring_module_goes() -> Case {
+    b57_js_project(Change::DeleteImportedModule, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.js", B57_JS_LOGGER)
+        .remove("src/log/console.js")
+        .edge_before("function run", "calls", B57_JS_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_JS_HELPER_INFO)
+        .no_edge_after("function run", "calls", B57_JS_FILE_INFO)
+}
+
+/// OD-B58 (KEEP-RUST): a project header defining Common Test's `?config`,
+/// and the suite using it.
+const B58_HEADER_DEFINE: &str = "-define(config(Key, Config), proplists:get_value(Key, Config)).\n";
+const B58_SUITE: &str = "-module(my_SUITE).\n-include(\"ct_helpers.hrl\").\n-export([t/1]).\n\nt(Config) ->\n    ?config(priv_dir, Config).\n";
+const B58_USE: &str = "function my_SUITE::t/1";
+const B58_HEADERS_CONFIG: &str = "constant config @include/ct_helpers.hrl";
+
+/// W7-24 (OD-B58): the suite gains its own `-define` of the macro: the use
+/// binds the file's own define, not the header's.
+pub fn erlang_macro_use_binds_a_define_its_module_gains() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Erlang])
+        .file("include/ct_helpers.hrl", B58_HEADER_DEFINE)
+        .file("test/my_SUITE.erl", B58_SUITE)
+        .write(
+            "test/my_SUITE.erl",
+            "-module(my_SUITE).\n-include(\"ct_helpers.hrl\").\n-define(config(Key, Config), element(2, lists:keyfind(Key, 1, Config))).\n-export([t/1]).\n\nt(Config) ->\n    ?config(priv_dir, Config).\n",
+        )
+        .edge_before(B58_USE, "calls", B58_HEADERS_CONFIG)
+        .edge_after(B58_USE, "calls", "constant my_SUITE::config")
+        .no_edge_after(B58_USE, "calls", B58_HEADERS_CONFIG)
+}
+
+/// W7-24 (OD-B58): the header's define goes: another module's define of the
+/// name is no candidate, a macro being file-scoped, and the use links
+/// nothing.
+pub fn erlang_macro_use_loses_its_header_define() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Erlang])
+        .file("include/ct_helpers.hrl", B58_HEADER_DEFINE)
+        .file(
+            "src/other.erl",
+            "-module(other).\n-define(config(Key, Config), maps:get(Key, Config)).\n-export([x/1]).\n\nx(Config) ->\n    ?config(a, Config).\n",
+        )
+        .file("test/my_SUITE.erl", B58_SUITE)
+        .write("include/ct_helpers.hrl", "-define(RETRIES, 3).\n")
+        .edge_before(B58_USE, "calls", B58_HEADERS_CONFIG)
+        .edge_throughout("function other::x/1", "calls", "constant other::config")
+        .no_edge_after(B58_USE, "calls", "constant other::config")
+}
+
+/// W7-24 (OD-B58): a second header defines the macro: no `-include` is
+/// read, so two headers defining it leave the use unresolved.
+pub fn erlang_macro_use_second_header_define_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Erlang])
+        .file("include/ct_helpers.hrl", B58_HEADER_DEFINE)
+        .file("test/my_SUITE.erl", B58_SUITE)
+        .write(
+            "include/ct_extra.hrl",
+            "-define(config(Key, Config), maps:get(Key, Config)).\n",
+        )
+        .edge_before(B58_USE, "calls", B58_HEADERS_CONFIG)
+        .no_edge_after(B58_USE, "calls", B58_HEADERS_CONFIG)
+        .no_edge_after(B58_USE, "calls", "constant config @include/ct_extra.hrl")
+}
+
+/// W7-24 (OD-B58, rebar3's shape): a use of a macro an external header
+/// defines stays parked when a type alias of its name appears, in a module
+/// or in a header; the header define beside it keeps its use.
+pub fn erlang_parked_macro_use_ignores_an_added_type_alias() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Erlang])
+        .file("include/limits.hrl", "-define(RETRIES, 3).\n")
+        .file(
+            "test/my_SUITE.erl",
+            "-module(my_SUITE).\n-include_lib(\"common_test/include/ct.hrl\").\n-include(\"limits.hrl\").\n-export([t/1]).\n\nt(Config) ->\n    {?config(priv_dir, Config), ?RETRIES}.\n",
+        )
+        .write(
+            "src/r3_hex_core.erl",
+            "-module(r3_hex_core).\n-export_type([config/0]).\n-type config() :: map().\n",
+        )
+        .write("include/types.hrl", "-type config() :: list().\n")
+        .edge_throughout(B58_USE, "references", "constant RETRIES")
+        .no_edge_after(B58_USE, "calls", "type_alias r3_hex_core::config")
+        .no_edge_after(B58_USE, "calls", "type_alias config @include/types.hrl")
+}
+
 // ----- W7-28 (OD-B46): a JSX tag in a `.js` file renders as in `.jsx` -----
 
 /// [`JSX_APP`] written in `.js`.
