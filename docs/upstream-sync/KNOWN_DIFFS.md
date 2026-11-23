@@ -1317,3 +1317,27 @@ as changed, and an Angular file that only lazy-loads routes files scopes its
 app's calls; and Angular's and React Router's calls whose destination reads
 a constant in a rewritten file go back (`route_modules.rs`,
 `navigation.rs`).
+
+The watcher leaves one shape to the next full sync that a fresh index sees
+(W7-29): a directory replaced in place by another of the same name, as a
+rename onto an empty directory does, keeps a path the watcher knows, so it is
+not walked and the files it brought send no event. On Linux the replaced
+directory reports its own removal, which escalates to one full reconcile at
+once; macOS and Windows are not verified. colby's check misses it too, since
+the directory's real path does not change (`watcher.rs`).
+
+### Watcher
+
+- **A directory that arrives whole is walked (W7-29, OD-B63).** colby
+  reconciles the whole project when a directory it did not know appears, or a
+  known one now resolves to another real path: `handleDirEvent` calls
+  `scheduleTreeRefresh`, which walks the watch tree again and sets
+  `needsFullScan` (`src/sync/watcher.ts`, since #2025). The port walks only a
+  directory it does not know, whichever event finds it first. It watches each
+  directory of it just before reading it and hands the files the watch policy
+  keeps, source and control files alike, to the next incremental sync, as if
+  each had sent its own event. Only a directory holding more than 500 such
+  files, or a symlink, makes it reconcile the whole project, the first
+  reported as RECOVERING until that reconcile commits. An event naming a
+  directory the watcher knows walks only the new directories it finds below
+  it (`watcher.rs`).

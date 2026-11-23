@@ -34,11 +34,12 @@ type NoticeCallback = Arc<dyn Fn(String) + Send + Sync>;
 type DriftCheckFn = Arc<dyn Fn() -> Result<Option<String>> + Send + Sync>;
 
 /// The OS watcher, shared between [`ProjectWatcher`] (which owns its lifetime)
-/// and the event-loop thread (which registers a watch when a brand-new
-/// non-ignored directory appears). Because Linux watches are NON-recursive
-/// per-dir (see [`collect_watch_dirs`]), a freshly-created directory would
-/// otherwise hold no watch until a server restart; the loop adds one on its
-/// create event.
+/// and the event-loop thread (which registers watches for a directory that
+/// arrives after start). Because Linux watches are NON-recursive per-dir (see
+/// [`collect_watch_dirs`]), a directory created, moved or copied in would
+/// otherwise hold no watch until a server restart; on its event the loop
+/// watches each of its directories just before reading that directory for the
+/// files already in it ([`collect_arrived_tree`]).
 type SharedWatcher = Arc<Mutex<Option<RecommendedWatcher>>>;
 
 #[derive(Debug, Clone)]
@@ -389,6 +390,114 @@ fn collect_watch_tree(root: &Path, policy: &WatchPolicy) -> (Vec<PathBuf>, bool)
     (dirs, saw_link)
 }
 
+/// What one walk of a directory the event loop was told of found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeWalk {
+    /// Every directory the walk listed, sorted: the set [`collect_watch_tree`]
+    /// lists, however many files there were.
+    dirs: Vec<PathBuf>,
+    /// The files to hand to the sync, by project path, sorted: at most one
+    /// past the walk's limit.
+    files: Vec<String>,
+    /// More files than the limit were to be handed on, so the walk stopped
+    /// taking them.
+    overflowed: bool,
+    /// A listed directory holds a symlink.
+    saw_link: bool,
+}
+
+/// Walk `root`, a directory that arrived whole (created, moved or copied in),
+/// for its directories and for the files already in them, which no backend
+/// reports: the regular files `accept` keeps, by project path.
+///
+/// Directories are pruned exactly as [`collect_watch_tree`] prunes them, and
+/// `register` is called with each one just before it is read, so a file or
+/// directory created in it afterwards has an event of its own and one created
+/// earlier is listed (upstream's `watchTree(dir, markExisting)` before #2025).
+/// An ignored `config/` or `layout/` is read for its files, which may mark a
+/// Shopify theme (W4-LIQ-01), and nothing below it. Symlinks are only noted,
+/// as there. Once it has taken one file past `limit`, the walk takes no more
+/// and only lists the remaining directories. A directory that cannot be read
+/// is skipped.
+fn collect_arrived_tree(
+    root: &Path,
+    policy: &WatchPolicy,
+    mut register: impl FnMut(&Path),
+    mut accept: impl FnMut(&str) -> bool,
+    limit: usize,
+) -> TreeWalk {
+    let mut walk = TreeWalk::default();
+    // Each directory, with whether the walk goes below it: a theme marker
+    // folder is read for its files only.
+    let mut stack = vec![(root.to_path_buf(), true)];
+    while let Some((dir, descend)) = stack.pop() {
+        register(&dir);
+        let entries = fs::read_dir(&dir);
+        walk.dirs.push(dir);
+        let Ok(entries) = entries else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                walk.saw_link |= descend;
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !descend {
+                    continue;
+                }
+                match policy.normalize_relative(&path) {
+                    Some(relative) if !policy.should_watch_dir(&relative) => {
+                        if policy.watches_for_theme_markers(&relative) {
+                            stack.push((path, false));
+                        }
+                    }
+                    Some(_) => stack.push((path, true)),
+                    None => {}
+                }
+            } else if file_type.is_file()
+                && walk.files.len() <= limit
+                && let Some(relative) = policy.normalize_relative(&path)
+                && accept(&relative)
+            {
+                walk.files.push(relative);
+            }
+        }
+    }
+    walk.dirs.sort();
+    walk.files.sort();
+    walk.overflowed = walk.files.len() > limit;
+    walk
+}
+
+/// The directories of `dirs`, a walk's listing of a known directory, that
+/// arrived before their own events were handled: those `known_dirs` lacks,
+/// read before the walk merges into it, whose parent it holds. A new directory
+/// below a new parent is the parent's walk's, so no file is handed on twice. A
+/// theme marker folder is no arrival: its own event reads it, known or not
+/// (W4-LIQ-01).
+fn arrival_roots(
+    dirs: &[PathBuf],
+    known_dirs: &BTreeSet<String>,
+    policy: &WatchPolicy,
+) -> Vec<(String, PathBuf)> {
+    dirs.iter()
+        .filter_map(|dir| Some((policy.normalize_relative(dir)?, dir)))
+        .filter(|(relative, _)| {
+            !known_dirs.contains(relative)
+                && policy.should_watch_dir(relative)
+                && relative
+                    .rsplit_once('/')
+                    .is_none_or(|(parent, _)| known_dirs.contains(parent))
+        })
+        .map(|(relative, dir)| (relative, dir.clone()))
+        .collect()
+}
+
 /// The symlinks the index follows (upstream #770), exactly as the scan chose
 /// them, narrowed to what the stricter watch policy watches. The watcher never
 /// watches a directory the scan did not walk through that very logical path,
@@ -572,23 +681,12 @@ fn register_new_dirs_with(
     }
 }
 
-/// The ohpm manifests directly in `dirs`, directories a move or a `mkdir -p`
-/// brought in, by project path: regular files only, as the ohpm walk reads
-/// them (W7-24a1).
-fn ohpm_manifests_in(dirs: &[PathBuf], policy: &WatchPolicy) -> Vec<String> {
-    dirs.iter()
-        .map(|dir| dir.join(codegraph_resolve::workspace_packages::OHPM_MANIFEST))
-        .filter(|manifest| {
-            fs::symlink_metadata(manifest).is_ok_and(|meta| meta.file_type().is_file())
-        })
-        .filter_map(|manifest| policy.normalize_relative(&manifest))
-        .collect()
-}
-
-/// Register a NonRecursive watch for the newly-created directory `dir` alone,
-/// an ignored one watched for a Shopify theme marker (W4-LIQ-01), on
-/// per-directory backends; a no-op on the recursive ones.
-fn register_marker_dir(watcher: &SharedWatcher, dir: &Path) {
+/// Register a NonRecursive watch for the directory `dir` alone on
+/// per-directory backends, ignoring a failure as [`register_new_dirs`] does; a
+/// no-op on the recursive ones. `dir` is a directory the walk of an arriving
+/// tree is about to read ([`collect_arrived_tree`]), or a new ignored one
+/// watched for a Shopify theme marker (W4-LIQ-01).
+fn register_dir_alone(watcher: &SharedWatcher, dir: &Path) {
     if watch_registration(platform_watch_backend()) == WatchRegistration::SingleRootRecursive {
         return;
     }
@@ -600,10 +698,14 @@ fn register_marker_dir(watcher: &SharedWatcher, dir: &Path) {
     }
 }
 
-/// Register a NonRecursive watch for a newly-created directory `new_dir` and all
-/// of its non-ignored descendants (a `mkdir -p a/b/c` surfaces one create event,
-/// so the subtree must be re-walked) on per-directory backends. Windows and macOS
-/// use one native recursive root watch, so this is intentionally a no-op there.
+/// Register a NonRecursive watch for `new_dir`, a directory the watcher already
+/// knows, and all of its non-ignored descendants again, on per-directory
+/// backends: an event naming a known directory can mean it was replaced in
+/// place, which keeps the path but not the watch. This lists the whole tree
+/// before it adds any watch, so a directory that arrives is registered by
+/// [`collect_arrived_tree`] instead, each just before it is read. Windows and
+/// macOS use one native recursive root watch, so this is intentionally a no-op
+/// there.
 fn register_new_dirs(watcher: &SharedWatcher, policy: &WatchPolicy, new_dir: &Path) {
     let backend = platform_watch_backend();
     if watch_registration(backend) == WatchRegistration::SingleRootRecursive {
@@ -1588,6 +1690,55 @@ struct PendingInfo {
     last_seen_ms: u128,
 }
 
+/// Whether a change at `relative`, a directory when `is_dir`, goes to the next
+/// sync: a source file, or a path that may have been one. So does a Shopify
+/// theme marker, which need not be source nor in scope, yet its coming or
+/// going reclassifies the theme's JSON templates: the sync it is handed to
+/// reads the theme (W4-LIQ-01). A control file or an input the index records
+/// is no source either, yet resolution reads it (W5-06). The event path and
+/// the walk of a directory that arrived ([`collect_arrived_tree`]) share this
+/// gate, so the two never drift.
+fn hands_to_sync(
+    policy: &WatchPolicy,
+    control_paths: &crate::control_inputs::RecordedInputs,
+    relative: &str,
+    is_dir: bool,
+) -> bool {
+    policy.should_handle_file(relative)
+        || (policy.allows_file_path(relative) && maybe_deleted_source(relative))
+        || policy.may_mark_a_theme(relative)
+        || policy.is_project_control_file(relative)
+        || control_paths.may_move(relative, is_dir)
+}
+
+/// Queue `relative` for the next sync, with every file link aliasing it: the
+/// same content under another indexed path, so it is re-indexed too.
+fn queue_with_aliases(
+    pending: &mut BTreeMap<String, PendingInfo>,
+    link_state: &LinkState,
+    policy: &WatchPolicy,
+    relative: String,
+    now: u128,
+) {
+    let aliases = link_state
+        .aliases
+        .get(&relative)
+        .into_iter()
+        .flatten()
+        .filter(|alias| policy.should_handle_file(alias))
+        .cloned()
+        .collect::<Vec<_>>();
+    for path in std::iter::once(relative).chain(aliases) {
+        pending
+            .entry(path)
+            .and_modify(|info| info.last_seen_ms = now)
+            .or_insert(PendingInfo {
+                first_seen_ms: now,
+                last_seen_ms: now,
+            });
+    }
+}
+
 struct EventLoopCtx {
     rx: mpsc::Receiver<LoopMessage>,
     project_root: PathBuf,
@@ -1785,11 +1936,6 @@ fn event_loop(ctx: EventLoopCtx) {
                         }
                         continue;
                     }
-                    // A brand-new non-ignored directory holds no inotify watch
-                    // yet (Linux watches are per-dir NonRecursive — see
-                    // `collect_watch_dirs`). Register it (and any non-ignored
-                    // descendants created in the same burst, e.g. `mkdir -p`) so
-                    // edits inside it are seen without a server restart.
                     // A new ignored `config/` or `layout/` is watched for a theme
                     // marker alone; a marker written before the watch counts as
                     // seen (W4-LIQ-01).
@@ -1799,7 +1945,7 @@ fn event_loop(ctx: EventLoopCtx) {
                         && !fs::symlink_metadata(&path)
                             .is_ok_and(|meta| meta.file_type().is_symlink())
                     {
-                        register_marker_dir(&watcher, &path);
+                        register_dir_alone(&watcher, &path);
                         known_dirs.insert(relative.clone());
                         let now = epoch_millis();
                         for entry in fs::read_dir(&path).into_iter().flatten().flatten() {
@@ -1824,75 +1970,120 @@ fn event_loop(ctx: EventLoopCtx) {
                         let is_link = fs::symlink_metadata(&path)
                             .is_ok_and(|meta| meta.file_type().is_symlink());
                         if !is_link {
-                            register_new_dirs(&watcher, &runtime_scope.policy, &path);
-                            let (new_dirs, saw_link) =
-                                collect_watch_tree(&path, &runtime_scope.policy);
-                            known_dirs.extend(
-                                new_dirs
-                                    .iter()
-                                    .filter_map(|dir| runtime_scope.policy.normalize_relative(dir)),
-                            );
-                            // An ohpm manifest moved in with its directory
-                            // sends no event of its own, yet the JavaScript
-                            // kind's walk reads every one (W7-24a1).
-                            let now = epoch_millis();
-                            for manifest in ohpm_manifests_in(&new_dirs, &runtime_scope.policy) {
-                                pending
-                                    .entry(manifest)
-                                    .and_modify(|info| info.last_seen_ms = now)
-                                    .or_insert(PendingInfo {
-                                        first_seen_ms: now,
-                                        last_seen_ms: now,
-                                    });
+                            // A directory the watcher does not know arrived
+                            // whole: created, moved or copied in. It holds no
+                            // watch yet (Linux watches are per-dir NonRecursive,
+                            // see `collect_watch_dirs`), and no backend reports
+                            // the files already in it, so the walk watches each
+                            // of its directories and then hands the files there
+                            // to the sync, as their own events would. An event
+                            // naming a known directory registers its watches
+                            // again and hands on nothing of its own.
+                            let register = |dir: &Path| register_dir_alone(&watcher, dir);
+                            let gate = |file: &str| {
+                                hands_to_sync(&runtime_scope.policy, &control_paths, file, false)
+                            };
+                            let mut walks = Vec::new();
+                            if known_dirs.contains(&relative) {
+                                register_new_dirs(&watcher, &runtime_scope.policy, &path);
+                                let (dirs, saw_link) =
+                                    collect_watch_tree(&path, &runtime_scope.policy);
+                                // A directory this walk finds that the watcher
+                                // does not know arrived before its own event was
+                                // handled (Windows reports a directory whose
+                                // entries changed as modified, and nothing orders
+                                // that after the new directory's own event): it
+                                // is walked as an arrival all the same.
+                                for (arrived, dir) in
+                                    arrival_roots(&dirs, &known_dirs, &runtime_scope.policy)
+                                {
+                                    let walk = collect_arrived_tree(
+                                        &dir,
+                                        &runtime_scope.policy,
+                                        register,
+                                        gate,
+                                        SCOPED_SYNC_MAX_PENDING,
+                                    );
+                                    walks.push((arrived, walk));
+                                }
+                                walks.push((
+                                    relative.clone(),
+                                    TreeWalk {
+                                        dirs,
+                                        saw_link,
+                                        ..TreeWalk::default()
+                                    },
+                                ));
+                            } else {
+                                let walk = collect_arrived_tree(
+                                    &path,
+                                    &runtime_scope.policy,
+                                    register,
+                                    gate,
+                                    SCOPED_SYNC_MAX_PENDING,
+                                );
+                                walks.push((relative.clone(), walk));
                             }
-                            if saw_link {
-                                // The directory may add no pending file, yet the
-                                // full sync it owes must still run on the deadline.
-                                link_topology_changed = true;
-                                let now = epoch_millis();
-                                pending
-                                    .entry(relative.clone())
-                                    .and_modify(|info| info.last_seen_ms = now)
-                                    .or_insert(PendingInfo {
-                                        first_seen_ms: now,
-                                        last_seen_ms: now,
-                                    });
+                            for (arrived, walk) in walks {
+                                known_dirs.extend(walk.dirs.iter().filter_map(|dir| {
+                                    runtime_scope.policy.normalize_relative(dir)
+                                }));
+                                if walk.saw_link {
+                                    // The directory may add no pending file, yet
+                                    // the full sync it owes must still run on the
+                                    // deadline.
+                                    link_topology_changed = true;
+                                    let now = epoch_millis();
+                                    pending
+                                        .entry(relative.clone())
+                                        .and_modify(|info| info.last_seen_ms = now)
+                                        .or_insert(PendingInfo {
+                                            first_seen_ms: now,
+                                            last_seen_ms: now,
+                                        });
+                                } else if walk.overflowed {
+                                    // Too many to hand on path by path: one full
+                                    // reconcile instead, reported as RECOVERING
+                                    // like a burst past the ceiling until it
+                                    // commits.
+                                    full_sync_pending = true;
+                                    begin_lost_event_recovery(
+                                        &degraded,
+                                        &mut deadline,
+                                        runtime_scope.debounce,
+                                        &format!(
+                                            "a directory arrived with more than \
+                                             {SCOPED_SYNC_MAX_PENDING} files: {arrived}"
+                                        ),
+                                    );
+                                } else {
+                                    let now = epoch_millis();
+                                    for file in walk.files {
+                                        queue_with_aliases(
+                                            &mut pending,
+                                            &link_state,
+                                            &runtime_scope.policy,
+                                            file,
+                                            now,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
-                    // A Shopify theme marker need not be source, nor in scope,
-                    // yet its coming or going reclassifies the theme's JSON
-                    // templates: the sync it is handed to reads the theme
-                    // (W4-LIQ-01).
-                    if runtime_scope.policy.should_handle_file(&relative)
-                        || (runtime_scope.policy.allows_file_path(&relative)
-                            && maybe_deleted_source(&relative))
-                        || runtime_scope.policy.may_mark_a_theme(&relative)
-                        // A control file or an input the index records is
-                        // no source either, yet resolution reads it (W5-06).
-                        || runtime_scope.policy.is_project_control_file(&relative)
-                        || control_paths.may_move(&relative, path.is_dir())
-                    {
-                        let now = epoch_millis();
-                        // A file link aliasing this path is the same content
-                        // under another indexed path, so it is re-indexed too.
-                        let aliases = link_state
-                            .aliases
-                            .get(&relative)
-                            .into_iter()
-                            .flatten()
-                            .filter(|alias| runtime_scope.policy.should_handle_file(alias))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        for path in std::iter::once(relative).chain(aliases) {
-                            pending
-                                .entry(path)
-                                .and_modify(|info| info.last_seen_ms = now)
-                                .or_insert(PendingInfo {
-                                    first_seen_ms: now,
-                                    last_seen_ms: now,
-                                });
-                        }
+                    if hands_to_sync(
+                        &runtime_scope.policy,
+                        &control_paths,
+                        &relative,
+                        path.is_dir(),
+                    ) {
+                        queue_with_aliases(
+                            &mut pending,
+                            &link_state,
+                            &runtime_scope.policy,
+                            relative,
+                            epoch_millis(),
+                        );
                     }
                 }
                 if link_topology_changed && runtime_scope.enabled {
@@ -5401,6 +5592,599 @@ mod tests {
                 .observe_only(|_| {}, || {})
                 .drift_sentinel,
             None
+        );
+    }
+
+    // ---- W7-29 red seeds: a directory that arrives whole -----------------
+    //
+    // Appended to `mod tests` in crates/codegraph-watch/src/watcher.rs. The
+    // inert seeds feed the exact notify shape each backend gives a directory
+    // that arrives with its files already inside, so they are deterministic on
+    // every platform; R4 uses the real backend.
+
+    /// The canonical project root the watcher's policy strips, so an injected
+    /// absolute path normalizes on every platform (macOS `/var` → `/private/var`,
+    /// Windows short names and the `\\?\` prefix).
+    fn w729_root(dir: &Path) -> PathBuf {
+        IndexPaths::resolve(dir, None)
+            .unwrap()
+            .project()
+            .to_path_buf()
+    }
+
+    fn w729_write(root: &Path, files: &[(&str, &str)]) {
+        for (relative, text) in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+    }
+
+    /// What each backend reports for a directory that arrives whole, by notify
+    /// kind: inotify's `IN_MOVED_TO` (also Windows' `FILE_ACTION_RENAMED_NEW_NAME`),
+    /// inotify's `IN_CREATE` of a directory filled before its watch exists,
+    /// FSEvents' `ItemRenamed` and Windows' `FILE_ACTION_ADDED`.
+    fn w729_arrival_shapes() -> Vec<(&'static str, EventKind)> {
+        use notify::event::{CreateKind, ModifyKind, RenameMode};
+        vec![
+            (
+                "inotify moved-to / windows renamed-new-name",
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            ),
+            ("inotify create", EventKind::Create(CreateKind::Folder)),
+            (
+                "fsevents renamed",
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            ),
+            ("windows added", EventKind::Create(CreateKind::Any)),
+        ]
+    }
+
+    /// The tree R1 moves in: three sources at two depths, two control files,
+    /// and what the scan (or the watch policy) leaves out.
+    const W729_GOODS: &[(&str, &str)] = &[
+        ("src/goods/a.ts", "export const a = 1;\n"),
+        ("src/goods/b.ts", "export const b = 2;\n"),
+        ("src/goods/nested/c.ts", "export const c = 3;\n"),
+        ("src/goods/package.json", "{ \"name\": \"goods\" }\n"),
+        ("src/goods/oh-package.json5", "{}\n"),
+        ("src/goods/notes.txt", "notes\n"),
+        (
+            "src/goods/node_modules/dep/index.ts",
+            "export const dep = 1;\n",
+        ),
+        ("src/goods/gen/out.ts", "export const out = 1;\n"),
+        ("src/goods/.cache/cached.ts", "export const cached = 1;\n"),
+    ];
+
+    /// R1: a directory that arrives whole hands the sync its source and
+    /// control files, under the scan's ignore rules, in one incremental batch.
+    #[test]
+    fn w729_a_directory_arriving_whole_hands_its_files_to_the_sync() {
+        let _env = crate::test_env::env_guard();
+        for (shape, kind) in w729_arrival_shapes() {
+            let dir = crate::sync::tests::TestDir::new("watch-w729-arrives");
+            fs::create_dir_all(dir.path().join("src")).unwrap();
+            fs::write(dir.path().join(".gitignore"), "gen/\n").unwrap();
+            let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+            // The directory is on disk with its files before its one event.
+            w729_write(dir.path(), W729_GOODS);
+            watcher.ingest_notify_event_for_tests(Ok(
+                Event::new(kind).add_path(w729_root(dir.path()).join("src/goods"))
+            ));
+            watcher.flush_for_tests();
+            let synced = wait_until(|| !log.incremental.lock().unwrap().is_empty());
+            watcher.stop();
+            let batches = log.incremental.lock().unwrap().clone();
+            assert!(synced, "[{shape}] no sync for the arriving directory");
+            assert_eq!(
+                batches,
+                vec![vec![
+                    "src/goods/a.ts".to_string(),
+                    "src/goods/b.ts".to_string(),
+                    "src/goods/nested/c.ts".to_string(),
+                    "src/goods/oh-package.json5".to_string(),
+                    "src/goods/package.json".to_string(),
+                ]],
+                "[{shape}] the directory's source and control files, nothing the \
+                 scan or the watch policy leaves out"
+            );
+            assert!(
+                log.full.try_recv().is_err(),
+                "[{shape}] a directory under the ceiling stays incremental"
+            );
+        }
+    }
+
+    /// R2 (guard, green before and after): an event that names a directory
+    /// the watcher already knows hands none of its files. Windows reports a
+    /// directory whose entries changed as modified, so walking known
+    /// directories would hand a whole subtree to every sync.
+    #[test]
+    fn w729_an_event_naming_a_known_directory_hands_none_of_its_files() {
+        use notify::event::{CreateKind, ModifyKind};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-w729-known");
+        w729_write(
+            dir.path(),
+            &[
+                ("src/a.ts", "export const a = 1;\n"),
+                ("src/lib/b.ts", "export const b = 2;\n"),
+            ],
+        );
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+        let root = w729_root(dir.path());
+        watcher.ingest_notify_event_for_tests(Ok(
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src"))
+        ));
+        watcher
+            .ingest_notify_event_for_tests(Ok(
+                Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.join("src/lib"))
+            ));
+        watcher.ingest_event_for_tests("src/fence.ts");
+        watcher.flush_for_tests();
+        let synced = wait_until(|| !log.incremental.lock().unwrap().is_empty());
+        watcher.stop();
+        assert!(synced, "the fence reaches a sync");
+        assert_eq!(
+            *log.incremental.lock().unwrap(),
+            vec![vec!["src/fence.ts".to_string()]],
+            "a known directory's files are not handed again"
+        );
+    }
+
+    /// R3: at the ceiling a directory still syncs path by path; one file more
+    /// and it is one full sync instead (the walk stops there), reported as
+    /// RECOVERING until it commits.
+    #[test]
+    fn w729_a_directory_arriving_with_more_files_than_the_ceiling_runs_one_full_sync() {
+        use notify::event::{ModifyKind, RenameMode};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-w729-ceiling");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let full_started = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&full_started);
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), move || {
+            started.fetch_add(1, AtomicOrdering::SeqCst);
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| anyhow::anyhow!("test never released the sync"))
+        });
+        let root = w729_root(dir.path());
+        let moved_in = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::To)));
+
+        for n in 0..SCOPED_SYNC_MAX_PENDING {
+            let path = dir.path().join(format!("src/at/f{n:04}.ts"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("export const f{n} = {n};\n")).unwrap();
+        }
+        watcher.ingest_notify_event_for_tests(Ok(moved_in.clone().add_path(root.join("src/at"))));
+        watcher.flush_for_tests();
+        let scoped = wait_until(|| !log.incremental.lock().unwrap().is_empty());
+        assert!(scoped, "a directory at the ceiling syncs path by path");
+        assert_eq!(
+            log.incremental.lock().unwrap()[0].len(),
+            SCOPED_SYNC_MAX_PENDING
+        );
+        assert!(log.full.try_recv().is_err());
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+
+        for n in 0..=SCOPED_SYNC_MAX_PENDING {
+            let path = dir.path().join(format!("src/over/g{n:04}.ts"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("export const g{n} = {n};\n")).unwrap();
+        }
+        watcher.ingest_notify_event_for_tests(Ok(moved_in.add_path(root.join("src/over"))));
+        watcher.flush_for_tests();
+        assert!(
+            wait_until(|| full_started.load(AtomicOrdering::SeqCst) == 1),
+            "a directory past the ceiling runs a full sync"
+        );
+        match watcher.health() {
+            // OD (owner question 3), option 甲: the cause names the directory.
+            WatchHealth::Recovering { reason } => assert!(
+                reason.contains("events may have been lost") && reason.contains("src/over"),
+                "the reason names the arriving directory: {reason}"
+            ),
+            other => panic!("RECOVERING while the directory is reconciled, got {other:?}"),
+        }
+        release_tx.send(()).unwrap();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the full sync commits");
+        let healthy = wait_until(|| watcher.health() == WatchHealth::Healthy);
+        watcher.stop();
+        assert!(healthy, "the committed full sync ends the recovery");
+        assert_eq!(
+            log.incremental.lock().unwrap().len(),
+            1,
+            "the directory past the ceiling never takes the path-scoped sync"
+        );
+    }
+
+    /// R4 (real backend): a directory created and filled at once, as `cp -r`
+    /// or a checkout does, reaches the sync with its files. On Linux the files
+    /// are written before the new directory's watch exists; FSEvents and
+    /// ReadDirectoryChangesW report each file anyway.
+    #[test]
+    fn w729_a_directory_created_and_filled_at_once_reaches_the_sync_with_its_files() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-w729-filled");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, synced, _) = recording_watcher(dir.path());
+        w729_write(
+            dir.path(),
+            &[
+                ("src/fresh/a.ts", "export const a = 1;\n"),
+                ("src/fresh/deep/b.ts", "export const b = 2;\n"),
+            ],
+        );
+        let reached = wait_until(|| {
+            saw_path(&synced, "src/fresh/a.ts") && saw_path(&synced, "src/fresh/deep/b.ts")
+        });
+        watcher.stop();
+        assert!(reached, "{:?}", synced.lock().unwrap());
+    }
+
+    /// R5: the walk follows the watcher's scope: an `include` that forces a
+    /// gitignored directory back in, and an `exclude`.
+    #[test]
+    fn w729_the_walk_of_an_arriving_directory_follows_include_and_exclude() {
+        use notify::event::{ModifyKind, RenameMode};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-w729-scope");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join(".gitignore"), "gen/\n").unwrap();
+        let (watcher, log) = logging_watcher(
+            dir.path(),
+            WatchOptions {
+                include: vec!["src/goods/gen/".to_string()],
+                exclude: vec!["src/goods/b.ts".to_string()],
+                ..quiet_options()
+            },
+            || Ok(()),
+        );
+        w729_write(dir.path(), W729_GOODS);
+        watcher.ingest_notify_event_for_tests(Ok(Event::new(EventKind::Modify(ModifyKind::Name(
+            RenameMode::To,
+        )))
+        .add_path(w729_root(dir.path()).join("src/goods"))));
+        watcher.flush_for_tests();
+        let synced = wait_until(|| !log.incremental.lock().unwrap().is_empty());
+        watcher.stop();
+        assert!(synced);
+        let batch = log.incremental.lock().unwrap()[0].clone();
+        assert!(
+            batch.contains(&"src/goods/gen/out.ts".to_string()),
+            "include forces the gitignored file in: {batch:?}"
+        );
+        assert!(
+            !batch.contains(&"src/goods/b.ts".to_string()),
+            "exclude keeps b.ts out: {batch:?}"
+        );
+        assert!(batch.contains(&"src/goods/a.ts".to_string()), "{batch:?}");
+    }
+
+    // ---- W7-29: the walk of an arriving directory ----------------------------
+
+    /// The walk takes one file past its limit and no more, yet lists every
+    /// directory: `known_dirs` must stay whole, or a later removal of one of
+    /// them would not be told apart.
+    #[test]
+    fn w729_the_walk_takes_one_file_past_its_limit_and_lists_every_directory() {
+        let dir = crate::sync::tests::TestDir::new("watch-w729-walk-limit");
+        let bulk = dir.path().join("src").join("bulk");
+        let deep = bulk.join("deep");
+        let deeper = deep.join("deeper");
+        fs::create_dir_all(&deeper).unwrap();
+        for n in 0..600 {
+            fs::write(bulk.join(format!("m{n:03}.ts")), "export {};\n").unwrap();
+        }
+        fs::write(deep.join("d.ts"), "export {};\n").unwrap();
+        fs::write(deeper.join("e.ts"), "export {};\n").unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        let walk = |limit| collect_arrived_tree(&bulk, &policy, |_| {}, |_| true, limit);
+        let every_dir = vec![bulk.clone(), deep.clone(), deeper.clone()];
+
+        let past = walk(SCOPED_SYNC_MAX_PENDING);
+        assert_eq!(
+            past.dirs, every_dir,
+            "every directory is listed past the limit"
+        );
+        assert_eq!(past.files.len(), SCOPED_SYNC_MAX_PENDING + 1);
+        assert!(past.overflowed);
+        assert!(past.files.is_sorted(), "{:?}", &past.files[..5]);
+
+        // The bounds: one file past the limit overflows, a limit that holds
+        // every file does not.
+        let one_past = walk(601);
+        assert_eq!((one_past.files.len(), one_past.overflowed), (602, true));
+        let all = walk(602);
+        assert_eq!((all.files.len(), all.overflowed), (602, false));
+        assert_eq!(all.dirs, every_dir);
+        assert!(all.files.contains(&"src/bulk/deep/deeper/e.ts".to_string()));
+    }
+
+    /// The walk lists the directories `collect_watch_tree` lists, and hands on
+    /// only what the event path's gate passes: an ignored `config/` is read
+    /// for its theme marker and nothing below it, a control file inside an
+    /// ignored subtree stays out with the subtree, and a link is noted, not
+    /// taken. A link in a marker folder is not noted, as the watch tree never
+    /// reads that folder.
+    #[test]
+    fn w729_the_walk_prunes_as_the_watch_tree_does() {
+        let dir = crate::sync::tests::TestDir::new("watch-w729-walk-prune");
+        fs::write(dir.path().join(".gitignore"), "gen/\nconfig/\n").unwrap();
+        w729_write(
+            dir.path(),
+            &[
+                ("src/goods/a.ts", "export const a = 1;\n"),
+                ("src/goods/package.json", "{}\n"),
+                ("src/goods/notes.txt", "notes\n"),
+                ("src/goods/nested/c.ts", "export const c = 3;\n"),
+                ("src/goods/node_modules/dep/index.ts", "export {};\n"),
+                ("src/goods/node_modules/dep/package.json", "{}\n"),
+                ("src/goods/gen/out.ts", "export {};\n"),
+                ("src/goods/.cache/cached.ts", "export {};\n"),
+                ("src/goods/config/settings_schema.json", "[]\n"),
+                ("src/goods/config/helper.ts", "export {};\n"),
+                ("src/goods/config/below/config/settings_schema.json", "[]\n"),
+                ("src/marked/config/settings_schema.json", "[]\n"),
+            ],
+        );
+        let policy = WatchPolicy::new(dir.path());
+        let none_recorded = crate::control_inputs::RecordedInputs::default();
+        let gate = |relative: &str| hands_to_sync(&policy, &none_recorded, relative, false);
+        let goods = dir.path().join("src").join("goods");
+        let linked = symlink_at(
+            &goods.join("a.ts"),
+            &goods.join("nested").join("link.ts"),
+            false,
+        );
+
+        let walk = collect_arrived_tree(&goods, &policy, |_| {}, gate, SCOPED_SYNC_MAX_PENDING);
+        assert_eq!(
+            (walk.dirs.clone(), walk.saw_link),
+            collect_watch_tree(&goods, &policy),
+            "the same directories, pruned the same way"
+        );
+        assert!(walk.dirs.contains(&goods.join("config")));
+        assert_eq!(walk.saw_link, linked);
+        assert_eq!(
+            walk.files,
+            vec![
+                "src/goods/a.ts".to_string(),
+                "src/goods/config/settings_schema.json".to_string(),
+                "src/goods/nested/c.ts".to_string(),
+                "src/goods/package.json".to_string(),
+            ],
+            "only what the gate passes, nothing below an ignored directory"
+        );
+        assert!(!walk.overflowed);
+
+        let marked = dir.path().join("src").join("marked");
+        if symlink_at(
+            &goods.join("a.ts"),
+            &marked.join("config").join("l.ts"),
+            false,
+        ) {
+            let walk =
+                collect_arrived_tree(&marked, &policy, |_| {}, gate, SCOPED_SYNC_MAX_PENDING);
+            assert_eq!(
+                (walk.dirs.clone(), walk.saw_link),
+                collect_watch_tree(&marked, &policy)
+            );
+            assert!(!walk.saw_link, "a marker folder's link is not noted");
+            assert_eq!(walk.files, vec!["src/marked/config/settings_schema.json"]);
+        }
+    }
+
+    /// D1: the walk registers each directory of an arriving tree just before
+    /// it reads that directory. A subdirectory made right after its parent's
+    /// watch exists is registered, listed, and its file handed on; a file
+    /// written right after the subdirectory's own watch exists is listed too.
+    /// `register_new_dirs`' order (list the whole tree, then register it)
+    /// would leave that subdirectory with no watch, though the walk lists it.
+    #[test]
+    fn w729_the_walk_registers_each_directory_just_before_reading_it() {
+        let dir = crate::sync::tests::TestDir::new("watch-w729-walk-order");
+        let arrived = dir.path().join("src").join("arrived");
+        fs::create_dir_all(&arrived).unwrap();
+        let sub = arrived.join("sub");
+        let policy = WatchPolicy::new(dir.path());
+        let mut registered = Vec::new();
+        let walk = collect_arrived_tree(
+            &arrived,
+            &policy,
+            |dir| {
+                registered.push(dir.to_path_buf());
+                if dir == arrived {
+                    // A mkdir and a write that land right after the watch.
+                    fs::create_dir_all(&sub).unwrap();
+                    fs::write(sub.join("early.ts"), "export const early = 1;\n").unwrap();
+                } else if dir == sub {
+                    fs::write(sub.join("late.ts"), "export const late = 1;\n").unwrap();
+                }
+            },
+            |_| true,
+            SCOPED_SYNC_MAX_PENDING,
+        );
+        assert_eq!(
+            registered,
+            vec![arrived.clone(), sub.clone()],
+            "each directory is registered, the parent first"
+        );
+        assert_eq!(walk.dirs, vec![arrived.clone(), sub.clone()]);
+        assert_eq!(
+            walk.files,
+            vec![
+                "src/arrived/sub/early.ts".to_string(),
+                "src/arrived/sub/late.ts".to_string(),
+            ],
+            "a directory is read only after its watch is registered"
+        );
+    }
+
+    /// The tree D3's order tests move in, at two depths.
+    const W729_ORDER_GOODS: &[(&str, &str)] = &[
+        ("src/goods/a.ts", "export const a = 1;\n"),
+        ("src/goods/nested/c.ts", "export const c = 3;\n"),
+    ];
+
+    /// Feed the parent's and the arriving directory's events in `order` and
+    /// return every incremental batch, and whether a full sync ran.
+    fn w729_feed_in_order(label: &str, parent_first: bool) -> (Vec<Vec<String>>, bool) {
+        use notify::event::{CreateKind, ModifyKind};
+        let dir = crate::sync::tests::TestDir::new(label);
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), || Ok(()));
+        let root = w729_root(dir.path());
+        w729_write(dir.path(), W729_ORDER_GOODS);
+        // Windows reports a directory whose entries changed as modified
+        // (`FILE_NOTIFY_CHANGE_LAST_WRITE`), and nothing orders that event
+        // after the new directory's own.
+        let parent = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src"));
+        let arrived =
+            Event::new(EventKind::Create(CreateKind::Any)).add_path(root.join("src/goods"));
+        let events = if parent_first {
+            [parent, arrived]
+        } else {
+            [arrived, parent]
+        };
+        for event in events {
+            watcher.ingest_notify_event_for_tests(Ok(event));
+        }
+        watcher.flush_for_tests();
+        wait_until(|| !log.incremental.lock().unwrap().is_empty());
+        watcher.stop();
+        let batches = log.incremental.lock().unwrap().clone();
+        (batches, log.full.try_recv().is_ok())
+    }
+
+    /// D3 (a): an event naming a known parent that is handled after a
+    /// directory arrived in it, and before that directory's own event, finds
+    /// the directory first. The directory still arrived: its files reach the
+    /// sync once, in one incremental batch.
+    #[test]
+    fn w729_a_directory_its_parents_event_finds_first_hands_its_files_once() {
+        let _env = crate::test_env::env_guard();
+        let (batches, full) = w729_feed_in_order("watch-w729-parent-first", true);
+        assert_eq!(
+            batches,
+            vec![vec![
+                "src/goods/a.ts".to_string(),
+                "src/goods/nested/c.ts".to_string(),
+            ]],
+            "the arriving directory's files, once, whichever event finds it first"
+        );
+        assert!(!full, "a small arrival stays incremental");
+    }
+
+    /// D3 (b): the arriving directory's own event first, then its parent's:
+    /// the parent's walk finds nothing new, and each file is handed once.
+    #[test]
+    fn w729_a_directory_whose_own_event_comes_first_hands_its_files_once() {
+        let _env = crate::test_env::env_guard();
+        let (batches, full) = w729_feed_in_order("watch-w729-child-first", false);
+        assert_eq!(
+            batches,
+            vec![vec![
+                "src/goods/a.ts".to_string(),
+                "src/goods/nested/c.ts".to_string(),
+            ]]
+        );
+        assert!(!full);
+    }
+
+    /// D3: of a known directory's walk, only the topmost directories the
+    /// watcher does not know arrive. One below a new parent is that parent's
+    /// to walk, and an ignored theme marker folder is no arrival.
+    #[test]
+    fn w729_only_the_topmost_unknown_directories_of_a_known_walk_arrive() {
+        let dir = crate::sync::tests::TestDir::new("watch-w729-arrival-roots");
+        fs::write(dir.path().join(".gitignore"), "config/\n").unwrap();
+        for sub in ["src/old/inner", "src/new/inner", "src/also", "src/config"] {
+            fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        let policy = WatchPolicy::new(dir.path());
+        let src = dir.path().join("src");
+        let (dirs, _) = collect_watch_tree(&src, &policy);
+        assert!(
+            dirs.contains(&src.join("config")),
+            "the marker folder is listed"
+        );
+        let known = ["src", "src/old", "src/old/inner"]
+            .map(str::to_string)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            arrival_roots(&dirs, &known, &policy),
+            vec![
+                ("src/also".to_string(), src.join("also")),
+                ("src/new".to_string(), src.join("new")),
+            ]
+        );
+    }
+
+    /// D3: the ceiling applies to a directory the parent's walk finds first
+    /// as it does on the direct path: one full sync, never the path-scoped
+    /// one, RECOVERING with that directory named until the sync commits.
+    #[test]
+    fn w729_a_directory_its_parents_event_finds_first_past_the_ceiling_runs_one_full_sync() {
+        use notify::event::{CreateKind, ModifyKind};
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-w729-parent-first-ceiling");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let full_started = Arc::new(AtomicUsize::new(0));
+        let started = Arc::clone(&full_started);
+        let (watcher, log) = logging_watcher(dir.path(), quiet_options(), move || {
+            started.fetch_add(1, AtomicOrdering::SeqCst);
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|_| anyhow::anyhow!("test never released the sync"))
+        });
+        let root = w729_root(dir.path());
+        for n in 0..=SCOPED_SYNC_MAX_PENDING {
+            let path = dir.path().join(format!("src/over/g{n:04}.ts"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("export const g{n} = {n};\n")).unwrap();
+        }
+        watcher.ingest_notify_event_for_tests(Ok(
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src"))
+        ));
+        watcher.ingest_notify_event_for_tests(Ok(
+            Event::new(EventKind::Create(CreateKind::Any)).add_path(root.join("src/over"))
+        ));
+        watcher.flush_for_tests();
+        assert!(
+            wait_until(|| full_started.load(AtomicOrdering::SeqCst) == 1),
+            "a directory past the ceiling runs a full sync"
+        );
+        match watcher.health() {
+            WatchHealth::Recovering { reason } => assert!(
+                reason.contains("events may have been lost") && reason.contains("src/over"),
+                "the reason names the arriving directory: {reason}"
+            ),
+            other => panic!("RECOVERING while the directory is reconciled, got {other:?}"),
+        }
+        release_tx.send(()).unwrap();
+        log.full
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the full sync commits");
+        let healthy = wait_until(|| watcher.health() == WatchHealth::Healthy);
+        watcher.stop();
+        assert!(healthy, "the committed full sync ends the recovery");
+        assert!(
+            log.incremental.lock().unwrap().is_empty(),
+            "the directory past the ceiling never takes the path-scoped sync"
         );
     }
 }

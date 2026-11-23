@@ -1187,19 +1187,22 @@ target lies outside every indexed directory. Edits to that target are picked
 up by the next full `sync`.
 
 This keeps the total watch count well inside the OS inotify limit on large trees
-and makes daemon startup fast. A newly-created non-ignored directory is picked up
-automatically on its create event — no restart required. One kind of ignored
+and makes daemon startup fast. A directory that arrives whole, created, moved or
+copied in, or filled before its watch exists, is watched as soon as its event
+arrives, and the files already in it go to the next sync under the same ignore
+rules, as if each had sent its own event. One kind of ignored
 directory is still watched, itself and not below it: a `config/` or `layout/`
 directory, which may hold a Shopify theme marker (`config/settings_schema.json`,
 `layout/theme.liquid`). A marker counts though ignored, since it only tells a
 theme's JSON templates apart, and the watcher hands its events to the sync; a
 marker folder removed or moved away takes its marker with it.
 
-A settled burst normally syncs exactly the paths its events named. Three cases
+A settled burst normally syncs exactly the paths its events named. These cases
 make it run one full project reconcile instead, the same pass `codegraph sync`
 runs:
 
 - the burst named more than 500 paths, as a branch switch or a mass rename does;
+- a directory arrived holding more than 500 files the watcher would hand on;
 - the backend said events may have been dropped: inotify's queue overflowed,
   FSEvents asked for a rescan, or an event arrived without naming any path;
 - on Windows, whose backend can lose events without saying so, an idle watcher

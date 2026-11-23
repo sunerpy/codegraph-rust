@@ -1867,6 +1867,7 @@ matrix! {
     typescript_workspace_member_manifest_renames_its_package,
     typescript_workspace_member_manifest_is_deleted,
     typescript_workspace_glob_gains_a_member,
+    typescript_workspace_member_directory_appears,
     tauri_config_marker_appears,
     tauri_command_attribute_makes_an_invoke_call_its_edge,
     tauri_command_body_edit_keeps_the_invoke_edges_resolver_name,

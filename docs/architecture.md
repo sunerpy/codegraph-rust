@@ -606,7 +606,8 @@ bursts, reloads project control files, and reconciles additions, modifications,
 deletions, and scope changes through `codegraph-watch`. A burst past 500 paths,
 a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
-commits. A sync re-resolves the references that name what it changed, a
+commits. A directory that arrives whole is walked and its files join the batch;
+one holding more than 500 escalates like a dropped event. A sync re-resolves the references that name what it changed, a
 qualified one (`User.create`) by its last segment as well (at most 500 per
 segment), and one written with `::` (an Erlang `util::double/1`, a MyBatis
 include's `app.CommonMapper::userColumns`) by the whole qualified name of a node

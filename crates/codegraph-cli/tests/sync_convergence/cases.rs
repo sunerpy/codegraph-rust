@@ -15175,6 +15175,25 @@ pub fn typescript_workspace_glob_gains_a_member() -> Case {
         .edge_after("file:src/app.ts", "imports", "class Button")
 }
 
+/// W7-29: a workspace member's directory arrives whole, its manifest and its
+/// source together, as a directory moved or copied in does: the import of its
+/// package resolves into it. The watch driver hands the sync the two paths the
+/// watcher's walk of the arriving directory hands it.
+pub fn typescript_workspace_member_directory_appears() -> Case {
+    Case::new(Change::ControlFile, &[Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"root\",\"workspaces\":[\"packages/*\"]}\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { Button } from '@acme/kit';\n\nexport const b = new Button();\n",
+        )
+        .write("packages/kit/package.json", "{\"name\":\"@acme/kit\"}\n")
+        .write("packages/kit/index.ts", "export class Button {}\n")
+        .edge_after("file:src/app.ts", "imports", "class Button")
+}
+
 /// W5-06: a Tauri config appearing makes the project a Tauri one: the
 /// command reference an `invoke` call site gains at extraction, parked here
 /// with no command to bind, and the detected frameworks match a fresh index.
