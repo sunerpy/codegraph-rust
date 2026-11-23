@@ -3,6 +3,7 @@
 //! navigation are [`super::react_router`]'s; Next.js pages, route handlers and
 //! navigation are [`super::nextjs`]'s.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
@@ -73,7 +74,7 @@ impl FrameworkResolver for ReactResolver {
     fn resolve(&self, reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
         let name = &reference.reference_name;
         if let Some(spec) = name.strip_prefix(LAZY_ROUTE_PREFIX) {
-            return lazy_route_component(spec, &reference.file_path, context)
+            return lazy_route_component(spec, &reference.file_path, context, None)
                 .map(|target| framework_resolved(reference, target, 0.9));
         }
         // The export a lazy route's loader picks. Vue Router and Angular name
@@ -81,7 +82,7 @@ impl FrameworkResolver for ReactResolver {
         // theirs.
         if let Some((spec, export)) = lazy_loader::picked_export_name(name) {
             return is_react_route_ref(reference)
-                .then(|| picked_export(spec, export, &reference.file_path, context))
+                .then(|| picked_export(spec, export, &reference.file_path, context, None))
                 .flatten()
                 .map(|target| framework_resolved(reference, target, 0.9));
         }
@@ -200,6 +201,45 @@ impl FrameworkResolver for ReactResolver {
             kind: NodeKind::Route,
             owns: react_tables::is_table_route,
         })
+    }
+
+    /// The modules a route's answer is read from (upstream `lazyModules`,
+    /// #2452): a lazily loaded page or layout (`lazy-import:` references,
+    /// and a React route's `import:…#…` for the export a loader picks), or
+    /// the module a same-file lazy value the route renders, or renders
+    /// inside, loads (`declaredComponent`), with every barrel the lookup
+    /// reads on the way. KEEP-RUST: a JSX tag's static reference to such a
+    /// value reads the same files (upstream draws that edge in its
+    /// jsx-render pass), so a tsx or jsx `references` reference is read the
+    /// same way.
+    fn lazy_modules(&self, reference: &RefView, context: &dyn ResolutionContext) -> Vec<String> {
+        let reads = RefCell::new(BTreeSet::new());
+        let name = reference.reference_name.as_str();
+        let own = name.strip_prefix(LAYOUT_PREFIX).unwrap_or(name);
+        let route = is_react_route_ref(reference);
+        if let Some((spec, export)) = route
+            .then(|| lazy_loader::picked_export_name(own))
+            .flatten()
+        {
+            picked_export(spec, export, &reference.file_path, context, Some(&reads));
+        } else if let Some(spec) = own.strip_prefix(LAZY_ROUTE_PREFIX) {
+            lazy_route_component(spec, &reference.file_path, context, Some(&reads));
+        } else if (route
+            || (matches!(reference.language, Language::Tsx | Language::Jsx)
+                && reference.reference_kind == EdgeKind::References))
+            && is_pascal_case(own)
+            && !is_built_in_type(own)
+            && let Some(declaration) = declared_value(own, &reference.file_path, context)
+            && let Ok(Some(LoadedPage { spec, member })) = value_loader(&declaration, context)
+        {
+            // A page or layout the file declares as a value it loads lazily.
+            if member == "default" {
+                lazy_route_component(&spec, &reference.file_path, context, Some(&reads));
+            } else {
+                picked_export(&spec, &member, &reference.file_path, context, Some(&reads));
+            }
+        }
+        reads.into_inner().into_iter().collect()
     }
 }
 
@@ -337,9 +377,9 @@ fn declared_component(
         Ok(None) => wrapped_component(&declaration, context).map(|node| node.id.clone()),
         Ok(Some(LoadedPage { spec, member })) => {
             if member == "default" {
-                lazy_route_component(&spec, file_path, context)
+                lazy_route_component(&spec, file_path, context, None)
             } else {
-                picked_export(&spec, &member, file_path, context)
+                picked_export(&spec, &member, file_path, context, None)
             }
         }
         Err(lazy_loader::Exhausted) => None,
@@ -489,11 +529,15 @@ fn is_exported_component_kind(kind: NodeKind) -> bool {
 /// (`MAX_REEXPORT_HOPS`).
 const MAX_REEXPORT_HOPS: usize = 4;
 
+/// Where a module lookup records the files it reads, when asked
+/// ([`FrameworkResolver::lazy_modules`], W7-23a).
+type Reads<'a> = Option<&'a RefCell<BTreeSet<String>>>;
+
 /// The file a lazily loaded module is, from the file that loads it
 /// (`lazyModuleFile`): by the extensions that file's own imports resolve with
 /// (`./MainLayout` is `MainLayout/index.jsx` from a `.jsx` file), else by
 /// TypeScript's.
-fn lazy_module_file(
+pub(crate) fn lazy_module_file(
     spec: &str,
     from_file: &str,
     context: &dyn ResolutionContext,
@@ -512,10 +556,11 @@ fn lazy_route_component(
     spec: &str,
     from_file: &str,
     context: &dyn ResolutionContext,
+    reads: Reads<'_>,
 ) -> Option<String> {
     let file = lazy_module_file(spec, from_file, context)?;
-    exported_component(&file, "default", context, &[])
-        .or_else(|| exported_component(&file, "Component", context, &[]))
+    exported_component(&file, "default", context, &[], reads)
+        .or_else(|| exported_component(&file, "Component", context, &[], reads))
 }
 
 /// The component a lazy route's loader picks from the module `spec` loads:
@@ -525,9 +570,10 @@ fn picked_export(
     name: &str,
     from_file: &str,
     context: &dyn ResolutionContext,
+    reads: Reads<'_>,
 ) -> Option<String> {
     let file = lazy_module_file(spec, from_file, context)?;
-    exported_component(&file, name, context, &[])
+    exported_component(&file, name, context, &[], reads)
 }
 
 /// The component a tag imported from a module of the project renders
@@ -557,7 +603,7 @@ fn imported_component(
     } else {
         mapping.exported_name.as_str()
     };
-    let target = exported_component(&module, exported, context, &[])?;
+    let target = exported_component(&module, exported, context, &[], None)?;
     let imported = resolve_via_import(reference, context).map(|resolved| resolved.target_node_id);
     (imported.as_deref() != Some(target.as_str())).then_some(target)
 }
@@ -585,22 +631,27 @@ fn is_react_route_ref(reference: &RefView) -> bool {
 /// value, outline's `const Avatar = AvatarWithHoverCard; export { Avatar }`.
 /// As in JavaScript, a name the file exports itself hides one an `export *`
 /// would forward, and a name two `export *` modules both forward is exported
-/// by neither. `visited` are the files the lookup came through.
+/// by neither. `visited` are the files the lookup came through; `reads`,
+/// when given, collects every file it reads (W7-23a).
 fn exported_component(
     file: &str,
     name: &str,
     context: &dyn ResolutionContext,
     visited: &[&str],
+    reads: Reads<'_>,
 ) -> Option<String> {
     if visited.contains(&file) || visited.len() > MAX_REEXPORT_HOPS {
         return None;
+    }
+    if let Some(reads) = reads {
+        reads.borrow_mut().insert(file.to_string());
     }
     let language = js_language_for(file);
     let mut through = visited.to_vec();
     through.push(file);
     let forwarded = |source: &str, exported: &str| -> Option<String> {
         let target = resolve_import_path(source, file, language, context)?;
-        exported_component(&target, exported, context, &through)
+        exported_component(&target, exported, context, &through, reads)
     };
     let content = context.read_file_shared(file);
     let code = strip_comments_for_regex(content.as_deref().unwrap_or(""), CommentLang::TypeScript);
@@ -1006,12 +1057,12 @@ fn layout_component(
     context: &dyn ResolutionContext,
 ) -> Option<String> {
     if let Some(module) = spec.strip_prefix(LAZY_ROUTE_PREFIX) {
-        return lazy_route_component(module, &reference.file_path, context);
+        return lazy_route_component(module, &reference.file_path, context, None);
     }
     if is_react_route_ref(reference)
         && let Some((module, export)) = lazy_loader::picked_export_name(spec)
     {
-        return picked_export(module, export, &reference.file_path, context);
+        return picked_export(module, export, &reference.file_path, context, None);
     }
     let Some(mapping) = context
         .get_import_mappings(&reference.file_path, reference.language)
@@ -1039,7 +1090,7 @@ fn layout_component(
     // `import { default as AppRoot } from './routes/app/root'`: read the
     // module the import names — never a same-named component somewhere else.
     if mapping.is_default || mapping.exported_name == "default" {
-        return lazy_route_component(&mapping.source, &reference.file_path, context);
+        return lazy_route_component(&mapping.source, &reference.file_path, context, None);
     }
     let file = resolve_import_path(
         &mapping.source,
@@ -1306,6 +1357,14 @@ mod tests {
         }
         fn get_import_mappings(&self, file: &str, _l: Language) -> Vec<ImportMapping> {
             self.imports.get(file).cloned().unwrap_or_default()
+        }
+        // The file's own re-exports, read as the store context reads them
+        // (W7-23a: a barrel the lookup forwards through).
+        fn get_re_exports(&self, file: &str, language: Language) -> Vec<ReExport> {
+            self.files
+                .get(file)
+                .map(|content| crate::import_resolver::extract_re_exports(content, language))
+                .unwrap_or_default()
         }
     }
 
@@ -1835,6 +1894,83 @@ mod tests {
                 .map(|r| r.target_node_id),
             Some("function:src/components/Home.tsx:Home:1".to_string())
         );
+    }
+
+    /// W7-23a (upstream #2452's `lazyModules`): the files a route's answer
+    /// is read from, every barrel the lookup passes through included, for a
+    /// lazy route, a lazy layout, the export a loader picks, and a same-file
+    /// lazy value the route renders. KEEP-RUST: a JSX tag's static reference
+    /// to the value reads the same files (upstream draws that edge in its
+    /// jsx-render pass). A module the lookup cannot find reads nothing, and
+    /// a reference no React lookup reads through a module reads nothing.
+    #[test]
+    fn lazy_modules_are_the_files_a_route_answer_is_read_from() {
+        let route = |name: &str| RefView {
+            from_node_id: "route:src/App.tsx:9:/home".to_string(),
+            ..a_ref(name, EdgeKind::References, "src/App.tsx", Language::Tsx)
+        };
+        let modules = |ctx: &Ctx, reference: &RefView| {
+            let mut files = ReactResolver.lazy_modules(reference, ctx);
+            files.sort();
+            files
+        };
+        // `const Home = lazy(() => import('./pages/Home'))` with no module.
+        let ctx = app_with_values();
+        for name in ["Home", "lazy-import:./pages/Home"] {
+            assert!(modules(&ctx, &route(name)).is_empty(), "{name}");
+        }
+        // The module is a barrel over the page: both are read.
+        let ctx = app_with_values()
+            .file(
+                "src/pages/Home/index.ts",
+                "export { default } from './HomePage';\n",
+            )
+            .file(
+                "src/pages/Home/HomePage.tsx",
+                "export default function HomePage() { return null; }\n",
+            )
+            .node(placed(
+                NodeKind::Function,
+                "HomePage",
+                "src/pages/Home/HomePage.tsx",
+                (1, 1),
+                (0, 52),
+            ));
+        let read = ["src/pages/Home/HomePage.tsx", "src/pages/Home/index.ts"];
+        for name in [
+            "Home",
+            "layout:Home",
+            "lazy-import:./pages/Home",
+            "layout:lazy-import:./pages/Home",
+            "import:./pages/Home#default",
+        ] {
+            assert_eq!(modules(&ctx, &route(name)), read, "{name}");
+        }
+        let tag = a_ref("Home", EdgeKind::References, "src/App.tsx", Language::Tsx);
+        assert_eq!(modules(&ctx, &tag), read);
+        // Not React's: Vue Router's and Angular's lazy components, a value in
+        // a script the tag pass never reads, a call, and a value that loads
+        // nothing.
+        let vue = RefView {
+            from_node_id: "route:src/router/index.js:3:/:vue".to_string(),
+            ..a_ref(
+                "import:../pages/Home#default",
+                EdgeKind::Calls,
+                "src/router/index.js",
+                Language::JavaScript,
+            )
+        };
+        assert!(modules(&ctx, &vue).is_empty());
+        let script = a_ref(
+            "Home",
+            EdgeKind::References,
+            "src/App.tsx",
+            Language::TypeScript,
+        );
+        assert!(modules(&ctx, &script).is_empty());
+        let call = a_ref("Home", EdgeKind::Calls, "src/App.tsx", Language::Tsx);
+        assert!(modules(&ctx, &call).is_empty());
+        assert!(modules(&ctx, &route("Panel")).is_empty());
     }
 
     #[test]

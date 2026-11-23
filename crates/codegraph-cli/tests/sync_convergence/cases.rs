@@ -25261,3 +25261,863 @@ pub fn react_native_bridge_answers_again_when_the_arkts_namesake_goes() -> Case 
             "react-native-bridge",
         )
 }
+
+// =============================================================================
+// W7-23a: the modules a route lazily loads, and the values that load them
+// =============================================================================
+//
+// Each module a case adds or edits sits in a folder the index already has: a
+// file in a new folder moves the JavaScript control inputs (the configs and
+// manifests probed below every file), which re-resolves every
+// JavaScript-family file and would converge the case whatever the lanes do.
+// The components are named unlike their files and the route file's values,
+// so no touched name reaches the routes either.
+
+/// The package of the W7-23 React Router 6 cases.
+const W723_REACT_ROUTER_6: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}\n";
+/// The package of the W7-23 React Router 7 cases.
+const W723_REACT_ROUTER_7: &str = "{\"name\":\"shop\",\"private\":true,\"dependencies\":{\"react\":\"^18\",\"react-router\":\"^7\"}}\n";
+/// A data router whose `/team` route lazily loads `./pages/Team`.
+const W723_TEAM_ROUTER: &str = "import { createBrowserRouter } from 'react-router-dom';\nexport const router = createBrowserRouter([{ path: '/team', lazy: () => import('./pages/Team') }]);\n";
+/// The package of the W7-23 Vue Router cases.
+const W723_VUE_ROUTER_4: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"vue\":\"^3\",\"vue-router\":\"^4\"}}\n";
+/// A `.vue` view.
+const W723_VUE_VIEW: &str =
+    "<template><div>x</div></template>\n<script setup>\nconst ready = true\n</script>\n";
+/// The package of the W7-23 Angular 17 cases.
+const W723_ANGULAR_17: &str =
+    "{\"name\":\"app\",\"dependencies\":{\"@angular/core\":\"^17\",\"@angular/router\":\"^17\"}}\n";
+/// A standalone Angular component class `HomeComponent`.
+const W723_ANGULAR_HOME: &str = "import { Component } from '@angular/core';\n\n@Component({ selector: 'app-x', template: '' })\nexport class HomeComponent {}\n";
+
+/// W7-23a (upstream #2422, `sync-route-module-retry.test.ts` "when an edit
+/// gives the module its component"): the module a lazy route names gains a
+/// default export named unlike its file, so neither the route's path tail
+/// nor any touched name waits for it.
+pub fn tsx_react_router_lazy_module_gains_a_default_named_unlike_its_file() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/router.tsx", W723_TEAM_ROUTER)
+        .file("src/pages/Team.tsx", "export const placeholder = 1;\n")
+        .write(
+            "src/pages/Team.tsx",
+            "export default function TeamPage() { return null; }\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function TeamPage",
+        )
+}
+
+/// W7-23a (upstream #2422, the Vue Router scenario): the view a route lazily
+/// loads appears in the views folder. Vue Router's route names its component
+/// as a call, `import:../views/About.vue#About`, which no tail retry reads.
+pub fn javascript_vue_router_lazy_view_appears_in_its_folder() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript, Language::Vue])
+        .file("package.json", W723_VUE_ROUTER_4)
+        .file(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: '/', component: () => import('../views/Home.vue') },\n    { path: '/about', component: () => import('../views/About.vue') },\n  ]\n})\n",
+        )
+        .file("src/views/Home.vue", W723_VUE_VIEW)
+        .write("src/views/About.vue", W723_VUE_VIEW)
+        .edge_after(
+            "route src/router/index.js::route:/about",
+            "calls",
+            "component src/views/About.vue::About",
+        )
+}
+
+/// W7-23a (upstream #2422, "when an edit gives the module its component",
+/// Vue Router): the script module a route loads gains its default export.
+pub fn javascript_vue_router_lazy_module_gains_its_default() -> Case {
+    Case::new(Change::BodyEdit, &[Language::JavaScript])
+        .file("package.json", W723_VUE_ROUTER_4)
+        .file(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({ history: createWebHistory(), routes: [{ path: '/', component: () => import('../views/Home.js') }] })\n",
+        )
+        .file("src/views/Home.js", "export const placeholder = 1\n")
+        .write(
+            "src/views/Home.js",
+            "export default function Home() { return null }\n",
+        )
+        .edge_after("route src/router/index.js::route:/", "calls", "function Home")
+}
+
+/// W7-23a (upstream #2422, "when an edit gives the module its component",
+/// Angular): the module a route's `loadComponent` imports gains the class.
+pub fn typescript_angular_lazy_component_gains_its_class() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("package.json", W723_ANGULAR_17)
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [{ path: '', loadComponent: () => import('./home/home.component').then((m) => m.HomeComponent) }];\n",
+        )
+        .file("src/app/home/home.component.ts", "export const placeholder = 1;\n")
+        .write("src/app/home/home.component.ts", W723_ANGULAR_HOME)
+        .edge_after(
+            "route src/app/app.routes.ts::route:/",
+            "references",
+            "class HomeComponent",
+        )
+}
+
+/// W7-23a (W7-09c's seed, upstream `react-router-lazy-member.test.ts`): the
+/// module a loader picks an export from appears beside the route file. The
+/// parked `import:./report_list#ReportList` waits under `report_list`.
+pub fn tsx_react_router_picked_export_module_appears_beside_the_router() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_7)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/reports',\n    lazy: async () => {\n      const { ReportList } = await import('./report_list');\n      return { Component: ReportList };\n    },\n  },\n]);\n",
+        )
+        .file("src/other.ts", "export const x = 1;\n")
+        .write(
+            "src/report_list.tsx",
+            "export function ReportList() {\n  return null;\n}\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/reports",
+            "references",
+            "function ReportList",
+        )
+}
+
+/// W7-23a (W7-09c's seed, `react-router-lazy-member.test.ts` sync case 3):
+/// an edit gives the module behind the barrel the export the loader picks.
+pub fn tsx_react_router_picked_export_gains_its_export() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_7)
+        .file("src/router.tsx", REPORTS_ROUTER_LIST)
+        .file("src/reports/index.ts", "export * from './report_list';\n")
+        .file(
+            "src/reports/report_list.tsx",
+            "export const placeholder = 1;\n",
+        )
+        .write(
+            "src/reports/report_list.tsx",
+            "export function ReportList() {\n  return null;\n}\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/reports",
+            "references",
+            "function ReportList",
+        )
+}
+
+/// The router of upstream `sync-nested-barrel-route.test.ts`: lazy routes
+/// whose modules are barrels over folders below them.
+const W723_NESTED_BARREL_ROUTER: &str = "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  {\n    path: '/',\n    lazy: async () => {\n      const { HomePage } = await import('@/pages');\n      return { Component: HomePage };\n    },\n  },\n  {\n    path: '/cart',\n    lazy: async () => {\n      const { CartPage } = await import('@/shop');\n      return { Component: CartPage };\n    },\n  },\n  { path: '/admin', lazy: () => import('@/admin') },\n]);\n";
+
+/// Upstream `sync-nested-barrel-route.test.ts`'s project, the pages left out.
+fn nested_barrel_app(case: Case) -> Case {
+    case.file("package.json", W723_REACT_ROUTER_7)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"./src/*\"]}}}",
+        )
+        .file("src/router.tsx", W723_NESTED_BARREL_ROUTER)
+        .file("src/pages/index.ts", "export * from './home';\n")
+        .file(
+            "src/pages/home/index.ts",
+            "export { HomePage } from './HomePage';\n",
+        )
+        .file(
+            "src/shop/index.ts",
+            "import { CartPage } from './cart';\n\nexport { CartPage };\n",
+        )
+        .file("src/admin/index.ts", "export * from './dashboard';\n")
+        .file("src/admin/dashboard/index.ts", "export * from './panel';\n")
+        .file(
+            "src/admin/dashboard/panel/index.ts",
+            "export * from './Dashboard';\n",
+        )
+}
+
+const W723_HOME_PAGE: &str = "export function HomePage() {\n  return null;\n}\n";
+const W723_CART_PAGE: &str = "export function CartPage() {\n  return null;\n}\n";
+const W723_DASHBOARD: &str = "export function Component() {\n  return null;\n}\n";
+
+/// The three routes of [`nested_barrel_app`] rendering their pages.
+fn nested_barrel_pages_linked(case: Case) -> Case {
+    case.edge_after(
+        "route src/router.tsx::route:/",
+        "references",
+        "function HomePage",
+    )
+    .edge_after(
+        "route src/router.tsx::route:/cart",
+        "references",
+        "function CartPage",
+    )
+    .edge_after(
+        "route src/router.tsx::route:/admin",
+        "references",
+        "function Component @src/admin/dashboard/panel/Dashboard.tsx",
+    )
+}
+
+/// W7-23a (upstream #2560, "links each page once it appears"): the pages
+/// appear below the barrels the routes load, in folders the index has (the
+/// cart page beside its barrel rather than in a `cart/` folder of its own).
+/// Their own keys name their folders and stems, never the barrels'.
+pub fn tsx_react_router_barrel_pages_appear_below_their_barrels() -> Case {
+    nested_barrel_pages_linked(
+        nested_barrel_app(Case::new(
+            Change::AddImportTarget,
+            &[Language::TypeScript, Language::Tsx],
+        ))
+        .write("src/pages/home/HomePage.tsx", W723_HOME_PAGE)
+        .write("src/shop/cart.tsx", W723_CART_PAGE)
+        .write("src/admin/dashboard/panel/Dashboard.tsx", W723_DASHBOARD),
+    )
+}
+
+/// W7-23a (upstream #2560, "links each page once an edit gives it the
+/// export"): the pages below the barrels gain their exports.
+pub fn tsx_react_router_barrel_pages_gain_their_export() -> Case {
+    nested_barrel_pages_linked(
+        nested_barrel_app(Case::new(
+            Change::BodyEdit,
+            &[Language::TypeScript, Language::Tsx],
+        ))
+        .file(
+            "src/pages/home/HomePage.tsx",
+            "export const placeholder = 1;\n",
+        )
+        .file("src/shop/cart/index.tsx", "export const placeholder = 1;\n")
+        .file(
+            "src/admin/dashboard/panel/Dashboard.tsx",
+            "export const placeholder = 1;\n",
+        )
+        .write("src/pages/home/HomePage.tsx", W723_HOME_PAGE)
+        .write("src/shop/cart/index.tsx", W723_CART_PAGE)
+        .write("src/admin/dashboard/panel/Dashboard.tsx", W723_DASHBOARD),
+    )
+}
+
+/// W7-23a, a regression (upstream #2560's fixture as written): the cart
+/// page appears in a new folder, which moves the JavaScript control inputs.
+pub fn tsx_react_router_upstream_barrel_pages_appear() -> Case {
+    nested_barrel_pages_linked(
+        nested_barrel_app(Case::new(
+            Change::AddImportTarget,
+            &[Language::TypeScript, Language::Tsx],
+        ))
+        .write("src/pages/home/HomePage.tsx", W723_HOME_PAGE)
+        .write("src/shop/cart/index.tsx", W723_CART_PAGE)
+        .write("src/admin/dashboard/panel/Dashboard.tsx", W723_DASHBOARD),
+    )
+}
+
+/// W7-23a, a regression (upstream #2560, the pages deleted): the routes
+/// lose them, and the admin route, whose page stays, keeps its own.
+pub fn tsx_react_router_barrel_pages_go() -> Case {
+    nested_barrel_app(Case::new(
+        Change::DeleteImportedModule,
+        &[Language::TypeScript, Language::Tsx],
+    ))
+    .file("src/pages/home/HomePage.tsx", W723_HOME_PAGE)
+    .file("src/shop/cart/index.tsx", W723_CART_PAGE)
+    .file("src/admin/dashboard/panel/Dashboard.tsx", W723_DASHBOARD)
+    .remove("src/pages/home/HomePage.tsx")
+    .remove("src/shop/cart/index.tsx")
+    .edge_before(
+        "route src/router.tsx::route:/",
+        "references",
+        "function HomePage",
+    )
+    .edge_before(
+        "route src/router.tsx::route:/cart",
+        "references",
+        "function CartPage",
+    )
+    .edge_after(
+        "route src/router.tsx::route:/admin",
+        "references",
+        "function Component @src/admin/dashboard/panel/Dashboard.tsx",
+    )
+}
+
+/// W7-23a (W7-09e's seed): a lazy route's module forwards an import as its
+/// default export, and re-points the import. The route resolved, and its
+/// edge reaches a page the edit did not touch.
+pub fn tsx_react_router_lazy_module_re_points_the_page_it_forwards() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router-dom';\n\nexport const router = createBrowserRouter([\n  { path: '/home', lazy: () => import('./pages') },\n]);\n",
+        )
+        .file(
+            "src/pages/index.ts",
+            "import Page from './Home';\n\nexport default Page;\n",
+        )
+        .file(
+            "src/pages/Home.tsx",
+            "export default function Home() {\n  return <main />;\n}\n",
+        )
+        .file(
+            "src/pages/Other.tsx",
+            "export default function Other() {\n  return <main />;\n}\n",
+        )
+        .write(
+            "src/pages/index.ts",
+            "import Page from './Other';\n\nexport default Page;\n",
+        )
+        .edge_before("route src/router.tsx::route:/home", "references", "function Home")
+        .edge_after("route src/router.tsx::route:/home", "references", "function Other")
+}
+
+/// W7-23a (W7-09b's note, #2560): the page a lazy route's barrel forwards
+/// appears in a folder below the barrel, beside a file already there.
+pub fn tsx_react_router_barrel_page_appears_one_level_below() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_7)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router';\n\nexport const router = createBrowserRouter([\n  { path: '/login', lazy: () => import('./auth') },\n]);\n",
+        )
+        .file(
+            "src/auth/index.ts",
+            "import Login from './login';\n\nexport default Login;\n",
+        )
+        .file("src/auth/login/styles.ts", "export const styles = 1;\n")
+        .write(
+            "src/auth/login/index.tsx",
+            "export default function Login() {\n  return null;\n}\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/login",
+            "references",
+            "function Login",
+        )
+}
+
+/// Upstream `sync-route-module-retry.test.ts`'s React Router scenario: the
+/// router, the pages left out.
+const W723_UPSTREAM_ROUTER: &str = "import { createBrowserRouter } from 'react-router-dom';\nexport const router = createBrowserRouter([\n  { path: '/team', lazy: () => import('./pages/Team') },\n  { path: '/about', lazy: () => import('./pages/About.tsx') },\n  { path: '/docs', lazy: () => import('./pages/Docs') },\n  { path: '/settings', lazy: () => import('./pages/Settings') },\n  { path: '/billing', lazy: () => import('@/pages/Billing') },\n  { path: '/app', lazy: () => import('./layouts/Shell'), children: [\n    { path: 'inbox', lazy: () => import('./pages/Inbox') },\n  ] },\n]);\n";
+
+/// W7-23a, a regression (upstream #2422's React Router scenario as written):
+/// the modules appear in new folders, which moves the JavaScript control
+/// inputs.
+pub fn tsx_react_router_upstream_lazy_modules_appear() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"src/*\"]}}}",
+        )
+        .file("src/router.tsx", W723_UPSTREAM_ROUTER)
+        .write(
+            "src/pages/Team.tsx",
+            "export default function Team() { return null; }\n",
+        )
+        .write(
+            "src/pages/About.tsx",
+            "export default function About() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs.tsx",
+            "export default function DocsPage() { return null; }\n",
+        )
+        .write(
+            "src/pages/Settings/index.tsx",
+            "export default function Settings() { return null; }\n",
+        )
+        .write(
+            "src/pages/Billing.tsx",
+            "export function Component() { return null; }\n",
+        )
+        .write(
+            "src/layouts/Shell.tsx",
+            "export default function Shell() { return null; }\n",
+        )
+        .write(
+            "src/pages/Inbox.tsx",
+            "export default function Inbox() { return null; }\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function Team",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/docs",
+            "references",
+            "function DocsPage",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/settings",
+            "references",
+            "function Settings",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/billing",
+            "references",
+            "function Component",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/app/inbox",
+            "references",
+            "function Shell",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/app/inbox",
+            "references",
+            "function Inbox",
+        )
+}
+
+/// W7-23a, a regression (upstream #2422's Vue Router scenario as written).
+pub fn javascript_vue_router_upstream_lazy_views_appear() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::JavaScript, Language::Vue])
+        .file("package.json", W723_VUE_ROUTER_4)
+        .file(
+            "src/router/index.js",
+            "import { createRouter, createWebHistory } from 'vue-router'\nexport default createRouter({\n  history: createWebHistory(),\n  routes: [\n    { path: '/', component: () => import('../views/Home.vue') },\n    { path: '/login', component: () => import('@/views/Login') },\n    { path: '/admin', component: () => import('@/layout/index.vue'), children: [\n      { path: 'dashboard', component: () => import('@/views/dashboard/index') },\n    ] },\n  ]\n})\n",
+        )
+        .write("src/views/Home.vue", W723_VUE_VIEW)
+        .write("src/views/Login.vue", W723_VUE_VIEW)
+        .write("src/layout/index.vue", "<template><div><router-view /></div></template>\n<script setup>\nconst ready = true\n</script>\n")
+        .write("src/views/dashboard/index.vue", W723_VUE_VIEW)
+        .edge_after(
+            "route src/router/index.js::route:/",
+            "calls",
+            "component src/views/Home.vue::Home",
+        )
+        .edge_after(
+            "route src/router/index.js::route:/admin/dashboard",
+            "calls",
+            "component src/views/dashboard/index.vue::index",
+        )
+}
+
+/// W7-23a, a regression (upstream #2422's Angular scenarios as written: the
+/// components in new folders, and a child that loads its layout's class).
+pub fn typescript_angular_upstream_lazy_components_appear() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("package.json", W723_ANGULAR_17)
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nexport const routes: Routes = [\n  { path: '', loadComponent: () => import('./home/home.component').then((m) => m.HomeComponent) },\n  { path: 'admin', loadComponent: () => import('./admin/shell.component').then((m) => m.ShellComponent), children: [\n      { path: 'users', loadComponent: () => import('./admin/users.component').then((m) => m.UsersComponent) },\n  ] },\n];\n",
+        )
+        .write("src/app/home/home.component.ts", W723_ANGULAR_HOME)
+        .write(
+            "src/app/admin/shell.component.ts",
+            "import { Component } from '@angular/core';\n\n@Component({ selector: 'app-x', template: '' })\nexport class ShellComponent {}\n",
+        )
+        .write(
+            "src/app/admin/users.component.ts",
+            "import { Component } from '@angular/core';\n\n@Component({ selector: 'app-x', template: '' })\nexport class UsersComponent {}\n",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/",
+            "references",
+            "class HomeComponent",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/admin/users",
+            "references",
+            "class UsersComponent",
+        )
+}
+
+/// W7-23a, a regression (upstream's "Angular, a child loading its layout's
+/// class", ghostfolio's markets page): the child's route reference and its
+/// layout reference make one edge, at one site, resolved again together.
+pub fn typescript_angular_child_loads_its_layout_class() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("package.json", W723_ANGULAR_17)
+        .file(
+            "src/app/app.routes.ts",
+            "import { Routes } from '@angular/router';\nimport { MarketsComponent } from './markets/markets.component';\nexport const routes: Routes = [\n  { path: 'markets', component: MarketsComponent, children: [\n      { path: '', loadComponent: () => import('./markets/markets.component').then((m) => m.MarketsComponent) },\n  ] },\n];\n",
+        )
+        .file("src/app/markets/markets.service.ts", "export const marketsService = 1;\n")
+        .write(
+            "src/app/markets/markets.component.ts",
+            "import { Component } from '@angular/core';\n\n@Component({ selector: 'app-x', template: '' })\nexport class MarketsComponent {}\n",
+        )
+        .edge_after(
+            "route src/app/app.routes.ts::route:/markets",
+            "references",
+            "class MarketsComponent",
+        )
+}
+
+/// W7-23a, a regression: the module a resolved lazy route renders is
+/// deleted, and the route takes the index of the folder of that name.
+pub fn tsx_react_router_lazy_module_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/router.tsx", W723_TEAM_ROUTER)
+        .file(
+            "src/pages/Team.tsx",
+            "export default function TeamPage() { return null; }\n",
+        )
+        .file(
+            "src/pages/Team/index.tsx",
+            "export default function TeamIndex() { return null; }\n",
+        )
+        .remove("src/pages/Team.tsx")
+        .edge_before(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function TeamPage",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/team",
+            "references",
+            "function TeamIndex",
+        )
+}
+
+/// The router of upstream `sync-lazy-route-value.test.ts`: two pages it
+/// loads lazily into values of its own.
+const W723_LAZY_VALUE_APP: &str = "import { lazy } from 'react';\nimport { BrowserRouter, Routes, Route } from 'react-router-dom';\nconst Team = lazy(() => import('./pages/Team'));\nconst Docs = lazy(() => import('./pages/Docs'));\nexport function App() {\n  return (\n    <BrowserRouter>\n      <Routes>\n        <Route path=\"/team\" element={<Team />} />\n        <Route path=\"/docs\" element={<Docs />} />\n      </Routes>\n    </BrowserRouter>\n  );\n}\n";
+/// [`W723_LAZY_VALUE_APP`] with the docs value named unlike its module.
+const W723_LAZY_VALUE_APP_RENAMED: &str = "import { lazy } from 'react';\nimport { BrowserRouter, Routes, Route } from 'react-router-dom';\nconst Team = lazy(() => import('./pages/Team'));\nconst Documentation = lazy(() => import('./pages/Docs'));\nexport function App() {\n  return (\n    <BrowserRouter>\n      <Routes>\n        <Route path=\"/team\" element={<Team />} />\n        <Route path=\"/docs\" element={<Documentation />} />\n      </Routes>\n    </BrowserRouter>\n  );\n}\n";
+
+/// The docs route and the app's tag rendering `DocsPage`.
+fn lazy_docs_linked(case: Case) -> Case {
+    case.edge_after(
+        "route src/App.tsx::route:/docs",
+        "references",
+        "function DocsPage",
+    )
+    .edge_after("function App", "references", "function DocsPage")
+}
+
+/// W7-23a (#2452's sync half): the module a same-file lazy value loads
+/// appears, its page named unlike the value. While it was missing, the route
+/// and the app's `<Documentation />` were the declaration; no touched name
+/// reaches them.
+pub fn tsx_react_lazy_value_module_appears_named_unlike_the_value() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/App.tsx", W723_LAZY_VALUE_APP_RENAMED)
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs.tsx",
+            "export default function DocsPage() { return null; }\n",
+        )
+        .edge_after(
+            "route src/App.tsx::route:/docs",
+            "references",
+            "function DocsPage",
+        )
+        .edge_after("function App", "references", "function DocsPage")
+}
+
+/// W7-23a (#2452's sync half, upstream "when the modules are added after
+/// the router" with the team page already there): the docs module appears.
+pub fn tsx_react_lazy_value_module_appears_beside_a_namesake() -> Case {
+    lazy_docs_linked(
+        Case::new(Change::AddImportTarget, &[Language::Tsx])
+            .file("package.json", W723_REACT_ROUTER_6)
+            .file("src/App.tsx", W723_LAZY_VALUE_APP)
+            .file(
+                "src/pages/Team.tsx",
+                "export default function Team() { return null; }\n",
+            )
+            .write(
+                "src/pages/Docs.tsx",
+                "export default function DocsPage() { return null; }\n",
+            ),
+    )
+}
+
+/// W7-23a (#2452, upstream "when an edit gives the module its default
+/// export"): no name appears or goes; only the export changes.
+pub fn tsx_react_lazy_value_module_gains_its_default() -> Case {
+    lazy_docs_linked(
+        Case::new(Change::BodyEdit, &[Language::Tsx])
+            .file("package.json", W723_REACT_ROUTER_6)
+            .file("src/App.tsx", W723_LAZY_VALUE_APP)
+            .file(
+                "src/pages/Team.tsx",
+                "export default function Team() { return null; }\n",
+            )
+            .file(
+                "src/pages/Docs.tsx",
+                "export function DocsPage() { return null; }\n",
+            )
+            .write(
+                "src/pages/Docs.tsx",
+                "export function DocsPage() { return null; }\nexport default DocsPage;\n",
+            ),
+    )
+}
+
+/// W7-23a (#2452, upstream "when the page behind a barrel is added"): the
+/// value's module is a barrel whose page comes later.
+pub fn tsx_react_lazy_value_barrel_page_appears() -> Case {
+    lazy_docs_linked(
+        Case::new(
+            Change::AddImportTarget,
+            &[Language::Tsx, Language::TypeScript],
+        )
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/App.tsx", W723_LAZY_VALUE_APP)
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() { return null; }\n",
+        )
+        .file(
+            "src/pages/Docs/index.ts",
+            "export { default } from './DocsPage';\n",
+        )
+        .write(
+            "src/pages/Docs/DocsPage.tsx",
+            "export default function DocsPage() { return null; }\n",
+        ),
+    )
+}
+
+/// W7-23a (#2452, upstream "in a route table another file hands the router",
+/// codedthemes' admin templates): the module a table's lazy value loads
+/// appears, in the views folder the index has.
+pub fn jsx_react_lazy_value_in_a_route_table_module_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Jsx])
+        .file(
+            "package.json",
+            "{\"name\":\"berry\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^7\"}}\n",
+        )
+        .file(
+            "src/routes/index.jsx",
+            "import { createBrowserRouter } from 'react-router-dom';\nimport MainRoutes from './MainRoutes';\n\nconst router = createBrowserRouter([MainRoutes]);\n\nexport default router;\n",
+        )
+        .file(
+            "src/routes/MainRoutes.jsx",
+            "import { lazy } from 'react';\nimport MainLayout from '../layout/MainLayout';\nimport Loadable from '../ui-component/Loadable';\n\nconst DashboardDefault = Loadable(lazy(() => import('../views/dashboard/Default')));\n\nconst MainRoutes = {\n  path: '/',\n  element: <MainLayout />,\n  children: [{ path: 'dashboard/default', element: <DashboardDefault /> }]\n};\n\nexport default MainRoutes;\n",
+        )
+        .file(
+            "src/layout/MainLayout.jsx",
+            "export default function MainLayout() {\n  return <main />;\n}\n",
+        )
+        .file(
+            "src/ui-component/Loadable.jsx",
+            "export default function Loadable(Component) {\n  return (props) => <Component {...props} />;\n}\n",
+        )
+        .file(
+            "src/views/dashboard/Analytics.jsx",
+            "export default function Analytics() { return null; }\n",
+        )
+        .write(
+            "src/views/dashboard/Default.jsx",
+            "export default function DashboardDefaultPage() { return null; }\n",
+        )
+        .edge_after(
+            "route src/routes/MainRoutes.jsx::route:/dashboard/default",
+            "references",
+            "function DashboardDefaultPage",
+        )
+        .edge_after(
+            "constant MainRoutes",
+            "references",
+            "function DashboardDefaultPage",
+        )
+}
+
+/// W7-23a (KEEP-RUST beyond upstream): the barrel a same-file lazy value
+/// loads re-points the page it forwards. The route and the tag resolved to
+/// a page the edit did not touch.
+pub fn tsx_react_lazy_value_barrel_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file(
+            "src/App.tsx",
+            "import { lazy } from 'react';\nimport { BrowserRouter, Routes, Route } from 'react-router-dom';\nconst Home = lazy(() => import('./pages'));\nexport function App() {\n  return (\n    <BrowserRouter>\n      <Routes>\n        <Route path=\"/\" element={<Home />} />\n      </Routes>\n    </BrowserRouter>\n  );\n}\n",
+        )
+        .file(
+            "src/pages/index.ts",
+            "import Page from './Landing';\n\nexport default Page;\n",
+        )
+        .file(
+            "src/pages/Landing.tsx",
+            "export default function Landing() { return null; }\n",
+        )
+        .file(
+            "src/pages/Welcome.tsx",
+            "export default function Welcome() { return null; }\n",
+        )
+        .write(
+            "src/pages/index.ts",
+            "import Page from './Welcome';\n\nexport default Page;\n",
+        )
+        .edge_before("route src/App.tsx::route:/", "references", "function Landing")
+        .edge_after("route src/App.tsx::route:/", "references", "function Welcome")
+        .edge_after("function App", "references", "function Welcome")
+}
+
+/// W7-23a, a regression (upstream "when the modules are added after the
+/// router" as written): the pages appear in a new folder, which moves the
+/// JavaScript control inputs.
+pub fn tsx_react_lazy_value_upstream_modules_appear() -> Case {
+    lazy_docs_linked(
+        Case::new(Change::AddImportTarget, &[Language::Tsx])
+            .file("package.json", W723_REACT_ROUTER_6)
+            .file("src/App.tsx", W723_LAZY_VALUE_APP)
+            .write(
+                "src/pages/Team.tsx",
+                "export default function Team() { return null; }\n",
+            )
+            .write(
+                "src/pages/Docs.tsx",
+                "export default function DocsPage() { return null; }\n",
+            ),
+    )
+}
+
+/// W7-23a, a regression (upstream "when the module's default export moves
+/// to another component"): the route's edge reached the edited module.
+pub fn tsx_react_lazy_value_module_moves_its_default() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/App.tsx", W723_LAZY_VALUE_APP)
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() { return null; }\n",
+        )
+        .file(
+            "src/pages/Docs.tsx",
+            "export default function DocsPage() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs.tsx",
+            "export function DocsPage() { return null; }\nexport default function Documentation() { return null; }\n",
+        )
+        .edge_after(
+            "route src/App.tsx::route:/docs",
+            "references",
+            "function Documentation",
+        )
+}
+
+/// W7-23a, a regression (upstream "when deleted modules come back", the
+/// deletion): each route is the declaration it renders again.
+pub fn tsx_react_lazy_value_modules_go() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/App.tsx", W723_LAZY_VALUE_APP)
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() { return null; }\n",
+        )
+        .file(
+            "src/pages/Docs.tsx",
+            "export default function DocsPage() { return null; }\n",
+        )
+        .file("src/pages/Other.tsx", "export const other = 1;\n")
+        .remove("src/pages/Team.tsx")
+        .remove("src/pages/Docs.tsx")
+        .edge_before(
+            "route src/App.tsx::route:/docs",
+            "references",
+            "function DocsPage",
+        )
+        .edge_after(
+            "route src/App.tsx::route:/docs",
+            "references",
+            "constant Docs",
+        )
+}
+
+/// W7-23a, a regression (upstream "then switches its default export"): the
+/// page behind the value's barrel moves its default export.
+pub fn tsx_react_lazy_value_barrel_page_moves_its_default() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx, Language::TypeScript])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/App.tsx", W723_LAZY_VALUE_APP)
+        .file(
+            "src/pages/Team.tsx",
+            "export default function Team() { return null; }\n",
+        )
+        .file(
+            "src/pages/Docs/index.ts",
+            "export { default } from './DocsPage';\n",
+        )
+        .file(
+            "src/pages/Docs/DocsPage.tsx",
+            "export default function DocsPage() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs/DocsPage.tsx",
+            "export function DocsPage() { return null; }\nexport default function Documentation() { return null; }\n",
+        )
+        .edge_after(
+            "route src/App.tsx::route:/docs",
+            "references",
+            "function Documentation",
+        )
+}
+
+/// W7-23a, a regression (upstream "for a data router's lazy route whose
+/// module switches its default export").
+pub fn tsx_react_router_data_router_lazy_module_moves_its_default() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file(
+            "src/router.tsx",
+            "import { createBrowserRouter } from 'react-router-dom';\nexport const router = createBrowserRouter([{ path: '/docs', lazy: () => import('./pages/Docs') }]);\n",
+        )
+        .file(
+            "src/pages/Docs.tsx",
+            "export default function DocsPage() { return null; }\n",
+        )
+        .write(
+            "src/pages/Docs.tsx",
+            "export function DocsPage() { return null; }\nexport default function Documentation() { return null; }\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/docs",
+            "references",
+            "function Documentation",
+        )
+}
+
+/// A data router with 501 routes that all lazily load `./pages/Team`.
+static W723_MANY_LAZY_ROUTES: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from(
+        "import { createBrowserRouter } from 'react-router-dom';\nexport const router = createBrowserRouter([\n",
+    );
+    for route in 0..501 {
+        text.push_str(&format!(
+            "  {{ path: '/t{route}', lazy: () => import('./pages/Team') }},\n"
+        ));
+    }
+    text.push_str("]);\n");
+    text
+});
+
+/// W7-23a, no ceiling (memory `name-tail-retry-ceiling`): 501 parked route
+/// references wait for one module, which gains its default export; every
+/// one of them links, however many share the module's stem.
+pub fn tsx_react_router_501_lazy_routes_wait_for_one_module() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Tsx])
+        .file("package.json", W723_REACT_ROUTER_6)
+        .file("src/router.tsx", W723_MANY_LAZY_ROUTES.as_str())
+        .file("src/pages/Team.tsx", "export const placeholder = 1;\n")
+        .write(
+            "src/pages/Team.tsx",
+            "export default function TeamPage() { return null; }\n",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/t0",
+            "references",
+            "function TeamPage",
+        )
+        .edge_after(
+            "route src/router.tsx::route:/t500",
+            "references",
+            "function TeamPage",
+        )
+}

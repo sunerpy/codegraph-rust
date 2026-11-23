@@ -28,6 +28,7 @@ pub mod r_bindings;
 pub mod rails_routes;
 pub mod resolved_refs;
 pub mod rn_bridges;
+mod route_modules;
 pub mod ruby_heads;
 pub mod rust_crate_roots;
 pub mod rust_receivers;

@@ -207,6 +207,17 @@ pub trait FrameworkResolver: Sync {
     fn navigation(&self) -> Option<&dyn NavigationCalls> {
         None
     }
+
+    /// The files `reference`'s answer is read from through a module it
+    /// lazily loads (`lazyModules?`, upstream #2452): the module and every
+    /// barrel the lookup passes through, read as the store holds the files
+    /// now. A sync sends such a reference back when one of them changed,
+    /// since the reference names no symbol of the module and holds no edge
+    /// into a barrel. Empty when the resolver reads no module so; React
+    /// reads its routes' lazy pages and layouts and its same-file lazy values.
+    fn lazy_modules(&self, _reference: &RefView, _context: &dyn ResolutionContext) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The nodes a [`FrameworkResolver::cross_file_nodes`] pass wants now

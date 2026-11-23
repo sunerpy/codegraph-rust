@@ -1682,6 +1682,35 @@ impl ReferenceResolver {
         crate::cpp_includers::include_walk_dependents(paths, &context)
     }
 
+    /// The files `reference`'s answer is read from through a module it
+    /// lazily loads, as every detected framework reads them
+    /// ([`FrameworkResolver::lazy_modules`], upstream #2452), sorted: a
+    /// sync's route-module lane sends the reference back when one changed
+    /// (W7-23a).
+    pub fn lazy_modules(
+        &self,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Vec<String> {
+        let mut files = BTreeSet::new();
+        for resolver in &self.framework_resolver_extensions {
+            files.extend(resolver.lazy_modules(reference, context));
+        }
+        files.into_iter().collect()
+    }
+
+    /// The file a route's module path names from `from_file`, read the way
+    /// React reads a lazy route's module (`lazyModuleFile`): by the route
+    /// file's own extensions, else by TypeScript's (W7-23a).
+    pub fn route_module_file(
+        &self,
+        module_path: &str,
+        from_file: &str,
+        context: &dyn ResolutionContext,
+    ) -> Option<String> {
+        crate::frameworks::react::lazy_module_file(module_path, from_file, context)
+    }
+
     pub fn plan_cross_file_nodes(&self, store: &Store) -> anyhow::Result<CrossFilePlan> {
         let mut passes = Vec::new();
         {

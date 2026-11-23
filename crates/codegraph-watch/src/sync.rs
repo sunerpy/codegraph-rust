@@ -1844,6 +1844,55 @@ fn sync_paths_with_store(
                 changed_names.note_any(names);
             }
         }
+        // W7-23a — the route and value references a changed module can move,
+        // read once the framework nodes are back: a route's lazily loaded
+        // module (#2422), through the barrels that forward it (#2560), and a
+        // same-file lazy value a route or a tag renders (#2452). None of them
+        // names a symbol the module declares or holds an edge into a barrel.
+        // They go back by site, with no ceiling. A sync that re-resolves
+        // every JavaScript-family file whole already covers them.
+        let js_whole = frameworks_changed
+            || surface_bootstrap
+            || control
+                .changed
+                .contains(&crate::control_inputs::ControlKind::Js);
+        if !js_whole {
+            let mut modules: BTreeSet<String> = BTreeSet::new();
+            for file in reindexed.iter().chain(&changed_names.file_nodes_changed) {
+                let language = store.file_by_path(file)?.map(|record| record.language);
+                if crate::route_modules::may_be_a_module(file, language) {
+                    modules.insert(file.clone());
+                }
+            }
+            for file in &changed_names.removed_files {
+                if crate::route_modules::may_be_a_module(file, None) {
+                    modules.insert(file.clone());
+                }
+            }
+            let file_set_changed =
+                !changed_names.added_files.is_empty() || !changed_names.removed_files.is_empty();
+            let sites = crate::route_modules::route_module_sites(
+                store,
+                &resolver,
+                &modules,
+                || {
+                    surfaces.forwarding_closure(
+                        store,
+                        project_root,
+                        scope.options.max_file_size,
+                        &changed_names.js_surfaces,
+                        &modules,
+                        file_set_changed,
+                    )
+                },
+                &reindexed,
+            )?;
+            for found in sites {
+                if !dependent_fallbacks.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+        }
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -11834,5 +11883,86 @@ pub(crate) mod tests {
                 fresh_edges("macro-gate-fresh", &[MAIN, WRAP, macro_header, BESIDE])
             );
         }
+    }
+
+    const W723_PACKAGE: (&str, &str) = (
+        "package.json",
+        "{\"name\":\"app\",\"dependencies\":{\"react\":\"^18\",\"react-router-dom\":\"^6\"}}\n",
+    );
+    /// A data router whose loader picks `TeamPage` from `./pages/Team`: the
+    /// route's reference is `import:./pages/Team#TeamPage`, whose stem is
+    /// `Team`, and whose path tail (`Team#TeamPage`) no file's key matches.
+    const W723_ROUTER: (&str, &str) = (
+        "src/router.tsx",
+        "import { createBrowserRouter } from 'react-router-dom';\nexport const router = createBrowserRouter([\n  {\n    path: '/team',\n    lazy: async () => {\n      const { TeamPage } = await import('./pages/Team');\n      return { Component: TeamPage };\n    },\n  },\n]);\n",
+    );
+    const W723_TEAM: (&str, &str) = (
+        "src/pages/Team.tsx",
+        "export function TeamPage() {\n  return null;\n}\n",
+    );
+    const W723_OTHER: (&str, &str) = ("src/pages/Other.tsx", "export const other = 1;\n");
+    const W723_LIB: (&str, &str) = ("src/lib/util.ts", "export const util = 1;\n");
+
+    /// W7-23a (upstream "re-opens nothing for a module no route loads"): a
+    /// module no route loads sends no route file back, and neither does one
+    /// whose keys a resolved route's module path shares (`src/lib/Team.ts`
+    /// for `./pages/Team`) but which the path does not name: a resolved
+    /// route reference goes back only when its module now resolves into the
+    /// changed files or the barrels over them. The added files sit in a
+    /// folder the index has, so the JavaScript control inputs stay.
+    #[test]
+    fn a_module_no_route_loads_sends_no_route_file_back() {
+        let mut files = vec![W723_PACKAGE, W723_ROUTER, W723_TEAM, W723_OTHER, W723_LIB];
+        let (dir, db) = fully_indexed("route-module-unrelated", &files);
+        for added in [
+            ("src/lib/Team.ts", "export const team = 1;\n"),
+            (
+                "src/lib/slug.ts",
+                "export function slug(s: string) {\n  return s;\n}\n",
+            ),
+        ] {
+            take_dependent_refreshes();
+            write_files(dir.path(), &[added]);
+            sync_changed_paths(dir.path(), &db, [added.0]).unwrap();
+            let refreshes = take_dependent_refreshes();
+            assert!(
+                !refreshes
+                    .iter()
+                    .any(|refresh| refresh.file == W723_ROUTER.0),
+                "{added:?}: {refreshes:?}"
+            );
+            files.push(added);
+        }
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("route-module-unrelated-fresh", &files)
+        );
+    }
+
+    /// W7-23a: a sync that adds the module a parked lazy route waits for and
+    /// fails after its mutations leaves the route unlinked, and the next sync
+    /// sees no added file. That sync still links it: the JavaScript-family
+    /// marker the failed one withdrew makes it reconcile every
+    /// JavaScript-family file.
+    #[test]
+    fn a_lazy_module_a_failed_sync_added_links_the_route_next_time() {
+        let (dir, db) = fully_indexed(
+            "route-module-fail",
+            &[W723_PACKAGE, W723_ROUTER, W723_OTHER, W723_LIB],
+        );
+        write_files(dir.path(), &[W723_TEAM]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [W723_TEAM.0]);
+        FAIL_BEFORE_RESOLUTION.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the failed sync withdrew it");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "route-module-fail-fresh",
+                &[W723_PACKAGE, W723_ROUTER, W723_TEAM, W723_OTHER, W723_LIB]
+            )
+        );
     }
 }

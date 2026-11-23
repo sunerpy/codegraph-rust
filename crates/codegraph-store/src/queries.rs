@@ -145,6 +145,10 @@ pub enum LaneReferences {
     /// A Swift route's references: Vapor's, the only resolver that makes
     /// Swift routes.
     SwiftRoutes,
+    /// The references of a route the JavaScript routers make (React Router,
+    /// Vue Router, Angular, TanStack, Next.js, Expo Router, SvelteKit),
+    /// whose lazily loaded modules a sync follows (W7-23).
+    JsRoutes,
     /// The references written in one of these languages: what the React
     /// Native and Swift-Objective-C bridges read, which their lane narrows
     /// by name (W7-21).
@@ -185,6 +189,12 @@ impl LaneReferences {
             ),
             Self::SwiftRoutes => (
                 "from_node_id >= 'route:' AND from_node_id < 'route;' AND language = 'swift'"
+                    .into(),
+                Vec::new(),
+            ),
+            Self::JsRoutes => (
+                "from_node_id >= 'route:' AND from_node_id < 'route;' \
+                 AND language IN ('tsx', 'jsx', 'typescript', 'javascript', 'vue')"
                     .into(),
                 Vec::new(),
             ),
@@ -2795,6 +2805,70 @@ impl Store {
         Ok(out)
     }
 
+    /// The files holding a dynamic `import(…)` call, which the extractor
+    /// records as a `calls` reference named `import` (W7-23): a module-level
+    /// value a React route or tag renders lazily loads its module so. Such a
+    /// reference stays unresolved unless a node is named `import`, so
+    /// `resolved_refs`, which no index holds by name, is read only then.
+    pub fn files_with_dynamic_imports(&self) -> rusqlite::Result<BTreeSet<String>> {
+        let mut out = BTreeSet::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT file_path FROM unresolved_refs \
+             WHERE reference_name = 'import' AND reference_kind = 'calls'",
+        )?;
+        for file in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            out.insert(file?);
+        }
+        let named: bool = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE name = 'import')",
+            [],
+            |row| row.get(0),
+        )?;
+        if named {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT DISTINCT file_path FROM resolved_refs \
+                 WHERE reference_name = 'import' AND reference_kind = 'calls'",
+            )?;
+            for file in stmt.query_map([], |row| row.get::<_, String>(0))? {
+                out.insert(file?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `references` references of `files` named like a module-level
+    /// constant or variable of their own file (`qualified_name = name`), or
+    /// a route's `layout:` reference to one, the unresolved ones then the
+    /// resolved ones, each by id: what React's Pattern 1 and its layout
+    /// lookup read through a declared value (upstream `declaredComponent`,
+    /// W7-23).
+    pub fn same_file_value_references(
+        &self,
+        files: &[String],
+    ) -> rusqlite::Result<Vec<UnresolvedRef>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let files = serde_json::to_string(files)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+        let mut out = Vec::new();
+        for table in ["unresolved_refs", "resolved_refs"] {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT r.* FROM json_each(?1) AS f CROSS JOIN {table} AS r \
+                 ON r.file_path = f.value \
+                 WHERE r.reference_kind = 'references' \
+                 AND EXISTS (SELECT 1 FROM nodes AS n WHERE n.file_path = r.file_path \
+                 AND (n.name = r.reference_name OR 'layout:' || n.name = r.reference_name) \
+                 AND n.kind IN ('constant', 'variable') AND n.qualified_name = n.name) \
+                 ORDER BY r.id"
+            ))?;
+            for reference in stmt.query_map([&files], row_to_unresolved_ref)? {
+                out.push(reference?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Ports `getDependencyFilePaths` from
     /// `upstream db/queries.ts:1410-1420`: the OUTGOING twin of
     /// `dependent_file_paths` — every file containing a symbol that a symbol of
@@ -3477,6 +3551,41 @@ pub fn import_path_keys(file_path: &str) -> Vec<String> {
         }
     }
     keys
+}
+
+/// The module path a route's reference to the module it lazily loads names
+/// (upstream `MODULE_REFERENCE`, #2422): React Router's
+/// `lazy-import:<path>`, Vue Router's and Angular's `import:<path>#<export>`
+/// (the path may hold a `#` itself, as vben's `#/views/…` alias does), each
+/// also behind `layout:`. Only a `references` or a `calls` reference names a
+/// module so: Vue Router's route names the component it renders as a call.
+pub fn route_module_path(reference_name: &str, reference_kind: EdgeKind) -> Option<&str> {
+    if !matches!(reference_kind, EdgeKind::References | EdgeKind::Calls) {
+        return None;
+    }
+    let name = reference_name
+        .strip_prefix("layout:")
+        .unwrap_or(reference_name);
+    if let Some(path) = name.strip_prefix("lazy-import:") {
+        return (!path.is_empty()).then_some(path);
+    }
+    let (path, export) = name.strip_prefix("import:")?.rsplit_once('#')?;
+    (!path.is_empty() && !export.is_empty()).then_some(path)
+}
+
+/// The key a route's module path waits under (upstream `moduleTail`): the
+/// path's last segment up to its first dot past the first character,
+/// `./pages/Team` -> `Team`, `@/views/error/404.vue` -> `404`, the one
+/// [`import_path_keys`] gives a file that could be the module; `None` when
+/// that is only dots (`..`, `.`), which name a folder only through the
+/// route file's location.
+pub fn route_module_stem(module_path: &str) -> Option<&str> {
+    let trimmed = module_path.trim_end_matches('/');
+    let segment = trimmed
+        .rfind('/')
+        .map_or(trimmed, |slash| &trimmed[slash + 1..]);
+    let stem = file_name_stem(segment);
+    (!stem.chars().all(|c| c == '.')).then_some(stem)
 }
 
 /// A text column of `row`, borrowed rather than copied.

@@ -30,7 +30,7 @@ pub use index_state_publisher::{
 };
 pub use queries::{
     CODEGRAPH_NO_WAL_DEFER, CODEGRAPH_WAL_VALVE_MB, DEFAULT_WAL_VALVE_MB, import_path_keys,
-    reference_name_tail, wal_valve_threshold_bytes,
+    reference_name_tail, route_module_path, route_module_stem, wal_valve_threshold_bytes,
 };
 pub use rebuild::{
     ActiveFullRebuild, FullRebuild, RebuildError, RebuildKind, begin_full_rebuild,
