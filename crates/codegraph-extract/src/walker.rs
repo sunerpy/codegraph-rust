@@ -1994,26 +1994,44 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// Terraform/HCL extraction (upstream `terraformExtractor.visitNode`,
-    /// `terraform.ts`, #1173 — the extraction slice only). HCL's AST has no
-    /// C-family type-set node kinds — EVERY top-level construct is a `block`
-    /// distinguished only by its first `identifier` child — so `TERRAFORM_SPEC`
-    /// returns `&[]` for every type-set and this custom visitor (like
-    /// `visit_nix_node`) is the SOLE owner of the `block` kind. Every other kind
-    /// returns `false` → generic `visit_named_children` descent (so
-    /// `config_file`/`body` are walked into automatically, reaching each
-    /// `block`). Strictly `Language::Terraform`-guarded.
+    /// `terraform.ts`, #1173, #1174). HCL's AST has no C-family type-set node
+    /// kinds — EVERY top-level construct is a `block` distinguished only by
+    /// its first `identifier` child — so `TERRAFORM_SPEC` returns `&[]` for
+    /// every type-set and this custom visitor (like `visit_nix_node`) is the
+    /// SOLE owner of the `block` kind. Every other kind returns `false` →
+    /// generic `visit_named_children` descent (so `config_file`/`body` are
+    /// walked into automatically, reaching each `block`), but for a `.tfvars`
+    /// file's top-level assignment. Strictly `Language::Terraform`-guarded.
     ///
     /// Block-type dispatch: `resource`/`data` → Class, `module` → Module,
-    /// `variable`/`output` → Variable, `provider` → Namespace, `locals` →
-    /// Constant per attribute; body attribute-expression traversal refs
-    /// (`var.X`/`local.X`/`module.M`/`data.T.N`/`<type>.<name>`) →
-    /// `EdgeKind::References` with built-ins skipped. The `emitModuleWiring`
-    /// `:`-scoped refs and the `.tfvars` var ref are DEFERRED (they feed the
-    /// deferred `TerraformResolver`).
+    /// `variable`/`output` → Variable, `provider` → Namespace (an aliased one
+    /// `provider.P.alias`), `locals` → Constant per attribute; `moved`,
+    /// `import`, `removed` and a check's `assert` declare nothing and
+    /// reference what they name from the file. Body attribute-expression
+    /// traversal refs (`var.X`/`local.X`/`module.M`/`data.T.N`/`<type>.<name>`)
+    /// → `EdgeKind::References` with built-ins skipped, where each variable is
+    /// written; a module block adds its `:`-scoped wiring, and a provider
+    /// selection references the configuration it selects.
     fn visit_terraform_node(&mut self, node: SyntaxNode<'tree>) -> bool {
         if node.kind() != "block" {
-            // .tfvars top-level-assignment `var.X` ref DEFERRED — no special
-            // case; let the generic walker descend.
+            // A `.tfvars` file holds no blocks: each top-level assignment
+            // sets the root module variable of its name, a reference from
+            // the file (upstream #1174).
+            if node.kind() == "attribute"
+                && self.file_path.ends_with(".tfvars")
+                && node.parent().is_some_and(|body| {
+                    body.kind() == "body"
+                        && body
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "config_file")
+                })
+            {
+                if let Some(name) = crate::lang::terraform_attribute_name(node, self.source) {
+                    let file = file_node_id(self.file_path);
+                    self.push_ref(&file, &format!("var.{name}"), EdgeKind::References, node);
+                }
+                return true;
+            }
             return false;
         }
 
@@ -2035,6 +2053,23 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return true;
         }
 
+        // moved / import / removed: state-migration blocks name resource
+        // addresses, and a check's assert its condition's dependencies; none
+        // declares a symbol, so the file references them. A scoped module
+        // reference is dropped: `module.a.aws_x.b` names a resource inside a
+        // module instance, no output (upstream #1174).
+        if matches!(
+            block_type.as_str(),
+            "moved" | "import" | "removed" | "assert"
+        ) && labels.is_empty()
+        {
+            if let Some(body) = body {
+                let file = file_node_id(self.file_path);
+                self.emit_terraform_references_in_body(body, &file, true, &[]);
+            }
+            return true;
+        }
+
         // resource / data / module / variable / output / provider.
         let Some(decl) = crate::lang::describe_terraform_block(&block_type, &labels) else {
             // Unknown top-level block — generic descent.
@@ -2042,10 +2077,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         };
         let crate::lang::TerraformBlockDecl {
             kind,
-            name,
-            qualified_name,
-            signature,
+            mut name,
+            mut qualified_name,
+            mut signature,
         } = decl;
+        // `provider "aws" { alias = "east" }` is addressed as `aws.east`
+        // (upstream #1174).
+        if block_type == "provider"
+            && let Some(body) = body
+            && let Some(provider) = labels.first()
+            && let Some(alias) = crate::lang::terraform_string_attr(body, "alias", self.source)
+        {
+            name = format!("{provider}.{alias}");
+            qualified_name = format!("provider.{provider}.{alias}");
+            signature = format!("provider \"{provider}\" alias=\"{alias}\"");
+        }
         let is_exported = kind == NodeKind::Variable;
         if let Some(created) = self.create_node(
             kind,
@@ -2058,11 +2104,27 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 ..NodeExtra::default()
             },
         ) {
-            self.node_stack.push(created.id);
+            self.node_stack.push(created.id.clone());
             if let Some(body) = body {
-                self.emit_terraform_references_in_body(body);
+                // A resource's `provider` and a module's `providers` select
+                // a provider configuration, which the expression walk would
+                // read as a resource: they reference the configuration.
+                let mut skipped: Vec<&str> = Vec::new();
+                if matches!(block_type.as_str(), "resource" | "data") {
+                    self.emit_terraform_provider_selection(body, &created.id);
+                    skipped.push("provider");
+                }
+                if block_type == "module" {
+                    self.emit_terraform_module_providers(body, &created.id);
+                    skipped.push("providers");
+                }
+                self.emit_terraform_references_in_body(body, &created.id, false, &skipped);
+                if block_type == "module"
+                    && let Some(module) = labels.first()
+                {
+                    self.emit_terraform_module_wiring(module, node, body, &created.id);
+                }
             }
-            // emitModuleWiring for `module` blocks DEFERRED.
             self.node_stack.pop();
         }
         true
@@ -2079,13 +2141,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if attr.kind() != "attribute" {
                 continue;
             }
-            let Some(id_node) = attr
-                .named_children(&mut attr.walk())
-                .find(|c| c.kind() == "identifier")
-            else {
+            let Some(name) = crate::lang::terraform_attribute_name(attr, self.source) else {
                 continue;
             };
-            let name = node_text(id_node, self.source);
             if let Some(created) = self.create_node(
                 NodeKind::Constant,
                 &name,
@@ -2096,13 +2154,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     ..NodeExtra::default()
                 },
             ) {
-                if let Some(expr) = attr
-                    .named_children(&mut attr.walk())
-                    .find(|c| c.kind() == "expression")
-                {
+                if let Some(expr) = crate::lang::terraform_attribute_expression(attr) {
                     let refs = crate::lang::collect_terraform_references(expr, self.source);
-                    for (qname, _line, _col) in refs {
-                        self.push_ref(&created.id, &qname, EdgeKind::References, expr);
+                    for (qname, line, col) in refs {
+                        self.push_ref_at(&created.id, &qname, EdgeKind::References, line, col);
                     }
                 }
             }
@@ -2110,27 +2165,159 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// BFS the block body; when a node's kind is `expression`, run
-    /// `collect_terraform_references` and push each ref from the current owner,
-    /// then DON'T descend into that expression (the collector already walked
-    /// it). Ports `emitReferencesInBody` (terraform.ts:526-550).
-    fn emit_terraform_references_in_body(&mut self, body: SyntaxNode<'tree>) {
-        let Some(from_id) = self.node_stack.last().cloned() else {
-            return;
-        };
+    /// `collect_terraform_references` and push each ref from `from_id`, then
+    /// DON'T descend into that expression (the collector already walked it).
+    /// `suppress_scoped` drops the `:`-scoped module refs, and the body's
+    /// own attributes `skipped` names are left out (meta-arguments read
+    /// elsewhere). Ports `emitReferencesInBody` (terraform.ts:526-550).
+    fn emit_terraform_references_in_body(
+        &mut self,
+        body: SyntaxNode<'tree>,
+        from_id: &str,
+        suppress_scoped: bool,
+        skipped: &[&str],
+    ) {
         let mut queue: std::collections::VecDeque<SyntaxNode<'tree>> =
             std::collections::VecDeque::new();
-        queue.push_back(body);
+        for child in body.named_children(&mut body.walk()) {
+            if child.kind() == "attribute"
+                && crate::lang::terraform_attribute_name(child, self.source)
+                    .is_some_and(|name| skipped.contains(&name.as_str()))
+            {
+                continue;
+            }
+            queue.push_back(child);
+        }
         while let Some(node) = queue.pop_front() {
             if node.kind() == "expression" {
                 let refs = crate::lang::collect_terraform_references(node, self.source);
-                for (qname, _line, _col) in refs {
-                    self.push_ref(&from_id, &qname, EdgeKind::References, node);
+                for (qname, line, col) in refs {
+                    if suppress_scoped && qname.contains(':') {
+                        continue;
+                    }
+                    self.push_ref_at(from_id, &qname, EdgeKind::References, line, col);
                 }
                 continue;
             }
             for child in node.named_children(&mut node.walk()) {
                 queue.push_back(child);
             }
+        }
+    }
+
+    /// A module block's wiring across its boundary, in `:`-scoped
+    /// references only the Terraform resolver reads (upstream
+    /// `emitModuleWiring`, #1174): `module.M:file` (imports) for a local
+    /// `./` or `../` source, the entry of the module's directory, and
+    /// `module.M:var.<in>` for each input attribute, the child's variable it
+    /// sets. Meta-arguments configure the call and set nothing.
+    fn emit_terraform_module_wiring(
+        &mut self,
+        module: &str,
+        block: SyntaxNode<'tree>,
+        body: SyntaxNode<'tree>,
+        from_id: &str,
+    ) {
+        const META_ARGUMENTS: [&str; 6] = [
+            "source",
+            "version",
+            "count",
+            "for_each",
+            "providers",
+            "depends_on",
+        ];
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute" {
+                continue;
+            }
+            let Some(name) = crate::lang::terraform_attribute_name(attr, self.source) else {
+                continue;
+            };
+            if name == "source" {
+                let source = crate::lang::terraform_attribute_expression(attr)
+                    .and_then(crate::lang::find_terraform_string_lit)
+                    .map(|literal| crate::lang::terraform_string_lit_value(literal, self.source))
+                    .unwrap_or_default();
+                if source.starts_with("./") || source.starts_with("../") {
+                    self.push_ref(
+                        from_id,
+                        &format!("module.{module}:file"),
+                        EdgeKind::Imports,
+                        block,
+                    );
+                }
+                continue;
+            }
+            if META_ARGUMENTS.contains(&name.as_str()) {
+                continue;
+            }
+            self.push_ref(
+                from_id,
+                &format!("module.{module}:var.{name}"),
+                EdgeKind::References,
+                attr,
+            );
+        }
+    }
+
+    /// A resource's or data source's `provider = aws.east` (or a bare
+    /// `provider = google-beta`) selects a provider configuration: a
+    /// reference to `provider.aws.east` (upstream
+    /// `emitProviderSelectionRef`).
+    fn emit_terraform_provider_selection(&mut self, body: SyntaxNode<'tree>, from_id: &str) {
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute"
+                || crate::lang::terraform_attribute_name(attr, self.source).as_deref()
+                    != Some("provider")
+            {
+                continue;
+            }
+            if let Some(selection) = crate::lang::terraform_attribute_expression(attr)
+                .and_then(|expr| crate::lang::terraform_provider_selection(expr, self.source))
+            {
+                self.push_ref(
+                    from_id,
+                    &format!("provider.{selection}"),
+                    EdgeKind::References,
+                    attr,
+                );
+            }
+            return;
+        }
+    }
+
+    /// A module's `providers = { aws = aws.east }` maps the child's provider
+    /// slots (the keys) to this scope's configurations (the values): a
+    /// reference to each value (upstream `emitModuleProvidersRefs`).
+    fn emit_terraform_module_providers(&mut self, body: SyntaxNode<'tree>, from_id: &str) {
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute"
+                || crate::lang::terraform_attribute_name(attr, self.source).as_deref()
+                    != Some("providers")
+            {
+                continue;
+            }
+            let mut queue: std::collections::VecDeque<SyntaxNode<'tree>> =
+                std::collections::VecDeque::from([attr]);
+            while let Some(node) = queue.pop_front() {
+                if node.kind() == "object_elem" {
+                    if let Some(selection) = child_by_field(node, "val").and_then(|value| {
+                        crate::lang::terraform_provider_selection(value, self.source)
+                    }) {
+                        self.push_ref(
+                            from_id,
+                            &format!("provider.{selection}"),
+                            EdgeKind::References,
+                            node,
+                        );
+                    }
+                    continue;
+                }
+                for child in node.named_children(&mut node.walk()) {
+                    queue.push_back(child);
+                }
+            }
+            return;
         }
     }
 
@@ -8621,6 +8808,31 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         });
     }
 
+    /// [`Self::push_ref`] at a position read elsewhere: `line` 1-based,
+    /// `col` the tree's byte column.
+    fn push_ref_at(
+        &mut self,
+        from_node_id: &str,
+        reference_name: &str,
+        kind: EdgeKind,
+        line: u32,
+        col: u32,
+    ) {
+        self.unresolved_references.push(UnresolvedRef {
+            id: None,
+            from_node_id: from_node_id.to_string(),
+            reference_name: reference_name.to_string(),
+            reference_kind: kind,
+            line: i64::from(line),
+            col: i64::from(col),
+            candidates: None,
+            file_path: self.file_path.to_string(),
+            language: self.spec.language(),
+            is_function_ref: false,
+            reference_subkind: None,
+        });
+    }
+
     /// The node's prose from both places it can live — a preceding comment and
     /// a docstring inside the body — joined when both are present: they are
     /// two things the author wrote about the same symbol (upstream
@@ -13774,8 +13986,11 @@ public:
         assert!(has_ref(&refs, EdgeKind::References, "aws_s3_bucket.b"));
     }
 
+    /// W7-24c: a module block with a local source imports the module's
+    /// entry through the `module.M:file` reference (upstream #1174
+    /// `emitModuleWiring`), and no other scoped reference.
     #[test]
-    fn terraform_module_is_module_no_scoped_ref() {
+    fn terraform_module_is_module_with_its_file_ref() {
         let (nodes, refs) = run(
             "main.tf",
             "module \"vpc\" { source = \"./vpc\" }",
@@ -13783,10 +13998,12 @@ public:
         );
         let n = node(&nodes, NodeKind::Module, "vpc");
         assert_eq!(n.qualified_name, "module.vpc");
-        assert!(
-            !refs.iter().any(|r| r.reference_name.contains(':')),
-            "no :-scoped module wiring ref (emitModuleWiring DEFERRED): {refs:?}"
-        );
+        let scoped: Vec<(&str, EdgeKind)> = refs
+            .iter()
+            .filter(|r| r.reference_name.contains(':'))
+            .map(|r| (r.reference_name.as_str(), r.reference_kind))
+            .collect();
+        assert_eq!(scoped, [("module.vpc:file", EdgeKind::Imports)], "{refs:?}");
     }
 
     #[test]
@@ -13824,18 +14041,17 @@ public:
         assert!(has_ref(&refs, EdgeKind::References, "var.name"));
     }
 
+    /// W7-24c: a module output chain also references the output inside
+    /// the module (upstream #1174's `module.M:output.O`).
     #[test]
-    fn terraform_module_output_ref_is_plain() {
+    fn terraform_module_output_ref_has_its_scoped_half() {
         let (_nodes, refs) = run(
             "main.tf",
             "output \"vpc_id\" { value = module.vpc.id }",
             Language::Terraform,
         );
         assert!(has_ref(&refs, EdgeKind::References, "module.vpc"));
-        assert!(
-            !refs.iter().any(|r| r.reference_name.contains(':')),
-            "the module.vpc:output.id scoped half is DEFERRED: {refs:?}"
-        );
+        assert!(has_ref(&refs, EdgeKind::References, "module.vpc:output.id"));
     }
 
     #[test]
@@ -13851,6 +14067,252 @@ public:
                 .any(|r| r.reference_kind == EdgeKind::References),
             "built-in heads (each/count/path) emit no ref: {refs:?}"
         );
+    }
+
+    /// The reference names of `refs`.
+    fn terraform_ref_names(refs: &[UnresolvedRef]) -> Vec<&str> {
+        refs.iter().map(|r| r.reference_name.as_str()).collect()
+    }
+
+    /// W7-24c: a `.tfvars` file's top-level assignment sets the root
+    /// module's variable of its name (upstream `extraction.test.ts`
+    /// 12833-12851): a reference from the file, and no symbol.
+    #[test]
+    fn w724c_terraform_tfvars_assignments_reference_variables() {
+        let (nodes, refs) = run(
+            "terraform.tfvars",
+            "\nregion      = \"us-east-1\"\nenvironment = \"prod\"\n",
+            Language::Terraform,
+        );
+        assert!(nodes.iter().all(|n| n.kind == NodeKind::File), "{nodes:?}");
+        let file = &nodes[0].id;
+        for name in ["var.region", "var.environment"] {
+            let reference = refs
+                .iter()
+                .find(|r| r.reference_name == name)
+                .unwrap_or_else(|| panic!("{name}: {refs:?}"));
+            assert_eq!(&reference.from_node_id, file);
+            assert_eq!(reference.reference_kind, EdgeKind::References);
+        }
+        // The same assignment in a `.tf` file is no variable setting.
+        let (_nodes, refs) = run("main.tf", "region = \"us-east-1\"\n", Language::Terraform);
+        assert!(
+            !has_ref(&refs, EdgeKind::References, "var.region"),
+            "{refs:?}"
+        );
+    }
+
+    /// W7-24c: module wiring (upstream `extraction.test.ts` 12876-12957): an
+    /// input attribute references the child's variable, a meta-argument does
+    /// not, a local source imports the entry, a registry or git source does
+    /// not, and `module.M.outputs.X` is a remote-state output candidate.
+    #[test]
+    fn w724c_terraform_module_wiring() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "module \"vpc\" {\n  source     = \"./modules/vpc\"\n  version    = \"1.0.0\"\n  count      = 2\n  depends_on = [aws_iam_role.net]\n  cidr       = var.vpc_cidr\n  name       = \"prod\"\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in [
+            "module.vpc:var.cidr",
+            "module.vpc:var.name",
+            "var.vpc_cidr",
+            "aws_iam_role.net",
+        ] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        for meta in ["source", "version", "count", "depends_on", "providers"] {
+            assert!(
+                !names.contains(&format!("module.vpc:var.{meta}").as_str()),
+                "{meta}"
+            );
+        }
+        let file = refs
+            .iter()
+            .find(|r| r.reference_name == "module.vpc:file")
+            .expect("the module.vpc:file ref");
+        assert_eq!(file.reference_kind, EdgeKind::Imports);
+        assert_eq!((file.line, file.col), (1, 0));
+        let cidr = refs
+            .iter()
+            .find(|r| r.reference_name == "module.vpc:var.cidr")
+            .expect("the input ref");
+        assert_eq!((cidr.line, cidr.col), (6, 2));
+
+        let (_nodes, refs) = run(
+            "main.tf",
+            "module \"s3\" {\n  source  = \"terraform-aws-modules/s3-bucket/aws\"\n  version = \"4.0.0\"\n  bucket  = \"x\"\n}\nmodule \"net\" {\n  source = \"git::https://example.com/net.git\"\n  cidr   = \"10.0.0.0/16\"\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        assert!(!names.iter().any(|n| n.ends_with(":file")), "{names:?}");
+        assert!(names.contains(&"module.s3:var.bucket"), "{names:?}");
+
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"aws_eks_cluster\" \"this\" {\n  vpc_id = module.vpc.outputs.vpc_id\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        assert!(names.contains(&"module.vpc"), "{names:?}");
+        assert!(
+            names.contains(&"module.vpc:remote-output.vpc_id"),
+            "{names:?}"
+        );
+        let (_nodes, refs) = run(
+            "o.tf",
+            "output \"x\" {\n  value = module.vpc.vpc_id\n}\n",
+            Language::Terraform,
+        );
+        assert!(
+            !terraform_ref_names(&refs)
+                .iter()
+                .any(|n| n.contains(":remote-output.")),
+            "{refs:?}"
+        );
+        let (_nodes, refs) = run(
+            "o.tf",
+            "output \"m\" {\n  value = module.vpc\n}\n",
+            Language::Terraform,
+        );
+        assert_eq!(terraform_ref_names(&refs), ["module.vpc"]);
+    }
+
+    /// W7-24c: state-migration blocks and a check's assert reference what
+    /// they name from the file, with no scoped half and no symbol; a check's
+    /// own data block is still one (upstream `extraction.test.ts`
+    /// 12958-13010).
+    #[test]
+    fn w724c_terraform_state_and_check_blocks() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "resource \"aws_instance\" \"new\" {}\nmoved {\n  from = aws_instance.old\n  to   = aws_instance.new\n}\nimport {\n  to = aws_s3_bucket.b\n  id = \"bucket-name\"\n}\nremoved {\n  from = module.legacy.aws_iam_role.r\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in [
+            "aws_instance.old",
+            "aws_instance.new",
+            "aws_s3_bucket.b",
+            "module.legacy",
+        ] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        assert!(!names.iter().any(|n| n.contains(':')), "{names:?}");
+        let file = &nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::File)
+            .expect("file")
+            .id;
+        assert!(
+            refs.iter()
+                .filter(|r| r.reference_name == "aws_instance.old")
+                .all(|r| &r.from_node_id == file)
+        );
+        assert_eq!(nodes.iter().filter(|n| n.kind != NodeKind::File).count(), 1);
+
+        let (nodes, refs) = run(
+            "checks.tf",
+            "check \"health\" {\n  data \"http\" \"ping\" {\n    url = var.endpoint\n  }\n  assert {\n    condition     = data.http.ping.status_code == 200 && var.strict\n    error_message = \"unhealthy\"\n  }\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in ["data.http.ping", "var.strict", "var.endpoint"] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        assert!(nodes.iter().any(|n| n.qualified_name == "data.http.ping"));
+    }
+
+    /// W7-24c: an aliased provider block is `provider.aws.east`, and a
+    /// provider selection (a resource's `provider`, a module's `providers`
+    /// values) references the configuration, never a resource (upstream
+    /// `extraction.test.ts` 13012-13056).
+    #[test]
+    fn w724c_terraform_provider_alias_and_selection() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "provider \"aws\" {\n  region = \"us-east-1\"\n}\nprovider \"aws\" {\n  alias  = \"east\"\n  region = \"us-east-2\"\n}\nresource \"aws_s3_bucket\" \"b\" {\n  provider = aws.east\n  bucket   = \"x\"\n}\nresource \"google_service_account\" \"sa\" {\n  provider = google-beta\n}\n",
+            Language::Terraform,
+        );
+        let mut providers: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Namespace)
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        providers.sort_unstable();
+        assert_eq!(providers, ["provider.aws", "provider.aws.east"]);
+        let names = terraform_ref_names(&refs);
+        assert!(names.contains(&"provider.aws.east"), "{names:?}");
+        assert!(names.contains(&"provider.google-beta"), "{names:?}");
+        assert!(!names.contains(&"aws.east"), "{names:?}");
+
+        let (_nodes, refs) = run(
+            "main.tf",
+            "module \"vpc\" {\n  source    = \"./modules/vpc\"\n  providers = {\n    aws = aws.east\n  }\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        assert!(names.contains(&"provider.aws.east"), "{names:?}");
+        assert!(!names.contains(&"provider.aws"), "{names:?}");
+        assert!(!names.contains(&"aws.east"), "{names:?}");
+        assert!(!names.contains(&"module.vpc:var.providers"), "{names:?}");
+    }
+
+    /// W7-24c (OD-B49): an operation's last operand keeps its traversal,
+    /// which tree-sitter-hcl 1.1.0 hangs on the whole operation
+    /// (`var.left + var.right` reads `operation(var.left + var) .right`), as
+    /// upstream's grammar reads it; a chain on a parenthesised operation is
+    /// the parentheses' and names no operand.
+    #[test]
+    fn w724c_terraform_operation_operands_keep_their_traversals() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"x\" \"y\" {\n  a = var.left + var.right\n  b = !var.flag\n  c = -var.num + 1\n  d = var.m + var.n.o[0].p\n  e = (var.p + var.q).x\n  f = var.c ? var.d : local.e\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in [
+            "var.left",
+            "var.right",
+            "var.flag",
+            "var.num",
+            "var.m",
+            "var.n",
+            "var.p",
+            "var.q",
+            "var.c",
+            "var.d",
+            "local.e",
+        ] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        assert!(!names.contains(&"var.x"), "{names:?}");
+        let right = refs
+            .iter()
+            .find(|r| r.reference_name == "var.right")
+            .expect("var.right");
+        assert_eq!((right.line, right.col), (2, 17));
+    }
+
+    /// W7-24c: a reference is where its variable is written, not where the
+    /// expression holding it starts (OD-W724-4, upstream's `variable_expr`
+    /// position).
+    #[test]
+    fn w724c_terraform_reference_position_is_the_variable() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"x\" \"y\" {\n  tags = merge(\n    var.a,\n    local.b\n  )\n}\n",
+            Language::Terraform,
+        );
+        let at = |name: &str| {
+            refs.iter()
+                .find(|r| r.reference_name == name)
+                .map(|r| (r.line, r.col))
+                .unwrap_or_else(|| panic!("{name}: {refs:?}"))
+        };
+        assert_eq!(at("var.a"), (3, 4));
+        assert_eq!(at("local.b"), (4, 4));
     }
 
     // ---- Erlang (form-based; visit_erlang_node-driven) ----

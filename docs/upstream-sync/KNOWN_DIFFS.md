@@ -39,13 +39,13 @@ matching (`name-matcher.ts`) — orchestrated by `ReferenceResolver`
 `FrameworkResolver` trait EXTENSION POINT (`crates/codegraph-resolve/src/framework.rs`):
 Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri, Nuxt, React Router, TanStack Router,
 Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask,
-FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules (their JavaScript side and their Swift and Kotlin declarations), Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge and Fabric's view components (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
+FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules (their JavaScript side and their Swift and Kotlin declarations), Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge and Fabric's view components and Terraform (`crates/codegraph-resolve/src/frameworks/`), detected per-project by
 `detect_frameworks`. The other colby resolvers stay deferred. The following
 colby behaviors are intentionally NOT ported in v1:
 
 - **The other framework-specific resolvers** — every concrete `FrameworkResolver`
   in `reference/colby/src/resolution/frameworks/**` EXCEPT those above:
-  Terraform's (W7-24c) and CICS's, which is left out with COBOL (OD-2). These
+  CICS's, which is left out with COBOL (OD-2). These
   are an additive heuristic layer; on a project where none
   of them is detected the orchestrator holds an empty resolver list, so
   behavior matches colby with zero frameworks detected. Astro's extraction

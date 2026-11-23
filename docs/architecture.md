@@ -192,7 +192,14 @@ no ambient cross-file namespace: a static relative path import (`import
 ./x.nix`, `callPackage ./pkgs/hello`, a module's `imports = [ ./a.nix ]`)
 resolves by import alone, to the indexed file its path names or a directory's
 `default.nix`, and a name match from Nix into another file is dropped, as is
-another language's name match onto a Nix node. Calls in Vue, Svelte and
+another language's name match onto a Nix node. Terraform's scope is a module
+directory: a Terraform reference resolves only through the `terraform`
+resolver, to a declaration of its own directory, or, for a `.tfvars`
+assignment and a provider configuration, of the nearest ancestor directory; a
+module block's `:`-scoped references bridge to the entry file, variables and
+outputs of its local source directory, and a cloudposse remote-state output to
+the one directory of the component's name that declares it; a registry or git
+source stays unresolved. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -243,7 +250,7 @@ erased by ordinary source-language visibility (for example Tauri IPC to a
 private Rust command).
 
 The registered framework candidates are Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri,
-Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules' JavaScript side, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge, Expo modules' Swift and Kotlin declarations and Fabric's view components. Strategy 1 asks them in this order: the first to answer `>= 0.9` wins, and among lower answers the most confident, the earlier on a tie. An answer of the React Native or the Swift–Objective-C bridge below `0.9` only fills in: any other candidate whose target is in the reference's own language (TypeScript, TSX, JavaScript and JSX counting as one) takes its place, even a less confident one. A port takes the place upstream's `FRAMEWORK_RESOLVERS` gives it among its ported neighbours (Laravel and Drupal first, Express before NestJS, Astro between Angular Router and Expo Router, Django, Flask and FastAPI after Astro, Rails after FastAPI, Spring and Play after Rails, Go between Expo Router and GoFrame, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after ASP.NET, the React Native bridge and Expo modules' JavaScript side just before Expo Router, the Swift–Objective-C bridge, Expo modules and Fabric after Vapor), and one placed ahead of others answers below `0.9` or only for references they do not claim. Each activates only when its detection guard
+Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules' JavaScript side, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge, Expo modules' Swift and Kotlin declarations, Fabric's view components and Terraform. Strategy 1 asks them in this order: the first to answer `>= 0.9` wins, and among lower answers the most confident, the earlier on a tie. An answer of the React Native or the Swift–Objective-C bridge below `0.9` only fills in: any other candidate whose target is in the reference's own language (TypeScript, TSX, JavaScript and JSX counting as one) takes its place, even a less confident one. A port takes the place upstream's `FRAMEWORK_RESOLVERS` gives it among its ported neighbours (Laravel and Drupal first, Express before NestJS, Astro between Angular Router and Expo Router, Django, Flask and FastAPI after Astro, Rails after FastAPI, Spring and Play after Rails, Go between Expo Router and GoFrame, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after ASP.NET, the React Native bridge and Expo modules' JavaScript side just before Expo Router, the Swift–Objective-C bridge, Expo modules and Fabric after Vapor, Terraform last), and one placed ahead of others answers below `0.9` or only for references they do not claim. Each activates only when its detection guard
 matches, and resolves only references written in its own languages (React
 and Vue their scripts', Express and NestJS TypeScript and JavaScript, Django, Flask and FastAPI Python, Rails Ruby, Spring Java, Kotlin, YAML and
 Properties, Play Scala, Java and YAML, Laravel PHP, Drupal PHP and YAML, ASP.NET C# and Razor, the Go resolver Go, the `rust` resolver Rust, SwiftUI, UIKit and Vapor Swift, the React Native bridge and Expo modules' JavaScript side the JS family, the Swift–Objective-C bridge Swift and Objective-C, Expo modules and Fabric none (they extract their nodes from Swift and Kotlin, and from JS-family, Objective-C, Java and Kotlin files), Tauri the JS-family
@@ -848,6 +855,10 @@ the change and after it, since whether such a binding is what a call of its name
 from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the
 `r_base_bindings_version` marker is withdrawn and restored with the others, and a sync that
 finds it missing re-resolves every R file;
+a Terraform module block's `:`-scoped references read the files of the
+directory its source names, which no reference's name matches, so a sync that
+adds, removes or re-extracts a Terraform file re-resolves whole every file
+holding a `module.M:` reference;
 a Lua file whose module row moved touches the name of each declaration that became or stopped
 being `local`, since a `local` is invisible outside its file, and when the digest of what an
 alias through it reads changed (its functions, its variables and their locality, in source

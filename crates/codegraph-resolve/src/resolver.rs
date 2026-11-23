@@ -2948,10 +2948,14 @@ impl ReferenceResolver {
         // import's URI: `package:flutter/foundation.dart` matched by its last
         // segment went to riverpod's own foundation.dart (#2388), and a Nix
         // path import: `./x.nix` would name-match an unrelated node (#1190).
+        // A Terraform reference is the framework resolver's whole: its scope
+        // is a module directory, and a qualified-name match could only add a
+        // cross-module edge (#1173).
         if is_php_include_path_ref(reference)
             || is_lua_require_ref(reference)
             || is_dart_import_ref(reference)
             || is_nix_path_import_ref(reference)
+            || reference.language == Language::Terraform
         {
             return (best_candidate(candidates, reference, context), None);
         }

@@ -525,6 +525,11 @@ fn open_sync_writer(paths: &IndexPaths, cancel: Option<&SyncCancellation>) -> Re
     }
 }
 
+/// Whether `path` is a Terraform source file (`.tf`, `.tfvars`, `.tofu`).
+fn is_terraform_path(path: &str) -> bool {
+    path.ends_with(".tf") || path.ends_with(".tfvars") || path.ends_with(".tofu")
+}
+
 pub fn sync_changed_paths(
     project_root: impl AsRef<Path>,
     db_path: impl AsRef<Path>,
@@ -1014,6 +1019,22 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(surfaces.names.iter().cloned());
+        // What a Terraform module bridge reads beside its reference: a
+        // module declaration's `source` and `component`, a variable's
+        // `default`, and which `.tf` files the module's directory holds
+        // (W7-24c). A sync that adds, removes or re-extracts a Terraform
+        // file re-resolves whole every file holding a `module.M:` reference:
+        // one scan of both reference tables, uncapped.
+        if reindexed
+            .iter()
+            .chain(&changed_names.removed_files)
+            .any(|path| is_terraform_path(path))
+        {
+            for file in store.terraform_module_reference_files()? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         // What C/C++ resolution in an unchanged file read from a changed
         // file's text: its same-stem header, or the aliases and class heads
         // an alias lookup walks (W4-CPP-04), or the namespace aliases and

@@ -1,6 +1,26 @@
 [
   {
     "candidates": null,
+    "col": 0,
+    "file_path": "main.tf",
+    "from_node_id": "module:6387ce4b696974e8905686ae83527943",
+    "language": "terraform",
+    "line": 19,
+    "reference_kind": "imports",
+    "reference_name": "module.vpc:file"
+  },
+  {
+    "candidates": null,
+    "col": 10,
+    "file_path": "main.tf",
+    "from_node_id": "variable:20d776b47f45d7da835d4d4e82010d17",
+    "language": "terraform",
+    "line": 29,
+    "reference_kind": "references",
+    "reference_name": "module.vpc:output.id"
+  },
+  {
+    "candidates": null,
     "col": 15,
     "file_path": "main.tf",
     "from_node_id": "class:9ea649776b48847a71f06911daf0119e",
@@ -8,5 +28,15 @@
     "line": 16,
     "reference_kind": "references",
     "reference_name": "aws_kms_key.logs"
+  },
+  {
+    "candidates": null,
+    "col": 2,
+    "file_path": "main.tf",
+    "from_node_id": "module:6387ce4b696974e8905686ae83527943",
+    "language": "terraform",
+    "line": 21,
+    "reference_kind": "references",
+    "reference_name": "module.vpc:var.region"
   }
 ]

@@ -2804,6 +2804,25 @@ impl Store {
         rows.collect()
     }
 
+    /// The files holding a Terraform reference through a module's boundary
+    /// (`module.M:file`, `module.M:var.X`, `module.M:output.O`,
+    /// `module.M:remote-output.O`), resolved or not, sorted: a sync that
+    /// changed a Terraform file re-resolves them whole (W7-24c). One scan of
+    /// each reference table, which no index holds by name.
+    pub fn terraform_module_reference_files(&self) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path FROM unresolved_refs \
+             WHERE language = 'terraform' AND substr(reference_name, 1, 7) = 'module.' \
+             AND instr(reference_name, ':') > 0 \
+             UNION SELECT file_path FROM resolved_refs \
+             WHERE language = 'terraform' AND substr(reference_name, 1, 7) = 'module.' \
+             AND instr(reference_name, ':') > 0 \
+             ORDER BY file_path",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// The sites of the resolved references named one of `names`, sorted and
     /// deduplicated: a sync refreshes the Play actions whose candidates
     /// moved (W7-19c). One scan of `resolved_refs`, which no index holds by

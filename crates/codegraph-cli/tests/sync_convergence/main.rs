@@ -2210,6 +2210,10 @@ matrix! {
     nix_directory_import_default_appears,
     nix_directory_import_default_goes,
     nix_option_declared_elsewhere_changes,
+    terraform_module_source_changes,
+    terraform_module_entry_file_appears,
+    terraform_remote_state_default_changes,
+    terraform_variable_declared_in_the_same_dir_appears,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold

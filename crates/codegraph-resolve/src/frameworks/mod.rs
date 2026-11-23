@@ -64,6 +64,7 @@ pub mod swift;
 pub mod swift_objc;
 pub mod tanstack_router;
 pub mod tauri;
+pub mod terraform;
 pub mod vue;
 pub mod vue_router;
 
@@ -249,6 +250,10 @@ pub fn detect_frameworks(context: &dyn ResolutionContext) -> Vec<Box<dyn Framewo
         Box::new(swift_objc::SwiftObjcBridgeResolver),
         Box::new(expo_modules::ExpoModulesResolver),
         Box::new(fabric::FabricViewResolver),
+        // Terraform's directory scope and module boundaries (#1173,
+        // #1174), last as upstream registers it; it reads Terraform
+        // references only.
+        Box::new(terraform::TerraformResolver),
     ];
     candidates
         .into_iter()

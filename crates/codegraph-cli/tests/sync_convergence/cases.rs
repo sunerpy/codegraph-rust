@@ -27402,3 +27402,116 @@ pub fn nix_option_declared_elsewhere_changes() -> Case {
             "variable options.launchd.user.agents",
         )
 }
+
+/// W7-24c: a module declared in one file of a directory and used in
+/// another; both child directories declare the input and the output.
+const TF_VPC_VARIABLES: &str = "variable \"cidr\" {}\n";
+const TF_VPC_OUTPUTS: &str = "output \"id\" {\n  value = \"x\"\n}\n";
+const TF_USES: &str = "output \"vpc_id\" {\n  value = module.vpc.id\n}\n";
+
+/// W7-24c: the module's `source` moves to another directory: the uses in
+/// the other file of the declaration's directory follow it (the Terraform
+/// lane re-resolves every file holding a `module.*:` reference).
+pub fn terraform_module_source_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file("modules/vpc/variables.tf", TF_VPC_VARIABLES)
+        .file("modules/vpc/outputs.tf", TF_VPC_OUTPUTS)
+        .file("modules/vpc2/variables.tf", TF_VPC_VARIABLES)
+        .file("modules/vpc2/outputs.tf", TF_VPC_OUTPUTS)
+        .file(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\n}\n",
+        )
+        .file("outputs.tf", TF_USES)
+        .write(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/vpc2\"\n  cidr   = \"10.0.0.0/16\"\n}\n",
+        )
+        .edge_before(
+            "variable output.vpc_id",
+            "references",
+            "variable output.id @modules/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "variable output.vpc_id",
+            "references",
+            "variable output.id @modules/vpc2/outputs.tf:1",
+        )
+}
+
+/// W7-24c: the module's directory gains a `main.tf`: the module imports it
+/// instead of the first file by name.
+pub fn terraform_module_entry_file_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Terraform])
+        .file("modules/vpc/a.tf", TF_VPC_VARIABLES)
+        .file(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\n",
+        )
+        .write("modules/vpc/main.tf", TF_VPC_OUTPUTS)
+        .edge_before("module module.vpc", "imports", "file:modules/vpc/a.tf")
+        .edge_after("module module.vpc", "imports", "file:modules/vpc/main.tf")
+}
+
+/// W7-24c: the default of the variable a remote-state module's component
+/// names changes: the bridged output follows it.
+pub fn terraform_remote_state_default_changes() -> Case {
+    let remote_state = |component: &str| -> &'static str {
+        match component {
+            "vpc" => {
+                "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.net_component\n}\nvariable \"net_component\" {\n  type    = string\n  default = \"vpc\"\n}\n"
+            }
+            _ => {
+                "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.net_component\n}\nvariable \"net_component\" {\n  type    = string\n  default = \"network\"\n}\n"
+            }
+        }
+    };
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file(
+            "components/terraform/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"v\"\n}\n",
+        )
+        .file(
+            "components/terraform/network/outputs.tf",
+            "output \"id\" {\n  value = \"n\"\n}\n",
+        )
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            remote_state("vpc"),
+        )
+        .file(
+            "components/terraform/eks/main.tf",
+            "resource \"aws_eks_cluster\" \"c\" {\n  vpc_id = module.net.outputs.id\n}\n",
+        )
+        .write(
+            "components/terraform/eks/remote-state.tf",
+            remote_state("network"),
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/network/outputs.tf:1",
+        )
+}
+
+/// W7-24c: the directory comes to declare the variable a reference names:
+/// the reference, parked by its name's tail, comes to link it.
+pub fn terraform_variable_declared_in_the_same_dir_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Terraform])
+        .file("other/variables.tf", "variable \"region\" {}\n")
+        .file(
+            "app/main.tf",
+            "resource \"aws_s3_bucket\" \"b\" {\n  bucket = var.region\n}\n",
+        )
+        .write("app/variables.tf", "variable \"region\" {}\n")
+        .edge_after(
+            "class aws_s3_bucket.b",
+            "references",
+            "variable var.region @app/variables.tf:1",
+        )
+}

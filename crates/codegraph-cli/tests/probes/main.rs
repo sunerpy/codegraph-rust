@@ -44178,3 +44178,241 @@ mod nix_modules {
         );
     }
 }
+
+/// W7-24c: Terraform's directory scope and module boundaries (upstream
+/// #1173, #1174).
+mod terraform_modules {
+    use super::support::{Graph, Project, assert_edge, assert_unresolved};
+
+    /// The non-contains edges out of the node `selector` matches, described.
+    fn edges_from(graph: &Graph, selector: &str) -> Vec<String> {
+        let sources: Vec<&str> = graph
+            .nodes_matching(selector)
+            .into_iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(sources.len(), 1, "`{selector}`: {}", graph.report());
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && edge.source == sources[0])
+            .map(|edge| graph.describe_edge(edge))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The non-contains edges into the node `selector` matches.
+    fn edges_into(graph: &Graph, selector: &str) -> Vec<String> {
+        let targets: Vec<&str> = graph
+            .nodes_matching(selector)
+            .into_iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(targets.len(), 1, "`{selector}`: {}", graph.report());
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind != "contains" && edge.target == targets[0])
+            .map(|edge| graph.describe_edge(edge))
+            .collect()
+    }
+
+    fn multi_module_repo() -> Project {
+        Project::new()
+            .file(
+                "main.tf",
+                "variable \"vpc_cidr\" {\n  type = string\n}\n\nmodule \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = var.vpc_cidr\n}\n\nmodule \"registry_thing\" {\n  source  = \"terraform-aws-modules/s3-bucket/aws\"\n  bucket  = \"x\"\n}\n\noutput \"vpc_id\" {\n  value = module.vpc.vpc_id\n}\n",
+            )
+            .file("modules/vpc/variables.tf", "variable \"cidr\" {\n  type = string\n}\n")
+            .file(
+                "modules/vpc/main.tf",
+                "resource \"aws_vpc\" \"this\" {\n  cidr_block = var.cidr\n}\n",
+            )
+            .file(
+                "modules/vpc/outputs.tf",
+                "output \"vpc_id\" {\n  value = aws_vpc.this.id\n}\n",
+            )
+            .file(
+                "modules/other/variables.tf",
+                "variable \"cidr\" {\n  type = string\n}\nvariable \"orphan_ref_target\" {}\n",
+            )
+            .file(
+                "modules/other/main.tf",
+                "resource \"aws_eip\" \"e\" {\n  tags = { Name = var.undeclared_here_elsewhere_yes }\n}\n",
+            )
+            .file("envs/prod.tfvars", "vpc_cidr = \"10.0.0.0/16\"\n")
+    }
+
+    /// Upstream `frameworks-integration.test.ts:1202-1323`.
+    #[test]
+    fn w724c_module_boundary_and_directory_scope() {
+        let project = multi_module_repo().index();
+        let graph = project.graph();
+        assert_edge!(
+            project,
+            "module module.vpc" => references => "variable var.cidr @modules/vpc/variables.tf:1",
+            resolved_by = "framework"
+        );
+        assert_edge!(
+            project,
+            "module module.vpc" => imports => "file:modules/vpc/main.tf",
+            resolved_by = "framework"
+        );
+        assert_edge!(
+            project,
+            "variable output.vpc_id @main.tf:15" => references => "variable output.vpc_id @modules/vpc/outputs.tf:1",
+            resolved_by = "framework"
+        );
+        assert_edge!(
+            project,
+            "variable output.vpc_id @main.tf:15" => references => "module module.vpc"
+        );
+        assert_edge!(
+            project,
+            "file:envs/prod.tfvars" => references => "variable var.vpc_cidr",
+            resolved_by = "framework"
+        );
+        assert_edge!(
+            project,
+            "class aws_vpc.this" => references => "variable var.cidr @modules/vpc/variables.tf:1",
+            resolved_by = "framework"
+        );
+        assert_eq!(
+            edges_into(graph, "variable var.cidr @modules/other/variables.tf:1"),
+            Vec::<String>::new()
+        );
+        assert_unresolved!(
+            project,
+            "class aws_eip.e" => references => "var.undeclared_here_elsewhere_yes"
+        );
+        assert_eq!(
+            edges_from(graph, "module module.registry_thing"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Upstream `frameworks-integration.test.ts:1333-1442`: the remote-state
+    /// bridge through a variable's default, an ambiguous component, a
+    /// provider alias selected below its declaration, a moved block.
+    #[test]
+    fn w724c_remote_state_provider_alias_and_moved_blocks() {
+        let project = Project::new()
+            .file(
+                "components/terraform/vpc/outputs.tf",
+                "output \"vpc_id\" {\n  value = \"vpc-123\"\n}\n",
+            )
+            .file(
+                "components/terraform/eks/cluster/remote-state.tf",
+                "module \"vpc\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.vpc_component_name\n}\nvariable \"vpc_component_name\" {\n  type    = string\n  default = \"vpc\"\n}\n",
+            )
+            .file(
+                "components/terraform/eks/cluster/main.tf",
+                "resource \"aws_eks_cluster\" \"this\" {\n  vpc_id = module.vpc.outputs.vpc_id\n}\n",
+            )
+            .file(
+                "components/terraform/dns/outputs.tf",
+                "output \"zone_id\" {\n  value = \"z1\"\n}\n",
+            )
+            .file("legacy/dns/outputs.tf", "output \"zone_id\" {\n  value = \"z2\"\n}\n")
+            .file(
+                "components/terraform/eks/cluster/dns.tf",
+                "module \"dns\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = \"dns\"\n}\noutput \"zone\" {\n  value = module.dns.outputs.zone_id\n}\n",
+            )
+            .file(
+                "providers.tf",
+                "provider \"aws\" {\n  region = \"us-east-1\"\n}\nprovider \"aws\" {\n  alias  = \"east\"\n  region = \"us-east-2\"\n}\n",
+            )
+            .file(
+                "modules/app/main.tf",
+                "resource \"aws_s3_bucket\" \"b\" {\n  provider = aws.east\n  bucket   = \"x\"\n}\n",
+            )
+            .file(
+                "main.tf",
+                "resource \"aws_instance\" \"renamed\" {}\nmoved {\n  from = aws_instance.old\n  to   = aws_instance.renamed\n}\n",
+            )
+            .index();
+        let graph = project.graph();
+        assert_edge!(
+            project,
+            "class aws_eks_cluster.this" => references => "variable output.vpc_id @components/terraform/vpc/outputs.tf:1",
+            resolved_by = "framework"
+        );
+        assert!(
+            edges_from(graph, "variable output.zone")
+                .iter()
+                .all(|edge| !edge.contains("output.zone_id")),
+            "{}",
+            graph.report()
+        );
+        assert_edge!(
+            project,
+            "class aws_s3_bucket.b" => references => "namespace provider.aws.east",
+            resolved_by = "framework"
+        );
+        assert!(
+            edges_from(graph, "class aws_s3_bucket.b")
+                .iter()
+                .all(|edge| !edge.contains("namespace provider.aws @")),
+            "{}",
+            graph.report()
+        );
+        assert_edge!(
+            project,
+            "file:main.tf" => references => "class aws_instance.renamed",
+            resolved_by = "framework"
+        );
+    }
+
+    /// A name no declaration in its own directory has never binds another
+    /// directory's: Terraform cannot reference across sibling modules.
+    #[test]
+    fn w724c_a_name_never_binds_another_directorys_declaration() {
+        let project = Project::new()
+            .file("a/variables.tf", "variable \"cidr\" {}\n")
+            .file("b/variables.tf", "variable \"cidr\" {}\n")
+            .file(
+                "c/main.tf",
+                "resource \"aws_vpc\" \"v\" {\n  cidr_block = var.cidr\n}\n",
+            )
+            .index();
+        assert_unresolved!(project, "class aws_vpc.v" => references => "var.cidr");
+    }
+
+    /// A remote-state component that is no literal, and no variable with a
+    /// literal default, names nothing.
+    #[test]
+    fn w724c_a_dynamic_remote_state_component_names_nothing() {
+        let project = Project::new()
+            .file("components/terraform/vpc/outputs.tf", "output \"vpc_id\" {\n  value = \"v\"\n}\n")
+            .file(
+                "components/terraform/eks/remote-state.tf",
+                "module \"vpc\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.x\n}\nvariable \"x\" {\n  type = string\n}\n",
+            )
+            .file(
+                "components/terraform/eks/main.tf",
+                "resource \"aws_eks_cluster\" \"c\" {\n  vpc_id = module.vpc.outputs.vpc_id\n}\n",
+            )
+            .index();
+        assert_unresolved!(
+            project,
+            "class aws_eks_cluster.c" => references => "module.vpc:remote-output.vpc_id"
+        );
+    }
+
+    /// Two directories declare `module "vpc"` and a third references it: the
+    /// declaration is in neither the reference's directory nor alone in the
+    /// project, so neither the module nor its output links.
+    #[test]
+    fn w724c_an_ambiguous_module_declaration_links_nothing() {
+        let project = Project::new()
+            .file("a/main.tf", "module \"vpc\" {\n  source = \"./vpc\"\n}\n")
+            .file("a/vpc/outputs.tf", "output \"id\" {\n  value = \"a\"\n}\n")
+            .file("b/main.tf", "module \"vpc\" {\n  source = \"./vpc\"\n}\n")
+            .file("b/vpc/outputs.tf", "output \"id\" {\n  value = \"b\"\n}\n")
+            .file("c/main.tf", "output \"o\" {\n  value = module.vpc.id\n}\n")
+            .index();
+        assert_unresolved!(project, "variable output.o" => references => "module.vpc");
+        assert_unresolved!(project, "variable output.o" => references => "module.vpc:output.id");
+    }
+}
