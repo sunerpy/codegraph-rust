@@ -51,6 +51,17 @@ static DISPATCH: LazyLock<Regex> = LazyLock::new(|| {
 static VARIABLE_MODULE_CALL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Z][A-Za-z0-9_@]*:[a-z]").expect("variable module call"));
 
+/// Whether `content` can hold a dispatch site of one of the callbacks
+/// `needles` spell as `:<name>(`: every [`DISPATCH`] match whose name is a
+/// callback's holds its needle, and stripping comments only blanks comment
+/// characters, which a needle holds none of, so the comment-stripped text
+/// matches only where the raw text holds the needle (W7-24 cost, OD-B73).
+fn may_dispatch(content: &str, needles: &[String]) -> bool {
+    needles
+        .iter()
+        .any(|needle| content.contains(needle.as_str()))
+}
+
 /// Whether `file` is an Erlang module or header (upstream `ERLANG_EXT`).
 fn is_erlang_source(file: &str) -> bool {
     file.ends_with(".erl") || file.ends_with(".hrl")
@@ -62,7 +73,10 @@ fn is_erlang_source(file: &str) -> bool {
 /// strings, quoted atoms and `$c` characters inside count no comma. `None`
 /// when the list does not close within [`ARITY_WINDOW`] UTF-16 units.
 fn arity_at(src: &str, open: usize) -> Option<usize> {
-    let chars: Vec<char> = src[open + 1..].chars().collect();
+    // Every character is at least one UTF-16 unit, so the window holds at
+    // most [`ARITY_WINDOW`] of them, and the `<<` look-ahead one more: the
+    // rest of the file is never decoded (W7-24 cost, OD-B73).
+    let chars: Vec<char> = src[open + 1..].chars().take(ARITY_WINDOW + 1).collect();
     // Each character's UTF-16 offset from the one after `(`.
     let mut offsets = Vec::with_capacity(chars.len());
     let mut units = 0usize;
@@ -222,7 +236,13 @@ pub(super) fn behaviour_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
         Ok(found)
     };
 
-    // Pass 2: the dispatch sites.
+    // Pass 2: the dispatch sites. A file without `:<callback>(` for any
+    // declared callback holds none, so it is neither comment-stripped nor
+    // read (W7-24 cost, OD-B73).
+    let needles: Vec<String> = callback_names
+        .iter()
+        .map(|name| format!(":{name}("))
+        .collect();
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for file in &files {
@@ -232,12 +252,14 @@ pub(super) fn behaviour_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
         let Some(content) = view.text(file) else {
             continue;
         };
-        if !VARIABLE_MODULE_CALL.is_match(&content) {
+        if !VARIABLE_MODULE_CALL.is_match(&content) || !may_dispatch(&content, &needles) {
             continue;
         }
         let safe = strip_comments_for_regex(&content, CommentLang::Erlang);
-        let nodes = view.nodes_in_file(file)?;
-        let lines = LineAt::new(&safe, 1);
+        // The file's nodes and line index, read at its first site that
+        // passes the checks below.
+        let mut nodes: Option<Vec<Node>> = None;
+        let mut lines: Option<LineAt> = None;
         for captures in DISPATCH.captures_iter(&safe) {
             let whole = captures.get(0).expect("the whole match");
             let name = &captures[2];
@@ -255,8 +277,13 @@ pub(super) fn behaviour_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
             if targets.is_empty() || targets.len() > FANOUT_CAP {
                 continue;
             }
-            let line = lines.line(whole.start());
-            let Some(dispatcher) = enclosing_fn(&nodes, line) else {
+            if nodes.is_none() {
+                nodes = Some(view.nodes_in_file(file)?);
+            }
+            let line = lines
+                .get_or_insert_with(|| LineAt::new(&safe, 1))
+                .line(whole.start());
+            let Some(dispatcher) = enclosing_fn(nodes.as_deref().unwrap_or_default(), line) else {
                 continue;
             };
             for target in &targets {
@@ -307,6 +334,128 @@ mod tests {
         let wide = |n: usize| format!("f({})", "\u{1F600}".repeat(n));
         assert_eq!(at(&wide(ARITY_WINDOW / 2 - 1)), Some(1));
         assert_eq!(at(&wide(ARITY_WINDOW / 2)), None);
+    }
+
+    /// The body `arity_at` had before W7-24's cost revision: it decoded the
+    /// whole rest of the file.
+    fn arity_at_unbounded(src: &str, open: usize) -> Option<usize> {
+        let chars: Vec<char> = src[open + 1..].chars().collect();
+        let mut offsets = Vec::with_capacity(chars.len());
+        let mut units = 0usize;
+        for c in &chars {
+            offsets.push(units);
+            units += c.len_utf16();
+        }
+        let within = |k: usize| k < chars.len() && offsets[k] + 1 < ARITY_WINDOW;
+        let (mut depth, mut binary_depth, mut commas, mut saw_argument) =
+            (1usize, 0usize, 0, false);
+        let mut k = 0;
+        while within(k) {
+            let c = chars[k];
+            if c == '"' || c == '\'' {
+                k += 1;
+                while within(k) && chars[k] != c {
+                    if chars[k] == '\\' {
+                        k += 1;
+                    }
+                    k += 1;
+                }
+                saw_argument = true;
+                k += 1;
+                continue;
+            }
+            if c == '$' {
+                k += 1;
+                if within(k) && chars[k] == '\\' {
+                    k += 1;
+                }
+                saw_argument = true;
+                k += 1;
+                continue;
+            }
+            if c == '<' && chars.get(k + 1) == Some(&'<') {
+                binary_depth += 1;
+                saw_argument = true;
+                k += 2;
+                continue;
+            }
+            if c == '>' && chars.get(k + 1) == Some(&'>') && binary_depth > 0 {
+                binary_depth -= 1;
+                k += 2;
+                continue;
+            }
+            match c {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    saw_argument = true;
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(if saw_argument { commas + 1 } else { 0 });
+                    }
+                }
+                ',' if depth == 1 && binary_depth == 0 => commas += 1,
+                _ if !is_js_whitespace(c) => saw_argument = true,
+                _ => {}
+            }
+            k += 1;
+        }
+        None
+    }
+
+    /// W7-24 cost (OD-B73): reading at most the window's characters answers
+    /// as decoding the rest of the file did, at the window's edges, for
+    /// ASCII, for characters of two UTF-16 units, and for a binary or a
+    /// string the window cuts.
+    #[test]
+    fn arity_reads_only_the_window_as_the_whole_rest_did() {
+        let both = |src: &str| {
+            let open = src.find('(').expect("an open paren");
+            (arity_at(src, open), arity_at_unbounded(src, open))
+        };
+        let mut checked = 0;
+        for n in ARITY_WINDOW - 6..ARITY_WINDOW + 4 {
+            for (body, tail) in [
+                ("a".repeat(n), ")".to_string()),
+                ("a".repeat(n), ", b)".to_string()),
+                ("a".repeat(n), "<<1,2>>)".to_string()),
+                ("a".repeat(n), "\"x, y\")".to_string()),
+                ("a".repeat(n), ") trailing, text) more".to_string()),
+                ("\u{1F600}".repeat(n / 2), ")".to_string()),
+                ("\u{1F600}".repeat(n / 2), "a)".to_string()),
+                (format!("{}<", "a".repeat(n)), "<1>>)".to_string()),
+            ] {
+                let src = format!("f({body}{tail}");
+                let (bounded, whole) = both(&src);
+                assert_eq!(bounded, whole, "window {n}, tail {tail:?}");
+                checked += usize::from(whole.is_some());
+            }
+        }
+        assert!(checked > 0, "some lists close inside the window");
+    }
+
+    /// W7-24 cost (OD-B73): only a file whose text holds `:<callback>(` can
+    /// dispatch; one holding it in a comment passes this filter, and the
+    /// comment-stripped match then finds nothing there.
+    #[test]
+    fn may_dispatch_needs_a_colon_call_of_a_callback() {
+        let needles = vec![":handle_thing(".to_string(), ":init(".to_string()];
+        assert!(may_dispatch(
+            "run(M, A) ->\n    M:handle_thing(A).\n",
+            &needles
+        ));
+        assert!(may_dispatch("x() -> Mod:init([]).\n", &needles));
+        assert!(!may_dispatch(
+            "x() -> handle_thing(A), init([]).\n",
+            &needles
+        ));
+        assert!(!may_dispatch("x() -> Mod:handle_things(A).\n", &needles));
+        assert!(!may_dispatch("x() -> Mod:other(A).\n", &[]));
+        let commented = "run(Mod, Arg) -> % Mod:handle_thing(Arg)\n    ok.\n";
+        assert!(may_dispatch(commented, &needles));
+        let safe = strip_comments_for_regex(commented, CommentLang::Erlang);
+        assert!(DISPATCH.captures_iter(&safe).next().is_none());
     }
 
     #[test]

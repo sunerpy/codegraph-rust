@@ -15,7 +15,7 @@ use codegraph_core::source_file::{SourceText, read_source_file};
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_extract::ExtractOptions;
 use codegraph_store::Store;
-use codegraph_store::queries::{MethodHeader, ReferenceSite};
+use codegraph_store::queries::{MethodHeader, NodeSpan, ReferenceSite};
 use rayon::prelude::*;
 
 use super::context::ViewContext;
@@ -630,6 +630,22 @@ impl<'a> View<'a> {
         let mut nodes = self.store.nodes_of_kinds_in_languages(kinds, languages)?;
         nodes.sort_by(node_order);
         Ok(nodes)
+    }
+
+    /// [`Self::nodes_of_kinds_in`]'s nodes as [`NodeSpan`]s (id, name,
+    /// file, lines), in the same [`node_order`] (W7-24 cost, OD-B73).
+    pub(super) fn node_spans_of_kinds_in(
+        &self,
+        kinds: &[NodeKind],
+        languages: &[Language],
+    ) -> Result<Vec<NodeSpan>> {
+        let mut spans = self
+            .store
+            .node_spans_of_kinds_in_languages(kinds, languages)?;
+        spans.sort_by(|a, b| {
+            (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
+        });
+        Ok(spans)
     }
 
     /// The [`MethodHeader`]s of the methods written in `languages`, in

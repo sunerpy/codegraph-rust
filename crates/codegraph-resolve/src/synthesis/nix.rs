@@ -103,12 +103,14 @@ fn leading_static_segments(name: &str) -> Vec<String> {
 
 /// Each Nix variable's and function's binding with a static head, by file in
 /// the order the files first appear (upstream's `byFile`: the variables,
-/// then the functions, each in node order).
+/// then the functions, each in node order). A binding needs only its node's
+/// id, name, file and lines, read as spans, not whole rows (W7-24 cost,
+/// OD-B73).
 fn bindings_by_file(view: &View<'_>) -> Result<Vec<Vec<Binding>>> {
     let mut order: Vec<String> = Vec::new();
     let mut by_file: HashMap<String, Vec<Binding>> = HashMap::new();
     for kind in [NodeKind::Variable, NodeKind::Function] {
-        for node in view.nodes_of_kinds_in(&[kind], &[Language::Nix])? {
+        for node in view.node_spans_of_kinds_in(&[kind], &[Language::Nix])? {
             let segments = leading_static_segments(&node.name);
             if segments.is_empty() {
                 continue;

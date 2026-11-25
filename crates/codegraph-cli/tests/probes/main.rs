@@ -46977,3 +46977,73 @@ mod w724_b73_resolution_memos {
         }
     }
 }
+
+/// W7-24 cost (OD-B73): the Erlang behaviour pass reads a file only when its
+/// text holds `:<callback>(`, and the nodes of that file alone.
+mod w724_b73_synthesis_reads {
+    use super::support::{Graph, Project};
+
+    /// The `erlang-behaviour` edges, as `source -> file:target via`, sorted.
+    fn behaviour_edges(graph: &Graph) -> Vec<String> {
+        let mut edges: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.metadata["synthesizedBy"] == "erlang-behaviour")
+            .map(|edge| {
+                let source = graph.node(&edge.source).expect("the source");
+                let target = graph.node(&edge.target).expect("the target");
+                format!(
+                    "{} -> {}:{} via {}",
+                    source.name,
+                    target.file_path.rsplit('/').next().unwrap_or(""),
+                    target.name,
+                    edge.metadata["via"].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
+        edges.sort();
+        edges
+    }
+
+    /// A dispatch written only in a comment links nothing, though its file's
+    /// text holds `:handle_thing(`; each of two dispatching modules links
+    /// from its own function, on an index and after a sync.
+    #[test]
+    fn w724_b73_an_erlang_dispatch_in_a_comment_links_nothing() {
+        let first =
+            "-module(first).\n-export([go/2]).\n\ngo(Mod, Arg) ->\n    Mod:handle_thing(Arg).\n";
+        let mut project = Project::new()
+            .file(
+                "src/beh.erl",
+                "-module(beh).\n\n-callback handle_thing(term()) -> ok.\n",
+            )
+            .file(
+                "src/impl1.erl",
+                "-module(impl1).\n-behaviour(beh).\n-export([handle_thing/1]).\n\nhandle_thing(X) -> X.\n",
+            )
+            .file(
+                "src/commented.erl",
+                "-module(commented).\n-export([run/2]).\n\nrun(Mod, Arg) -> % Mod:handle_thing(Arg)\n    {Mod, Arg}.\n",
+            )
+            .file("src/first.erl", first)
+            .file(
+                "src/second.erl",
+                "-module(second).\n-export([pad/0, again/2]).\n\npad() -> ok.\nagain(Mod, Arg) ->\n    Mod:handle_thing(Arg).\n",
+            )
+            .index();
+        for round in 0..2 {
+            assert_eq!(
+                behaviour_edges(project.graph()),
+                [
+                    "again -> impl1.erl:handle_thing via beh:handle_thing/1",
+                    "go -> impl1.erl:handle_thing via beh:handle_thing/1",
+                ],
+                "round {round}"
+            );
+            if round == 0 {
+                project.write("src/first.erl", &format!("{first}% w724 b73\n"));
+                project.sync();
+            }
+        }
+    }
+}

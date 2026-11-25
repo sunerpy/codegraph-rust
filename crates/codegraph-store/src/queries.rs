@@ -228,6 +228,18 @@ pub struct MethodHeader {
     pub start_line: i64,
 }
 
+/// A node's id, name, file and lines: what a pass reading declarations by
+/// their names and spans takes of each, not the whole row (W7-24 cost,
+/// OD-B73).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSpan {
+    pub id: String,
+    pub name: String,
+    pub file_path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
 /// [`Store::methods_named`]'s query: each name's rows of `idx_nodes_name`,
 /// whose kind and language it tests unindexed (`+`). Left to itself the
 /// planner, which has no row statistics for these tables, walks the
@@ -513,6 +525,46 @@ impl Store {
             .map(|kind| kind.as_str())
             .chain(languages.iter().map(|language| language.as_str()));
         query_nodes(&self.conn, &sql, rusqlite::params_from_iter(values))
+    }
+
+    /// [`Store::nodes_of_kinds_in_languages`]'s nodes as [`NodeSpan`]s,
+    /// unordered: five columns of each instead of the whole row (W7-24 cost,
+    /// OD-B73: the Nix option pass read 7349 whole rows of nix-darwin on
+    /// every sync).
+    pub fn node_spans_of_kinds_in_languages(
+        &self,
+        kinds: &[NodeKind],
+        languages: &[Language],
+    ) -> rusqlite::Result<Vec<NodeSpan>> {
+        if kinds.is_empty() || languages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slots = |count: usize| {
+            std::iter::repeat_n("?", count)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let sql = format!(
+            "SELECT id, name, file_path, start_line, end_line FROM nodes \
+             WHERE kind IN ({}) AND language IN ({})",
+            slots(kinds.len()),
+            slots(languages.len())
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let values = kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .chain(languages.iter().map(|language| language.as_str()));
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok(NodeSpan {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                file_path: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// The methods written in `language` named one of `names` (W7-21's cost
@@ -8259,6 +8311,118 @@ mod tests {
                 "{sql}: {steps:?}"
             );
         }
+    }
+
+    /// W7-24 cost (OD-B73): the span rows of the nodes of some kinds in some
+    /// languages are the whole rows' ids, names, files and lines, for the
+    /// same nodes; another kind's and another language's have none.
+    #[test]
+    fn node_spans_are_the_whole_rows_spans() {
+        let mut store = store("node-spans");
+        let at = |id: &str,
+                  kind: NodeKind,
+                  language: Language,
+                  name: &str,
+                  file: &str,
+                  lines: (i64, i64)| Node {
+            kind,
+            language,
+            start_line: lines.0,
+            end_line: lines.1,
+            ..node(id, name, file)
+        };
+        store
+            .upsert_nodes(&[
+                at(
+                    "variable:ab",
+                    NodeKind::Variable,
+                    Language::Nix,
+                    "a.b",
+                    "x.nix",
+                    (3, 9),
+                ),
+                at(
+                    "variable:z",
+                    NodeKind::Variable,
+                    Language::Nix,
+                    "z",
+                    "a.nix",
+                    (5, 5),
+                ),
+                at(
+                    "function:f",
+                    NodeKind::Function,
+                    Language::Nix,
+                    "f",
+                    "x.nix",
+                    (1, 2),
+                ),
+                at(
+                    "constant:c",
+                    NodeKind::Constant,
+                    Language::Nix,
+                    "c",
+                    "x.nix",
+                    (4, 4),
+                ),
+                at(
+                    "variable:py",
+                    NodeKind::Variable,
+                    Language::Python,
+                    "a.b",
+                    "x.py",
+                    (3, 9),
+                ),
+            ])
+            .unwrap();
+        let spans_of = |node: Node| NodeSpan {
+            id: node.id,
+            name: node.name,
+            file_path: node.file_path,
+            start_line: node.start_line,
+            end_line: node.end_line,
+        };
+        let order = |a: &NodeSpan, b: &NodeSpan| {
+            (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
+        };
+        for kinds in [
+            &[NodeKind::Variable][..],
+            &[NodeKind::Function],
+            &[NodeKind::Variable, NodeKind::Function],
+        ] {
+            let mut spans = store
+                .node_spans_of_kinds_in_languages(kinds, &[Language::Nix])
+                .unwrap();
+            let mut whole: Vec<NodeSpan> = store
+                .nodes_of_kinds_in_languages(kinds, &[Language::Nix])
+                .unwrap()
+                .into_iter()
+                .map(spans_of)
+                .collect();
+            spans.sort_by(order);
+            whole.sort_by(order);
+            assert!(!spans.is_empty(), "{kinds:?}");
+            assert_eq!(spans, whole, "{kinds:?}");
+        }
+        assert!(
+            store
+                .node_spans_of_kinds_in_languages(&[NodeKind::Variable], &[Language::Python])
+                .unwrap()
+                .iter()
+                .all(|span| span.id == "variable:py")
+        );
+        assert!(
+            store
+                .node_spans_of_kinds_in_languages(&[], &[Language::Nix])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .node_spans_of_kinds_in_languages(&[NodeKind::Variable], &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// W7-21's cost revision: a method's light row is its id, name,
