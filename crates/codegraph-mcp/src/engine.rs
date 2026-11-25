@@ -158,6 +158,11 @@ pub struct CodeGraphEngine {
     /// callees, impact) names as locations. Checked for drift before the answer
     /// is served while auto-sync is not healthy (upstream #1959).
     answer_files: RefCell<BTreeSet<String>>,
+    /// Request-local memo of [`Self::find_all_symbols`], by the exact symbol
+    /// asked for (W7-25 cost, OD-B75): explore's exact targets and its named
+    /// seeds look up the same qualified tokens, and on a large index each
+    /// lookup can scan every node. `execute` clears it before every tool call.
+    symbol_memo: RefCell<HashMap<String, AllSymbols>>,
 }
 
 impl CodeGraphEngine {
@@ -185,6 +190,7 @@ impl CodeGraphEngine {
             source_probes: RefCell::new(HashMap::new()),
             source_citations: RefCell::new(HashSet::new()),
             answer_files: RefCell::new(BTreeSet::new()),
+            symbol_memo: RefCell::new(HashMap::new()),
         })
     }
 
@@ -370,6 +376,7 @@ impl CodeGraphEngine {
         self.source_probes.borrow_mut().clear();
         self.source_citations.borrow_mut().clear();
         self.answer_files.borrow_mut().clear();
+        self.symbol_memo.borrow_mut().clear();
         let health = codegraph_watch::watch_health(&self.project_root);
         let result = match tool_name {
             "codegraph_search" => self.handle_search(args),
@@ -2197,17 +2204,20 @@ impl CodeGraphEngine {
             && group
                 .iter()
                 .any(|n| callable(n) && unique(n) && !on_spine(n));
+        // The group's implements and extends edges, one batched read per kind
+        // (W7-25 cost): the answer is whether any reaches a supertype with
+        // many implementers, whatever the order the edges come in.
         let sibling = || {
-            group.iter().any(|n| {
-                self.store
-                    .edges_by_source_kind(&n.id, None)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|e| {
-                        matches!(e.kind, EdgeKind::Implements | EdgeKind::Extends)
-                            && self.has_many_implementers(subgraph, &e.target)
-                    })
-            })
+            let ids: Vec<String> = group.iter().map(|n| n.id.clone()).collect();
+            [EdgeKind::Implements, EdgeKind::Extends]
+                .into_iter()
+                .any(|kind| {
+                    self.store
+                        .edges_by_sources_kind(&ids, kind)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|e| self.has_many_implementers(subgraph, &e.target))
+                })
         };
         if !(on_spine_god_file || (!has_spine && !spared && sibling())) {
             return None;
@@ -2451,18 +2461,20 @@ impl CodeGraphEngine {
     }
 
     /// Whether at least [`MIN_SIBLINGS`] types implement or extend `id`, asked
-    /// once per explore.
+    /// once per explore. The two kinds are counted through the kind index, not
+    /// by reading every edge into `id` (W7-25 cost).
     fn has_many_implementers(&self, subgraph: &ExploreSubgraph, id: &str) -> bool {
         if let Some(&known) = subgraph.implementer_cache.borrow().get(id) {
             return known;
         }
-        let many = self
-            .store
-            .edges_by_target_kind(id, None)
-            .unwrap_or_default()
-            .iter()
-            .filter(|e| matches!(e.kind, EdgeKind::Implements | EdgeKind::Extends))
-            .count()
+        let many = [EdgeKind::Implements, EdgeKind::Extends]
+            .into_iter()
+            .map(|kind| {
+                self.store
+                    .edges_by_target_kind(id, Some(kind))
+                    .map_or(0, |edges| edges.len())
+            })
+            .sum::<usize>()
             >= MIN_SIBLINGS;
         subgraph
             .implementer_cache
@@ -3623,8 +3635,21 @@ impl CodeGraphEngine {
     }
 
     /// `findAllSymbols` (`tools.ts:3271-3307`): aggregate matches + the
-    /// multi-match "Aggregated results" note.
+    /// multi-match "Aggregated results" note. Looked up once per symbol and
+    /// request ([`Self::symbol_memo`]); a failed lookup is not remembered.
     fn find_all_symbols(&self, symbol: &str) -> anyhow::Result<AllSymbols> {
+        if let Some(found) = self.symbol_memo.borrow().get(symbol) {
+            return Ok(found.clone());
+        }
+        let found = self.look_up_all_symbols(symbol)?;
+        self.symbol_memo
+            .borrow_mut()
+            .insert(symbol.to_string(), found.clone());
+        Ok(found)
+    }
+
+    /// [`Self::find_all_symbols`] without the memo.
+    fn look_up_all_symbols(&self, symbol: &str) -> anyhow::Result<AllSymbols> {
         let results = self.search_qualified(symbol, 50)?;
         if results.is_empty() {
             return Ok(AllSymbols {
@@ -3928,14 +3953,18 @@ impl CodeGraphEngine {
         // substring test there (713).
         let lowered = query.to_lowercase();
         let test_query = lowered.contains("test") || lowered.contains("spec");
-        let walked = explore_gather::walk(&self.store, &entries, test_query)?;
-        for node in walked.gathered.nodes {
+        let explore_gather::Walk {
+            gathered,
+            roots,
+            mut reads,
+        } = explore_gather::walk(&self.store, &entries, test_query)?;
+        for node in gathered.nodes {
             sub.insert(node);
         }
-        for edge in walked.gathered.edges {
+        for edge in gathered.edges {
             sub.add_edge(edge);
         }
-        sub.roots = walked.roots;
+        sub.roots = roots;
         for file_path in pinned_files {
             sub.pin_file(file_path);
             let mut file_nodes = self.store.nodes_by_file_path(file_path)?;
@@ -3965,7 +3994,7 @@ impl CodeGraphEngine {
         // 4352-4626), run only when something was found (upstream answers an
         // empty gather before it): glue, then the named-symbol seeds.
         if !sub.nodes.is_empty() {
-            self.glue_entry_neighbours(&mut sub)?;
+            self.glue_entry_neighbours(&mut sub, &mut reads)?;
             self.seed_named_symbols(&mut sub, query)?;
         }
 
@@ -4032,16 +4061,21 @@ impl CodeGraphEngine {
     /// callers and callees join the subgraph when they live in a file it
     /// already holds, at most [`GLUE_NODE_CAP`]; the walk skips some of them
     /// for their kind (a file node calling at the top level). Nodes only, as
-    /// upstream: the edge recovery ran before.
-    fn glue_entry_neighbours(&self, sub: &mut ExploreSubgraph) -> anyhow::Result<()> {
+    /// upstream: the edge recovery ran before. The callers and callees come
+    /// from what the walk read (`reads`), which visited every entry point.
+    fn glue_entry_neighbours(
+        &self,
+        sub: &mut ExploreSubgraph,
+        reads: &mut explore_gather::WalkReads,
+    ) -> anyhow::Result<()> {
         let gathered_files: HashSet<String> =
             sub.nodes.iter().map(|n| n.file_path.clone()).collect();
         for root in sub.roots.clone() {
             if sub.glue_ids.len() >= GLUE_NODE_CAP {
                 break;
             }
-            let mut neighbours = explore_gather::callers(&self.store, &root)?;
-            neighbours.extend(explore_gather::callees(&self.store, &root)?);
+            let mut neighbours = reads.callers(&self.store, &root)?;
+            neighbours.extend(reads.callees(&self.store, &root)?);
             for neighbour in neighbours {
                 if sub.glue_ids.len() >= GLUE_NODE_CAP {
                     break;
@@ -4228,21 +4262,22 @@ impl CodeGraphEngine {
         cache: &mut HashMap<String, HashSet<String>>,
     ) -> anyhow::Result<bool> {
         if !cache.contains_key(file_path) {
-            let nodes = self.store.nodes_by_file_path(file_path)?;
+            // Each node's kind, lines and name, not the whole row (W7-25 cost).
+            let nodes = self.store.node_kinds_and_spans_in_file(file_path)?;
             let interfaces: Vec<(i64, i64)> = nodes
                 .iter()
-                .filter(|n| n.kind == NodeKind::Interface)
-                .map(|n| (n.start_line, n.end_line))
+                .filter(|(kind, _)| *kind == NodeKind::Interface)
+                .map(|(_, n)| (n.start_line, n.end_line))
                 .collect();
             let names = nodes
                 .iter()
-                .filter(|n| {
-                    !(matches!(n.kind, NodeKind::Property | NodeKind::Method)
+                .filter(|(kind, n)| {
+                    !(matches!(kind, NodeKind::Property | NodeKind::Method)
                         && interfaces
                             .iter()
                             .any(|(start, end)| n.start_line >= *start && n.end_line <= *end))
                 })
-                .map(|n| n.name.to_lowercase())
+                .map(|(_, n)| n.name.to_lowercase())
                 .collect();
             cache.insert(file_path.to_string(), names);
         }
@@ -4286,7 +4321,10 @@ impl CodeGraphEngine {
     /// on this" and damp a type module the repo genuinely imports.
     ///
     /// Conditions 1 and 2 run first as a cheap pre-filter, so the two edge queries
-    /// execute only for the handful of declaration-only files.
+    /// execute only for the handful of declaration-only files. Before that, one
+    /// probe skips a file holding a node of a kind outside
+    /// [`AMBIENT_FILE_NODE_KINDS`] without reading its rows (W7-25 cost): such a
+    /// node is a declaration and not a type, so condition 2 fails on it.
     fn ambient_declaration_files(
         &self,
         candidate_paths: &[String],
@@ -4295,6 +4333,12 @@ impl CodeGraphEngine {
         let precise = precise_query_tokens(query);
         let mut ambient = HashSet::new();
         for path in candidate_paths {
+            if self
+                .store
+                .file_has_node_outside_kinds(path, &AMBIENT_FILE_NODE_KINDS)?
+            {
+                continue;
+            }
             let nodes = self.store.nodes_by_file_path(path)?;
             let interface_owners = nodes
                 .iter()
@@ -4691,6 +4735,7 @@ enum CallDir {
     Callees,
 }
 
+#[derive(Clone)]
 struct AllSymbols {
     nodes: Vec<Node>,
     note: String,
@@ -6623,6 +6668,23 @@ fn is_type_declaration_kind(kind: NodeKind) -> bool {
     )
 }
 
+/// Every kind a node of an ambient declaration file can have: the bookkeeping
+/// kinds ([`is_ambient_bookkeeping_kind`]), the type-declaration kinds
+/// ([`is_type_declaration_kind`]) and the two an interface member has.
+const AMBIENT_FILE_NODE_KINDS: [NodeKind; 11] = [
+    NodeKind::File,
+    NodeKind::Import,
+    NodeKind::Export,
+    NodeKind::Parameter,
+    NodeKind::Interface,
+    NodeKind::TypeAlias,
+    NodeKind::Enum,
+    NodeKind::EnumMember,
+    NodeKind::Namespace,
+    NodeKind::Method,
+    NodeKind::Property,
+];
+
 /// Header of the "Not shown above" pointer block (`tools.ts:2910-2927`).
 const POINTER_BLOCK_HEADER: &str = "### Not shown above — explore these names for their source";
 
@@ -7128,6 +7190,7 @@ mod tests {
                 source_probes: RefCell::new(HashMap::new()),
                 source_citations: RefCell::new(HashSet::new()),
                 answer_files: RefCell::new(BTreeSet::new()),
+                symbol_memo: RefCell::new(HashMap::new()),
             }),
             root: base,
         }
@@ -14189,6 +14252,360 @@ mod tests {
         let mut edge = mk_edge(&source.id, &target.id, kind);
         edge.line = Some(line);
         edge
+    }
+
+    // === W7-25 cost (OD-B75): what explore reads, it reads once =============
+
+    /// The ids `counts` holds more than once, with their counts.
+    fn w725_cost_read_twice(counts: &HashMap<String, usize>) -> Vec<String> {
+        let mut twice: Vec<String> = counts
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(id, n)| format!("{id} ×{n}"))
+            .collect();
+        twice.sort();
+        twice
+    }
+
+    /// W7-25 cost (OD-B75): the walk reads each node's row and each node's
+    /// edges at most once, though two entry points walk to the same helper,
+    /// the file node and a parameter sit next to every visit, and the glue
+    /// asks for the entry points' callers and callees again.
+    #[test]
+    fn w725_cost_the_walk_reads_each_row_and_each_nodes_edges_once() {
+        let mut engine = test_engine();
+        let file = node_lang(
+            "shared.ts",
+            "shared.ts",
+            "src/shared.ts",
+            1,
+            40,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        let alpha = w725_fn("alphaEntry", "src/shared.ts", 1);
+        let beta = w725_fn("betaEntry", "src/shared.ts", 10);
+        let helper = w725_fn("sharedHelper", "src/shared.ts", 20);
+        let deep = w725_fn("deepHelper", "src/deep.ts", 1);
+        let param = node_lang(
+            "input",
+            "alphaEntry::input",
+            "src/shared.ts",
+            1,
+            1,
+            NodeKind::Parameter,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                file.clone(),
+                alpha.clone(),
+                beta.clone(),
+                helper.clone(),
+                deep.clone(),
+                param.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&file.id, &alpha.id, EdgeKind::Contains),
+                mk_edge(&file.id, &beta.id, EdgeKind::Contains),
+                mk_edge(&file.id, &helper.id, EdgeKind::Contains),
+                mk_edge(&alpha.id, &param.id, EdgeKind::Contains),
+                w725_edge_at(&alpha, &helper, EdgeKind::Calls, 2),
+                w725_edge_at(&beta, &helper, EdgeKind::Calls, 11),
+                w725_edge_at(&helper, &deep, EdgeKind::Calls, 21),
+            ],
+        );
+        explore_gather::test_reads::take();
+        let sub = engine
+            .find_relevant_context("alphaEntry betaEntry")
+            .unwrap();
+        let (rows, edges) = explore_gather::test_reads::take();
+        assert!(
+            sub.roots.contains(&alpha.id) && sub.roots.contains(&beta.id),
+            "both are entry points: {:?}",
+            sub.roots
+        );
+        assert!(sub.node(&deep.id).is_some(), "the walk reaches deepHelper");
+        assert!(
+            rows.contains_key(&file.id) && edges.contains_key(&helper.id),
+            "the walk read the file's row and the helper's edges: {rows:?} {edges:?}"
+        );
+        assert_eq!(w725_cost_read_twice(&rows), Vec::<String>::new(), "rows");
+        assert_eq!(w725_cost_read_twice(&edges), Vec::<String>::new(), "edges");
+    }
+
+    /// W7-25 cost (OD-B75): past its node limit a walk skips a new neighbour
+    /// without reading its row, as it skipped it after reading it, and the
+    /// rows it does read come a growing batch at a time: of a helper's 400
+    /// callees the walk reads 32, 64 and 128.
+    #[test]
+    fn w725_cost_a_full_walk_does_not_read_the_rows_it_skips() {
+        let mut engine = test_engine();
+        let entry = w725_fn("hubEntry", "src/hub.ts", 1);
+        let mid = w725_fn("middleStep", "src/mid.ts", 1);
+        let mut nodes = vec![entry.clone(), mid.clone()];
+        let mut edges = vec![w725_edge_at(&entry, &mid, EdgeKind::Calls, 2)];
+        for i in 0..400 {
+            let file = format!("src/leaf{}.ts", i / 20);
+            let leaf = w725_fn(&format!("leafStep{i:03}"), &file, 1 + 4 * (i % 20));
+            edges.push(w725_edge_at(&mid, &leaf, EdgeKind::Calls, 2));
+            nodes.push(leaf);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        explore_gather::test_reads::take();
+        let sub = engine.find_relevant_context("hubEntry").unwrap();
+        let (rows, _) = explore_gather::test_reads::take();
+        let leaf_rows = rows.keys().filter(|id| id.contains(":leafStep")).count();
+        assert!(
+            sub.nodes.iter().any(|n| n.name.starts_with("leafStep")),
+            "the walk keeps leaves"
+        );
+        assert_eq!(leaf_rows, 32 + 64 + 128, "the leaves' rows read");
+    }
+
+    /// W7-25 cost (OD-B75): the walk's reads are keyed by node id, so two
+    /// helpers of one name in two files keep their own rows and edges.
+    #[test]
+    fn w725_cost_the_walk_keeps_same_named_nodes_apart() {
+        let mut engine = test_engine();
+        let entry = w725_fn("startJob", "src/job.ts", 1);
+        let helper_a = w725_fn("helper", "src/a.ts", 1);
+        let helper_b = w725_fn("helper", "src/b.ts", 1);
+        let deep_a = w725_fn("deepAlpha", "src/deep_a.ts", 1);
+        let deep_b = w725_fn("deepBeta", "src/deep_b.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                entry.clone(),
+                helper_a.clone(),
+                helper_b.clone(),
+                deep_a.clone(),
+                deep_b.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&entry, &helper_a, EdgeKind::Calls, 2),
+                w725_edge_at(&entry, &helper_b, EdgeKind::Calls, 3),
+                w725_edge_at(&helper_a, &deep_a, EdgeKind::Calls, 2),
+                w725_edge_at(&helper_b, &deep_b, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("startJob").unwrap();
+        for n in [&helper_a, &helper_b, &deep_a, &deep_b] {
+            assert!(
+                sub.node(&n.id).is_some(),
+                "{} of {} is gathered: {:?}",
+                n.name,
+                n.file_path,
+                sub.nodes
+                    .iter()
+                    .map(|n| (&n.name, &n.file_path))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn w725_cost_files_of(engine: &CodeGraphEngine, symbol: &str) -> Vec<String> {
+        engine
+            .find_all_symbols(symbol)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.file_path.clone())
+            .collect()
+    }
+
+    fn w725_cost_method(name: &str, owner: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            &format!("{owner}::{name}"),
+            file,
+            line,
+            line + 2,
+            NodeKind::Method,
+            Language::TypeScript,
+        )
+    }
+
+    /// W7-25 cost (OD-B75): the request's memo of `find_all_symbols` is keyed
+    /// by the whole symbol: two classes' `run` keep their own definitions.
+    #[test]
+    fn w725_cost_the_symbol_memo_keeps_two_symbols_apart() {
+        let mut engine = test_engine();
+        put_nodes(
+            &mut engine,
+            &[
+                w725_cost_method("run", "Alpha", "src/alpha.ts", 3),
+                w725_cost_method("run", "Beta", "src/beta.ts", 3),
+            ],
+        );
+        assert_eq!(w725_cost_files_of(&engine, "Alpha.run"), ["src/alpha.ts"]);
+        assert_eq!(w725_cost_files_of(&engine, "Beta.run"), ["src/beta.ts"]);
+        assert_eq!(
+            w725_cost_files_of(&engine, "Alpha.run"),
+            ["src/alpha.ts"],
+            "a repeated lookup answers the same"
+        );
+    }
+
+    /// W7-25 cost (OD-B75): the memo lives in one request's engine, so two
+    /// projects asked the same symbol in one process keep their own answers.
+    #[test]
+    fn w725_cost_two_projects_do_not_share_the_symbol_memo() {
+        let mut first = test_engine();
+        let mut second = test_engine();
+        put_nodes(
+            &mut first,
+            &[w725_cost_method("open", "Store", "src/store.ts", 3)],
+        );
+        put_nodes(
+            &mut second,
+            &[w725_cost_method("open", "Store", "lib/db/store.ts", 8)],
+        );
+        assert_eq!(w725_cost_files_of(&first, "Store.open"), ["src/store.ts"]);
+        assert_eq!(
+            w725_cost_files_of(&second, "Store.open"),
+            ["lib/db/store.ts"]
+        );
+    }
+
+    /// W7-25 cost (OD-B75): `execute` starts every tool call with an empty
+    /// memo, so the next request on the same engine sees what a sync added in
+    /// between, as a long-lived server's next call does.
+    #[test]
+    fn w725_cost_each_request_starts_with_an_empty_symbol_memo() {
+        let mut engine = test_engine();
+        let ask = |engine: &CodeGraphEngine| {
+            text_of(&engine.execute(
+                "codegraph_callers",
+                &serde_json::json!({ "symbol": "Store.open" }),
+            ))
+        };
+        let before = ask(&engine);
+        assert!(before.contains("not found"), "{before}");
+        let open = w725_cost_method("open", "Store", "src/store.ts", 3);
+        let boot = w725_fn("bootApp", "src/main.ts", 1);
+        put_nodes(&mut engine, &[open.clone(), boot.clone()]);
+        put_edges(
+            &mut engine,
+            &[w725_edge_at(&boot, &open, EdgeKind::Calls, 2)],
+        );
+        let after = ask(&engine);
+        assert!(
+            after.contains("bootApp"),
+            "the second request sees the new caller: {after}"
+        );
+    }
+
+    /// W7-25 cost (OD-B75): the ranking reads each owner's kind once, by the
+    /// owner: an interface's method and a class's method in one file keep
+    /// their own answer, and an owner outside the subgraph is read from the
+    /// index.
+    #[test]
+    fn w725_cost_interface_ownership_is_read_per_owner() {
+        let mut engine = test_engine();
+        let ts = |name: &str, file: &str, start: i64, end: i64, kind: NodeKind| {
+            node_lang(name, name, file, start, end, kind, Language::TypeScript)
+        };
+        let shape = ts("Shape", "src/shapes.ts", 1, 3, NodeKind::Interface);
+        let shape_area = w725_cost_method("area", "Shape", "src/shapes.ts", 2);
+        let square = ts("Square", "src/shapes.ts", 5, 9, NodeKind::Class);
+        let square_area = w725_cost_method("area", "Square", "src/shapes.ts", 6);
+        let round = ts("Round", "src/round.ts", 1, 3, NodeKind::Interface);
+        let round_area = w725_cost_method("area", "Round", "src/round.ts", 2);
+        put_nodes(
+            &mut engine,
+            &[
+                shape.clone(),
+                shape_area.clone(),
+                square.clone(),
+                square_area.clone(),
+                round.clone(),
+                round_area.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&shape.id, &shape_area.id, EdgeKind::Contains),
+                mk_edge(&square.id, &square_area.id, EdgeKind::Contains),
+                mk_edge(&round.id, &round_area.id, EdgeKind::Contains),
+            ],
+        );
+        // `Round` itself is not in the subgraph.
+        let held = [
+            shape,
+            shape_area.clone(),
+            square,
+            square_area,
+            round_area.clone(),
+        ];
+        let mut owned: Vec<String> =
+            crate::explore_rank::interface_owned_methods(&engine.store, &held)
+                .unwrap()
+                .into_iter()
+                .collect();
+        owned.sort();
+        let mut want = vec![shape_area.id, round_area.id];
+        want.sort();
+        assert_eq!(owned, want);
+    }
+
+    /// W7-25 cost (OD-B75): the glue answers from the walk's edges of every
+    /// kind but keeps only the caller kinds, as reading callers and callees
+    /// did: a parameter the entry point contains in its own (gathered) file is
+    /// not glued, while a top-level call from its file node is.
+    #[test]
+    fn w725_cost_the_glue_follows_only_the_caller_kinds() {
+        let mut engine = test_engine();
+        let demo = w725_fn("runDemo", "src/app.ts", 3);
+        let own_file = node_lang(
+            "app.ts",
+            "app.ts",
+            "src/app.ts",
+            1,
+            9,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        let param = node_lang(
+            "options",
+            "runDemo::options",
+            "src/app.ts",
+            3,
+            3,
+            NodeKind::Parameter,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[demo.clone(), own_file.clone(), param.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&demo.id, &param.id, EdgeKind::Contains),
+                w725_edge_at(&own_file, &demo, EdgeKind::Calls, 9),
+            ],
+        );
+        let sub = engine.find_relevant_context("runDemo").unwrap();
+        assert!(
+            sub.glue_ids.contains(&own_file.id),
+            "the file's top-level call is glued: {:?}",
+            sub.glue_ids
+        );
+        assert!(
+            !sub.glue_ids.contains(&param.id) && sub.node(&param.id).is_none(),
+            "a contained parameter is not glued: {:?}",
+            sub.glue_ids
+        );
     }
 
     /// W7-25a: the walk goes three hops out, so a type the seed's callee

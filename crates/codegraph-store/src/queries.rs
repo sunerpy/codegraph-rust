@@ -366,6 +366,52 @@ impl Store {
         )
     }
 
+    /// The kind and the [`NodeSpan`] of each node of `file_path`, by start
+    /// line: [`Self::nodes_by_file_path`]'s rows without the rest of each row
+    /// (W7-25 cost, OD-B75).
+    pub fn node_kinds_and_spans_in_file(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<(NodeKind, NodeSpan)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT kind, id, name, file_path, start_line, end_line FROM nodes \
+             WHERE file_path = ? ORDER BY start_line",
+        )?;
+        let rows = stmt.query_map([file_path], |row| {
+            Ok((
+                parse_node_kind(row.get::<_, String>(0)?)?,
+                NodeSpan {
+                    id: row.get(1)?,
+                    name: row.get(2)?,
+                    file_path: row.get(3)?,
+                    start_line: row.get(4)?,
+                    end_line: row.get(5)?,
+                },
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Whether `file_path` holds a node of a kind not among `kinds` (W7-25
+    /// cost, OD-B75): one probe of the file's own rows instead of reading
+    /// them all. The `+` keeps the kind index out of the plan, as
+    /// [`Self::callables_by_file_path`] does.
+    pub fn file_has_node_outside_kinds(
+        &self,
+        file_path: &str,
+        kinds: &[NodeKind],
+    ) -> rusqlite::Result<bool> {
+        let slots = std::iter::repeat_n("?", kinds.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM nodes WHERE file_path = ? AND +kind NOT IN ({slots}))"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let values = std::iter::once(file_path).chain(kinds.iter().map(|kind| kind.as_str()));
+        stmt.query_row(rusqlite::params_from_iter(values), |row| row.get(0))
+    }
+
     /// The functions and methods of `file_path`, by start line: the file's
     /// rows of [`Self::nodes_by_file_path`] of those kinds (W5-08). The `+`
     /// keeps the kind index out of the plan, so the file's own index walks
@@ -8422,6 +8468,117 @@ mod tests {
                 .node_spans_of_kinds_in_languages(&[NodeKind::Variable], &[])
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    fn file_node(id: &str, kind: NodeKind, name: &str, file: &str, lines: (i64, i64)) -> Node {
+        Node {
+            kind,
+            start_line: lines.0,
+            end_line: lines.1,
+            ..node(id, name, file)
+        }
+    }
+
+    /// W7-25 cost (OD-B75): a file's kinds and spans are its whole rows'
+    /// kinds, ids, names and lines, in the same order; another file's nodes
+    /// are not among them, and a file without nodes has none.
+    #[test]
+    fn node_kinds_and_spans_are_the_file_rows_own() {
+        let mut store = store("node-kinds-spans");
+        store
+            .upsert_nodes(&[
+                file_node(
+                    "interface:shape",
+                    NodeKind::Interface,
+                    "Shape",
+                    "x.ts",
+                    (1, 4),
+                ),
+                file_node("method:area", NodeKind::Method, "area", "x.ts", (2, 2)),
+                file_node("function:draw", NodeKind::Function, "draw", "x.ts", (6, 9)),
+                file_node(
+                    "function:other",
+                    NodeKind::Function,
+                    "other",
+                    "y.ts",
+                    (1, 3),
+                ),
+            ])
+            .unwrap();
+        let whole: Vec<(NodeKind, NodeSpan)> = store
+            .nodes_by_file_path("x.ts")
+            .unwrap()
+            .into_iter()
+            .map(|node| {
+                (
+                    node.kind,
+                    NodeSpan {
+                        id: node.id,
+                        name: node.name,
+                        file_path: node.file_path,
+                        start_line: node.start_line,
+                        end_line: node.end_line,
+                    },
+                )
+            })
+            .collect();
+        let spans = store.node_kinds_and_spans_in_file("x.ts").unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans, whole);
+        assert!(
+            store
+                .node_kinds_and_spans_in_file("z.ts")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// W7-25 cost (OD-B75): the probe says whether a file holds a node of a
+    /// kind outside the list, from that file's rows only.
+    #[test]
+    fn a_file_holds_a_node_outside_kinds_only_when_it_has_one() {
+        let mut store = store("node-outside-kinds");
+        store
+            .upsert_nodes(&[
+                file_node(
+                    "interface:shape",
+                    NodeKind::Interface,
+                    "Shape",
+                    "types.ts",
+                    (1, 4),
+                ),
+                file_node("method:area", NodeKind::Method, "area", "types.ts", (2, 2)),
+                file_node(
+                    "function:draw",
+                    NodeKind::Function,
+                    "draw",
+                    "draw.ts",
+                    (1, 3),
+                ),
+                file_node("method:paint", NodeKind::Method, "paint", "draw.ts", (5, 7)),
+            ])
+            .unwrap();
+        let kinds = [NodeKind::Interface, NodeKind::Method];
+        assert!(
+            !store
+                .file_has_node_outside_kinds("types.ts", &kinds)
+                .unwrap()
+        );
+        assert!(
+            store
+                .file_has_node_outside_kinds("draw.ts", &kinds)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .file_has_node_outside_kinds("draw.ts", &[NodeKind::Function, NodeKind::Method])
+                .unwrap()
+        );
+        assert!(
+            !store
+                .file_has_node_outside_kinds("none.ts", &kinds)
+                .unwrap()
         );
     }
 

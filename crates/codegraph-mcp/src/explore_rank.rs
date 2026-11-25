@@ -242,30 +242,12 @@ pub(crate) fn rank_files(store: &Store, input: &RankInput<'_>) -> anyhow::Result
         *usage_degree.entry(edge.target.as_str()).or_default() += 1;
     }
 
-    let mut interface_owned: HashMap<String, bool> = HashMap::new();
-    let mut is_signature = |node: &Node| -> anyhow::Result<bool> {
-        if node.kind != NodeKind::Method {
-            return Ok(false);
-        }
-        if let Some(&known) = interface_owned.get(&node.id) {
-            return Ok(known);
-        }
-        let mut owned = false;
-        for edge in store.edges_by_target_kind(&node.id, Some(EdgeKind::Contains))? {
-            if store
-                .node_by_id(&edge.source)?
-                .is_some_and(|owner| owner.kind == NodeKind::Interface)
-            {
-                owned = true;
-                break;
-            }
-        }
-        interface_owned.insert(node.id.clone(), owned);
-        Ok(owned)
-    };
+    let interface_owned = interface_owned_methods(store, input.nodes)?;
+    let is_signature =
+        |node: &Node| node.kind == NodeKind::Method && interface_owned.contains(&node.id);
     let mut isolated: HashMap<String, bool> = HashMap::new();
     let mut relevance_weight = |node: &Node, probe: bool| -> anyhow::Result<f64> {
-        let signature = is_signature(node)?;
+        let signature = is_signature(node);
         let weight = if signature {
             TYPE_MEMBER_WEIGHT
         } else {
@@ -615,6 +597,48 @@ pub(crate) fn rank_files(store: &Store, input: &RankInput<'_>) -> anyhow::Result
         central_files,
         connected,
     })
+}
+
+/// The methods among `nodes` that an interface contains (a signature without a
+/// body, #1638). The `contains` edges into every method come in one batched
+/// read, and each owner's kind is taken once, from `nodes` when they hold the
+/// owner (W7-25 cost); whether any owner is an interface does not depend on
+/// the order the edges come in.
+pub(crate) fn interface_owned_methods(
+    store: &Store,
+    nodes: &[Node],
+) -> anyhow::Result<HashSet<String>> {
+    let methods: Vec<String> = nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Method)
+        .map(|n| n.id.clone())
+        .collect();
+    let mut owned = HashSet::new();
+    if methods.is_empty() {
+        return Ok(owned);
+    }
+    let held: HashMap<&str, NodeKind> = nodes.iter().map(|n| (n.id.as_str(), n.kind)).collect();
+    let mut owner_kind: HashMap<String, Option<NodeKind>> = HashMap::new();
+    for edge in store.edges_by_targets_kind(&methods, EdgeKind::Contains)? {
+        if owned.contains(&edge.target) {
+            continue;
+        }
+        let kind = match owner_kind.get(&edge.source) {
+            Some(kind) => *kind,
+            None => {
+                let kind = match held.get(edge.source.as_str()) {
+                    Some(kind) => Some(*kind),
+                    None => store.node_by_id(&edge.source)?.map(|owner| owner.kind),
+                };
+                owner_kind.insert(edge.source.clone(), kind);
+                kind
+            }
+        };
+        if kind == Some(NodeKind::Interface) {
+            owned.insert(edge.target);
+        }
+    }
+    Ok(owned)
 }
 
 fn cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {

@@ -14,6 +14,13 @@
 //! `ORDER BY kind, target, line, col`, `getIncomingEdges` `ORDER BY kind,
 //! source, line, col`), so a synced index and a fresh one, which store their
 //! rows in different orders, gather the same subgraph.
+//!
+//! The walk reads each node's edges and each node's row at most once
+//! ([`WalkReads`], W7-25 cost, OD-B75): the entry points' walks share what
+//! they read, a row is read only while a walk still has room for it, and the
+//! glue after the walk answers from the same reads. The engine holds its
+//! shared lease for the whole request, which keeps every writer out, so a
+//! second read would return the same rows.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -152,11 +159,111 @@ impl Gathered {
     }
 }
 
-/// The walk's result: the gathered subgraph and the entry points that survived
-/// the non-production cap, in their rank order.
+/// The walk's result: the gathered subgraph, the entry points that survived
+/// the non-production cap, in their rank order, and what the walk read.
 pub(crate) struct Walk {
     pub(crate) gathered: Gathered,
     pub(crate) roots: Vec<String>,
+    pub(crate) reads: WalkReads,
+}
+
+/// The rows one batch of a visit reads at first; each further batch of the
+/// same visit reads twice as many.
+const FIRST_ROW_BATCH: usize = 32;
+
+/// What one explore's walk read from the store, so that nothing is read twice
+/// (W7-25 cost, OD-B75): every visited node's edges of every kind, in
+/// upstream's order, and every node row looked up (`None`: no such node).
+/// The entry points' walks share it, and the glue answers from it.
+#[derive(Default)]
+pub(crate) struct WalkReads {
+    edges: HashMap<String, (Vec<Edge>, Vec<Edge>)>,
+    rows: HashMap<String, Option<Node>>,
+}
+
+impl WalkReads {
+    /// `id`'s outgoing and incoming edges of every kind, in the orders of
+    /// [`outgoing_in_order`] and [`incoming_in_order`], read once.
+    fn edges(&mut self, store: &Store, id: &str) -> anyhow::Result<(Vec<Edge>, Vec<Edge>)> {
+        if let Some((outgoing, incoming)) = self.edges.get(id) {
+            return Ok((outgoing.clone(), incoming.clone()));
+        }
+        #[cfg(test)]
+        test_reads::note_edges(id);
+        let outgoing = outgoing_in_order(store, id, &[])?;
+        let incoming = incoming_in_order(store, id, &[])?;
+        self.edges
+            .insert(id.to_string(), (outgoing.clone(), incoming.clone()));
+        Ok((outgoing, incoming))
+    }
+
+    /// Reads, in one query, the rows of those of `ids` not read yet.
+    fn read_rows(&mut self, store: &Store, ids: &[String]) -> anyhow::Result<()> {
+        let mut missing: Vec<String> = Vec::new();
+        let mut picked: HashSet<&str> = HashSet::new();
+        for id in ids {
+            if !self.rows.contains_key(id) && picked.insert(id) {
+                missing.push(id.clone());
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        for id in &missing {
+            test_reads::note_row(id);
+        }
+        let mut found = store.nodes_by_ids(&missing)?;
+        for id in missing {
+            let row = found.remove(&id);
+            self.rows.insert(id, row);
+        }
+        Ok(())
+    }
+
+    fn has_row(&self, id: &str) -> bool {
+        self.rows.contains_key(id)
+    }
+
+    fn row(&self, id: &str) -> Option<&Node> {
+        self.rows.get(id).and_then(Option::as_ref)
+    }
+
+    /// [`callers`] of `id`, answered from its edges when the walk visited it
+    /// (every entry point is visited first by its own walk). Keeping only
+    /// [`CALLER_KINDS`] leaves the kept edges in their order; edges that tie
+    /// on the order's whole key share their caller, so the deduplicated list
+    /// is the one [`callers`] reads.
+    pub(crate) fn callers(&mut self, store: &Store, id: &str) -> anyhow::Result<Vec<Node>> {
+        let Some((_, incoming)) = self.edges.get(id) else {
+            return callers(store, id);
+        };
+        let ends = incoming
+            .iter()
+            .filter(|edge| CALLER_KINDS.contains(&edge.kind))
+            .map(|edge| edge.source.clone())
+            .collect::<Vec<_>>();
+        self.rows_in_order(store, distinct_ends(id, ends))
+    }
+
+    /// [`callees`] of `id`, the mirror of [`Self::callers`].
+    pub(crate) fn callees(&mut self, store: &Store, id: &str) -> anyhow::Result<Vec<Node>> {
+        let Some((outgoing, _)) = self.edges.get(id) else {
+            return callees(store, id);
+        };
+        let ends = outgoing
+            .iter()
+            .filter(|edge| CALLER_KINDS.contains(&edge.kind))
+            .map(|edge| edge.target.clone())
+            .collect::<Vec<_>>();
+        self.rows_in_order(store, distinct_ends(id, ends))
+    }
+
+    /// The nodes of `ids` that exist, in that order.
+    fn rows_in_order(&mut self, store: &Store, ids: Vec<String>) -> anyhow::Result<Vec<Node>> {
+        self.read_rows(store, &ids)?;
+        Ok(ids.iter().filter_map(|id| self.row(id).cloned()).collect())
+    }
 }
 
 /// Upstream's walk from the entry points `roots` (in rank order), the steps
@@ -172,8 +279,9 @@ pub(crate) fn walk(store: &Store, roots: &[Node], test_query: bool) -> anyhow::R
     }
     expand_type_hierarchies(store, &mut gathered, &root_ids)?;
     let per_root = MAX_NODES.div_ceil(root_ids.len().max(1));
+    let mut reads = WalkReads::default();
     for root in roots {
-        let (nodes, edges) = breadth_first(store, root, TRAVERSAL_DEPTH, per_root)?;
+        let (nodes, edges) = breadth_first(store, root, TRAVERSAL_DEPTH, per_root, &mut reads)?;
         for node in nodes {
             gathered.insert(node);
         }
@@ -194,6 +302,7 @@ pub(crate) fn walk(store: &Store, roots: &[Node], test_query: bool) -> anyhow::R
     Ok(Walk {
         gathered,
         roots: root_ids,
+        reads,
     })
 }
 
@@ -334,11 +443,17 @@ fn type_relatives(
 /// structural edges first (`contains`, then `calls`), each node queued once,
 /// the node budget checked at every addition, and every distinct edge between
 /// kept nodes recorded while scanning.
+///
+/// A neighbour neither visited nor queued when its visit began has its row
+/// read through `reads`, in edge order, a batch at a time, and only while
+/// the walk has room: past `limit` such a neighbour is skipped without its
+/// row, as it was skipped after reading it.
 fn breadth_first(
     store: &Store,
     start: &Node,
     max_depth: usize,
     limit: usize,
+    reads: &mut WalkReads,
 ) -> anyhow::Result<(Vec<Node>, Vec<Edge>)> {
     let mut nodes = Gathered::default();
     let mut edges: Vec<Edge> = Vec::new();
@@ -354,8 +469,8 @@ fn breadth_first(
         if !visited.insert(node.id.clone()) || depth >= max_depth {
             continue;
         }
-        let mut adjacent = outgoing_in_order(store, &node.id, &[])?;
-        adjacent.extend(incoming_in_order(store, &node.id, &[])?);
+        let (mut adjacent, incoming) = reads.edges(store, &node.id)?;
+        adjacent.extend(incoming);
         adjacent.sort_by_key(|edge| match edge.kind {
             EdgeKind::Contains => 0,
             EdgeKind::Calls => 1,
@@ -366,11 +481,30 @@ fn breadth_first(
             .map(|edge| other_end(edge, &node.id).to_string())
             .filter(|id| !visited.contains(id) && !enqueued.contains(id))
             .collect();
-        let found = store.nodes_by_ids(&wanted)?;
+        let new_at_visit: HashSet<&str> = wanted.iter().map(String::as_str).collect();
+        let mut next_unread = 0usize;
+        let mut batch = FIRST_ROW_BATCH;
         for edge in adjacent {
             let next_id = other_end(&edge, &node.id).to_string();
+            let new = new_at_visit.contains(next_id.as_str());
+            if new && nodes.len() >= limit && !nodes.contains(&next_id) {
+                continue;
+            }
+            if new && !reads.has_row(&next_id) {
+                // This one and the next unread ones of the visit, in edge order.
+                let mut ids: Vec<String> = vec![next_id.clone()];
+                while next_unread < wanted.len() && ids.len() < batch {
+                    let id = &wanted[next_unread];
+                    next_unread += 1;
+                    if !reads.has_row(id) && *id != next_id {
+                        ids.push(id.clone());
+                    }
+                }
+                batch *= 2;
+                reads.read_rows(store, &ids)?;
+            }
+            let found = if new { reads.row(&next_id) } else { None };
             let Some(next) = found
-                .get(&next_id)
                 .or_else(|| nodes.index.get(&next_id).map(|at| &nodes.nodes[*at]))
                 .cloned()
             else {
@@ -638,6 +772,16 @@ fn ends_in_order(
     id: &str,
     ends: impl Iterator<Item = String>,
 ) -> anyhow::Result<Vec<Node>> {
+    let order = distinct_ends(id, ends);
+    let found = store.nodes_by_ids(&order)?;
+    Ok(order
+        .iter()
+        .filter_map(|id| found.get(id).cloned())
+        .collect())
+}
+
+/// The distinct `ends` in their first order, `id` itself left out.
+fn distinct_ends(id: &str, ends: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::from([id.to_string()]);
     for end in ends {
@@ -645,9 +789,35 @@ fn ends_in_order(
             order.push(end);
         }
     }
-    let found = store.nodes_by_ids(&order)?;
-    Ok(order
-        .iter()
-        .filter_map(|id| found.get(id).cloned())
-        .collect())
+    order
+}
+
+/// What the walk read from the store, by id, on this thread: the hook the
+/// tests that pin "each node read once" count with (W7-25 cost).
+#[cfg(test)]
+pub(crate) mod test_reads {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static ROWS: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+        static EDGES: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+    }
+
+    pub(crate) fn note_row(id: &str) {
+        ROWS.with(|rows| *rows.borrow_mut().entry(id.to_string()).or_default() += 1);
+    }
+
+    pub(crate) fn note_edges(id: &str) {
+        EDGES.with(|edges| *edges.borrow_mut().entry(id.to_string()).or_default() += 1);
+    }
+
+    /// The counts since the last call, `(rows, edges)`: how often each id's
+    /// row and each id's edges were read.
+    pub(crate) fn take() -> (HashMap<String, usize>, HashMap<String, usize>) {
+        (
+            ROWS.with(|rows| std::mem::take(&mut *rows.borrow_mut())),
+            EDGES.with(|edges| std::mem::take(&mut *edges.borrow_mut())),
+        )
+    }
 }
