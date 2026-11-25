@@ -47053,9 +47053,7 @@ mod w724_b73_synthesis_reads {
 /// so the first sync after a full index compares rows instead of
 /// re-resolving every file holding a `module.M:` reference.
 mod w724_b73_terraform_wiring_rows {
-    use rusqlite::{Connection, OpenFlags};
-
-    use super::support::Project;
+    use super::support::{Project, project_metadata_with_prefix};
 
     #[test]
     fn w724_b73_a_full_index_writes_the_terraform_wiring_rows() {
@@ -47067,21 +47065,7 @@ mod w724_b73_terraform_wiring_rows {
             .file("modules/vpc/variables.tf", "variable \"cidr\" {\n  default = \"10.0.0.0/16\"\n}\n")
             .file("modules/vpc/plain.tf", "resource \"null_resource\" \"m\" {}\n")
             .index();
-        let uri = format!("file:{}?immutable=1", project.db().display());
-        let db = Connection::open_with_flags(
-            &uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .expect("open the index");
-        let rows: Vec<(String, String)> = db
-            .prepare(
-                "SELECT key, value FROM project_metadata WHERE key LIKE 'terraform_wiring%' ORDER BY key",
-            )
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+        let rows = project_metadata_with_prefix(&project.db(), "terraform_wiring");
         assert_eq!(
             rows,
             [
