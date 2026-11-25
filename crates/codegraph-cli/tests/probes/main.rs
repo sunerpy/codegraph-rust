@@ -46901,3 +46901,79 @@ mod explore_skeleton {
         assert!(section.contains("more (signatures elided)"), "{section}");
     }
 }
+
+/// W7-24 cost (OD-B73): the resolution memos are keyed by everything their
+/// answers read. A receiver that is a class field takes its type from that
+/// class's field of that name; a call through an imported value, from that
+/// value node's declaration. Each probe holds two declarations that agree on
+/// every key part but one, on a full index and after a sync.
+mod w724_b73_resolution_memos {
+    use super::support::{Project, assert_edge, assert_no_edge};
+
+    const TYPES: &str =
+        "export class Alpha {\n  run(): void {}\n}\nexport class Beta {\n  run(): void {}\n}\n";
+
+    /// Two classes of one file, each with a field `repo` of its own type.
+    #[test]
+    fn w724_b73_a_class_field_receiver_takes_its_own_classes_field_type() {
+        let owners = "import { Alpha, Beta } from './types';\nexport class Owner1 {\n  private repo: Alpha = new Alpha();\n  go(): void {\n    repo.run();\n  }\n}\nexport class Owner2 {\n  private repo: Beta = new Beta();\n  go(): void {\n    repo.run();\n  }\n}\n";
+        let mut project = Project::new()
+            .file("src/types.ts", TYPES)
+            .file("src/owners.ts", owners)
+            .index();
+        for round in 0..2 {
+            assert_edge!(project, "method Owner1::go" => calls => "method Alpha::run");
+            assert_edge!(project, "method Owner2::go" => calls => "method Beta::run");
+            assert_no_edge!(project, "method Owner2::go" => calls => "method Alpha::run");
+            if round == 0 {
+                project.write("src/owners.ts", &format!("{owners}// w724 b73\n"));
+                project.sync();
+            }
+        }
+    }
+
+    /// One class with two fields of different types.
+    #[test]
+    fn w724_b73_a_class_field_receiver_takes_its_own_fields_type() {
+        let pair = "import { Alpha, Beta } from './types';\nexport class Pair {\n  private left: Alpha = new Alpha();\n  private right: Beta = new Beta();\n  first(): void {\n    left.run();\n  }\n  second(): void {\n    right.run();\n  }\n}\n";
+        let mut project = Project::new()
+            .file("src/types.ts", TYPES)
+            .file("src/pair.ts", pair)
+            .index();
+        for round in 0..2 {
+            assert_edge!(project, "method Pair::first" => calls => "method Alpha::run");
+            assert_edge!(project, "method Pair::second" => calls => "method Beta::run");
+            assert_no_edge!(project, "method Pair::second" => calls => "method Alpha::run");
+            if round == 0 {
+                project.write("src/pair.ts", &format!("{pair}// w724 b73\n"));
+                project.sync();
+            }
+        }
+    }
+
+    /// Two modules each export a `logger` of their own class; one file
+    /// imports both under other names.
+    #[test]
+    fn w724_b73_a_call_through_an_imported_value_takes_that_values_type() {
+        let user = "import { logger as la } from './a';\nimport { logger as lb } from './b';\nexport function both(): void {\n  la.info();\n  lb.info();\n}\n";
+        let mut project = Project::new()
+            .file(
+                "src/a.ts",
+                "export class Logger {\n  info(): void {}\n}\nexport const logger = new Logger();\n",
+            )
+            .file(
+                "src/b.ts",
+                "export class Audit {\n  info(): void {}\n}\nexport const logger = new Audit();\n",
+            )
+            .file("src/use.ts", user)
+            .index();
+        for round in 0..2 {
+            assert_edge!(project, "function both" => calls => "method Logger::info");
+            assert_edge!(project, "function both" => calls => "method Audit::info");
+            if round == 0 {
+                project.write("src/use.ts", &format!("{user}// w724 b73\n"));
+                project.sync();
+            }
+        }
+    }
+}

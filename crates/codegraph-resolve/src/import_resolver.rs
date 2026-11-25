@@ -12,6 +12,7 @@ use crate::name_matcher::{
 };
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
+use crate::source_facts::SourceFacts;
 use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 use crate::workspace_packages::resolve_workspace_import;
 use codegraph_core::types::{Language, Node, NodeKind};
@@ -3060,19 +3061,60 @@ fn resolve_imported_instance_member(
     let remainder = reference.reference_name.strip_prefix(&prefix)?;
     let member = remainder.split('.').next().filter(|s| !s.is_empty())?;
 
-    let source = context.read_file(&value.file_path)?;
-    let lines: Vec<&str> = source
+    // What the patterns read off the value's own declaration lines depends
+    // on the value alone: its file's facts remember it per value node, so a
+    // call through the value neither re-reads its file nor compiles the
+    // patterns for its name again (W7-24 cost, OD-B73).
+    let facts = context.source_facts(&value.file_path)?;
+    let declared = facts.value_declared_types(&value.id, |facts| declared_types_of(value, facts));
+    for (written, type_name) in declared.iter() {
+        // Several classes may share the name. The value's file says which
+        // one: the class it imports under that name, or else the one it
+        // declares (upstream #2644, OD-B57).
+        let declaring = is_esm_import_language(value.language).then(|| {
+            ts_imported_type_file(
+                written,
+                &value.file_path,
+                value.language,
+                reference,
+                context,
+            )
+            .unwrap_or_else(|| value.file_path.clone())
+        });
+        if let Some(resolved) = resolve_method_on_type(
+            type_name,
+            member,
+            reference,
+            context,
+            0.85,
+            ResolvedBy::InstanceMethod,
+            declaring.as_deref(),
+            0,
+        ) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// The `(written, normalized)` types the receiver-type patterns read, in
+/// their order, off the declaration lines of `value` in its file (`facts`):
+/// [`resolve_imported_instance_member`]'s candidates, each tried in turn.
+fn declared_types_of(value: &Node, facts: &SourceFacts) -> Vec<(String, String)> {
+    let lines: Vec<&str> = facts
+        .source()
         .split('\n')
         .map(|l| l.trim_end_matches('\r'))
         .collect();
     let start = (value.start_line.max(1) - 1) as usize;
     let end = (value.end_line.max(value.start_line) as usize).min(lines.len());
     if start >= end {
-        return None;
+        return Vec::new();
     }
     let decl_slice = lines[start..end].join("\n");
 
     let escaped = regex_escape(&value.name);
+    let mut declared = Vec::new();
     for (pattern, check) in local_receiver_type_patterns(value.language, &escaped) {
         let Some(captures) = pattern.captures(&decl_slice) else {
             continue;
@@ -3086,33 +3128,9 @@ fn resolve_imported_instance_member(
         let Some(type_name) = normalize_inferred_type_name(captured.as_str()) else {
             continue;
         };
-        // Several classes may share the name. The value's file says which
-        // one: the class it imports under that name, or else the one it
-        // declares (upstream #2644, OD-B57).
-        let declaring = is_esm_import_language(value.language).then(|| {
-            ts_imported_type_file(
-                captured.as_str(),
-                &value.file_path,
-                value.language,
-                reference,
-                context,
-            )
-            .unwrap_or_else(|| value.file_path.clone())
-        });
-        if let Some(resolved) = resolve_method_on_type(
-            &type_name,
-            member,
-            reference,
-            context,
-            0.85,
-            ResolvedBy::InstanceMethod,
-            declaring.as_deref(),
-            0,
-        ) {
-            return Some(resolved);
-        }
+        declared.push((captured.as_str().to_string(), type_name));
     }
-    None
+    declared
 }
 
 fn is_static_member_container(kind: NodeKind) -> bool {

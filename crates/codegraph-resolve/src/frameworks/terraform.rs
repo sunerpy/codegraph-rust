@@ -120,11 +120,19 @@ fn nearest_ancestor<'n>(candidates: &[&'n Node], dir: &str) -> Option<&'n Node> 
 /// The first capture of `pattern` across `node`'s lines in its file
 /// (upstream `readNodeSpanMatch`).
 fn span_match(node: &Node, pattern: &Regex, context: &dyn ResolutionContext) -> Option<String> {
-    let text = context.read_file_shared(&node.file_path)?;
-    let lines: Vec<&str> = text.split('\n').collect();
-    let end = usize::try_from(node.end_line).ok()?.min(lines.len());
+    // Through the file's line index: every scoped reference reads a
+    // declaration's lines, and splitting the whole file each time cost more
+    // than the match (W7-24 cost, OD-B73).
+    let facts = context.source_facts(&node.file_path)?;
+    let end = usize::try_from(node.end_line)
+        .ok()?
+        .min(facts.lines().raw_line_count());
     let start = usize::try_from(node.start_line - 1).unwrap_or(0);
-    lines.get(start..end)?.iter().find_map(|line| {
+    if start > end {
+        return None;
+    }
+    (start..end).find_map(|index| {
+        let line = facts.raw_line(index)?;
         pattern
             .captures(line)
             .map(|captures| captures[1].to_string())

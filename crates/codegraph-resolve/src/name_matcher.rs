@@ -3833,11 +3833,13 @@ fn is_erlang_macro_use(reference: &RefView, context: &dyn ResolutionContext) -> 
     ) else {
         return false;
     };
+    // The line through the file's line index, not a split from the top of
+    // the file for every reference (W7-24 cost, OD-B73).
     context
-        .read_file_shared(&reference.file_path)
-        .is_some_and(|text| {
-            text.split('\n')
-                .nth(row)
+        .source_facts(&reference.file_path)
+        .is_some_and(|facts| {
+            facts
+                .raw_line(row)
                 .and_then(|line| line.get(column..))
                 .is_some_and(|rest| rest.starts_with('?'))
         })
@@ -5383,35 +5385,40 @@ fn infer_class_field_receiver_type(
             && n.qualified_name == want
             && n.language == reference.language
     })?;
-    // Compiled only for a field the call's class declares: the answer is
-    // the same, and most receivers are none (W5-08).
-    let escaped = regex_escape(receiver_name);
-    let patterns = local_receiver_type_patterns_tagged(reference.language, &escaped);
-    if patterns.is_empty() {
-        return None;
-    }
-
-    let source = context.read_file(&reference.file_path)?;
-    let line = source
-        .split('\n')
-        .nth((field.start_line - 1).max(0) as usize)?
-        .trim_end_matches('\r');
-    if line.len() > 10_000 {
-        return None;
-    }
-    for (re, check) in &patterns {
-        if let Some(caps) = re.captures(line) {
-            if let (Some(whole), Some(m)) = (caps.get(0), caps.get(1)) {
-                if !check.passes(line, whole, m) {
-                    continue;
-                }
-                if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
-                    return Some(ty);
+    // The answer reads the field's declaration line alone, so the file's
+    // facts remember it per (class, field): the patterns compiled for the
+    // receiver's name run once per field, not once per call (W7-24 cost,
+    // OD-B73). Compiled only for a field the call's class declares: the
+    // answer is the same, and most receivers are none (W5-08).
+    let field_line = field.start_line;
+    let language = reference.language;
+    let facts = context.source_facts(&reference.file_path)?;
+    facts.class_field_type(&enclosing.id, receiver_name, |facts| {
+        let escaped = regex_escape(receiver_name);
+        let patterns = local_receiver_type_patterns_tagged(language, &escaped);
+        if patterns.is_empty() {
+            return None;
+        }
+        let line = facts
+            .raw_line((field_line - 1).max(0) as usize)?
+            .trim_end_matches('\r');
+        if line.len() > 10_000 {
+            return None;
+        }
+        for (re, check) in &patterns {
+            if let Some(caps) = re.captures(line) {
+                if let (Some(whole), Some(m)) = (caps.get(0), caps.get(1)) {
+                    if !check.passes(line, whole, m) {
+                        continue;
+                    }
+                    if let Some(ty) = normalize_inferred_type_name(m.as_str()) {
+                        return Some(ty);
+                    }
                 }
             }
         }
-    }
-    None
+        None
+    })
 }
 
 /// Resolve a JS/TS `this.<field>.<method>()` exclusively through the field's

@@ -57,8 +57,14 @@ pub(crate) fn alias_target_name(
             .map(|capture| capture.as_str().to_string());
     }
 
-    let bare =
-        Regex::new(r"^=\s*([A-Za-z_$][\w$]*)\s*(?:as\s+[A-Za-z_$][\w.$<>\[\]]*\s*)?;?$").ok()?;
+    // A constant pattern, compiled once: every call whose target is a
+    // constant, variable or property asks, and an Erlang project's macro
+    // calls compiled it hundreds of times (W7-24 cost, OD-B73).
+    static BARE: OnceLock<Regex> = OnceLock::new();
+    let bare = BARE.get_or_init(|| {
+        Regex::new(r"^=\s*([A-Za-z_$][\w$]*)\s*(?:as\s+[A-Za-z_$][\w.$<>\[\]]*\s*)?;?$")
+            .expect("the bare alias pattern compiles")
+    });
     bare.captures(initializer)
         .and_then(|captures| captures.get(1))
         .map(|capture| capture.as_str().to_string())
