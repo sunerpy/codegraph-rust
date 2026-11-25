@@ -27535,6 +27535,424 @@ pub fn terraform_variable_declared_in_the_same_dir_appears() -> Case {
         )
 }
 
+/// W7-24 cost (OD-B73): the Terraform wiring gate. A sync re-resolves the
+/// files holding a `module.M:` reference only when a changed Terraform
+/// file's wiring row moved, or a `.tf` or `.tofu` file came or went: one
+/// case per fact the row keeps, each converging only if the gate sees it.
+const TFW_OUTPUT_ID: &str = "output \"id\" {\n  value = \"x\"\n}\n";
+const TFW_EKS_MAIN: &str =
+    "resource \"aws_eks_cluster\" \"c\" {\n  vpc_id = module.net.outputs.id\n}\n";
+const TFW_REMOTE_STATE_VPC: &str = "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = \"vpc\"\n}\n";
+const TFW_REMOTE_STATE_NETWORK: &str = "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = \"network\"\n}\n";
+const TFW_REMOTE_STATE_VAR_A: &str = "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.a\n}\nvariable \"a\" {\n  default = \"vpc\"\n}\nvariable \"b\" {\n  default = \"network\"\n}\n";
+const TFW_REMOTE_STATE_VAR_B: &str = "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.b\n}\nvariable \"a\" {\n  default = \"vpc\"\n}\nvariable \"b\" {\n  default = \"network\"\n}\n";
+const TFW_VPC_MODULE: &str = "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\n";
+const TFW_USES_VPC_ID: &str = "output \"vpc_id\" {\n  value = module.vpc.id\n}\n";
+const TFW_APP_USES_VPC_ID: &str = "output \"app_vpc\" {\n  value = module.vpc.id\n}\n";
+const TFW_INFRA_VPC: &str = "module \"vpc\" {\n  source = \"../modules/vpc\"\n}\n";
+const TFW_OTHER_PLAIN: &str = "output \"x\" {\n  value = \"y\"\n}\n";
+const TFW_OTHER_WITH_VPC: &str =
+    "module \"vpc\" {\n  source = \"../modules/vpc\"\n}\noutput \"x\" {\n  value = \"y\"\n}\n";
+
+/// W7-24 cost (OD-B73): a remote-state module of one directory and its use
+/// in another, which binds it as the project's only `module "net"`.
+const TFW_APP_USES_NET: &str =
+    "resource \"aws_eks_cluster\" \"c\" {\n  vpc_id = module.net.outputs.id\n}\n";
+
+/// W7-24 cost (OD-B73): the only `module "vpc"`'s `source` moves to another
+/// directory: a use in a third directory follows it (the gate's `source`).
+pub fn terraform_module_source_changes_for_a_use_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file(
+            "modules/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"1\"\n}\n",
+        )
+        .file(
+            "modules/vpc2/outputs.tf",
+            "output \"id\" {\n  value = \"2\"\n}\n",
+        )
+        .file("infra/main.tf", TFW_INFRA_VPC)
+        .file("app/main.tf", TFW_APP_USES_VPC_ID)
+        .write(
+            "infra/main.tf",
+            "module \"vpc\" {\n  source = \"../modules/vpc2\"\n}\n",
+        )
+        .edge_before(
+            "variable output.app_vpc",
+            "references",
+            "variable output.id @modules/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "variable output.app_vpc",
+            "references",
+            "variable output.id @modules/vpc2/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): the remote-state module's literal `component`
+/// changes; a use in another directory follows it (the gate's `component`).
+pub fn terraform_remote_state_component_literal_changes_for_a_use_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file(
+            "components/terraform/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"v\"\n}\n",
+        )
+        .file(
+            "components/terraform/network/outputs.tf",
+            "output \"id\" {\n  value = \"n\"\n}\n",
+        )
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_VPC,
+        )
+        .file("components/terraform/app/main.tf", TFW_APP_USES_NET)
+        .write(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_NETWORK,
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/network/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): `component = var.X` names another variable; a use in
+/// another directory follows it (the gate's `component_var`).
+pub fn terraform_remote_state_component_variable_changes_for_a_use_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file(
+            "components/terraform/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"v\"\n}\n",
+        )
+        .file(
+            "components/terraform/network/outputs.tf",
+            "output \"id\" {\n  value = \"n\"\n}\n",
+        )
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_VAR_A,
+        )
+        .file("components/terraform/app/main.tf", TFW_APP_USES_NET)
+        .write(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_VAR_B,
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/network/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): the default of the variable the component names
+/// changes; a use in another directory follows it (the gate's `default`).
+pub fn terraform_remote_state_default_changes_for_a_use_elsewhere() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file("components/terraform/vpc/outputs.tf", "output \"id\" {\n  value = \"v\"\n}\n")
+        .file("components/terraform/network/outputs.tf", "output \"id\" {\n  value = \"n\"\n}\n")
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.which\n}\nvariable \"which\" {\n  default = \"vpc\"\n}\n",
+        )
+        .file("components/terraform/app/main.tf", TFW_APP_USES_NET)
+        .write(
+            "components/terraform/eks/remote-state.tf",
+            "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.which\n}\nvariable \"which\" {\n  default = \"network\"\n}\n",
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/network/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): another file of the declaration's directory comes to
+/// declare the variable `component = var.X` names, so it is no longer the
+/// only one and the use binds nothing (the gate's variable names).
+pub fn terraform_remote_state_component_variable_gets_a_twin() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Terraform])
+        .file("components/terraform/vpc/outputs.tf", "output \"id\" {\n  value = \"v\"\n}\n")
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            "module \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.which\n}\nvariable \"which\" {\n  default = \"vpc\"\n}\n",
+        )
+        .file("components/terraform/eks/extra.tf", "output \"unrelated\" {\n  value = \"u\"\n}\n")
+        .file("components/terraform/app/main.tf", TFW_APP_USES_NET)
+        .write(
+            "components/terraform/eks/extra.tf",
+            "output \"unrelated\" {\n  value = \"u\"\n}\nvariable \"which\" {\n  default = \"vpc\"\n}\n",
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .no_edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): a remote-state module's literal `component` names
+/// another component: the bridged output follows it.
+pub fn terraform_remote_state_component_literal_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file(
+            "components/terraform/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"v\"\n}\n",
+        )
+        .file(
+            "components/terraform/network/outputs.tf",
+            "output \"id\" {\n  value = \"n\"\n}\n",
+        )
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_VPC,
+        )
+        .file("components/terraform/eks/main.tf", TFW_EKS_MAIN)
+        .write(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_NETWORK,
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/network/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): `component = var.X` comes to name another variable,
+/// with another default: the bridged output follows it.
+pub fn terraform_remote_state_component_variable_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file(
+            "components/terraform/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"v\"\n}\n",
+        )
+        .file(
+            "components/terraform/network/outputs.tf",
+            "output \"id\" {\n  value = \"n\"\n}\n",
+        )
+        .file(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_VAR_A,
+        )
+        .file("components/terraform/eks/main.tf", TFW_EKS_MAIN)
+        .write(
+            "components/terraform/eks/remote-state.tf",
+            TFW_REMOTE_STATE_VAR_B,
+        )
+        .edge_before(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/vpc/outputs.tf:1",
+        )
+        .edge_after(
+            "class aws_eks_cluster.c",
+            "references",
+            "variable output.id @components/terraform/network/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): a directory with no declaration of its own binds
+/// the project's only `module "vpc"`; an existing file of a third directory
+/// comes to declare one too, and the use binds neither.
+pub fn terraform_module_declared_in_another_directory_appears() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Terraform])
+        .file("modules/vpc/outputs.tf", TFW_OUTPUT_ID)
+        .file("infra/main.tf", TFW_INFRA_VPC)
+        .file("app/main.tf", TFW_APP_USES_VPC_ID)
+        .file("other/main.tf", TFW_OTHER_PLAIN)
+        .write("other/main.tf", TFW_OTHER_WITH_VPC)
+        .edge_before(
+            "variable output.app_vpc",
+            "references",
+            "variable output.id @modules/vpc/outputs.tf:1",
+        )
+        .no_edge_after(
+            "variable output.app_vpc",
+            "references",
+            "variable output.id @modules/vpc/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): the second `module "vpc"` leaves its file, so the
+/// use binds the project's only one again.
+pub fn terraform_module_declared_in_another_directory_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Terraform])
+        .file("modules/vpc/outputs.tf", TFW_OUTPUT_ID)
+        .file("infra/main.tf", TFW_INFRA_VPC)
+        .file("app/main.tf", TFW_APP_USES_VPC_ID)
+        .file("other/main.tf", TFW_OTHER_WITH_VPC)
+        .write("other/main.tf", TFW_OTHER_PLAIN)
+        .edge_after(
+            "variable output.app_vpc",
+            "references",
+            "variable output.id @modules/vpc/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): the module's directory comes to declare the input a
+/// block sets, in a file it had: the parked `module.vpc:var.region` links.
+pub fn terraform_module_input_variable_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Terraform])
+        .file(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n  region = \"eu\"\n}\n",
+        )
+        .file("modules/vpc/variables.tf", "variable \"cidr\" {}\n")
+        .write(
+            "modules/vpc/variables.tf",
+            "variable \"cidr\" {}\nvariable \"region\" {}\n",
+        )
+        .edge_after(
+            "module module.vpc",
+            "references",
+            "variable var.region @modules/vpc/variables.tf:2",
+        )
+}
+
+/// W7-24 cost (OD-B73): the input is renamed in the module's directory:
+/// the block's `module.vpc:var.region` links nothing.
+pub fn terraform_module_input_variable_renamed() -> Case {
+    Case::new(Change::RenameSymbol, &[Language::Terraform])
+        .file(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n  region = \"eu\"\n}\n",
+        )
+        .file(
+            "modules/vpc/variables.tf",
+            "variable \"cidr\" {}\nvariable \"region\" {}\n",
+        )
+        .write(
+            "modules/vpc/variables.tf",
+            "variable \"cidr\" {}\nvariable \"zone\" {}\n",
+        )
+        .edge_before(
+            "module module.vpc",
+            "references",
+            "variable var.region @modules/vpc/variables.tf:2",
+        )
+}
+
+/// W7-24 cost (OD-B73): a file of the module's directory comes to declare
+/// the output a use reads: the parked `module.vpc:output.id` links.
+pub fn terraform_module_output_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Terraform])
+        .file("main.tf", TFW_VPC_MODULE)
+        .file("outputs.tf", TFW_USES_VPC_ID)
+        .file("modules/vpc/variables.tf", "variable \"cidr\" {}\n")
+        .write(
+            "modules/vpc/variables.tf",
+            "variable \"cidr\" {}\noutput \"id\" {\n  value = \"x\"\n}\n",
+        )
+        .edge_after(
+            "variable output.vpc_id",
+            "references",
+            "variable output.id @modules/vpc/variables.tf:2",
+        )
+}
+
+/// W7-24 cost (OD-B73): the module's `main.tf` goes: the module imports the
+/// first file by name.
+pub fn terraform_module_entry_file_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Terraform])
+        .file("modules/vpc/a.tf", "variable \"cidr\" {}\n")
+        .file("modules/vpc/main.tf", TFW_OUTPUT_ID)
+        .file("main.tf", TFW_VPC_MODULE)
+        .remove("modules/vpc/main.tf")
+        .edge_before("module module.vpc", "imports", "file:modules/vpc/main.tf")
+        .edge_after("module module.vpc", "imports", "file:modules/vpc/a.tf")
+}
+
+/// W7-24 cost (OD-B73): the module's directory gains a `main.tf` that
+/// declares no module, variable or output, so no row moves: the module
+/// imports it instead of the first file by name (the file trigger alone).
+pub fn terraform_module_entry_file_without_wiring_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Terraform])
+        .file("modules/vpc/a.tf", "variable \"cidr\" {}\n")
+        .file("main.tf", TFW_VPC_MODULE)
+        .write(
+            "modules/vpc/main.tf",
+            "resource \"null_resource\" \"n\" {}\n",
+        )
+        .edge_before("module module.vpc", "imports", "file:modules/vpc/a.tf")
+        .edge_after("module module.vpc", "imports", "file:modules/vpc/main.tf")
+}
+
+/// W7-24 cost (OD-B73): two blocks of one module name swap places: the use
+/// follows the first one (the row keeps the order of the file's blocks).
+pub fn terraform_same_named_module_blocks_swap() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file("modules/one/outputs.tf", "output \"id\" {\n  value = \"1\"\n}\n")
+        .file("modules/two/outputs.tf", "output \"id\" {\n  value = \"2\"\n}\n")
+        .file(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/one\"\n}\n\nmodule \"vpc\" {\n  source = \"./modules/two\"\n}\n",
+        )
+        .file("outputs.tf", TFW_USES_VPC_ID)
+        .write(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/two\"\n}\n\nmodule \"vpc\" {\n  source = \"./modules/one\"\n}\n",
+        )
+        .edge_before(
+            "variable output.vpc_id",
+            "references",
+            "variable output.id @modules/one/outputs.tf:1",
+        )
+        .edge_after(
+            "variable output.vpc_id",
+            "references",
+            "variable output.id @modules/two/outputs.tf:1",
+        )
+}
+
+/// W7-24 cost (OD-B73): a comment line in the module's own file moves no
+/// wiring: every bridge holds through the sync.
+pub fn terraform_comment_edit_keeps_every_bridge() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Terraform])
+        .file("main.tf", "module \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\n}\n")
+        .file("outputs.tf", TFW_USES_VPC_ID)
+        .file("modules/vpc/variables.tf", "variable \"cidr\" {}\n")
+        .file("modules/vpc/outputs.tf", TFW_OUTPUT_ID)
+        .write(
+            "main.tf",
+            "module \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\n}\n# a comment\n",
+        )
+        .edge_throughout(
+            "module module.vpc",
+            "references",
+            "variable var.cidr @modules/vpc/variables.tf:1",
+        )
+        .edge_throughout(
+            "variable output.vpc_id",
+            "references",
+            "variable output.id @modules/vpc/outputs.tf:1",
+        )
+}
+
 /// W7-24d: a behaviour, a dispatcher and one implementer.
 const ERL_BEHAVIOUR: &str = "-module(hook).\n\n-callback on_event(term()) -> ok.\n\n-export([fire/2]).\n\nfire(Mod, Ev) ->\n    Mod:on_event(Ev).\n";
 const ERL_IMPL: &str =

@@ -1271,6 +1271,17 @@ Fabric's detection reads the
 `libraries/`, which no index holds: those listings and manifests are
 JavaScript control inputs, so a manifest that comes, goes or changes there
 detects again.
+So do Terraform's module bridges (W7-24 cost, OD-B73): a module block's
+`module.M:` references read a block's `source`, `component` and
+`component = var.X` lines, a variable's `default`, the module, variable and
+output names a directory declares, and the `.tf` and `.tofu` files it holds,
+none of which a node records. Each Terraform file declaring a module, a
+variable or an output keeps a row of those declarations in the order of its
+lines, and a sync re-resolves whole every file holding a `module.M:`
+reference only when a changed file's row moved, a `.tf` or `.tofu` file came
+or went or gained or lost its file node, or the marker is missing
+(`terraform_wiring_version`); W7-24c did so on every sync that touched a
+Terraform file.
 Laravel's route names need no lane: every sync recomputes them from their
 qualified names, as colby's does, so a mount that goes away is undone in
 both. ASP.NET's route names (W7-19f) need none either: every sync recomputes

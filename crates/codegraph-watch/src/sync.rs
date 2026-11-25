@@ -525,11 +525,6 @@ fn open_sync_writer(paths: &IndexPaths, cancel: Option<&SyncCancellation>) -> Re
     }
 }
 
-/// Whether `path` is a Terraform source file (`.tf`, `.tfvars`, `.tofu`).
-fn is_terraform_path(path: &str) -> bool {
-    path.ends_with(".tf") || path.ends_with(".tfvars") || path.ends_with(".tofu")
-}
-
 pub fn sync_changed_paths(
     project_root: impl AsRef<Path>,
     db_path: impl AsRef<Path>,
@@ -734,6 +729,10 @@ fn sync_paths_with_store(
     // re-resolved once. The lane compares only when the index recorded a
     // bridge reading the rows, as Play's does.
     let rn_bootstrap = crate::rn_bridges::needs_bootstrap(store)?;
+    // And for the module bridges whose wiring a failed sync's changes
+    // moved (W7-24 cost, OD-B73): every file holding a `module.M:`
+    // reference is re-resolved once and the wiring rows are rebuilt.
+    let terraform_bootstrap = crate::terraform_wiring::needs_bootstrap(store)?;
     changed_names.rn_bridges.track = crate::rn_bridges::READERS.iter().any(|name| recorded(name));
     // And for the Rust references the module rule links to a crate root a
     // failed sync's changes added or removed (W7-19h): every Rust file is
@@ -899,6 +898,7 @@ fn sync_paths_with_store(
         || rails_bootstrap
         || vapor_bootstrap
         || rn_bootstrap
+        || terraform_bootstrap
         || rust_crate_roots_bootstrap
         || shopify_bootstrap
         || !shopify.moved.is_empty();
@@ -1034,15 +1034,26 @@ fn sync_paths_with_store(
         }
         // What a Terraform module bridge reads beside its reference: a
         // module declaration's `source` and `component`, a variable's
-        // `default`, and which `.tf` files the module's directory holds
-        // (W7-24c). A sync that adds, removes or re-extracts a Terraform
-        // file re-resolves whole every file holding a `module.M:` reference:
-        // one scan of both reference tables, uncapped.
-        if reindexed
-            .iter()
-            .chain(&changed_names.removed_files)
-            .any(|path| is_terraform_path(path))
-        {
+        // `default`, the names a directory declares, and which `.tf` files
+        // the module's directory holds (W7-24c). Only a changed file whose
+        // wiring row moved, a `.tf` or `.tofu` file that came or went, or a
+        // missing marker re-resolves whole every file holding a `module.M:`
+        // reference: one scan of both reference tables, uncapped (W7-24
+        // cost, OD-B73).
+        let terraform = crate::terraform_wiring::wiring_refresh(
+            store,
+            project_root,
+            scope.options.max_file_size,
+            &changed_names.terraform,
+            changed_names
+                .added_files
+                .iter()
+                .chain(&changed_names.removed_files)
+                .chain(&changed_names.file_nodes_changed)
+                .any(|path| crate::terraform_wiring::is_module_entry_candidate(path)),
+            terraform_bootstrap,
+        )?;
+        if terraform.rewire {
             for file in store.terraform_module_reference_files()? {
                 dependent_sites.remove(&file);
                 dependent_fallbacks.insert(file);
@@ -2075,6 +2086,7 @@ fn sync_paths_with_store(
         go.write_rows(store)?;
         php.write_rows(store)?;
         class_heads.write_rows(store)?;
+        terraform.write_rows(store)?;
         rn_bridges.write_rows(store)?;
         control.write_rows(store)?;
         crate::control_inputs::write_frameworks(store, &frameworks)?;
@@ -2098,6 +2110,7 @@ fn sync_paths_with_store(
         crate::rust_receivers::write_marker(store)?;
         crate::php_heads::write_marker(store)?;
         crate::class_heads::write_marker(store)?;
+        crate::terraform_wiring::write_marker(store)?;
         crate::control_inputs::write_marker(store)?;
         crate::case_folded::write_marker(store)?;
         crate::lua_modules::write_marker(store)?;
@@ -2846,6 +2859,7 @@ fn remove_tracked_file(
     changed_names.go.note(store, relative, None)?;
     changed_names.php.note(store, relative, &old_nodes, None)?;
     changed_names.class_heads.note(store, relative, None)?;
+    changed_names.terraform.note(store, relative, None)?;
     changed_names.lua.note(store, relative, None)?;
     changed_names.dart.note(store, relative, None)?;
     changed_names.dart_libraries.note(store, relative, None)?;
@@ -3304,6 +3318,11 @@ fn reextract_into_store(
         relative,
         Some((file.language, source, &result.nodes)),
     )?;
+    changed_names.terraform.note(
+        store,
+        relative,
+        Some((file.language, source, &result.nodes)),
+    )?;
     changed_names.lua.note(
         store,
         relative,
@@ -3568,6 +3587,9 @@ struct ChangedNames {
     /// What the changed files' type declarations' heads were and are, for a
     /// walk from a class name (W5-07).
     class_heads: crate::class_heads::ClassHeadChanges,
+    /// What the changed Terraform files declared that a module bridge reads
+    /// (W7-24 cost, OD-B73).
+    terraform: crate::terraform_wiring::WiringChanges,
     /// What the changed files held that a Lua call in other files reads:
     /// their locals and module surface (W4-LUA-01).
     lua: crate::lua_modules::LuaChanges,
@@ -3671,6 +3693,7 @@ impl ChangedNames {
             crate::rust_receivers::withdraw_marker(store)?;
             crate::php_heads::withdraw_marker(store)?;
             crate::class_heads::withdraw_marker(store)?;
+            crate::terraform_wiring::withdraw_marker(store)?;
             crate::control_inputs::withdraw_marker(store)?;
             crate::case_folded::withdraw_marker(store)?;
             crate::lua_modules::withdraw_marker(store)?;
@@ -13279,5 +13302,178 @@ pub(crate) mod tests {
                 ]
             )
         );
+    }
+
+    const TF_GATE_MAIN: (&str, &str) = (
+        "main.tf",
+        "module \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\n}\n",
+    );
+    const TF_GATE_MAIN_COMMENTED: (&str, &str) = (
+        "main.tf",
+        "module \"vpc\" {\n  source = \"./modules/vpc\"\n  cidr   = \"10.0.0.0/16\"\n}\n# a comment\n",
+    );
+    const TF_GATE_USES: (&str, &str) = (
+        "outputs.tf",
+        "output \"vpc_id\" {\n  value = module.vpc.id\n}\n",
+    );
+    const TF_GATE_VARIABLES: (&str, &str) = ("modules/vpc/variables.tf", "variable \"cidr\" {}\n");
+    const TF_GATE_OUTPUTS: (&str, &str) = (
+        "modules/vpc/outputs.tf",
+        "output \"id\" {\n  value = \"x\"\n}\n",
+    );
+
+    /// W7-24 cost (OD-B73): a Terraform edit that moves no module wiring (a
+    /// comment line) re-resolves no file whole, though another file holds
+    /// `module.vpc:` references, and the graph is a fresh index's.
+    #[test]
+    fn w724_b73_a_terraform_edit_moving_no_wiring_re_resolves_no_file_whole() {
+        let files = [
+            TF_GATE_MAIN,
+            TF_GATE_USES,
+            TF_GATE_VARIABLES,
+            TF_GATE_OUTPUTS,
+        ];
+        let (dir, db) = fully_indexed("tf-gate-quiet", &files);
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[TF_GATE_MAIN_COMMENTED]);
+        sync_changed_paths(dir.path(), &db, ["main.tf"]).unwrap();
+        let whole: Vec<DependentRefresh> = take_dependent_refreshes()
+            .into_iter()
+            .filter(|refresh| refresh.whole)
+            .collect();
+        assert_eq!(whole, [], "no file is re-resolved whole");
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "tf-gate-quiet-fresh",
+                &[
+                    TF_GATE_MAIN_COMMENTED,
+                    TF_GATE_USES,
+                    TF_GATE_VARIABLES,
+                    TF_GATE_OUTPUTS
+                ]
+            )
+        );
+    }
+
+    fn terraform_wiring_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix(crate::terraform_wiring::ROW_KEY_PREFIX)
+            .unwrap()
+    }
+
+    fn terraform_wiring_marker(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::terraform_wiring::VERSION_KEY)
+            .unwrap()
+    }
+
+    /// W7-24 cost (OD-B73): a full index writes a wiring row per Terraform
+    /// file declaring a module, a variable or an output, and the marker. An
+    /// index without the marker re-resolves the files holding `module.M:`
+    /// references once and rebuilds the same rows; the next quiet edit
+    /// re-resolves none.
+    #[test]
+    fn w724_b73_an_index_without_the_wiring_marker_rewires_once() {
+        let files = [
+            TF_GATE_MAIN,
+            TF_GATE_USES,
+            TF_GATE_VARIABLES,
+            TF_GATE_OUTPUTS,
+        ];
+        let (dir, db) = fully_indexed("tf-gate-bootstrap", &files);
+        let indexed = terraform_wiring_rows(&db);
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "terraform_wiring:main.tf",
+                "terraform_wiring:modules/vpc/outputs.tf",
+                "terraform_wiring:modules/vpc/variables.tf",
+                "terraform_wiring:outputs.tf",
+            ]
+        );
+        assert_eq!(
+            terraform_wiring_marker(&db).as_deref(),
+            Some(crate::terraform_wiring::VERSION)
+        );
+        {
+            let store = Store::open(&db).unwrap();
+            store
+                .delete_project_metadata(crate::terraform_wiring::VERSION_KEY)
+                .unwrap();
+            store
+                .delete_project_metadata_with_prefix(crate::terraform_wiring::ROW_KEY_PREFIX)
+                .unwrap();
+        }
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[TF_GATE_MAIN_COMMENTED]);
+        sync_changed_paths(dir.path(), &db, ["main.tf"]).unwrap();
+        let whole: Vec<String> = take_dependent_refreshes()
+            .into_iter()
+            .filter(|refresh| refresh.whole)
+            .map(|refresh| refresh.file)
+            .collect();
+        assert_eq!(whole, ["outputs.tf"], "the bootstrap re-resolves it once");
+        assert_eq!(
+            terraform_wiring_marker(&db).as_deref(),
+            Some(crate::terraform_wiring::VERSION)
+        );
+        assert_eq!(terraform_wiring_rows(&db), indexed, "the rows are rebuilt");
+
+        write_files(dir.path(), &[TF_GATE_MAIN]);
+        sync_changed_paths(dir.path(), &db, ["main.tf"]).unwrap();
+        assert!(
+            take_dependent_refreshes()
+                .iter()
+                .all(|refresh| !refresh.whole),
+            "the marker is back: a quiet edit re-resolves nothing whole"
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("tf-gate-bootstrap-fresh", &files)
+        );
+    }
+
+    /// W7-24 cost (OD-B73): a sync writes its changed files' rows, so the
+    /// only `module "vpc"`'s `source` moved away and back is seen both times
+    /// by a use in another directory, which no other lane re-resolves.
+    #[test]
+    fn w724_b73_a_sync_keeps_the_wiring_rows_current() {
+        let one = (
+            "modules/vpc/outputs.tf",
+            "output \"id\" {\n  value = \"1\"\n}\n",
+        );
+        let two = (
+            "modules/vpc2/outputs.tf",
+            "output \"id\" {\n  value = \"2\"\n}\n",
+        );
+        let infra =
+            |source: &'static str| -> (&'static str, &'static str) { ("infra/main.tf", source) };
+        let at_one = infra("module \"vpc\" {\n  source = \"../modules/vpc\"\n}\n");
+        let at_two = infra("module \"vpc\" {\n  source = \"../modules/vpc2\"\n}\n");
+        let app = (
+            "app/main.tf",
+            "output \"app_vpc\" {\n  value = module.vpc.id\n}\n",
+        );
+        let (dir, db) = fully_indexed("tf-gate-current", &[one, two, at_one, app]);
+        for (round, main) in [(1, at_two), (2, at_one)] {
+            write_files(dir.path(), &[main]);
+            sync_changed_paths(dir.path(), &db, [main.0]).unwrap();
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(
+                    &format!("tf-gate-current-fresh-{round}"),
+                    &[one, two, main, app]
+                ),
+                "round {round}"
+            );
+        }
     }
 }

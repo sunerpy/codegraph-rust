@@ -47047,3 +47047,56 @@ mod w724_b73_synthesis_reads {
         }
     }
 }
+
+/// W7-24 cost (OD-B73): `codegraph init` writes a wiring row per Terraform
+/// file declaring a module, a variable or an output, and the lane's marker,
+/// so the first sync after a full index compares rows instead of
+/// re-resolving every file holding a `module.M:` reference.
+mod w724_b73_terraform_wiring_rows {
+    use rusqlite::{Connection, OpenFlags};
+
+    use super::support::Project;
+
+    #[test]
+    fn w724_b73_a_full_index_writes_the_terraform_wiring_rows() {
+        let project = Project::new()
+            .file(
+                "main.tf",
+                "module \"vpc\" {\n  source = \"./modules/vpc\"\n}\nresource \"null_resource\" \"n\" {}\n",
+            )
+            .file("modules/vpc/variables.tf", "variable \"cidr\" {\n  default = \"10.0.0.0/16\"\n}\n")
+            .file("modules/vpc/plain.tf", "resource \"null_resource\" \"m\" {}\n")
+            .index();
+        let uri = format!("file:{}?immutable=1", project.db().display());
+        let db = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .expect("open the index");
+        let rows: Vec<(String, String)> = db
+            .prepare(
+                "SELECT key, value FROM project_metadata WHERE key LIKE 'terraform_wiring%' ORDER BY key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    "terraform_wiring:main.tf".to_string(),
+                    "{\"entries\":[{\"name\":\"module.vpc\",\"source\":\"./modules/vpc\"}]}"
+                        .to_string()
+                ),
+                (
+                    "terraform_wiring:modules/vpc/variables.tf".to_string(),
+                    "{\"entries\":[{\"name\":\"var.cidr\",\"default\":\"10.0.0.0/16\"}]}"
+                        .to_string()
+                ),
+                ("terraform_wiring_version".to_string(), "1".to_string()),
+            ]
+        );
+    }
+}

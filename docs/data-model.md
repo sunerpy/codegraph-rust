@@ -611,6 +611,23 @@ row counts as moved, so the lane keeps no marker. They are not a canonical
 surface; the sync matrix checks that a sync leaves them as a fresh index
 writes them.
 
+The Terraform wiring lane keeps one row per Terraform file declaring a module,
+a variable or an output, `terraform_wiring:{path}`: a JSON object whose
+`entries` list those declarations in the order of their lines, each with its
+qualified `name` and, as the module bridge reads its lines, a module block's
+`source`, `component` and `component_var` (the `X` of `component = var.X`)
+and a variable's `default`; a field the lines do not write is left out. A
+file declaring none has no row. A full index and a migration write every
+row; a sync writes the rows of the files it changed last and drops those of
+files that went or declare none any more. A sync re-resolves whole every file
+holding a `module.M:` reference only when a changed file's row moved, a
+`.tf` or `.tofu` file came or went or gained or lost its file node, or the
+marker is missing. The marker `terraform_wiring_version` (1) is written by a
+full index, a migration and every sync whose resolution is persisted, and
+withdrawn with the others before a sync's first change. A sync that finds it
+missing or at another version rebuilds every row and re-resolves every file
+holding a `module.M:` reference. They are not a canonical surface.
+
 `synthesis_version` (23) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws

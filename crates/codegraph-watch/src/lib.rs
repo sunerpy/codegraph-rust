@@ -39,6 +39,7 @@ pub mod shopify_themes;
 pub mod solidity_heads;
 pub mod swift_heads;
 mod sync;
+pub mod terraform_wiring;
 pub mod vapor_routes;
 mod watcher;
 mod worktree;

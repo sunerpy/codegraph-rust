@@ -867,10 +867,15 @@ the change and after it, since whether such a binding is what a call of its name
 from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the
 `r_base_bindings_version` marker is withdrawn and restored with the others, and a sync that
 finds it missing re-resolves every R file;
-a Terraform module block's `:`-scoped references read the files of the
-directory its source names, which no reference's name matches, so a sync that
-adds, removes or re-extracts a Terraform file re-resolves whole every file
-holding a `module.M:` reference;
+a Terraform module block's `:`-scoped references read what no node records
+and no reference's name matches: a block's `source`, `component` and
+`component = var.X` lines, a variable's `default`, the module, variable and
+output names a directory declares, and the `.tf` and `.tofu` files it holds;
+each Terraform file declaring a module, a variable or an output keeps a
+`terraform_wiring` row of those declarations, and a sync re-resolves whole
+every file holding a `module.M:` reference only when a changed file's row
+moved, a `.tf` or `.tofu` file came or went or gained or lost its file node,
+or the `terraform_wiring_version` marker is missing;
 a Lua file whose module row moved touches the name of each declaration that became or stopped
 being `local`, since a `local` is invisible outside its file, and when the digest of what an
 alias through it reads changed (its functions, its variables and their locality, in source

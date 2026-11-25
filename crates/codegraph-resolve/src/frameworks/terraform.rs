@@ -28,12 +28,13 @@
 //! unresolved: an out-of-repo module is a visible boundary, never a guess.
 
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use codegraph_core::types::{Language, Node, NodeKind};
 use regex::Regex;
 
 use crate::framework::FrameworkResolver;
+use crate::source_facts::SourceFacts;
 use crate::types::{RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 
 /// The Terraform framework resolver.
@@ -124,6 +125,12 @@ fn span_match(node: &Node, pattern: &Regex, context: &dyn ResolutionContext) -> 
     // declaration's lines, and splitting the whole file each time cost more
     // than the match (W7-24 cost, OD-B73).
     let facts = context.source_facts(&node.file_path)?;
+    span_capture(&facts, node, pattern)
+}
+
+/// [`span_match`] over `facts`, the text of `node`'s file: the bridge and
+/// a sync's wiring row read a declaration's lines alike.
+fn span_capture(facts: &SourceFacts, node: &Node, pattern: &Regex) -> Option<String> {
     let end = usize::try_from(node.end_line)
         .ok()?
         .min(facts.lines().raw_line_count());
@@ -137,6 +144,83 @@ fn span_match(node: &Node, pattern: &Regex, context: &dyn ResolutionContext) -> 
             .captures(line)
             .map(|captures| captures[1].to_string())
     })
+}
+
+/// The `project_metadata` key prefix of a sync's Terraform wiring rows
+/// (W7-24 cost, OD-B73).
+pub const WIRING_ROW_KEY_PREFIX: &str = "terraform_wiring:";
+
+/// The `project_metadata` key of `path`'s wiring row.
+pub fn wiring_row_key(path: &str) -> String {
+    format!("{WIRING_ROW_KEY_PREFIX}{path}")
+}
+
+/// One declaration of a Terraform file a module bridge reads: a `module`
+/// block (`module.M`, kind module) with the `source`, `component` and
+/// `component = var.X` its lines write, a variable (`var.X`) with its
+/// `default`, or an output (`output.O`), each as [`span_match`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WiringEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_var: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+/// What the module bridges read of one Terraform file beside the files a
+/// directory holds: its declarations in the order the file holds them (a
+/// directory's first same-named block is the one a bridge takes), without
+/// their lines (W7-24 cost, OD-B73).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WiringRow {
+    pub entries: Vec<WiringEntry>,
+}
+
+impl WiringRow {
+    pub fn encode(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        serde_json::from_str(value).ok()
+    }
+}
+
+/// `text`'s wiring row from its file's `nodes`, `None` when the file
+/// declares no module, variable or output.
+pub fn wiring_row(text: &str, nodes: &[Node]) -> Option<WiringRow> {
+    let facts = SourceFacts::new(Arc::from(text));
+    let mut declarations: Vec<&Node> = nodes
+        .iter()
+        .filter(|node| {
+            (node.kind == NodeKind::Module && node.qualified_name.starts_with("module."))
+                || node.qualified_name.starts_with("var.")
+                || node.qualified_name.starts_with("output.")
+        })
+        .collect();
+    declarations.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
+    let entries: Vec<WiringEntry> = declarations
+        .into_iter()
+        .map(|node| {
+            let read = |pattern: &Regex| span_capture(&facts, node, pattern);
+            let module =
+                node.kind == NodeKind::Module && node.qualified_name.starts_with("module.");
+            let variable = node.qualified_name.starts_with("var.");
+            WiringEntry {
+                name: node.qualified_name.clone(),
+                source: module.then(|| read(&SOURCE_ATTR)).flatten(),
+                component: module.then(|| read(&COMPONENT_ATTR)).flatten(),
+                component_var: module.then(|| read(&COMPONENT_VAR)).flatten(),
+                default: variable.then(|| read(&DEFAULT_ATTR)).flatten(),
+            }
+        })
+        .collect();
+    (!entries.is_empty()).then_some(WiringRow { entries })
 }
 
 fn framework(reference: &RefView, target: &Node, confidence: f64) -> ResolvedRef {
@@ -319,6 +403,79 @@ mod tests {
         assert_eq!(join_dirs("envs/prod", "../../modules/vpc/"), "modules/vpc");
         assert_eq!(join_dirs("a", ".."), ".");
         assert_eq!(join_dirs(".", "../outside"), "../outside");
+    }
+
+    /// W7-24 cost (OD-B73): a wiring row lists the file's modules,
+    /// variables and outputs in the order of their lines, with what the
+    /// bridge reads of each; a file declaring none has no row.
+    #[test]
+    fn a_wiring_row_is_what_the_bridges_read() {
+        let text = "output \"id\" {\n  value = \"x\"\n}\nmodule \"net\" {\n  source    = \"cloudposse/stack-config/yaml//modules/remote-state\"\n  component = var.which\n}\nvariable \"which\" {\n  default = \"vpc\"\n}\nmodule \"vpc\" {\n  source    = \"./modules/vpc\"\n  component = \"lit\"\n}\nresource \"aws_s3_bucket\" \"b\" {}\n";
+        let node = |id: &str, kind: NodeKind, qualified: &str, start: i64, end: i64| Node {
+            id: id.to_string(),
+            kind,
+            name: qualified
+                .rsplit('.')
+                .next()
+                .unwrap_or(qualified)
+                .to_string(),
+            qualified_name: qualified.to_string(),
+            file_path: "main.tf".to_string(),
+            language: Language::Terraform,
+            start_line: start,
+            end_line: end,
+            start_column: 0,
+            end_column: 0,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: false,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        };
+        let nodes = [
+            node("module:vpc", NodeKind::Module, "module.vpc", 11, 14),
+            node("variable:which", NodeKind::Variable, "var.which", 8, 10),
+            node("module:net", NodeKind::Module, "module.net", 4, 7),
+            node("variable:id", NodeKind::Variable, "output.id", 1, 3),
+            node("class:b", NodeKind::Class, "aws_s3_bucket.b", 15, 15),
+        ];
+        let row = wiring_row(text, &nodes).expect("a row");
+        let entry = |name: &str| WiringEntry {
+            name: name.to_string(),
+            source: None,
+            component: None,
+            component_var: None,
+            default: None,
+        };
+        assert_eq!(
+            row.entries,
+            [
+                entry("output.id"),
+                WiringEntry {
+                    source: Some("cloudposse/stack-config/yaml//modules/remote-state".to_string()),
+                    component_var: Some("which".to_string()),
+                    ..entry("module.net")
+                },
+                WiringEntry {
+                    default: Some("vpc".to_string()),
+                    ..entry("var.which")
+                },
+                WiringEntry {
+                    source: Some("./modules/vpc".to_string()),
+                    component: Some("lit".to_string()),
+                    ..entry("module.vpc")
+                },
+            ]
+        );
+        assert_eq!(WiringRow::decode(&row.encode()), Some(row));
+        assert_eq!(wiring_row(text, &nodes[4..]), None);
+        assert_eq!(wiring_row_key("a/main.tf"), "terraform_wiring:a/main.tf");
     }
 
     #[test]

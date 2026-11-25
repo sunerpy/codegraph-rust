@@ -6165,6 +6165,7 @@ fn index_project_inner(
         Option<codegraph_watch::rn_bridges::BridgeFacts>,
         // The binding-facts digest lane B compares (W7-31, OD-B72).
         Option<String>,
+        Option<codegraph_watch::terraform_wiring::WiringRow>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
@@ -6184,6 +6185,8 @@ fn index_project_inner(
     let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
     let mut class_head_rows: Vec<(String, codegraph_watch::class_heads::HeadsRow)> = Vec::new();
     let mut bridge_rows: Vec<(String, codegraph_watch::rn_bridges::BridgeFacts)> = Vec::new();
+    let mut terraform_rows: Vec<(String, codegraph_watch::terraform_wiring::WiringRow)> =
+        Vec::new();
     let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
     let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
@@ -6280,6 +6283,8 @@ fn index_project_inner(
                 &result.nodes,
                 &result.edges,
             );
+            let terraform_row =
+                codegraph_watch::terraform_wiring::row_of(language, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
@@ -6304,6 +6309,7 @@ fn index_project_inner(
                 dart_library_row,
                 bridge_row,
                 binding_facts_row,
+                terraform_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
@@ -6332,6 +6338,7 @@ fn index_project_inner(
                 dart_library_row,
                 bridge_row,
                 binding_facts_row,
+                terraform_row,
             )) = payload
             else {
                 files_not_source += 1;
@@ -6429,6 +6436,9 @@ fn index_project_inner(
             if let Some(row) = binding_facts_row {
                 binding_facts_rows.push((relative.clone(), row));
             }
+            if let Some(row) = terraform_row {
+                terraform_rows.push((relative.clone(), row));
+            }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
             }
@@ -6502,6 +6512,8 @@ fn index_project_inner(
     drop(class_head_rows);
     codegraph_watch::rn_bridges::write_index_rows(&store, &mut bridge_rows)?;
     drop(bridge_rows);
+    codegraph_watch::terraform_wiring::write_index_rows(&store, &mut terraform_rows)?;
+    drop(terraform_rows);
     codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
     drop(lua_rows);
     codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
@@ -6544,6 +6556,7 @@ fn index_project_inner(
     codegraph_watch::rails_routes::write_marker(&store)?;
     codegraph_watch::vapor_routes::write_marker(&store)?;
     codegraph_watch::rn_bridges::write_marker(&store)?;
+    codegraph_watch::terraform_wiring::write_marker(&store)?;
     codegraph_watch::rust_crate_roots::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;

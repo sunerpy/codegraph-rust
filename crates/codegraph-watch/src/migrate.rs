@@ -103,6 +103,7 @@ pub(crate) fn migrate_project(
     let mut php_rows = Vec::new();
     let mut class_head_rows = Vec::new();
     let mut bridge_rows = Vec::new();
+    let mut terraform_rows = Vec::new();
     let mut lua_rows = Vec::new();
     let mut dart_rows = Vec::new();
     let mut dart_library_rows = Vec::new();
@@ -200,6 +201,9 @@ pub(crate) fn migrate_project(
         if let Some(row) = crate::rn_bridges::row_of(relative, &source, &result.nodes) {
             bridge_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::terraform_wiring::row_of(file.language, &source, &result.nodes) {
+            terraform_rows.push((relative.clone(), row));
+        }
         if let Some(row) = crate::lua_modules::row_of(file.language, &source, &result.nodes) {
             lua_rows.push((relative.clone(), row));
         }
@@ -274,6 +278,8 @@ pub(crate) fn migrate_project(
     drop(class_head_rows);
     crate::rn_bridges::write_index_rows(rebuild.store(), &mut bridge_rows)?;
     drop(bridge_rows);
+    crate::terraform_wiring::write_index_rows(rebuild.store(), &mut terraform_rows)?;
+    drop(terraform_rows);
     crate::lua_modules::write_index_rows(rebuild.store(), &mut lua_rows)?;
     drop(lua_rows);
     crate::dart_heads::write_index_rows(rebuild.store(), &mut dart_rows)?;
@@ -308,6 +314,7 @@ pub(crate) fn migrate_project(
     crate::rails_routes::write_marker(rebuild.store())?;
     crate::vapor_routes::write_marker(rebuild.store())?;
     crate::rn_bridges::write_marker(rebuild.store())?;
+    crate::terraform_wiring::write_marker(rebuild.store())?;
     crate::rust_crate_roots::write_marker(rebuild.store())?;
     crate::dart_heads::write_marker(rebuild.store())?;
     crate::dart_libraries::write_marker(rebuild.store())?;
