@@ -1331,6 +1331,26 @@ app's calls; and Angular's and React Router's calls whose destination reads
 a constant in a rewritten file go back (`route_modules.rs`,
 `navigation.rs`).
 
+A reference through an import binding whose answer reads the bound module's
+text moves without a touched name too (W7-31, OD-B69): `logger.info()` after
+`import { logger } from './logging'` follows the class the value is made from
+or annotated with, and the module its file imports that class from (#1292,
+#2644), and a call through an object literal follows the binding the literal
+names (#1932). colby's sync leaves such a reference where it was: its rebind
+(`resurrectStaleResolutionEdges`) keys on the definitions a sync's files
+gained or lost, which an edit of a value's initializer or of the import of
+its class leaves alone, and its `typeFrom` re-open covers Python attribute
+types only. This port reads, before a removed module's nodes go, or a
+re-extracted module's whose binding facts moved (a digest row per file, over
+the import mappings resolution reads from its text, its module-level values
+and their namesakes; OD-B72), the import bindings other files of the
+module-surface languages and Python hold into it, and re-resolves at their
+sites the references each importer writes through a binding's local name,
+with no ceiling; a module the surface lane re-resolves whole counts too, so
+a barrel that re-points the class a value's file imports reaches the calls
+through the value (`sync.rs`, `binding_facts.rs`,
+`Store::import_binding_sites_into_file`, `Store::stored_refs_through_names`).
+
 The watcher leaves one shape to the next full sync that a fresh index sees
 (W7-29): a directory replaced in place by another of the same name, as a
 rename onto an empty directory does, keeps a path the watcher knows, so it is

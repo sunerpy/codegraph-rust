@@ -2638,6 +2638,78 @@ impl Store {
         Ok(out.into_iter().collect())
     }
 
+    /// The import bindings other files hold into `file_path` (W7-31's lane
+    /// B): the reference sites of the `imports` edges from another file's
+    /// file node to a node of `file_path`, each with the importer's
+    /// language. A NULL coordinate gives the importer whole (`site: None`),
+    /// as [`Self::reference_sites_dependent_on_file`] does for the same
+    /// edge. Sorted and deduplicated.
+    pub fn import_binding_sites_into_file(
+        &self,
+        file_path: &str,
+    ) -> rusqlite::Result<Vec<(FileReferenceSite, Language)>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            r#"SELECT src.file_path, e.source, e.line, e.col, src.language
+            FROM edges e
+            JOIN nodes tgt ON tgt.id = e.target
+            JOIN nodes src ON src.id = e.source
+            WHERE tgt.file_path = ?1
+              AND e.kind = 'imports'
+              AND src.kind = 'file'
+              AND src.file_path != ?1
+              AND NOT ({SYNTHESIZED_E})
+            ORDER BY src.file_path, e.source, e.line, e.col"#,
+        ))?;
+        let rows = stmt.query_map([file_path], |row| {
+            Ok((
+                row_to_file_reference_site(row)?,
+                parse_language(row.get::<_, String>(4)?)?,
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (site, language) = row?;
+            out.insert(site, language);
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// The sites in `file_path` of its stored references written through
+    /// one of `names` (`logger.info` through `logger`), from both reference
+    /// tables, of every kind but `imports` (W7-31's lane B): what a binding
+    /// of one of the names reads through it. Read by file, not by a scan of
+    /// either table. Sorted and deduplicated.
+    pub fn stored_refs_through_names(
+        &self,
+        file_path: &str,
+        names: &BTreeSet<String>,
+    ) -> rusqlite::Result<Vec<ReferenceSite>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT from_node_id, line, col FROM resolved_refs \
+             WHERE file_path = ?1 AND reference_kind != 'imports' \
+               AND substr(reference_name, 1, ?3) = ?2 \
+             UNION SELECT from_node_id, line, col FROM unresolved_refs \
+             WHERE file_path = ?1 AND reference_kind != 'imports' \
+               AND substr(reference_name, 1, ?3) = ?2",
+        )?;
+        let mut out = BTreeSet::new();
+        for name in names {
+            let prefix = format!("{name}.");
+            let width = i64::try_from(prefix.chars().count()).unwrap_or(i64::MAX);
+            let rows = stmt.query_map(params![file_path, prefix, width], |row| {
+                Ok(ReferenceSite {
+                    from_node_id: row.get(0)?,
+                    line: row.get(1)?,
+                    col: row.get(2)?,
+                })
+            })?;
+            for row in rows {
+                out.insert(row?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     /// The reference sites of the edges into the nodes `ids` names, other
     /// than `contains` edges, each with its source's file (W7-09d); a NULL
     /// coordinate gives its file whole (`site: None`). Sorted and

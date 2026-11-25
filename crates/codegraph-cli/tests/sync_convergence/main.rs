@@ -512,6 +512,8 @@ fn run_case(name: &str, case: &Case) {
         "rust_crate_roots",
         // The bridge-facts rows and the bridge lane marker (W7-21).
         "rn_bridge",
+        // The binding-facts rows lane B compares (W7-31, OD-B72).
+        "binding_facts",
     ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -2223,14 +2225,11 @@ matrix! {
     erlang_app_src_goes,
     // W7-24 (OD-B57, OD-B58): an imported value's call reaches the class its
     // file means; an Erlang macro use binds only a `-define` of its name.
-    #[ignore = "W7-31: an edit that re-points the value's class import in its module re-resolves no call through the imported value in another file (OD-B57)"]
     typescript_imported_value_class_import_re_points,
-    #[ignore = "W7-31: an edit that changes the class the value's module makes it from re-resolves no call through the imported value in another file (pre-existing since #1292)"]
     typescript_imported_value_class_changes,
     typescript_imported_value_file_comes_to_declare_its_class,
     typescript_imported_value_declaring_module_appears,
     typescript_imported_value_declaring_module_goes,
-    #[ignore = "W7-31: an edit that re-points the value's class import in its module re-resolves no call through the imported value in another file (OD-B57)"]
     javascript_imported_value_class_import_re_points,
     javascript_imported_value_declaring_module_appears,
     javascript_imported_value_declaring_module_goes,
@@ -2238,6 +2237,30 @@ matrix! {
     erlang_macro_use_loses_its_header_define,
     erlang_macro_use_second_header_define_appears,
     erlang_parked_macro_use_ignores_an_added_type_alias,
+    // W7-31 (OD-B69, OD-B71): a reference through an import binding follows
+    // the module it binds (lane B).
+    typescript_imported_value_annotation_changes,
+    typescript_imported_object_literal_binding_re_points,
+    typescript_imported_object_literal_binding_callback_re_points,
+    typescript_imported_object_literal_member_re_binds,
+    typescript_imported_value_commented_import_comes_first,
+    typescript_imported_value_namesake_comes_ahead,
+    tsx_imported_value_class_import_re_points,
+    jsx_imported_value_class_import_re_points,
+    vue_imported_value_class_import_re_points,
+    arkts_imported_value_class_import_re_points,
+    typescript_aliased_imported_value_class_import_re_points,
+    typescript_default_imported_value_class_import_re_points,
+    python_imported_value_class_changes,
+    python_imported_value_assignments_trade_places,
+    typescript_imported_value_class_barrel_re_points,
+    typescript_imported_value_class_barrel_re_points_beside_a_body_edit,
+    typescript_imported_value_501_calls_follow_a_class_change,
+    typescript_imported_value_call_beside_a_shadowing_local,
+    python_imported_value_module_goes,
+    typescript_imported_value_module_goes,
+    typescript_imported_value_module_appears,
+    typescript_imported_value_module_body_edit,
     // W7-28: a JSX tag in a `.js` file renders as in `.jsx`.
     javascript_rendered_component_appears,
     javascript_rendered_component_file_deleted,

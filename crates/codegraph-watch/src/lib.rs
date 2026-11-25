@@ -1,3 +1,4 @@
+pub mod binding_facts;
 pub mod case_folded;
 pub mod cfml_heads;
 pub mod class_heads;

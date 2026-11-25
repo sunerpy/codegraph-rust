@@ -106,6 +106,7 @@ pub(crate) fn migrate_project(
     let mut lua_rows = Vec::new();
     let mut dart_rows = Vec::new();
     let mut dart_library_rows = Vec::new();
+    let mut binding_facts_rows = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -208,6 +209,15 @@ pub(crate) fn migrate_project(
         if let Some(row) = crate::dart_libraries::row_of(file.language, &source) {
             dart_library_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::binding_facts::row_of(
+            relative,
+            file.language,
+            &source,
+            &result.nodes,
+            &result.edges,
+        ) {
+            binding_facts_rows.push((relative.clone(), row));
+        }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
             rebuild.store_mut().upsert_nodes(&pending_nodes)?;
@@ -270,6 +280,8 @@ pub(crate) fn migrate_project(
     drop(dart_rows);
     crate::dart_libraries::write_index_rows(rebuild.store(), &mut dart_library_rows)?;
     drop(dart_library_rows);
+    crate::binding_facts::write_index_rows(rebuild.store(), &mut binding_facts_rows)?;
+    drop(binding_facts_rows);
     crate::dart_libraries::write_pubspec_rows(rebuild.store(), project_root)?;
     crate::cpp_dependents::write_marker(rebuild.store())?;
     crate::java_heads::write_marker(rebuild.store())?;

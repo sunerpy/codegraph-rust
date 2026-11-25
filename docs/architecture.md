@@ -1000,7 +1000,35 @@ holds, so their calls in the files whose references into a rewritten file
 the sync refreshes go back too. Each goes back at its site, with no ceiling;
 a file the sync re-extracted is left out, and a sync that re-resolves the
 JavaScript family whole (a framework change, a JavaScript control-input
-change, a module-surface bootstrap) runs none of these lanes. Framework nodes (a React Router route) are made
+change, a module-surface bootstrap) runs none of these lanes. A reference
+written through an import binding (`logger.info()` after `import { logger }
+from './logging'`, `setTimeout(api.getUser)` after `import { api } from
+'./api'`) reads the bound module's own text: which of its declarations the
+binding names, the value's initializer or annotation and that file's import
+of the class it names (#1292, upstream #2644), or the binding an object
+literal names (#1932). No edge into the module and no touched name reaches
+it, so a sync that removes a module of a language with a module surface, or
+a Python module, or re-extracts one whose binding facts moved, reads the
+`imports` edges other files of those languages hold into it before its nodes
+go, and sends the references each importer writes through a binding's local
+name (`log.info()` after `import { logger as log }`, of any kind but an
+import) back at their sites with the binding (W7-31). The facts are a
+`binding_facts:` digest row per file (OD-B72): the import mappings
+resolution extracts from the file's text, its module-level values with their
+full lines, and each module-level declaration that shares its name with
+another, in the store's order. A missing row counts as moved, and a
+re-extracted module whose facts did not move still counts when the
+module-surface lane walked in the same sync, since that lane re-resolves no
+re-extracted file and a barrel the module imports through may have moved.
+The references are read from the importer's stored references while the
+stored-references marker holds, and from its extraction otherwise, as the
+dependent refresh reads them; a binding whose site holds no import reference
+sends the importer whole. A module the module-surface lane re-resolves
+whole, because a barrel it imports a class through moved, counts as
+rewritten too. There is no ceiling, and an importer the sync re-extracts or
+re-resolves whole is left out. A sync that fails after its first write
+leaves the class-heads marker away, and its bootstrap re-resolves every file
+of both languages once. Framework nodes (a React Router route) are made
 by passes that run after a file's re-extraction, so comparing a
 changed file's stored nodes with its re-extracted ones touches their names; when
 that comparison is all that touched names in a sync, and once the passes have

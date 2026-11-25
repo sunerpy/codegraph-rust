@@ -1019,6 +1019,19 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(surfaces.names.iter().cloned());
+        // W7-31 (OD-B72) — a module re-extracted with its facts unchanged
+        // may still import its value's class through a barrel that moved in
+        // this sync (the two-hop), and the surface lane re-resolves no
+        // re-extracted file: when the lane walked, lane B takes its
+        // bindings after all.
+        if surfaces.walked() {
+            for (module, importers) in std::mem::take(&mut changed_names.quiet_bindings) {
+                let into = changed_names.bindings.entry(module).or_default();
+                for (importer, sites) in importers {
+                    into.entry(importer).or_default().extend(sites);
+                }
+            }
+        }
         // What a Terraform module bridge reads beside its reference: a
         // module declaration's `source` and `component`, a variable's
         // `default`, and which `.tf` files the module's directory holds
@@ -1943,7 +1956,43 @@ fn sync_paths_with_store(
                     merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
                 }
             }
+            // W7-31 — the two-hop half of lane B: a module the surface lane
+            // re-resolves whole may import a value's class through the
+            // barrel that moved, so the references written through a
+            // binding into it go back too. Its nodes stay, and so do the
+            // bindings into it.
+            for file in &surfaces.files {
+                changed_names.note_bindings(store, file)?;
+            }
         }
+        // W7-31 — lane B: a reference written through an import binding
+        // (`logger.info()` after `import { logger } from './logging'`) reads
+        // the bound module's text: the value's initializer or annotation and
+        // its file's import of that class (#1292, #2644), or an object
+        // literal's binding (#1932). No edge into the module and no touched
+        // name reaches it, so when the module is re-extracted or removed,
+        // or the surface lane re-resolves it whole, the references through
+        // each binding into it go back by site with the binding.
+        let mut bindings: BTreeMap<String, BTreeSet<ReferenceSite>> = BTreeMap::new();
+        for importers in changed_names.bindings.values() {
+            for (importer, sites) in importers {
+                bindings
+                    .entry(importer.clone())
+                    .or_default()
+                    .extend(sites.iter().cloned());
+            }
+        }
+        binding_lane_sites(
+            project_root,
+            store,
+            scope,
+            &resolver,
+            &bindings,
+            &reindexed,
+            stored_refs_marker.is_some(),
+            &mut dependent_sites,
+            &mut dependent_fallbacks,
+        )?;
         let (mut scope_sites, fallback_files) = refresh_dependent_refs(
             project_root,
             store,
@@ -2010,6 +2059,7 @@ fn sync_paths_with_store(
         // Last: the surface and namespace rows, then the markers the first
         // mutation withdrew.
         surfaces.write_rows(store)?;
+        changed_names.binding_rows.write_rows(store)?;
         namespaces.write_rows(store)?;
         java.write_rows(store)?;
         kotlin.write_rows(store)?;
@@ -2136,6 +2186,125 @@ pub(crate) fn changed_records(
         .iter()
         .map(|path| Ok((path.clone(), store.file_by_path(path)?)))
         .collect()
+}
+
+/// Whether `name` is an import binding's local name (`logger`, `$store`):
+/// one identifier, never a module specifier (`./logging`, `@app/kit`,
+/// `app.logmod`).
+fn is_binding_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// The local names `sites` bind among `refs`: the identifier names of the
+/// `imports` references there. `None` when a site holds no `imports`
+/// reference, which no selection by name can stand in for.
+fn binding_names_at(
+    refs: &[codegraph_core::types::UnresolvedRef],
+    sites: &BTreeSet<ReferenceSite>,
+) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for site in sites {
+        let mut found = false;
+        for reference in refs.iter().filter(|reference| {
+            reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+                && reference.from_node_id == site.from_node_id
+                && reference.line == site.line
+                && reference.col == site.col
+        }) {
+            found = true;
+            if is_binding_name(&reference.reference_name) {
+                names.insert(reference.reference_name.clone());
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    Some(names)
+}
+
+/// Lane B's sites (W7-31): for each importer with a binding into a module
+/// the sync rewrote, the sites of the references written through the
+/// binding's local name. They come from the importer's stored references
+/// while the stored-references marker holds (W5-09e), and from its
+/// extraction otherwise, as `refresh_dependent_refs` reads a dependent's. A
+/// binding site that holds no `imports` reference sends the importer whole.
+/// An importer the sync re-extracted, or one already going whole, is
+/// skipped.
+#[allow(clippy::too_many_arguments)]
+fn binding_lane_sites(
+    project_root: &Path,
+    store: &Store,
+    scope: &ProjectScope,
+    resolver: &ReferenceResolver,
+    bindings: &BTreeMap<String, BTreeSet<ReferenceSite>>,
+    reindexed: &HashSet<String>,
+    stored_refs: bool,
+    dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
+    dependent_fallbacks: &mut BTreeSet<String>,
+) -> Result<()> {
+    for (importer, sites) in bindings {
+        if reindexed.contains(importer)
+            || dependent_fallbacks.contains(importer)
+            || !project_root.join(importer).exists()
+        {
+            continue;
+        }
+        let through = if stored_refs {
+            binding_names_at(&store.stored_refs_at_sites(sites)?, sites)
+                .map(|names| store.stored_refs_through_names(importer, &names))
+                .transpose()?
+        } else {
+            let refs = extract_dependent_refs(project_root, importer, scope, resolver)?;
+            binding_names_at(&refs, sites).map(|names| {
+                refs.iter()
+                    .filter(|reference| {
+                        reference.reference_kind != codegraph_core::types::EdgeKind::Imports
+                            && names.iter().any(|name| {
+                                reference
+                                    .reference_name
+                                    .strip_prefix(name.as_str())
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                            })
+                    })
+                    .map(|reference| ReferenceSite {
+                        from_node_id: reference.from_node_id.clone(),
+                        line: reference.line,
+                        col: reference.col,
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+        };
+        let Some(through) = through else {
+            #[cfg(test)]
+            tests::note_binding_lane(importer, None);
+            dependent_sites.remove(importer);
+            dependent_fallbacks.insert(importer.clone());
+            continue;
+        };
+        if through.is_empty() {
+            continue;
+        }
+        #[cfg(test)]
+        tests::note_binding_lane(importer, Some(through.len()));
+        for site in through {
+            merge_dependent_site(
+                dependent_sites,
+                dependent_fallbacks,
+                FileReferenceSite {
+                    file_path: importer.clone(),
+                    site: Some(site),
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Rebuild only the affected source-site groups of unchanged dependent files,
@@ -2478,6 +2647,15 @@ fn sync_one(
         importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
+    // W7-31 — lane B's bindings into this module, before its nodes go. A
+    // framework change re-extracts every file, and with it every importer.
+    if !force_reextract
+        && stored
+            .as_ref()
+            .is_some_and(|file| crate::binding_facts::is_lane_language(relative, file.language))
+    {
+        changed_names.note_bindings(store, relative)?;
+    }
     // #2450 — an importer whose statement of this module holds a binding
     // the import did not resolve (`W` of `import { Widget as W } from
     // './widgets/Widget'`, parked or matched by its name) may bind to what
@@ -2580,6 +2758,12 @@ fn remove_tracked_file(
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         importers.insert(dependent.file_path.clone());
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
+    }
+    // W7-31 — lane B's bindings into the removed module, which fire
+    // whatever its facts were, and its binding-facts row (OD-B72).
+    if crate::binding_facts::is_lane_language(relative, stored.language) {
+        changed_names.note_bindings(store, relative)?;
+        changed_names.binding_rows.note(store, relative, None)?;
     }
     let c_family = crate::cpp_dependents::is_c_family(stored.language);
     changed_names.cpp.before_change(store, relative, c_family)?;
@@ -3147,6 +3331,29 @@ fn reextract_into_store(
     // was or is generated can flip it with every node where it was, so all of
     // its names are touched and the refs naming them resolve afresh.
     let stored = store.file_by_path(relative)?;
+    // W7-31 (OD-B72): lane B fires for an edited module only when its facts
+    // moved (its import statements or module-level value declarations), or
+    // when it had no row.
+    if crate::binding_facts::is_lane_language(relative, file.language)
+        || stored
+            .as_ref()
+            .is_some_and(|stored| crate::binding_facts::is_lane_language(relative, stored.language))
+    {
+        let row = crate::binding_facts::row_of(
+            relative,
+            file.language,
+            source,
+            &result.nodes,
+            &result.edges,
+        );
+        if !changed_names.binding_rows.note(store, relative, row)?
+            && let Some(quiet) = changed_names.bindings.remove(relative)
+        {
+            changed_names
+                .quiet_bindings
+                .insert(relative.to_string(), quiet);
+        }
+    }
     let was_generated = stored.as_ref().is_some_and(|stored| stored.generated);
     // A JavaScript-family module's surface is read from its text, which is
     // gone after this (W4a-F3): keep the row it had and the surface it has.
@@ -3254,6 +3461,21 @@ struct ChangedNames {
     /// the edit may give the module what the binding imports under another
     /// name, which no name lookup finds.
     binding_importers: BTreeSet<String>,
+    /// The import-binding sites other files of lane B's languages hold into
+    /// each module this sync re-extracted or removed, or the surface lane
+    /// re-resolves whole, by module and then importer, read while the
+    /// module's nodes are there (W7-31): the references written through such
+    /// a binding go back with it. A re-extracted module whose facts did not
+    /// move is dropped again (OD-B72).
+    bindings: BTreeMap<String, BTreeMap<String, BTreeSet<ReferenceSite>>>,
+    /// The bindings of the re-extracted modules whose facts did not move,
+    /// set aside: they fire after all when the surface lane walked, since
+    /// what such a module's imports resolve to can move through a barrel
+    /// they name, and the surface lane re-resolves no re-extracted file
+    /// (OD-B72).
+    quiet_bindings: BTreeMap<String, BTreeMap<String, BTreeSet<ReferenceSite>>>,
+    /// The binding-facts rows of the files this sync rewrote (OD-B72).
+    binding_rows: crate::binding_facts::RowChanges,
     /// The namespaces and modules the changed files declare, which a parked
     /// import may name whole (`using Foo.Bar`, `import com.z.*`).
     module_names: HashSet<String>,
@@ -3465,6 +3687,27 @@ impl ChangedNames {
             crate::resolved_refs::withdraw_marker(store)?;
             codegraph_resolve::synthesis::withdraw_marker(store)?;
             self.surface_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Record the import bindings other files of lane B's languages hold
+    /// into `relative` (W7-31), while its nodes are still there. A binding
+    /// edge with no coordinates already sent its importer whole (the
+    /// dependents of `relative` hold the same edge).
+    fn note_bindings(&mut self, store: &Store, relative: &str) -> Result<()> {
+        for (found, language) in store.import_binding_sites_into_file(relative)? {
+            if !crate::binding_facts::is_lane_language(&found.file_path, language) {
+                continue;
+            }
+            if let Some(site) = found.site {
+                self.bindings
+                    .entry(relative.to_string())
+                    .or_default()
+                    .entry(found.file_path)
+                    .or_default()
+                    .insert(site);
+            }
         }
         Ok(())
     }
@@ -3869,6 +4112,11 @@ pub(crate) mod tests {
         /// How the syncs on this thread refreshed each dependent file.
         static DEPENDENT_REFRESHES: std::cell::RefCell<Vec<DependentRefresh>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// What lane B (W7-31) did with each importer on this thread: the
+        /// number of sites it selected, or `None` when the importer went
+        /// whole.
+        static BINDING_LANE: std::cell::RefCell<Vec<(String, Option<usize>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
         /// The names each sync on this thread retried parked references by,
         /// sorted.
         static RETRY_NAMES: std::cell::RefCell<Vec<Vec<String>>> =
@@ -3888,6 +4136,17 @@ pub(crate) mod tests {
     /// The navigation lanes' steps since the last call, in order.
     fn take_navigation_steps() -> Vec<&'static str> {
         NAVIGATION_STEPS.with(|steps| std::mem::take(&mut *steps.borrow_mut()))
+    }
+
+    pub(crate) fn note_binding_lane(importer: &str, sites: Option<usize>) {
+        BINDING_LANE.with(|lane| lane.borrow_mut().push((importer.to_string(), sites)));
+    }
+
+    /// Lane B's decisions since the last call, sorted by importer.
+    fn take_binding_lane() -> Vec<(String, Option<usize>)> {
+        let mut lane = BINDING_LANE.with(|lane| std::mem::take(&mut *lane.borrow_mut()));
+        lane.sort();
+        lane
     }
 
     pub(crate) fn note_retry_names(names: &HashSet<String>) {
@@ -12415,6 +12674,610 @@ pub(crate) mod tests {
         assert_eq!(
             edge_projection(&db),
             fresh_edges("nav-fail-fresh", &[package, settings, nav, profile])
+        );
+    }
+
+    // ----- W7-31: lane B, the references through an import binding ---------
+
+    const W731_LOGGER: &str = "export class Logger {\n  info(message: string) {\n    return message;\n  }\n  warn(message: string) {\n    return message;\n  }\n}\n";
+    const W731_HELPER: (&str, &str) = ("src/__tests__/helpers/logger.ts", W731_LOGGER);
+    const W731_CONSOLE: (&str, &str) = ("src/log/console.ts", W731_LOGGER);
+    const W731_FILE: (&str, &str) = ("src/log/file.ts", W731_LOGGER);
+    const W731_VALUE: (&str, &str) = (
+        "src/logging.ts",
+        "import { Logger } from './log/console';\n\nexport const logger = new Logger();\n",
+    );
+    const W731_VALUE_OF_FILE: (&str, &str) = (
+        "src/logging.ts",
+        "import { Logger } from './log/file';\n\nexport const logger = new Logger();\n",
+    );
+    const W731_VALUE_BODY_EDIT: (&str, &str) = (
+        "src/logging.ts",
+        "import { Logger } from './log/console';\n\nexport const logger = new Logger();\n\nexport function unrelated(): number {\n  return 1;\n}\n",
+    );
+    /// Two calls and a function reference written through the binding.
+    const W731_APP: (&str, &str) = (
+        "src/app.ts",
+        "import { logger } from './logging';\n\nexport function run() {\n  logger.info('a');\n  logger.warn('b');\n  setTimeout(logger.info, 1);\n}\n",
+    );
+    const W731_LONELY: (&str, &str) = (
+        "src/lonely.ts",
+        "export function lonely(): number {\n  return 1;\n}\n",
+    );
+    const W731_LONELY_EDITED: (&str, &str) = (
+        "src/lonely.ts",
+        "export function lonely(): number {\n  return 2;\n}\n",
+    );
+
+    /// W7-31: an edit of a module no file binds selects nothing.
+    #[test]
+    fn w731_lane_b_selects_nothing_for_a_module_no_file_binds() {
+        let files = [
+            W731_HELPER,
+            W731_CONSOLE,
+            W731_FILE,
+            W731_VALUE,
+            W731_APP,
+            W731_LONELY,
+        ];
+        let (dir, db) = fully_indexed("w731-lonely", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[W731_LONELY_EDITED]);
+        sync_changed_paths(dir.path(), &db, [W731_LONELY.0]).unwrap();
+        assert_eq!(take_binding_lane(), []);
+    }
+
+    /// W7-31: an edit that re-points the value's class import sends every
+    /// reference written through the binding back by site from its stored
+    /// references (two calls and a function reference), and the graph is a
+    /// fresh index's.
+    #[test]
+    fn w731_lane_b_takes_every_reference_through_a_binding() {
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-through", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-through-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_OF_FILE,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): a body edit of the value's module leaves its import
+    /// statements and value declarations alone, so lane B fires nothing, and
+    /// the graph is a fresh index's.
+    #[test]
+    fn w731_lane_b_fires_nothing_for_a_body_edit() {
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-body", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[W731_VALUE_BODY_EDIT]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), []);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-body-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_BODY_EDIT,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): the value's declaration changes (an annotation added,
+    /// the answer the same): its facts moved, so lane B fires.
+    #[test]
+    fn w731_lane_b_fires_when_the_value_declaration_changes() {
+        const ANNOTATED: (&str, &str) = (
+            "src/logging.ts",
+            "import { Logger } from './log/console';\n\nexport const logger: Logger = new Logger();\n",
+        );
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-declaration", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[ANNOTATED]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-declaration-fresh",
+                &[W731_HELPER, W731_CONSOLE, W731_FILE, ANNOTATED, W731_APP]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): an object literal's members are part of its value
+    /// declaration (#1932): a member added moves the facts, and lane B
+    /// fires for the call through the literal.
+    #[test]
+    fn w731_lane_b_fires_when_an_object_literal_member_changes() {
+        const ONE: (&str, &str) = (
+            "src/users/one.ts",
+            "export function getUser(id: string) {\n  return id;\n}\n",
+        );
+        const API: (&str, &str) = (
+            "src/api.ts",
+            "import { getUser } from './users/one';\n\nexport const api = { getUser };\n",
+        );
+        const API_WIDER: (&str, &str) = (
+            "src/api.ts",
+            "import { getUser } from './users/one';\n\nexport const api = { getUser, fetchUser: getUser };\n",
+        );
+        const CALLER: (&str, &str) = (
+            "src/app.ts",
+            "import { api } from './api';\n\nexport function run() {\n  return api.getUser('x');\n}\n",
+        );
+        let (dir, db) = fully_indexed("w731-literal", &[ONE, API, CALLER]);
+        take_binding_lane();
+        write_files(dir.path(), &[API_WIDER]);
+        sync_changed_paths(dir.path(), &db, [API.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(1))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("w731-literal-fresh", &[ONE, API_WIDER, CALLER])
+        );
+    }
+
+    /// W7-31 (OD-B72): #2644 reads the value's file's import mappings, a
+    /// regex over its text: import text a comment holds ahead of the
+    /// statement comes first and names the class. Only the mappings moved
+    /// (no line did), and lane B fires.
+    #[test]
+    fn w731_lane_b_fires_when_an_import_mapping_changes() {
+        const SPACED: (&str, &str) = (
+            "src/logging.ts",
+            "\nimport { Logger } from './log/console';\n\nexport const logger = new Logger();\n",
+        );
+        const COMMENTED: (&str, &str) = (
+            "src/logging.ts",
+            "// import { Logger } from './log/file';\nimport { Logger } from './log/console';\n\nexport const logger = new Logger();\n",
+        );
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, SPACED, W731_APP];
+        let (dir, db) = fully_indexed("w731-mapping", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[COMMENTED]);
+        sync_changed_paths(dir.path(), &db, [SPACED.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-mapping-fresh",
+                &[W731_HELPER, W731_CONSOLE, W731_FILE, COMMENTED, W731_APP]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): an exported interface of the value's name comes
+    /// ahead of it and is what the named import binds now. Only the
+    /// module's declarations moved, and lane B fires.
+    #[test]
+    fn w731_lane_b_fires_when_a_namesake_comes_ahead() {
+        const NAMESAKE: (&str, &str) = (
+            "src/logging.ts",
+            "import { Logger } from './log/console';\nexport interface logger {}\nexport const logger = new Logger();\n",
+        );
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-namesake", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[NAMESAKE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-namesake-fresh",
+                &[W731_HELPER, W731_CONSOLE, W731_FILE, NAMESAKE, W731_APP]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): a barrel the value's file imports its class through
+    /// re-points, and the value's file has a body edit in the same sync.
+    /// Its facts did not move, and the surface lane re-resolves no
+    /// re-extracted file, so lane B fires for it after all.
+    #[test]
+    fn w731_lane_b_fires_for_a_quiet_module_when_a_surface_moves() {
+        const BARREL: (&str, &str) = ("src/log/index.ts", "export { Logger } from './console';\n");
+        const BARREL_OF_FILE: (&str, &str) =
+            ("src/log/index.ts", "export { Logger } from './file';\n");
+        const VALUE: (&str, &str) = (
+            "src/logging.ts",
+            "import { Logger } from './log';\n\nexport const logger = new Logger();\n",
+        );
+        const VALUE_EDITED: (&str, &str) = (
+            "src/logging.ts",
+            "import { Logger } from './log';\n\nexport const logger = new Logger();\n\nexport function unrelated(): number {\n  return 1;\n}\n",
+        );
+        let files = [
+            W731_HELPER,
+            W731_CONSOLE,
+            W731_FILE,
+            BARREL,
+            VALUE,
+            W731_APP,
+        ];
+        let (dir, db) = fully_indexed("w731-quiet", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[BARREL_OF_FILE, VALUE_EDITED]);
+        sync_changed_paths(dir.path(), &db, [BARREL.0, VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-quiet-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    BARREL_OF_FILE,
+                    VALUE_EDITED,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): a module with no binding-facts row (an index from
+    /// before the rows) fires on a body edit, and the edit writes its row.
+    #[test]
+    fn w731_lane_b_fires_when_the_module_has_no_row() {
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-no-row", &files);
+        let key = crate::binding_facts::row_key(W731_VALUE.0);
+        let row = Store::open(&db)
+            .unwrap()
+            .get_project_metadata(&key)
+            .unwrap();
+        assert!(row.is_some(), "a full index writes the row");
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(&key)
+            .unwrap();
+        take_binding_lane();
+        write_files(dir.path(), &[W731_VALUE_BODY_EDIT]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            Store::open(&db)
+                .unwrap()
+                .get_project_metadata(&key)
+                .unwrap(),
+            row,
+            "the body edit leaves the facts, so the row is the one a full index wrote"
+        );
+    }
+
+    /// W7-31 (OD-B72): after edits, removals and additions, a sync leaves
+    /// the binding-facts rows a fresh index writes.
+    #[test]
+    fn w731_binding_facts_rows_follow_the_sync() {
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-rows", &files);
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        fs::remove_file(dir.path().join(W731_CONSOLE.0)).unwrap();
+        sync_changed_paths(dir.path(), &db, [W731_CONSOLE.0]).unwrap();
+        let rows = |db: &Path| {
+            Store::open(db)
+                .unwrap()
+                .project_metadata_with_prefix(crate::binding_facts::ROW_KEY_PREFIX)
+                .unwrap()
+        };
+        let fresh = TestDir::new("w731-rows-fresh");
+        let final_files = [W731_HELPER, W731_FILE, W731_VALUE_OF_FILE, W731_APP];
+        write_files(fresh.path(), &final_files);
+        let fresh_db = default_db_path(fresh.path()).unwrap();
+        sync_changed_paths(
+            fresh.path(),
+            &fresh_db,
+            final_files.iter().map(|(path, _)| *path),
+        )
+        .unwrap();
+        stage_outdated(&fresh);
+        sync_project_once(fresh.path()).unwrap();
+        assert!(!rows(&db).is_empty());
+        assert_eq!(rows(&db), rows(&fresh_db));
+    }
+
+    /// W7-31: without the stored-references marker (an index no full index
+    /// wrote), lane B reads the importer's references from its extraction,
+    /// as the dependent refresh does, and the call follows the value's class
+    /// import by site.
+    #[test]
+    fn w731_lane_b_reads_an_importer_extraction_without_the_stored_references_marker() {
+        let dir = TestDir::new("w731-no-marker");
+        let db = default_db_path(dir.path()).unwrap();
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        write_files(dir.path(), &files);
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(stored_refs_marker(&db), None);
+        take_binding_lane();
+        take_dependent_refreshes();
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            take_dependent_refreshes(),
+            [refresh("src/app.ts", false, false)]
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-no-marker-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_OF_FILE,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31: a sync failing once the value's module is re-extracted, before
+    /// lane B's sites are refreshed, leaves the JavaScript-family surface
+    /// marker and the class-heads marker away, so the next sync reconciles
+    /// every file of the lane's languages and the call follows the class
+    /// import.
+    #[test]
+    fn w731_a_failed_sync_leaves_lane_b_to_the_next_one() {
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-fail", &files);
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        FAIL_BEFORE_FRAMEWORK_REFS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [W731_VALUE.0]);
+        FAIL_BEFORE_FRAMEWORK_REFS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(surface_marker(&db), None, "the failed sync withdrew it");
+        assert_eq!(class_heads_marker(&db), None, "and this one");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-fail-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_OF_FILE,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31: without the marker lane B reads no `resolved_refs` row: an
+    /// index whose rows lack the importer's references still gives the three
+    /// sites, from the importer's extraction.
+    #[test]
+    fn w731_lane_b_trusts_no_stored_reference_without_the_marker() {
+        let dir = TestDir::new("w731-untrusted");
+        let db = default_db_path(dir.path()).unwrap();
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        write_files(dir.path(), &files);
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(stored_refs_marker(&db), None);
+        Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "DELETE FROM resolved_refs WHERE file_path = 'src/app.ts'",
+                [],
+            )
+            .unwrap();
+        take_binding_lane();
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), Some(3))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-untrusted-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_OF_FILE,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31: under the marker, a binding site that holds no stored `imports`
+    /// reference (its edge's column moved off the stored row) sends the
+    /// importer whole, and the call follows the value's class import.
+    #[test]
+    fn w731_lane_b_sends_an_importer_whole_when_a_stored_binding_site_holds_no_import() {
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        let (dir, db) = fully_indexed("w731-unread-stored", &files);
+        let moved = Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "UPDATE edges SET col = 99 WHERE kind = 'imports' AND line = 1 AND col = 9 \
+                 AND source = 'file:src/app.ts'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(moved, 1, "the binding edge");
+        take_binding_lane();
+        take_dependent_refreshes();
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), None)]);
+        assert_eq!(
+            take_dependent_refreshes(),
+            [refresh("src/app.ts", true, true)]
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-unread-stored-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_OF_FILE,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    /// W7-31: without the marker, a binding site the importer's extraction
+    /// holds no `imports` reference at (its edge's column moved) sends the
+    /// importer whole too.
+    #[test]
+    fn w731_lane_b_sends_an_importer_whole_when_an_extracted_binding_site_holds_no_import() {
+        let dir = TestDir::new("w731-unread-extracted");
+        let db = default_db_path(dir.path()).unwrap();
+        let files = [W731_HELPER, W731_CONSOLE, W731_FILE, W731_VALUE, W731_APP];
+        write_files(dir.path(), &files);
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(stored_refs_marker(&db), None);
+        let moved = Store::open(&db)
+            .unwrap()
+            .connection()
+            .execute(
+                "UPDATE edges SET col = 99 WHERE kind = 'imports' AND line = 1 AND col = 9 \
+                 AND source = 'file:src/app.ts'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(moved, 1, "the binding edge");
+        take_binding_lane();
+        write_files(dir.path(), &[W731_VALUE_OF_FILE]);
+        sync_changed_paths(dir.path(), &db, [W731_VALUE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("src/app.ts".to_string(), None)]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-unread-extracted-fresh",
+                &[
+                    W731_HELPER,
+                    W731_CONSOLE,
+                    W731_FILE,
+                    W731_VALUE_OF_FILE,
+                    W731_APP
+                ]
+            )
+        );
+    }
+
+    const W731_PY_INIT: (&str, &str) = ("app/__init__.py", "");
+    const W731_PY_LOGGERS: (&str, &str) = (
+        "app/loggers.py",
+        "class Logger:\n    def info(self, m):\n        return m\n\n\nclass Auditor:\n    def info(self, m):\n        return m\n",
+    );
+    const W731_PY_LOGMOD: (&str, &str) = (
+        "app/logmod.py",
+        "from app.loggers import Logger, Auditor\n\nlogger = Logger()\n",
+    );
+    const W731_PY_LOGMOD_AUDITOR: (&str, &str) = (
+        "app/logmod.py",
+        "from app.loggers import Logger, Auditor\n\nlogger = Auditor()\n",
+    );
+    const W731_PY_MAIN: (&str, &str) = (
+        "app/main.py",
+        "from app.logmod import logger\n\n\ndef run():\n    logger.info(\"start\")\n",
+    );
+
+    /// W7-31 (OD-B71): the same lane for Python: the call through the module
+    /// global follows its class change, by site.
+    #[test]
+    fn w731_lane_b_takes_python_references_through_a_binding() {
+        let files = [W731_PY_INIT, W731_PY_LOGGERS, W731_PY_LOGMOD, W731_PY_MAIN];
+        let (dir, db) = fully_indexed("w731-python", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[W731_PY_LOGMOD_AUDITOR]);
+        sync_changed_paths(dir.path(), &db, [W731_PY_LOGMOD.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("app/main.py".to_string(), Some(1))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-python-fresh",
+                &[
+                    W731_PY_INIT,
+                    W731_PY_LOGGERS,
+                    W731_PY_LOGMOD_AUDITOR,
+                    W731_PY_MAIN
+                ]
+            )
+        );
+    }
+
+    /// W7-31 (OD-B72): two module-level assignments of the value trade
+    /// places; the import binds the first, and every node keeps its line.
+    /// Only the order of the value declarations moved, and lane B fires.
+    #[test]
+    fn w731_lane_b_fires_when_python_values_trade_places() {
+        const TWICE: (&str, &str) = (
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Logger()\nlogger = Auditor()\n",
+        );
+        const SWAPPED: (&str, &str) = (
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Auditor()\nlogger = Logger()\n",
+        );
+        let files = [W731_PY_INIT, W731_PY_LOGGERS, TWICE, W731_PY_MAIN];
+        let (dir, db) = fully_indexed("w731-python-order", &files);
+        take_binding_lane();
+        write_files(dir.path(), &[SWAPPED]);
+        sync_changed_paths(dir.path(), &db, [TWICE.0]).unwrap();
+        assert_eq!(take_binding_lane(), [("app/main.py".to_string(), Some(1))]);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-python-order-fresh",
+                &[W731_PY_INIT, W731_PY_LOGGERS, SWAPPED, W731_PY_MAIN]
+            )
+        );
+    }
+
+    /// W7-31: Python has no surface marker; the class-heads marker the
+    /// failed sync withdrew sends every Python file whole through the next
+    /// sync, so the call follows the class change there.
+    #[test]
+    fn w731_a_failed_sync_leaves_python_lane_b_to_the_next_one() {
+        let files = [W731_PY_INIT, W731_PY_LOGGERS, W731_PY_LOGMOD, W731_PY_MAIN];
+        let (dir, db) = fully_indexed("w731-python-fail", &files);
+        write_files(dir.path(), &[W731_PY_LOGMOD_AUDITOR]);
+        FAIL_BEFORE_FRAMEWORK_REFS.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, [W731_PY_LOGMOD.0]);
+        FAIL_BEFORE_FRAMEWORK_REFS.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(class_heads_marker(&db), None, "the failed sync withdrew it");
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "w731-python-fail-fresh",
+                &[
+                    W731_PY_INIT,
+                    W731_PY_LOGGERS,
+                    W731_PY_LOGMOD_AUDITOR,
+                    W731_PY_MAIN
+                ]
+            )
         );
     }
 }

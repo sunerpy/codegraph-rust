@@ -6163,6 +6163,8 @@ fn index_project_inner(
         Option<codegraph_resolve::dart_scope::HeadRow>,
         Option<codegraph_resolve::dart_libraries::LibraryRow>,
         Option<codegraph_watch::rn_bridges::BridgeFacts>,
+        // The binding-facts digest lane B compares (W7-31, OD-B72).
+        Option<String>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
@@ -6186,6 +6188,7 @@ fn index_project_inner(
     let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
         Vec::new();
+    let mut binding_facts_rows: Vec<(String, String)> = Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -6270,6 +6273,13 @@ fn index_project_inner(
             let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
             let dart_library_row = codegraph_watch::dart_libraries::row_of(language, &source);
             let bridge_row = codegraph_watch::rn_bridges::row_of(relative, &source, &result.nodes);
+            let binding_facts_row = codegraph_watch::binding_facts::row_of(
+                relative,
+                language,
+                &source,
+                &result.nodes,
+                &result.edges,
+            );
             Ok(Some((
                 relative.clone(),
                 file,
@@ -6293,6 +6303,7 @@ fn index_project_inner(
                 dart_row,
                 dart_library_row,
                 bridge_row,
+                binding_facts_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
@@ -6320,6 +6331,7 @@ fn index_project_inner(
                 dart_row,
                 dart_library_row,
                 bridge_row,
+                binding_facts_row,
             )) = payload
             else {
                 files_not_source += 1;
@@ -6414,6 +6426,9 @@ fn index_project_inner(
             if let Some(row) = bridge_row {
                 bridge_rows.push((relative.clone(), row));
             }
+            if let Some(row) = binding_facts_row {
+                binding_facts_rows.push((relative.clone(), row));
+            }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
             }
@@ -6493,6 +6508,8 @@ fn index_project_inner(
     drop(dart_rows);
     codegraph_watch::dart_libraries::write_index_rows(&store, &mut dart_library_rows)?;
     drop(dart_library_rows);
+    codegraph_watch::binding_facts::write_index_rows(&store, &mut binding_facts_rows)?;
+    drop(binding_facts_rows);
     codegraph_watch::dart_libraries::write_pubspec_rows(&store, project)?;
     // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01), Kotlin
     // (W4-JVM-03), Scala (W4-SC-01), C# (W4-CS-01), member-walk (W4-CS-03)

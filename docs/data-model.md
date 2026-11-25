@@ -596,6 +596,21 @@ at another version rebuilds every row and re-resolves every JavaScript-family,
 Swift and Objective-C file of a project a bridge resolver is detected in.
 They are not a canonical surface.
 
+The import-binding lane (W7-31, OD-B72) keeps one row per text file of the
+languages with a module surface and per Python file, `binding_facts:<path>`:
+the sha256 of a canonical encoding of what resolution reads from the file
+when another file's reference goes through an import binding into it. That
+is its import mappings as resolution extracts them from the whole text, in
+order; each module-level constant or variable with its kind, name, export
+flag and full source lines; and the kind, name and export flag of each
+module-level declaration that shares its name with another, these two in the
+order the store lists a file's nodes. A full index and a migration write
+every row. A sync withdraws a file's row before it re-extracts or removes
+the file and writes the new row after its resolution is persisted; a missing
+row counts as moved, so the lane keeps no marker. They are not a canonical
+surface; the sync matrix checks that a sync leaves them as a fresh index
+writes them.
+
 `synthesis_version` (23) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws

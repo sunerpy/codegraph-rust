@@ -27891,6 +27891,484 @@ pub fn erlang_parked_macro_use_ignores_an_added_type_alias() -> Case {
         .no_edge_after(B58_USE, "calls", "type_alias config @include/types.hrl")
 }
 
+// ----- W7-31 (OD-B69, OD-B71): a reference through an import binding follows its module (lane B) --
+
+/// W7-31: the value's file imports both classes from one module; the test
+/// helper declares both too, first by path.
+const B31_KINDS: &str = "export class Logger {\n  info(message: string) {\n    return message;\n  }\n}\n\nexport class Auditor {\n  info(message: string) {\n    return message;\n  }\n}\n";
+
+/// W7-31 (#1292's annotation pattern): the value's type annotation names
+/// another class: the call in the unchanged caller follows it.
+pub fn typescript_imported_value_annotation_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/kinds.ts", B31_KINDS)
+        .file(
+            "src/logging.ts",
+            "import { Logger, Auditor } from './log/kinds';\n\nexport const logger: Logger = make();\n\nfunction make(): any {\n  return null;\n}\n",
+        )
+        .file("src/app.ts", B57_APP)
+        .write(
+            "src/logging.ts",
+            "import { Logger, Auditor } from './log/kinds';\n\nexport const logger: Auditor = make();\n\nfunction make(): any {\n  return null;\n}\n",
+        )
+        .edge_before("function run", "calls", "method Logger::info @src/log/kinds.ts")
+        .edge_after("function run", "calls", "method Auditor::info @src/log/kinds.ts")
+        .no_edge_after("function run", "calls", "method Logger::info @src/log/kinds.ts")
+}
+
+/// W7-31: two modules export a `getUser`; the object literal names the one
+/// its file imports (#1932).
+fn b31_api_project(change: Change, caller: &'static str) -> Case {
+    Case::new(change, &[Language::TypeScript])
+        .file(
+            "src/users/one.ts",
+            "export function getUser(id: string) {\n  return id;\n}\n",
+        )
+        .file(
+            "src/users/two.ts",
+            "export function getUser(id: string) {\n  return id + '2';\n}\n",
+        )
+        .file(
+            "src/api.ts",
+            "import { getUser } from './users/one';\n\nexport const api = { getUser };\n",
+        )
+        .file("src/app.ts", caller)
+        .write(
+            "src/api.ts",
+            "import { getUser } from './users/two';\n\nexport const api = { getUser };\n",
+        )
+}
+
+/// W7-31 (#1932): the object literal's file re-points the import of the
+/// binding it names: the call through the literal follows it.
+pub fn typescript_imported_object_literal_binding_re_points() -> Case {
+    b31_api_project(
+        Change::ReexportEdit,
+        "import { api } from './api';\n\nexport function run() {\n  return api.getUser('x');\n}\n",
+    )
+    .edge_before(
+        "function run",
+        "calls",
+        "function getUser @src/users/one.ts",
+    )
+    .edge_after(
+        "function run",
+        "calls",
+        "function getUser @src/users/two.ts",
+    )
+    .no_edge_after(
+        "function run",
+        "calls",
+        "function getUser @src/users/one.ts",
+    )
+}
+
+/// W7-31 (#1932): the same through a callback, a function reference and no
+/// call: lane B reads every kind written through the binding.
+pub fn typescript_imported_object_literal_binding_callback_re_points() -> Case {
+    b31_api_project(
+        Change::ReexportEdit,
+        "import { api } from './api';\n\nexport function later() {\n  setTimeout(api.getUser, 1);\n}\n",
+    )
+    .edge_before("function later", "references", "function getUser @src/users/one.ts")
+    .edge_after("function later", "references", "function getUser @src/users/two.ts")
+    .no_edge_after("function later", "references", "function getUser @src/users/one.ts")
+}
+
+/// W7-31 (OD-B72, the digest's value field): the literal's member comes to
+/// name another import of its file, with no import statement changed: the
+/// call through the literal follows it (#1932).
+pub fn typescript_imported_object_literal_member_re_binds() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/users/one.ts",
+            "export function getUser(id: string) {\n  return id;\n}\n",
+        )
+        .file(
+            "src/users/two.ts",
+            "export function fetchUser(id: string) {\n  return id + '2';\n}\n",
+        )
+        .file(
+            "src/api.ts",
+            "import { getUser } from './users/one';\nimport { fetchUser } from './users/two';\n\nexport const api = { getUser };\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { api } from './api';\n\nexport function run() {\n  return api.getUser('x');\n}\n",
+        )
+        .write(
+            "src/api.ts",
+            "import { getUser } from './users/one';\nimport { fetchUser } from './users/two';\n\nexport const api = { getUser: fetchUser };\n",
+        )
+        .edge_before("function run", "calls", "function getUser @src/users/one.ts")
+        .edge_after("function run", "calls", "function fetchUser @src/users/two.ts")
+        .no_edge_after("function run", "calls", "function getUser @src/users/one.ts")
+}
+
+/// W7-31 (OD-B72, the digest's import mappings): #2644 reads the value's
+/// file's imports as a regex over its text, so import text a comment holds
+/// ahead of the statement comes first. The call follows the class it
+/// names, with no import statement, value or declaration changed and no
+/// line moved.
+pub fn typescript_imported_value_commented_import_comes_first() -> Case {
+    b57_project(
+        Change::BodyEdit,
+        "\nimport { Logger } from './log/console';\n\nexport const logger = new Logger();\n",
+    )
+    .file("src/log/console.ts", B57_LOGGER)
+    .write(
+        "src/logging.ts",
+        "// import { Logger } from './log/file';\nimport { Logger } from './log/console';\n\nexport const logger = new Logger();\n",
+    )
+    .edge_before("function run", "calls", B57_CONSOLE_INFO)
+    .edge_after("function run", "calls", B57_FILE_INFO)
+    .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31 (OD-B72, the digest's declarations): an exported interface of
+/// the value's name, declared ahead of it, is what the named import binds
+/// (the module's first exported node of the name), so the call no longer
+/// reaches the value's class. No value or import changed.
+pub fn typescript_imported_value_namesake_comes_ahead() -> Case {
+    b57_project(Change::BodyEdit, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .write(
+            "src/logging.ts",
+            "import { Logger } from './log/console';\nexport interface logger {}\nexport const logger = new Logger();\n",
+        )
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", "interface logger @src/logging.ts")
+        .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31 (OD-B72, the digest's order): two module-level assignments of
+/// the value trade places; a named import binds the first, so the call
+/// follows the class the new first one makes. Every node keeps its line.
+pub fn python_imported_value_assignments_trade_places() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/__init__.py", "")
+        .file(
+            "app/loggers.py",
+            "class Logger:\n    def info(self, m):\n        return m\n\n\nclass Auditor:\n    def info(self, m):\n        return m\n",
+        )
+        .file(
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Logger()\nlogger = Auditor()\n",
+        )
+        .file(
+            "app/main.py",
+            "from app.logmod import logger\n\n\ndef run():\n    logger.info(\"start\")\n",
+        )
+        .write(
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Auditor()\nlogger = Logger()\n",
+        )
+        .edge_before("function run", "calls", "method Logger::info @app/loggers.py")
+        .edge_after("function run", "calls", "method Auditor::info @app/loggers.py")
+        .no_edge_after("function run", "calls", "method Logger::info @app/loggers.py")
+}
+
+/// W7-31: [`typescript_imported_value_class_import_re_points`] with a
+/// `.tsx` caller.
+pub fn tsx_imported_value_class_import_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Tsx, Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file("src/logging.ts", B57_VALUE_OF_CONSOLE)
+        .file(
+            "src/view.tsx",
+            "import { logger } from './logging';\n\nexport function View() {\n  logger.info('view');\n  return null;\n}\n",
+        )
+        .write("src/logging.ts", B57_VALUE_OF_FILE)
+        .edge_before("function View", "calls", B57_CONSOLE_INFO)
+        .edge_after("function View", "calls", B57_FILE_INFO)
+        .no_edge_after("function View", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31: [`javascript_imported_value_class_import_re_points`] with a
+/// `.jsx` caller.
+pub fn jsx_imported_value_class_import_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Jsx, Language::JavaScript])
+        .file("src/__tests__/helpers/logger.js", B57_JS_LOGGER)
+        .file("src/log/file.js", B57_JS_LOGGER)
+        .file("src/log/console.js", B57_JS_LOGGER)
+        .file("src/logging.js", B57_VALUE_OF_CONSOLE)
+        .file(
+            "src/view.jsx",
+            "import { logger } from './logging';\n\nexport function View() {\n  logger.info('view');\n  return null;\n}\n",
+        )
+        .write("src/logging.js", B57_VALUE_OF_FILE)
+        .edge_before("function View", "calls", B57_JS_CONSOLE_INFO)
+        .edge_after("function View", "calls", B57_JS_FILE_INFO)
+        .no_edge_after("function View", "calls", B57_JS_CONSOLE_INFO)
+}
+
+/// W7-31: the caller is a Vue component's `<script setup>`.
+pub fn vue_imported_value_class_import_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Vue, Language::TypeScript])
+        .file(
+            "package.json",
+            "{\"name\":\"app\",\"dependencies\":{\"vue\":\"^3.4.0\"}}\n",
+        )
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file("src/logging.ts", B57_VALUE_OF_CONSOLE)
+        .file(
+            "src/View.vue",
+            "<script setup lang=\"ts\">\nimport { logger } from './logging';\nfunction go() {\n  logger.info('go');\n}\n</script>\n<template><button @click=\"go\">go</button></template>\n",
+        )
+        .write("src/logging.ts", B57_VALUE_OF_FILE)
+        .edge_before("function go @src/View.vue", "calls", B57_CONSOLE_INFO)
+        .edge_after("function go @src/View.vue", "calls", B57_FILE_INFO)
+        .no_edge_after("function go @src/View.vue", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31: the value and its caller are ArkTS (`.ets`).
+pub fn arkts_imported_value_class_import_re_points() -> Case {
+    Case::new(
+        Change::ReexportEdit,
+        &[Language::ArkTs, Language::TypeScript],
+    )
+    .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+    .file("src/log/console.ts", B57_LOGGER)
+    .file("src/log/file.ts", B57_LOGGER)
+    .file(
+        "src/elog.ets",
+        "import { Logger } from './log/console';\n\nexport const elog = new Logger();\n",
+    )
+    .file(
+        "src/e.ets",
+        "import { elog } from './elog';\n\nexport function e(): void {\n  elog.info('e');\n}\n",
+    )
+    .write(
+        "src/elog.ets",
+        "import { Logger } from './log/file';\n\nexport const elog = new Logger();\n",
+    )
+    .edge_before("function e", "calls", B57_CONSOLE_INFO)
+    .edge_after("function e", "calls", B57_FILE_INFO)
+    .no_edge_after("function e", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31: the caller imports the value under another name: lane B reads
+/// the binding's local name, `log`.
+pub fn typescript_aliased_imported_value_class_import_re_points() -> Case {
+    b57_project(Change::ReexportEdit, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file(
+            "src/alias.ts",
+            "import { logger as log } from './logging';\n\nexport function aliased() {\n  log.info('a');\n}\n",
+        )
+        .write("src/logging.ts", B57_VALUE_OF_FILE)
+        .edge_before("function aliased", "calls", B57_CONSOLE_INFO)
+        .edge_after("function aliased", "calls", B57_FILE_INFO)
+        .no_edge_after("function aliased", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31: the caller imports the value as the module's default export,
+/// whose binding edge names the module's file node, not the value.
+pub fn typescript_default_imported_value_class_import_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file(
+            "src/logging.ts",
+            "import { Logger } from './log/console';\n\nconst base = new Logger();\nexport default base;\n",
+        )
+        .file(
+            "src/app.ts",
+            "import base from './logging';\n\nexport function run() {\n  base.info('start');\n}\n",
+        )
+        .write(
+            "src/logging.ts",
+            "import { Logger } from './log/file';\n\nconst base = new Logger();\nexport default base;\n",
+        )
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_FILE_INFO)
+        .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31 (OD-B71): a Python module's value changes class: the call in the
+/// unchanged module that imports it follows (#1292's `name = T(` pattern).
+pub fn python_imported_value_class_changes() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Python])
+        .file("app/__init__.py", "")
+        .file(
+            "app/loggers.py",
+            "class Logger:\n    def info(self, m):\n        return m\n\n\nclass Auditor:\n    def info(self, m):\n        return m\n",
+        )
+        .file(
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Logger()\n",
+        )
+        .file(
+            "app/main.py",
+            "from app.logmod import logger\n\n\ndef run():\n    logger.info(\"start\")\n",
+        )
+        .write(
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Auditor()\n",
+        )
+        .edge_before("function run", "calls", "method Logger::info @app/loggers.py")
+        .edge_after("function run", "calls", "method Auditor::info @app/loggers.py")
+        .no_edge_after("function run", "calls", "method Logger::info @app/loggers.py")
+}
+
+/// W7-31 (OD-B71, the two-hop): the value's file imports its class through
+/// a barrel, and only the barrel re-points; the surface lane re-resolves
+/// the value's file whole, and lane B takes the call through the value.
+pub fn typescript_imported_value_class_barrel_re_points() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file("src/log/index.ts", "export { Logger } from './console';\n")
+        .file(
+            "src/logging.ts",
+            "import { Logger } from './log';\n\nexport const logger = new Logger();\n",
+        )
+        .file("src/app.ts", B57_APP)
+        .write("src/log/index.ts", "export { Logger } from './file';\n")
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_FILE_INFO)
+        .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31 (OD-B72): [`typescript_imported_value_class_barrel_re_points`]
+/// with a body edit of the value's file in the same sync. Its facts did
+/// not move, but the barrel it imports its class through did: the surface
+/// lane re-resolves no re-extracted file, so lane B still takes the call.
+pub fn typescript_imported_value_class_barrel_re_points_beside_a_body_edit() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file("src/log/index.ts", "export { Logger } from './console';\n")
+        .file(
+            "src/logging.ts",
+            "import { Logger } from './log';\n\nexport const logger = new Logger();\n",
+        )
+        .file("src/app.ts", B57_APP)
+        .write("src/log/index.ts", "export { Logger } from './file';\n")
+        .write(
+            "src/logging.ts",
+            "import { Logger } from './log';\n\nexport const logger = new Logger();\n\nexport function unrelated(): number {\n  return 1;\n}\n",
+        )
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .edge_after("function run", "calls", B57_FILE_INFO)
+        .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// 501 calls through one binding, more than a name-tail retry takes.
+static B31_501_CALLS: LazyLock<String> = LazyLock::new(|| {
+    let mut text = String::from("import { logger } from './logging';\n\nexport function run() {\n");
+    for _ in 0..501 {
+        text.push_str("  logger.info('k');\n");
+    }
+    text.push_str("}\n");
+    text
+});
+
+/// W7-31: 501 calls through one binding follow the value's class change;
+/// lane B has no ceiling.
+pub fn typescript_imported_value_501_calls_follow_a_class_change() -> Case {
+    b57_project(
+        Change::BodyEdit,
+        "import { Logger } from './log/console';\nimport { Auditor } from './log/audit';\n\nexport const logger = new Logger();\n",
+    )
+    .file("src/log/console.ts", B57_LOGGER)
+    .file(
+        "src/log/audit.ts",
+        "export class Auditor {\n  info(message: string) {\n    return message;\n  }\n}\n",
+    )
+    .file("src/many.ts", B31_501_CALLS.as_str())
+    .write(
+        "src/logging.ts",
+        "import { Logger } from './log/console';\nimport { Auditor } from './log/audit';\n\nexport const logger = new Auditor();\n",
+    )
+    .edge_before("function run @src/many.ts", "calls", B57_CONSOLE_INFO)
+    .edge_after("function run @src/many.ts", "calls", "method Auditor::info @src/log/audit.ts")
+    .no_edge_after("function run @src/many.ts", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31: a local of the binding's name shadows it in one function: lane B
+/// re-resolves that call too, and it keeps the local's class.
+pub fn typescript_imported_value_call_beside_a_shadowing_local() -> Case {
+    b57_project(Change::ReexportEdit, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file(
+            "src/shadow.ts",
+            "import { logger } from './logging';\n\nclass Recorder {\n  info(message: string) {\n    return message;\n  }\n}\n\nexport function outer() {\n  logger.info('start');\n}\n\nexport function local() {\n  const logger = new Recorder();\n  return logger.info('local');\n}\n",
+        )
+        .write("src/logging.ts", B57_VALUE_OF_FILE)
+        .edge_before("function outer", "calls", B57_CONSOLE_INFO)
+        .edge_after("function outer", "calls", B57_FILE_INFO)
+        .edge_throughout("function local", "calls", "method Recorder::info")
+}
+
+/// W7-31 (OD-B71): a Python value's module goes. The call through the value
+/// loses the class the module made it from and takes the one its name says,
+/// as a fresh index does; no surface lane re-resolves a Python importer, so
+/// lane B's removal half is what brings the call along.
+pub fn python_imported_value_module_goes() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Python])
+        .file("app/__init__.py", "")
+        .file(
+            "app/loggers.py",
+            "class Logger:\n    def info(self, m):\n        return m\n\n\nclass Auditor:\n    def info(self, m):\n        return m\n",
+        )
+        .file(
+            "app/logmod.py",
+            "from app.loggers import Logger, Auditor\n\nlogger = Auditor()\n",
+        )
+        .file(
+            "app/main.py",
+            "from app.logmod import logger\n\n\ndef run():\n    logger.info(\"start\")\n",
+        )
+        .remove("app/logmod.py")
+        .edge_before("function run", "calls", "method Auditor::info @app/loggers.py")
+        .edge_after("function run", "calls", "method Logger::info @app/loggers.py")
+        .no_edge_after("function run", "calls", "method Auditor::info @app/loggers.py")
+}
+
+/// W7-31 (regression): the value's module goes: the binding links nothing
+/// and neither does the call through it (the surface lane re-resolves the
+/// caller whole).
+pub fn typescript_imported_value_module_goes() -> Case {
+    b57_project(Change::DeleteImportedModule, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .remove("src/logging.ts")
+        .edge_before("function run", "calls", B57_CONSOLE_INFO)
+        .no_edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31 (regression): the value's module appears where the caller's import
+/// named nothing.
+pub fn typescript_imported_value_module_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::TypeScript])
+        .file("src/__tests__/helpers/logger.ts", B57_HELPER)
+        .file("src/log/console.ts", B57_LOGGER)
+        .file("src/log/file.ts", B57_LOGGER)
+        .file("src/app.ts", B57_APP)
+        .write("src/logging.ts", B57_VALUE_OF_CONSOLE)
+        .edge_after("function run", "calls", B57_CONSOLE_INFO)
+}
+
+/// W7-31 (regression): the value's module gains an unrelated function and
+/// nothing moves; lane B re-resolves the call to the same method.
+pub fn typescript_imported_value_module_body_edit() -> Case {
+    b57_project(Change::BodyEdit, B57_VALUE_OF_CONSOLE)
+        .file("src/log/console.ts", B57_LOGGER)
+        .write(
+            "src/logging.ts",
+            "import { Logger } from './log/console';\n\nexport const logger = new Logger();\n\nexport function unrelated(): number {\n  return 1;\n}\n",
+        )
+        .edge_throughout("function run", "calls", B57_CONSOLE_INFO)
+}
+
 // ----- W7-28 (OD-B46): a JSX tag in a `.js` file renders as in `.jsx` -----
 
 /// [`JSX_APP`] written in `.js`.

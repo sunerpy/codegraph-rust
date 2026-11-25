@@ -162,6 +162,14 @@ pub(crate) struct SurfaceRefresh {
 }
 
 impl SurfaceRefresh {
+    /// Whether the lane read past the changed files' own surfaces: a
+    /// surface moved, a file came or went, the JavaScript controls changed,
+    /// or every row was rebuilt. Only then can what a file's unchanged
+    /// imports resolve to have moved through the modules they name.
+    pub(crate) fn walked(&self) -> bool {
+        self.rebuilt || self.barrels.is_some()
+    }
+
     /// Write the rows. Called after the sync's resolution is persisted.
     pub(crate) fn write_rows(&self, store: &Store) -> Result<()> {
         if self.rebuilt {
