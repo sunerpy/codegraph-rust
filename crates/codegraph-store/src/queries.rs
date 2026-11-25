@@ -350,10 +350,13 @@ impl Store {
             .execute("DELETE FROM nodes WHERE file_path = ?", [file_path])
     }
 
-    /// Ports `getNodeById` from `upstream db/queries.ts:412-436`.
+    /// Ports `getNodeById` from `upstream db/queries.ts:412-436`. The
+    /// statement is prepared once per connection (W7-25 cost, OD-B75): explore
+    /// asks for nodes one at a time, many times a request.
     pub fn node_by_id(&self, id: &str) -> rusqlite::Result<Option<Node>> {
         self.conn
-            .query_row("SELECT * FROM nodes WHERE id = ?", [id], row_to_node)
+            .prepare_cached("SELECT * FROM nodes WHERE id = ?")?
+            .query_row([id], row_to_node)
             .optional()
     }
 
@@ -1437,7 +1440,7 @@ impl Store {
             let sql = format!("SELECT * FROM edges WHERE {end} IN ({placeholders}) AND kind = ?");
             let mut params = chunk.iter().map(|id| id as &dyn ToSql).collect::<Vec<_>>();
             params.push(&kind);
-            edges.extend(query_edges(&self.conn, &sql, params.as_slice())?);
+            edges.extend(query_edges_once(&self.conn, &sql, params.as_slice())?);
         }
         Ok(edges)
     }
@@ -3766,7 +3769,23 @@ impl NodeColumns {
     }
 }
 
+/// The edges `sql` reads, its statement prepared once per connection, as
+/// [`query_nodes`] prepares its own (W7-25 cost, OD-B75: one explore reads
+/// a node's edges hundreds of times with the same few statements). For a
+/// statement whose text changes with its arguments, [`query_edges_once`].
 fn query_edges<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Edge>>
+where
+    P: rusqlite::Params,
+{
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(params, row_to_edge)?;
+    rows.collect()
+}
+
+/// [`query_edges`] for a statement whose text changes with its arguments (a
+/// list of placeholders as long as a chunk), prepared each time so that it
+/// does not push the fixed statements out of the connection's cache.
+fn query_edges_once<P>(conn: &Connection, sql: &str, params: P) -> rusqlite::Result<Vec<Edge>>
 where
     P: rusqlite::Params,
 {
@@ -8580,6 +8599,50 @@ mod tests {
                 .file_has_node_outside_kinds("none.ts", &kinds)
                 .unwrap()
         );
+    }
+
+    /// W7-25 cost (OD-B75): the edge and node lookups prepare their
+    /// statements once per connection, and a lookup after a write on that
+    /// connection still sees the write: a new edge, a new node, a node and its
+    /// edges deleted.
+    #[test]
+    fn cached_edge_and_node_lookups_see_later_writes() {
+        let mut store = store("cached-lookups");
+        store
+            .upsert_nodes(&[
+                node("function:a", "a", "x.ts"),
+                node("function:b", "b", "x.ts"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[edge("function:a", "function:b", EdgeKind::Calls)])
+            .unwrap();
+        let out_of_a = |store: &Store| store.edges_by_source_kind("function:a", None).unwrap();
+        let into_b = |store: &Store| {
+            store
+                .edges_by_target_kind("function:b", Some(EdgeKind::Calls))
+                .unwrap()
+        };
+        assert_eq!(out_of_a(&store).len(), 1);
+        assert_eq!(into_b(&store).len(), 1);
+        assert!(store.node_by_id("function:c").unwrap().is_none());
+
+        store
+            .upsert_nodes(&[node("function:c", "c", "y.ts")])
+            .unwrap();
+        store
+            .insert_edges(&[edge("function:a", "function:c", EdgeKind::Calls)])
+            .unwrap();
+        assert_eq!(out_of_a(&store).len(), 2);
+        assert_eq!(
+            store.node_by_id("function:c").unwrap().map(|n| n.name),
+            Some("c".to_string())
+        );
+
+        store.delete_node("function:b").unwrap();
+        assert!(store.node_by_id("function:b").unwrap().is_none());
+        assert!(into_b(&store).is_empty());
+        assert_eq!(out_of_a(&store).len(), 1);
     }
 
     /// W7-21's cost revision: a method's light row is its id, name,
