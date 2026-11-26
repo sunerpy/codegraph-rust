@@ -32,8 +32,9 @@ LLM to rediscover structure through repeated text searches.
 
 - **Deterministic:** no model calls, embeddings, or vector search; canonical graph
   output is guarded by byte-stable golden fixtures.
-- **Source-aware:** search, callers/callees, impact, file source, and multi-file
-  exploration use one indexed representation.
+- **Source-aware:** search, callers/callees, impact, file source, multi-file
+  exploration, and task context (`codegraph context`) use one indexed
+  representation.
 - **Agent-ready:** an MCP server exposes the same graph and verbatim source used by
   the CLI.
 - **Visual (preview):** a local browser viewer reads the same index: a symbol's
@@ -42,7 +43,10 @@ LLM to rediscover structure through repeated text searches.
 - **Local-first:** the index lives under the project; the shared daemon and HTTP
   transport are local processes.
 - **Broad language coverage:** grammar-backed languages, embedded/template files,
-  and framework-aware Godot/Tauri/JS ecosystem relationships share one schema.
+  and framework-aware relationships (routes, navigation, rendered components and
+  the dispatch that framework conventions imply) share one schema. A Lua project
+  that loads its modules through functions of its own can
+  [name them](docs/cli.md#custom-lua-module-loaders-lua) in its configuration.
 - **Incremental:** `sync` and the watcher update changed files while preserving the
   same final canonical result as a clean index.
 
@@ -154,6 +158,7 @@ codegraph index .                 # full rebuild of the selected project
 codegraph search "symbol" -p .
 codegraph explore "area or flow" -p .
 codegraph node "symbol-or-id" -p .
+codegraph context "task" -p .     # entry points, symbols and code for a task
 codegraph files -p . --format tree
 
 # Relationships

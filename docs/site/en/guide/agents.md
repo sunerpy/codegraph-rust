@@ -91,6 +91,10 @@ An agent sees the first four tools in its tool list; the others can still be cal
 list more, for example `CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact`. Every tool is read-only and marked as
 such, so agents that honour MCP's hints do not ask for confirmation.
 
+`codegraph context "<task>"` has no MCP tool. On the command line it gathers a task's entry points, the symbols
+around them and their code, as Markdown or JSON, for scripts and other tools.
+[CLI reference](../../../cli.md#codegraph-context--task-context-as-markdown-or-json)
+
 ## Over HTTP
 
 Editors that prefer HTTP, and remote development over SSH, can use the streamable-HTTP transport:

@@ -31,6 +31,11 @@ When the file exists it must have an `[app]` table with a `name`; without it eve
 | `indexing.deprioritize`  | none                                                                                         | Paths that stay indexed but rank below your own code in `search` and `explore`.                                                                                                                                      |
 | `watch.enabled`          | `true`                                                                                       | Whether the background process watches the files.                                                                                                                                                                    |
 | `watch.debounce_ms`      | `2000`                                                                                       | How long the watcher waits for a burst of changes to settle.                                                                                                                                                         |
+| `lua.loader_functions`   | none                                                                                         | Functions a Lua project loads its modules through, such as `Require`. A call to one with a string literal is read the way a `require` of that string is.                                                             |
+| `lua.module_roots`       | none                                                                                         | Folders, relative to the project root, where a loaded or required Lua module is looked for first.                                                                                                                    |
+
+The Lua settings, their JSON form in `codegraph.json` and the rules for loader names and roots are in the
+[CLI reference](../../../cli.md#custom-lua-module-loaders-lua).
 
 The project's `.gitignore` applies too: what Git ignores, CodeGraph does not index. A change to `config.toml` or to
 the root `.gitignore` takes effect without a restart; run `codegraph sync` if no background process is running.

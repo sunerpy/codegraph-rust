@@ -29,6 +29,10 @@ deprioritize = ["vendor/**"]
 | `indexing.deprioritize`  | 无                                                               | 仍然索引，但在 `search` 和 `explore` 中排在你自己的代码之后的路径。                                                                                              |
 | `watch.enabled`          | `true`                                                           | 后台进程是否监听文件。                                                                                                                                           |
 | `watch.debounce_ms`      | `2000`                                                           | 监听等待一连串变化平息的时间。                                                                                                                                   |
+| `lua.loader_functions`   | 无                                                               | Lua 项目用来加载模块的函数，例如 `Require`。以字符串字面量调用这些函数时，按同一字符串的 `require` 处理。                                                        |
+| `lua.module_roots`       | 无                                                               | 查找被加载或被 `require` 的 Lua 模块时优先查找的文件夹，相对于项目根目录。                                                                                       |
+
+Lua 设置在 `codegraph.json` 中的 JSON 写法，以及函数名和文件夹的规则，见 [CLI 参考](../../cli.md#custom-lua-module-loaders-lua)。
 
 项目的 `.gitignore` 同样生效：Git 忽略的文件，CodeGraph 不会索引。修改 `config.toml` 或根目录的 `.gitignore` 后无需重启即可生效；如果没有后台进程在运行，请执行 `codegraph sync`。
 

@@ -268,3 +268,4 @@ src/pricing.ts
 - [接入编码 Agent](agents.md)，让它自己提出这些问题。
 - [打开浏览器查看器](viewer.md)，以可视化方式阅读同一份索引。
 - [保持索引最新](keeping-current.md)，在编辑代码时跟上变化。
+- 用 `codegraph context` [收集一项任务的上下文](../../cli.md#codegraph-context--task-context-as-markdown-or-json)，以 Markdown 或 JSON 输出，供脚本和其他工具使用。

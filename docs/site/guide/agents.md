@@ -76,6 +76,8 @@ Skill 是一份简短的说明文件，告诉 Agent 在什么情况下使用哪�
 
 Agent 的工具列表中默认显示前四个工具，其余工具仍然可以调用。设置 `CODEGRAPH_MCP_TOOLS` 可以显示更多工具，例如 `CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact`。所有工具都是只读的，并按 MCP 的约定做了标注，遵循这些标注的 Agent 不会为调用请求确认。
 
+`codegraph context "<任务>"` 没有对应的 MCP 工具。它在命令行中收集一项任务的入口点、相关符号及其代码，以 Markdown 或 JSON 输出，供脚本和其他工具使用。[CLI 参考](../../cli.md#codegraph-context--task-context-as-markdown-or-json)
+
 ## 通过 HTTP
 
 偏好 HTTP 的编辑器，以及通过 SSH 进行的远程开发，可以使用 streamable HTTP 传输：

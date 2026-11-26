@@ -30,13 +30,15 @@ CodeGraph 把源码树转换成本地知识图谱：符号成为节点，调用�
 
 - **确定性：** 无模型调用、embedding 或向量检索；字节稳定 golden fixture 守护
   canonical 图谱输出。
-- **源码感知：** search、callers/callees、impact、文件源码和多文件探索共享同一索引。
+- **源码感知：** search、callers/callees、impact、文件源码、多文件探索和任务上下文
+  （`codegraph context`）共享同一索引。
 - **代理友好：** MCP 服务器暴露与 CLI 相同的图谱和逐字源码。
 - **可视化（预览）：** 本地浏览器查看器读取同一份索引：并排显示一个符号的调用方、
   源码和被调用方，以及调用路径、架构图、类型层级和没有代码到达的符号。
 - **本地优先：** 索引位于项目内；共享 daemon 和 HTTP transport 都是本地进程。
-- **广泛语言覆盖：** grammar、嵌入式/模板文件以及 Godot、Tauri、JS 生态框架
-  关系使用同一 schema。
+- **广泛语言覆盖：** grammar、嵌入式/模板文件，以及按框架约定得出的关系（路由与
+  导航、组件渲染、框架约定隐含的分派）使用同一 schema。通过自有函数加载模块的
+  Lua 项目，可以在配置中[声明这些函数](../cli.md#custom-lua-module-loaders-lua)。
 - **增量更新：** `sync` 与 watcher 只处理变化文件，最终 canonical 结果与干净全量
   索引一致。
 
@@ -144,6 +146,7 @@ codegraph index .                 # 对选中项目完整重建
 codegraph search "symbol" -p .
 codegraph explore "area or flow" -p .
 codegraph node "symbol-or-id" -p .
+codegraph context "task" -p .     # 任务的入口点、相关符号与代码
 codegraph files -p . --format tree
 
 # 关系查询
