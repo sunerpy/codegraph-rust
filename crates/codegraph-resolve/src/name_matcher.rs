@@ -5021,16 +5021,25 @@ pub(crate) fn infer_local_receiver_declaration(
         }
         None
     };
+    // The nearest declaration above the call, each line of the scope read
+    // once per receiver however many calls ask (table 9.1 row 24).
+    if !component_scoped {
+        return facts.receiver_declaration(
+            start_idx,
+            reference.language,
+            scan_receiver,
+            call_idx,
+            |i| match_line(line(i)),
+        );
+    }
     for i in (start_idx..=call_idx).rev() {
         if let Some(declared) = match_line(line(i)) {
             return Some(declared);
         }
     }
-    if component_scoped {
-        for i in call_idx + 1..line_count {
-            if let Some(declared) = match_line(line(i)) {
-                return Some(declared);
-            }
+    for i in call_idx + 1..line_count {
+        if let Some(declared) = match_line(line(i)) {
+            return Some(declared);
         }
     }
     None

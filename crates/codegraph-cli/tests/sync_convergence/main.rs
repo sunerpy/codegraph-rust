@@ -1124,6 +1124,7 @@ matrix! {
     java_overload_delegation_body_edit,
     python_call_ignores_a_react_hook_body_edit,
     typescript_type_parameter_added_body_edit,
+    typescript_local_receiver_declared_above_repeated_calls,
     python_function_value_bound_by_an_added_parameter,
     javascript_minified_script_becomes_readable,
     javascript_readable_script_becomes_minified,

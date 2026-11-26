@@ -30,6 +30,39 @@ fn smoke_typescript_call_edge_through_a_named_import() {
     assert_no_edge!(project, "function add" => calls => "function run");
 }
 
+/// Table 9.1 row 24 (upstream 974e6c8, #1392): a scope's receiver
+/// declarations are read once for all of its calls. Three calls under one
+/// `const svc = new Service()` reach `Service::run`; a later function that
+/// declares no `svc` keeps its call unresolved, and one that declares its own
+/// `svc` reaches its own type. One file holds the three, so a scan the first
+/// function's calls ran must not answer for the other two.
+#[test]
+fn pr1392_a_scope_reads_its_receiver_declarations_once_for_all_its_calls() {
+    let project = Project::new()
+        .file(
+            "src/service.ts",
+            "export class Service {\n  run(): number {\n    return 1;\n  }\n}\nexport class Other {\n  run(): number {\n    return 2;\n  }\n}\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { Service, Other } from './service';\n\nexport function first(): number {\n  const svc = new Service();\n  svc.run();\n  svc.run();\n  return svc.run();\n}\n\nexport function second(): number {\n  return svc.run();\n}\n\nexport function third(): number {\n  const svc = new Other();\n  return svc.run();\n}\n",
+        )
+        .index();
+    assert_eq!(
+        project
+            .graph()
+            .edges_matching("function first", "calls", "method Service::run")
+            .len(),
+        3,
+        "{}",
+        project.graph().report()
+    );
+    assert_no_edge!(project, "function second" => calls => "method Service::run");
+    assert_unresolved!(project, "function second" => calls => "svc.run");
+    assert_edge!(project, "function third" => calls => "method Other::run", resolved_by = "instance-method");
+    assert_no_edge!(project, "function third" => calls => "method Service::run");
+}
+
 #[test]
 fn smoke_external_import_stays_unresolved() {
     let project = Project::new()

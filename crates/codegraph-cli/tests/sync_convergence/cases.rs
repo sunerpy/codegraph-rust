@@ -776,6 +776,28 @@ pub fn typescript_type_parameter_added_body_edit() -> Case {
         .no_edge_after("function wrap", "references", "class T @src/model.ts")
 }
 
+/// Table 9.1 row 24 (upstream 974e6c8): the local declaration above
+/// repeated calls changes its type, and every call follows it; the scan of
+/// the scope's lines is remembered per receiver within one pass only.
+pub fn typescript_local_receiver_declared_above_repeated_calls() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/service.ts",
+            "export class Service {\n  run(): number {\n    return 1;\n  }\n}\nexport class Other {\n  run(): number {\n    return 2;\n  }\n}\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { Service, Other } from './service';\n\nexport function first(): number {\n  const svc = new Other();\n  svc.run();\n  svc.run();\n  return svc.run();\n}\n",
+        )
+        .write(
+            "src/app.ts",
+            "import { Service, Other } from './service';\n\nexport function first(): number {\n  const svc = new Service();\n  svc.run();\n  svc.run();\n  return svc.run();\n}\n",
+        )
+        .edge_before("function first", "calls", "method Other::run")
+        .edge_after("function first", "calls", "method Service::run")
+        .no_edge_after("function first", "calls", "method Other::run")
+}
+
 /// `util.js` with `u` on its first line and, below it, a data array: on one
 /// line of 5,000 characters of code (a minified script), or split over many.
 fn util_script(minified: bool) -> String {
