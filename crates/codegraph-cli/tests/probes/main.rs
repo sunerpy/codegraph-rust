@@ -14538,7 +14538,7 @@ mod php {
 }
 
 mod lua {
-    use super::support::{Graph, Project};
+    use super::support::{Graph, Project, assert_edge, assert_unresolved};
 
     /// `file: qualified_name` of every call edge out of `file`'s nodes, sorted
     /// (upstream's `callsFrom`).
@@ -14788,6 +14788,241 @@ mod lua {
             "codegraph.json's extensions still apply\n{}",
             project.graph().report()
         );
+    }
+
+    /// A `.codegraph/config.toml` naming `loaders` in its `[lua]` table.
+    fn loader_config(loaders: &str) -> String {
+        format!("[app]\nname = \"w902\"\n\n[lua]\nloader_functions = [{loaders}]\n")
+    }
+
+    /// The `imports` edges out of `file`'s nodes as `source -> target file`,
+    /// sorted.
+    fn imports_from(graph: &Graph, file: &str) -> Vec<String> {
+        let mut out: Vec<String> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "imports")
+            .filter_map(|e| Some((graph.node(&e.source)?, graph.node(&e.target)?)))
+            .filter(|(source, _)| source.file_path == file)
+            .map(|(source, target)| format!("{} -> {}", source.kind, target.file_path))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// W9-02 (#1617): the issue's shape. A call of a configured loader with
+    /// a string literal is an import of the module the literal names, as
+    /// `require`'s is: a path (`Script/Activity/ActivityMgrC`) or a dotted
+    /// name (`ui.button`), a call or the string-call form. Without the
+    /// setting neither is an import, and the statement is the unresolved
+    /// call it is today.
+    #[test]
+    fn w902_a_loader_call_imports_the_file_its_literal_names() {
+        let files = [
+            (
+                "Script/Activity/ActivityMgrC.lua",
+                "local M = {}\nfunction M.open()\n  return 1\nend\nreturn M\n",
+            ),
+            ("ui/button.lua", "local B = {}\nreturn B\n"),
+            (
+                "client.lua",
+                "Require(\"Script/Activity/ActivityMgrC\")\nlocal button = Include \"ui.button\"\nreturn button\n",
+            ),
+        ];
+        let configured = files
+            .iter()
+            .fold(
+                Project::new().file(
+                    ".codegraph/config.toml",
+                    &loader_config("\"Require\", \"Include\""),
+                ),
+                |project, (path, text)| project.file(path, text),
+            )
+            .index();
+        assert_edge!(configured, "file:client.lua" => imports => "file:Script/Activity/ActivityMgrC.lua", resolved_by = "import");
+        assert_edge!(configured, "file:client.lua" => imports => "file:ui/button.lua", resolved_by = "import");
+        assert!(
+            configured
+                .graph()
+                .unresolved_matching("file:client.lua", "calls", "Require")
+                .is_empty()
+                && configured
+                    .graph()
+                    .unresolved_matching("file:client.lua", "calls", "Include")
+                    .is_empty(),
+            "a loader call is no call\n{}",
+            configured.graph().report()
+        );
+
+        let plain = files
+            .iter()
+            .fold(Project::new(), |project, (path, text)| {
+                project.file(path, text)
+            })
+            .index();
+        assert_eq!(
+            imports_from(plain.graph(), "client.lua"),
+            Vec::<String>::new(),
+            "{}",
+            plain.graph().report()
+        );
+        assert_unresolved!(plain, "file:client.lua" => calls => "Require");
+    }
+
+    /// W9-02: a dotted loader matches the call's whole path of names, its
+    /// spacing aside; a shorter path is another function.
+    #[test]
+    fn w902_a_dotted_loader_is_matched_by_its_whole_path() {
+        let project = Project::new()
+            .file(".codegraph/config.toml", &loader_config("\"Script.Load\""))
+            .file("ui/button.lua", "return {}\n")
+            .file("ui/panel.lua", "return {}\n")
+            .file("ui/menu.lua", "return {}\n")
+            .file(
+                "boot.lua",
+                "Script.Load(\"ui.button\")\nScript . Load(\"ui.panel\")\nLoad(\"ui.menu\")\n",
+            )
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "boot.lua"),
+            vec![
+                "file -> ui/button.lua".to_string(),
+                "file -> ui/panel.lua".to_string(),
+            ],
+            "{}",
+            project.graph().report()
+        );
+        assert_unresolved!(project, "file:boot.lua" => calls => "Load");
+    }
+
+    /// W9-02: only one plain string literal names a loader's module (the
+    /// issue: anything else stays the unresolved call it is today).
+    #[test]
+    fn w902_a_loader_call_without_one_plain_literal_stays_a_call() {
+        let project = Project::new()
+            .file(".codegraph/config.toml", &loader_config("\"Require\""))
+            .file("ui/button.lua", "return {}\n")
+            .file(
+                "main.lua",
+                "local name = \"button\"\nRequire(\"ui.\" .. name)\nRequire(name)\nRequire((\"ui.button\"))\nRequire{\"ui.button\"}\n",
+            )
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "main.lua"),
+            Vec::<String>::new(),
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(
+            project
+                .graph()
+                .unresolved_matching("file:main.lua", "calls", "Require")
+                .len(),
+            4,
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// W9-02: a loader call in a function's body stays a call, as a
+    /// `require` there does (upstream walks a body's calls as calls).
+    #[test]
+    fn w902_a_loader_call_in_a_function_body_stays_a_call() {
+        let project = Project::new()
+            .file(".codegraph/config.toml", &loader_config("\"Require\""))
+            .file("ui/button.lua", "return {}\n")
+            .file(
+                "main.lua",
+                "local function open()\n  return Require(\"ui.button\")\nend\nreturn open\n",
+            )
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "main.lua"),
+            Vec::<String>::new(),
+            "{}",
+            project.graph().report()
+        );
+        assert_unresolved!(project, "function open" => calls => "Require");
+    }
+
+    /// W9-02: `config.toml`'s `loader_functions` replaces `codegraph.json`'s
+    /// `loaderFunctions` whole; without it, `codegraph.json`'s apply.
+    #[test]
+    fn w902_toml_lua_keys_replace_codegraph_json_keys() {
+        let json = "{\"lua\": {\"loaderFunctions\": [\"Include\"]}}\n";
+        let main = "Require(\"ui.button\")\nInclude(\"ui.panel\")\n";
+        let both = Project::new()
+            .file(".codegraph/config.toml", &loader_config("\"Require\""))
+            .file(".codegraph/codegraph.json", json)
+            .file("ui/button.lua", "return {}\n")
+            .file("ui/panel.lua", "return {}\n")
+            .file("main.lua", main)
+            .index();
+        assert_eq!(
+            imports_from(both.graph(), "main.lua"),
+            vec!["file -> ui/button.lua".to_string()],
+            "{}",
+            both.graph().report()
+        );
+        assert_unresolved!(both, "file:main.lua" => calls => "Include");
+
+        let json_only = Project::new()
+            .file(".codegraph/codegraph.json", json)
+            .file("ui/button.lua", "return {}\n")
+            .file("ui/panel.lua", "return {}\n")
+            .file("main.lua", main)
+            .index();
+        assert_eq!(
+            imports_from(json_only.graph(), "main.lua"),
+            vec!["file -> ui/panel.lua".to_string()],
+            "{}",
+            json_only.graph().report()
+        );
+        assert_unresolved!(json_only, "file:main.lua" => calls => "Require");
+    }
+
+    /// W9-02: `APP_CONFIG` replaces the project's `config.toml` whole, as it
+    /// does for every section: the project's `[lua]` is not read, the
+    /// override's is, and so is the project's `codegraph.json`.
+    #[test]
+    fn w902_app_config_replaces_the_project_config_toml() {
+        let overrides = assert_fs::TempDir::new().expect("a directory for the override");
+        let main = "Require(\"ui.button\")\nInclude(\"ui.panel\")\nLoad(\"ui.menu\")\n";
+        let project = || {
+            Project::new()
+                .file(".codegraph/config.toml", &loader_config("\"Require\""))
+                .file(
+                    ".codegraph/codegraph.json",
+                    "{\"lua\": {\"loaderFunctions\": [\"Include\"]}}\n",
+                )
+                .file("ui/button.lua", "return {}\n")
+                .file("ui/panel.lua", "return {}\n")
+                .file("ui/menu.lua", "return {}\n")
+                .file("main.lua", main)
+        };
+
+        let plain_override = overrides.path().join("plain.toml");
+        std::fs::write(&plain_override, "[app]\nname = \"global\"\n").unwrap();
+        let (indexed, _) = project().index_with_env(&[("APP_CONFIG", plain_override.as_os_str())]);
+        assert_eq!(
+            imports_from(indexed.graph(), "main.lua"),
+            vec!["file -> ui/panel.lua".to_string()],
+            "the project's [lua] is not read, its codegraph.json is\n{}",
+            indexed.graph().report()
+        );
+        assert_unresolved!(indexed, "file:main.lua" => calls => "Require");
+
+        let lua_override = overrides.path().join("lua.toml");
+        std::fs::write(&lua_override, loader_config("\"Load\"")).unwrap();
+        let (indexed, _) = project().index_with_env(&[("APP_CONFIG", lua_override.as_os_str())]);
+        assert_eq!(
+            imports_from(indexed.graph(), "main.lua"),
+            vec!["file -> ui/menu.lua".to_string()],
+            "the override's [lua] replaces codegraph.json's loaders\n{}",
+            indexed.graph().report()
+        );
+        assert_unresolved!(indexed, "file:main.lua" => calls => "Require");
+        assert_unresolved!(indexed, "file:main.lua" => calls => "Include");
     }
 }
 

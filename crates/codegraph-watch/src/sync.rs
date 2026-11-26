@@ -863,6 +863,16 @@ fn sync_paths_with_store(
     if tests::FAIL_AFTER_SHOPIFY_REFRESH.with(std::cell::Cell::get) {
         bail!("injected sync failure after the theme lane's refresh");
     }
+    // The project's custom Lua loaders and module roots (#1617), compared
+    // with the settings the index records before anything changes, once
+    // every marker the first change withdraws is read: new settings
+    // withdraw the record first, so a sync stopping partway leaves the next
+    // one to extract every Lua file again (W9-02).
+    let loaders_change = crate::lua_modules::loaders_change(store, &scope.options.lua_loaders)?;
+    if loaders_change != crate::lua_modules::LoadersChange::Same {
+        changed_names.begin_mutation(store)?;
+        crate::lua_modules::withdraw_loaders(store)?;
+    }
     let total = paths.len();
     for (done, path) in paths.into_iter().enumerate() {
         let Some(relative) = policy.normalize_relative(path.as_path()) else {
@@ -989,6 +999,7 @@ fn sync_paths_with_store(
         || any_bootstrap
         || control.any()
         || pubspecs.moved()
+        || loaders_change != crate::lua_modules::LoadersChange::Same
         || crate::control_inputs::frameworks_unchecked(store)?;
     let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
         .with_max_file_size(scope.options.max_file_size);
@@ -1032,6 +1043,39 @@ fn sync_paths_with_store(
             )? {
                 reindexed.insert(file.path);
             }
+        }
+    }
+    // A loader call is an import only under the settings that name it
+    // (W9-02): when the loader names changed, or the record is missing,
+    // every Lua and Luau file is extracted again, before any lane reads
+    // the changes. A framework change has re-extracted every file already.
+    if matches!(
+        loaders_change,
+        crate::lua_modules::LoadersChange::Loaders | crate::lua_modules::LoadersChange::Bootstrap
+    ) && !frameworks_changed
+    {
+        let skip =
+            |path: &str| reindexed.contains(path) || changed_names.removed_files.contains(path);
+        for path in crate::lua_modules::every_lua_file(store, &skip)? {
+            if sync_one(
+                project_root,
+                store,
+                &path,
+                scope,
+                rehash,
+                &mut outcome,
+                &mut dependent_sites,
+                &mut dependent_fallbacks,
+                &mut changed_names,
+                false,
+                true,
+            )? {
+                reindexed.insert(path);
+            }
+        }
+        #[cfg(test)]
+        if tests::FAIL_AFTER_LUA_LOADER_REEXTRACT.with(std::cell::Cell::get) {
+            bail!("injected sync failure once every Lua file is extracted again");
         }
     }
 
@@ -2169,6 +2213,7 @@ fn sync_paths_with_store(
         dart.write_rows(store)?;
         dart_libraries.write_rows(store)?;
         lua.write_rows(store)?;
+        crate::lua_modules::write_loaders(store, &scope.options.lua_loaders)?;
         crate::module_surfaces::finish_bootstrap(store)?;
         crate::cpp_dependents::write_marker(store)?;
         crate::java_heads::write_marker(store)?;
@@ -4203,6 +4248,10 @@ pub(crate) mod tests {
         /// Fail the next Lua row rebuild once the old rows are purged and
         /// one is written back.
         pub(crate) static FAIL_AFTER_LUA_ROW_PURGE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Fail the next sync that extracts every Lua file again for new
+        /// loader settings, once it has (W9-02).
+        pub(crate) static FAIL_AFTER_LUA_LOADER_REEXTRACT: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
         /// Fail the next Dart row rebuild once the old rows are purged and
         /// one is written back.
@@ -7739,6 +7788,95 @@ pub(crate) mod tests {
         assert_eq!(lua_marker(&db), version);
         assert_eq!(lua_rows(&db), rows);
         assert_eq!(edge_projection(&db), expected);
+    }
+
+    fn lua_loaders_record(db: &Path) -> Option<String> {
+        Store::open(db)
+            .unwrap()
+            .get_project_metadata(crate::lua_modules::LOADERS_KEY)
+            .unwrap()
+    }
+
+    const LUA_LOADED: (&str, &str) = (
+        "Script/Foo.lua",
+        "local M = {}\nfunction M.run()\n  return 1\nend\nreturn M\n",
+    );
+    const LUA_LOADER_CALLER: (&str, &str) = ("main.lua", "Require(\"Script.Foo\")\nreturn {}\n");
+    const LUA_LOADER_CONFIG: (&str, &str) = (
+        ".codegraph/config.toml",
+        "[app]\nname = \"lua-loaders\"\n\n[lua]\nloader_functions = [\"Require\"]\n",
+    );
+
+    /// W9-02: a sync for new Lua loader settings withdraws the record before
+    /// it changes anything, so one failing once every Lua file is extracted
+    /// again leaves the record away, and the next sync, with nothing
+    /// changed, extracts them again and converges with a fresh index.
+    #[test]
+    fn a_failed_loader_change_sync_leaves_the_record_withdrawn() {
+        let dir = TestDir::new("lua-loaders-fail");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LUA_LOADED, LUA_LOADER_CALLER];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let unconfigured = codegraph_extract::LuaLoaders::default().canonical_json();
+        assert_eq!(lua_loaders_record(&db), Some(unconfigured));
+        let imports_foo = |db: &Path| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.starts_with("main.lua:main.lua -[imports]-> Script/Foo.lua:"))
+        };
+        assert!(!imports_foo(&db), "{:#?}", edge_projection(&db));
+
+        write_files(dir.path(), &[LUA_LOADER_CONFIG]);
+        FAIL_AFTER_LUA_LOADER_REEXTRACT.with(|fail| fail.set(true));
+        let failed = sync_changed_paths(dir.path(), &db, Vec::<&str>::new());
+        FAIL_AFTER_LUA_LOADER_REEXTRACT.with(|fail| fail.set(false));
+        assert!(failed.is_err(), "the injected failure must stop the sync");
+        assert_eq!(
+            lua_loaders_record(&db),
+            None,
+            "the sync withdrew the record before its first change"
+        );
+
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        let configured = ProjectScope::load(dir.path(), &index_paths(dir.path()).unwrap())
+            .unwrap()
+            .options
+            .lua_loaders
+            .canonical_json();
+        assert_eq!(lua_loaders_record(&db), Some(configured));
+        assert!(imports_foo(&db), "{:#?}", edge_projection(&db));
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "lua-loaders-fail-fresh",
+                &[LUA_LOADER_CONFIG, LUA_LOADED, LUA_LOADER_CALLER]
+            )
+        );
+    }
+
+    /// W9-02: a project naming no Lua loader records that too, so its next
+    /// sync extracts only what changed, never every Lua file.
+    #[test]
+    fn a_lua_project_without_settings_does_not_reextract_on_sync() {
+        let dir = TestDir::new("lua-loaders-none");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [LUA_PHASES_EXPORTING, LUA_HANDLER, LUA_SPARE];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        assert_eq!(
+            lua_loaders_record(&db),
+            Some(codegraph_extract::LuaLoaders::default().canonical_json())
+        );
+        write_files(dir.path(), &[LUA_SPARE_EDITED]);
+        let outcome = sync_changed_paths(dir.path(), &db, [LUA_SPARE.0]).unwrap();
+        assert_eq!(outcome.changed_paths, vec![LUA_SPARE.0.to_string()]);
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            outcome.changed_paths.is_empty(),
+            "{:?}",
+            outcome.changed_paths
+        );
     }
 
     fn r_marker(db: &Path) -> Option<String> {

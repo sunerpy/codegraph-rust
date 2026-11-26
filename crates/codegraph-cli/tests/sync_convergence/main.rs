@@ -514,6 +514,8 @@ fn run_case(name: &str, case: &Case) {
         "rn_bridge",
         // The binding-facts rows lane B compares (W7-31, OD-B72).
         "binding_facts",
+        // The Lua loader settings the index records (W9-02).
+        "lua_loaders",
     ] {
         let fresh_rows = comparable_rows(&fresh.db(), prefix);
         for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -1011,6 +1013,7 @@ matrix! {
     csharp_using_of_an_added_namespace,
     java_import_of_an_added_class,
     lua_require_of_an_added_module,
+    lua_loader_target_appears,
     typescript_out_of_repo_call_ignores_an_added_namesake,
     svelte_lib_alias_call_reaches_an_added_module,
     vue_bare_call_ignores_an_added_interface_property,
@@ -1519,6 +1522,10 @@ matrix! {
     python_root_gitignore_hides_a_competitor,
     python_repository_exclude_hides_a_competitor,
     lua_extension_override_appears_in_codegraph_json,
+    lua_loader_functions_appear_in_config_toml,
+    lua_loader_function_leaves_config_toml,
+    lua_loader_functions_appear_in_codegraph_json,
+    luau_loader_functions_appear_in_config_toml,
     typescript_tsconfig_paths_alias_appears,
     typescript_tsconfig_past_64_mib_replaced_with_its_size_and_mtime_kept,
     typescript_react_dependency_appears_in_package_json,

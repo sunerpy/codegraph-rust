@@ -474,6 +474,27 @@ pub fn extract_source_with_observer(
     source: &str,
     language: Option<Language>,
     overrides: &ExtensionOverrides,
+    observer: impl FnMut(ExtractionStage),
+) -> ExtractionResult {
+    extract_source_with_settings(
+        file_path,
+        source,
+        language,
+        overrides,
+        LuaLoaders::unconfigured(),
+        observer,
+    )
+}
+
+/// [`extract_source_with_observer`] under one project's Lua loader settings
+/// too ([`ExtractOptions::lua_loaders`]): a call of a configured loader is a
+/// module import, as `require` is.
+fn extract_source_with_settings(
+    file_path: &str,
+    source: &str,
+    language: Option<Language>,
+    overrides: &ExtensionOverrides,
+    lua_loaders: &LuaLoaders,
     mut observer: impl FnMut(ExtractionStage),
 ) -> ExtractionResult {
     let start = Instant::now();
@@ -557,6 +578,7 @@ pub fn extract_source_with_observer(
     let parse_has_error = tree.root_node().has_error();
     let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
         .with_raw_source(source)
+        .with_lua_loaders(lua_loaders)
         .extract(start.elapsed().as_millis() as i64);
     // A CommonJS `require('./x')` is a file import, as ESM's `import` is
     // (upstream #2263).
@@ -635,9 +657,14 @@ pub fn extraction_of(
     observer: impl FnMut(ExtractionStage),
 ) -> ExtractionResult {
     match source {
-        SourceText::Text(text) => {
-            extract_source_with_observer(relative_path, text, None, &options.extensions, observer)
-        }
+        SourceText::Text(text) => extract_source_with_settings(
+            relative_path,
+            text,
+            None,
+            &options.extensions,
+            &options.lua_loaders,
+            observer,
+        ),
         SourceText::Oversize(size) => size_skip_result(relative_path, *size, options.max_file_size),
         SourceText::MpegTransportStream => ExtractionResult {
             nodes: Vec::new(),

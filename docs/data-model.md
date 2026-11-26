@@ -522,6 +522,18 @@ or a row it cannot read, withdraws the marker before changing anything,
 re-resolves every Lua file and rebuilds the rows, even with nothing changed.
 Neither is a canonical surface.
 
+`lua_loaders` records the project's custom Lua module loaders (`config.toml`
+`[lua]`, `codegraph.json` `lua`) as the JSON
+`{"loaderFunctions": [...], "moduleRoots": [...]}`: the loader names sorted,
+each once, and the module roots in the order written, each once, `""` for the
+project root. A full index and a migration write it, for a project naming
+neither too (two empty arrays), and so does every sync whose resolution is
+persisted. A sync reads it before its first change and, when the current
+settings differ, deletes it before anything changes. A sync that finds it
+missing or unreadable, or naming other loaders, extracts every Lua and Luau
+file again (chosen by the language of its file row) and resolves them whole.
+It is not a canonical surface.
+
 The case-folded lane stores no rows, only its marker:
 `case_folded_names_version` (1) is written by a full index, a migration and
 every sync whose resolution is persisted, and withdrawn with the others before
@@ -656,7 +668,11 @@ cross-file nodes in it (the routes of React Router tables, which no single
 file's extraction makes and a sync's re-extraction of the file merges in). Its value is `1:` and the
 sha256 of the inputs that decide what an unchanged file's extraction yields:
 the extension overrides, `max_file_size`, the Godot DSL configuration, the
-extraction version and the `frameworks_detected` row. Only a full index (`init`,
+extraction version and the `frameworks_detected` row. The Lua loader names
+decide a Lua file's extraction too but are left out: a sync that finds other
+names in the `lua_loaders` row, or no row, extracts every Lua file again before
+any dependent is resolved, so no Lua file is resolved from rows another set of
+names extracted. Only a full index (`init`,
 `index`, the rebuild of an outdated index) writes it, once resolution and
 framework finalization are persisted. A sync reads it before its first change,
 withdraws it with the other markers at that change, and writes it back once the

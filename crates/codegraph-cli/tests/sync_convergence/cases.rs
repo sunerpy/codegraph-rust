@@ -264,6 +264,16 @@ pub fn lua_require_of_an_added_module() -> Case {
         .edge_after("file:main.lua", "imports", "file:util.lua")
 }
 
+/// W9-02 (#1617): a call of a configured Lua loader parks its literal like
+/// a `require`, and links the module once its file appears.
+pub fn lua_loader_target_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Lua])
+        .file(".codegraph/config.toml", LUA_LOADER_CONFIG)
+        .file("main.lua", "Require(\"ui.button\")\nreturn {}\n")
+        .write("ui/button.lua", LUA_BUTTON)
+        .edge_after("file:main.lua", "imports", "file:ui/button.lua")
+}
+
 /// Upstream #2263 and #2392 (1): a side-effect import names a file, so one
 /// that names no file yet parks and links it when it appears (it used to bind
 /// its own import statement).
@@ -10024,6 +10034,59 @@ pub fn python_repository_exclude_hides_a_competitor() -> Case {
         .write(".git/info/exclude", "legacy/\n")
         .edge_before("function main", "calls", "function helper @legacy/beta.py")
         .edge_after("function main", "calls", "function helper @tools/alpha.py")
+}
+
+/// W9-02 (#1617): a project's Lua module loaders, in `config.toml`.
+const LUA_LOADER_CONFIG: &str =
+    "[app]\nname = \"matrix\"\n\n[lua]\nloader_functions = [\"Require\"]\n";
+const LUA_PLAIN_CONFIG: &str = "[app]\nname = \"matrix\"\n";
+const LUA_BUTTON: &str = "local B = {}\n\nfunction B.press()\n  return 1\nend\n\nreturn B\n";
+
+/// W9-02: a loader named in `config.toml` makes its calls imports, which a
+/// sync reads by extracting every Lua file again: no Lua file changed.
+pub fn lua_loader_functions_appear_in_config_toml() -> Case {
+    Case::new(Change::ControlFile, &[Language::Lua])
+        .file("ui/button.lua", LUA_BUTTON)
+        .file("main.lua", "Require(\"ui.button\")\nreturn {}\n")
+        .write(".codegraph/config.toml", LUA_LOADER_CONFIG)
+        .edge_after("file:main.lua", "imports", "file:ui/button.lua")
+}
+
+/// W9-02: a loader that leaves `config.toml` takes its imports with it.
+pub fn lua_loader_function_leaves_config_toml() -> Case {
+    Case::new(Change::ControlFile, &[Language::Lua])
+        .file(".codegraph/config.toml", LUA_LOADER_CONFIG)
+        .file("ui/button.lua", LUA_BUTTON)
+        .file("main.lua", "Require(\"ui.button\")\nreturn {}\n")
+        .write(".codegraph/config.toml", LUA_PLAIN_CONFIG)
+        .edge_before("file:main.lua", "imports", "file:ui/button.lua")
+        .no_edge_after("file:main.lua", "imports", "file:ui/button.lua")
+}
+
+/// W9-02: a loader named in `codegraph.json`'s `lua` object, likewise.
+pub fn lua_loader_functions_appear_in_codegraph_json() -> Case {
+    Case::new(Change::ControlFile, &[Language::Lua])
+        .file("ui/button.lua", LUA_BUTTON)
+        .file(
+            "main.lua",
+            "local Load = {}\nfunction Load.module(name)\n  return name\nend\nLoad.module(\"ui.button\")\nreturn Load\n",
+        )
+        .write(
+            ".codegraph/codegraph.json",
+            "{ \"lua\": { \"loaderFunctions\": [\"Load.module\"] } }\n",
+        )
+        .edge_before("file:main.lua", "calls", "method Load::module")
+        .edge_after("file:main.lua", "imports", "file:ui/button.lua")
+        .no_edge_after("file:main.lua", "calls", "method Load::module")
+}
+
+/// W9-02: Luau files are extracted again by their recorded language too.
+pub fn luau_loader_functions_appear_in_config_toml() -> Case {
+    Case::new(Change::ControlFile, &[Language::Luau])
+        .file("ui/button.luau", LUA_BUTTON)
+        .file("main.luau", "Require(\"ui.button\")\nreturn {}\n")
+        .write(".codegraph/config.toml", LUA_LOADER_CONFIG)
+        .edge_after("file:main.luau", "imports", "file:ui/button.luau")
 }
 
 pub fn lua_extension_override_appears_in_codegraph_json() -> Case {

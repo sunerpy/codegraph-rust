@@ -307,6 +307,7 @@ pub(crate) fn migrate_project(
     crate::class_heads::write_marker(rebuild.store())?;
     crate::case_folded::write_marker(rebuild.store())?;
     crate::lua_modules::write_marker(rebuild.store())?;
+    crate::lua_modules::write_loaders(rebuild.store(), &options.lua_loaders)?;
     crate::r_bindings::write_marker(rebuild.store())?;
     crate::play_routes::write_marker(rebuild.store())?;
     crate::laravel_routes::write_marker(rebuild.store())?;

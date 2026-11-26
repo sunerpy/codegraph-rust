@@ -63,6 +63,16 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    codegraph_env(cwd, args, &[])
+}
+
+/// [`codegraph`] with `env` set on top of the inherited environment.
+#[track_caller]
+pub fn codegraph_env<I, S>(cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args = args
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
@@ -72,6 +82,7 @@ where
         .current_dir(cwd)
         .env("CODEGRAPH_NO_DAEMON", "1")
         .env("CODEGRAPH_NO_WATCH", "1")
+        .envs(env.iter().copied())
         .output()
         .unwrap_or_else(|err| panic!("spawn {}: {err}", bin().display()));
     assert!(
@@ -185,7 +196,14 @@ impl Project {
     /// warning reads its stderr.
     #[track_caller]
     pub fn index_capturing(self) -> (Indexed, Output) {
-        let output = codegraph(&self.root, [OsStr::new("init"), self.root.as_os_str()]);
+        self.index_with_env(&[])
+    }
+
+    /// [`Self::index_capturing`] with `env` set for `codegraph init`
+    /// (`APP_CONFIG`, say).
+    #[track_caller]
+    pub fn index_with_env(self, env: &[(&str, &OsStr)]) -> (Indexed, Output) {
+        let output = codegraph_env(&self.root, [OsStr::new("init"), self.root.as_os_str()], env);
         let graph = Graph::load(&db_path(&self.root));
         let indexed = Indexed {
             project: self,

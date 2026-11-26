@@ -887,7 +887,9 @@ unchanged Lua file whose aliases or exports read a touched name through a global
 such a module, and so does a changed one for the files requiring it; the
 `lua_modules_version` marker is withdrawn and restored with the others, and a sync that finds
 it missing, or a row it cannot read, withdraws it before changing anything and re-resolves
-every Lua file;
+every Lua file; a sync whose custom Lua loader names differ from the `lua_loaders` row, or
+that finds no row, deletes the row before changing anything and extracts every Lua and Luau
+file again;
 a Rust enum variant that came, went or changed touches its enum's name, since a variant path
 reaches an enum only while it declares the variant; a Rust type, trait or alias name that came, went or changed re-resolves, in every unchanged
 Rust file whose text writes it as a path receiver (`Name::`, `Name.`), the references written

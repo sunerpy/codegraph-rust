@@ -1378,12 +1378,12 @@ flags here: passing either is an argument error.
 Place a `codegraph.json` inside the `.codegraph/` directory of any project to
 teach CodeGraph how to treat files with non-standard extensions:
 
-```jsonc
+```json
 {
   "extensions": {
     ".x": "lua",
-    ".blade": "php",
-  },
+    ".blade": "php"
+  }
 }
 ```
 
@@ -1418,12 +1418,12 @@ deprioritize = ["vendor/**", "generated/**"]
 The compatibility JSON form shares `.codegraph/codegraph.json` with extension
 overrides:
 
-```jsonc
+```json
 {
   "extensions": {
-    ".x": "lua",
+    ".x": "lua"
   },
-  "deprioritize": ["vendor/**"],
+  "deprioritize": ["vendor/**"]
 }
 ```
 
@@ -1439,6 +1439,79 @@ may waive only the inferred test penalty, never an explicit rule. Files, nodes,
 edges, exact path pins, and direct node/file reads are unchanged. MCP engines
 reload the addressed project's config for every request, so a long-running
 server observes edits on the next search/explore call.
+
+### Custom Lua module loaders (`[lua]`)
+
+A Lua code base that loads its modules through a function of its own,
+`Require("Script/Activity/ActivityMgrC")` or `Include "ui.button"`, where other
+code calls `require`, names those functions in the `[lua]` table of
+`config.toml`:
+
+```toml
+[app]
+name = "my-game"
+
+[lua]
+loader_functions = ["Require", "Include"]
+```
+
+The compatibility JSON form is the `lua` object of `.codegraph/codegraph.json`:
+
+```json
+{
+  "lua": {
+    "loaderFunctions": ["Require", "Include"]
+  }
+}
+```
+
+Sources and precedence:
+
+- The TOML table comes from the same file as every other `config.toml`
+  section: the file `APP_CONFIG` names when it is set, which replaces the
+  project's `config.toml` whole (that file's `[lua]` is then not read),
+  otherwise the selected index root's `config.toml`. The JSON object always
+  comes from the selected index root's `codegraph.json`. Neither is looked for
+  in a parent directory or in another project.
+- A TOML key written as an array, an empty one included, replaces the JSON
+  key of the same meaning whole; the two lists are never joined.
+
+Validation never stops indexing:
+
+- A loader name is a Lua name or a dotted path of names
+  (`[A-Za-z_][A-Za-z0-9_]*`, then any `.` and another), ASCII, matched as
+  written: case counts and nothing is trimmed. A name written twice counts
+  once.
+- An element that is not a valid name, a key that is not an array, an unknown
+  key, and a `lua` entry that is not a table are each ignored with one warning
+  on stderr naming the file, the key and the element. stdout is unaffected.
+
+What a loader call is:
+
+- The call's function is exactly a configured name: `Require(...)`, or the
+  whole dotted path of `Script.Load(...)`, whatever spaces or comments stand
+  between its names. A method call (`Script:Load(...)`), a bracket index and
+  the result of another call are none.
+- Its first argument is one plain string literal: `Require("m")`,
+  `Require "m"` or `Require [[m]]`, the text between the quotes trimmed and its
+  escapes kept as written, the other arguments unread. A concatenation, a
+  variable, a parenthesized string, a table constructor, an empty string and a
+  Luau backtick string are none, and such a call is what it is without the
+  setting.
+- A loader call is extracted as a `require` is: an `import` node named the
+  literal, an `imports` reference of that name, and no `calls` reference. The
+  literal is resolved as a `require` of the same string is.
+- It is one where a `require` is one: a top-level statement, a top-level
+  block, and anywhere in the value of a top-level declaration or assignment (a
+  function written there keeps its call too). In the body of a function
+  declared with `function`, a loader call stays a `calls` reference, as a
+  `require` there does.
+
+Every full index records the settings it ran under, a project naming no loader
+included. A sync compares them with the current settings before it changes
+anything: when the loader names changed, every Lua and Luau file is extracted
+and resolved again, and a sync that stops partway leaves the next one to do it.
+A running watcher reloads either file on change and runs one full reconcile.
 
 ### Extraction-version upgrades
 

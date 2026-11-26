@@ -6680,6 +6680,9 @@ fn index_project_inner(
     codegraph_watch::class_heads::write_marker(&store)?;
     codegraph_watch::case_folded::write_marker(&store)?;
     codegraph_watch::lua_modules::write_marker(&store)?;
+    // The Lua loader settings this index is extracted and resolved under
+    // (W9-02), for a project naming none too.
+    codegraph_watch::lua_modules::write_loaders(&store, &options.lua_loaders)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
     codegraph_watch::play_routes::write_marker(&store)?;
     codegraph_watch::laravel_routes::write_marker(&store)?;

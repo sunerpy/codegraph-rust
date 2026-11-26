@@ -575,6 +575,10 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// `auto kernel = &f<…>;` or a branch's `kernel = &g<…>;`, in the order
     /// first bound, so a call or launch through the local names them.
     cpp_local_fn_ptrs: HashMap<String, HashMap<String, Vec<String>>>,
+    /// The project's custom Lua module loaders (#1617): a call of one with
+    /// a plain string literal is an import, as `require` is. None by
+    /// default.
+    lua_loaders: &'a crate::lua_loaders::LuaLoaders,
 }
 
 /// The signature of a function node minted for an RTK Query generated hook
@@ -630,7 +634,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             walk_declared_types: false,
             raw_source: source,
             cpp_local_fn_ptrs: HashMap::new(),
+            lua_loaders: crate::lua_loaders::LuaLoaders::unconfigured(),
         }
+    }
+
+    /// Read calls of the project's custom Lua module loaders as imports
+    /// ([`crate::ExtractOptions::lua_loaders`]).
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: &'a crate::lua_loaders::LuaLoaders) -> Self {
+        self.lua_loaders = lua_loaders;
+        self
     }
 
     /// The source as written, when the pre-parse rewrote it in place; a text
@@ -3398,7 +3411,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn emit_lua_require(&mut self, call_node: SyntaxNode<'tree>) -> bool {
-        let Some(module_name) = lua_require_module(call_node, self.source) else {
+        let Some(module_name) = lua_require_module(call_node, self.source, self.lua_loaders) else {
             return false;
         };
         self.create_node(
@@ -10499,11 +10512,25 @@ fn collect_descendants_of_kind<'tree>(
     }
 }
 
-fn lua_require_module(call_node: SyntaxNode<'_>, source: &str) -> Option<String> {
+/// The module a Lua call loads: `require`'s by upstream's rule, a project
+/// loader's ([`crate::lua_loaders`], #1617) only through one plain string
+/// literal ([`lua_loader_literal`]); `None` for any other call.
+fn lua_require_module(
+    call_node: SyntaxNode<'_>,
+    source: &str,
+    loaders: &crate::lua_loaders::LuaLoaders,
+) -> Option<String> {
     let name =
         child_by_field(call_node, "name").or_else(|| child_by_field(call_node, "function"))?;
     if name.kind() != "identifier" || node_text(name, source) != "require" {
-        return None;
+        if loaders.loader_functions().is_empty() {
+            return None;
+        }
+        let callee = lua_dotted_callee(name, source)?;
+        if !loaders.is_loader(&callee) {
+            return None;
+        }
+        return lua_loader_literal(call_node, source);
     }
     let args = child_by_field(call_node, "arguments").or_else(|| call_node.named_child(1))?;
     if let Some(content) = first_descendant_kind(args, "string_content") {
@@ -10535,6 +10562,49 @@ fn lua_require_module(call_node: SyntaxNode<'_>, source: &str) -> Option<String>
         }
     }
     None
+}
+
+/// A call's function as the dotted path of names it is written as (`Require`,
+/// `Script.Load`), whatever space or comments stand between the names;
+/// `None` for any other shape: a method (`A:B`), a bracket index, a call's
+/// result, a parenthesized expression.
+fn lua_dotted_callee(name: SyntaxNode<'_>, source: &str) -> Option<String> {
+    match name.kind() {
+        "identifier" => Some(node_text(name, source).to_string()),
+        "dot_index_expression" => {
+            let table = lua_dotted_callee(child_by_field(name, "table")?, source)?;
+            let field = child_by_field(name, "field")?;
+            (field.kind() == "identifier").then(|| format!("{table}.{}", node_text(field, source)))
+        }
+        _ => None,
+    }
+}
+
+/// The module a loader call names: its first argument when that is one plain
+/// string literal (`Require("m")`, `Require "m"`, `Require [[m]]`), the text
+/// between the quotes trimmed, escapes as written, the other arguments
+/// unread. A concatenation, a variable, a parenthesized string, a table
+/// (`Require{…}`), an empty string and a Luau backtick string, interpolated
+/// or not, name none.
+fn lua_loader_literal(call_node: SyntaxNode<'_>, source: &str) -> Option<String> {
+    let args = child_by_field(call_node, "arguments")?;
+    let first = args
+        .named_children(&mut args.walk())
+        .find(|child| child.kind() != "comment")?;
+    if first.kind() != "string"
+        || node_text(first, source).starts_with('`')
+        || first
+            .named_children(&mut first.walk())
+            .any(|child| child.kind() == "interpolation")
+    {
+        return None;
+    }
+    let content = first
+        .named_children(&mut first.walk())
+        .find(|child| child.kind() == "string_content")?;
+    let module_name = node_text(content, source);
+    let module_name = module_name.trim();
+    (!module_name.is_empty()).then(|| module_name.to_string())
 }
 
 #[cfg(test)]
@@ -11179,6 +11249,202 @@ M:assignedFn()
         assert!(has_node(&nodes, NodeKind::Function, "helper"));
         assert!(!has_node(&nodes, NodeKind::Variable, "helper"));
         assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    // ---- Lua / Luau custom module loaders (#1617, W9-02) ----
+
+    /// `source` of `file` extracted under the project loaders `loaders`, as
+    /// a project pipeline extracts it ([`crate::engine::extraction_of`]).
+    fn run_with_loaders(
+        file: &str,
+        source: &str,
+        loaders: &[&str],
+    ) -> (Vec<Node>, Vec<UnresolvedRef>) {
+        let options = crate::ExtractOptions {
+            lua_loaders: std::sync::Arc::new(crate::LuaLoaders::merge(
+                Some(&serde_json::json!({ "loader_functions": loaders })),
+                None,
+            )),
+            ..crate::ExtractOptions::default()
+        };
+        let result = crate::engine::extraction_of(
+            file,
+            &codegraph_core::source_file::SourceText::Text(source.to_string()),
+            &options,
+            |_| {},
+        );
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        (result.nodes, result.unresolved_references)
+    }
+
+    fn refs_named<'a>(refs: &'a [UnresolvedRef], name: &str) -> Vec<&'a UnresolvedRef> {
+        refs.iter().filter(|r| r.reference_name == name).collect()
+    }
+
+    /// A configured loader called with a string literal is what `require`
+    /// is: an `Import` node named the literal, its signature the call's
+    /// text, an `Imports` reference of that name from the file at the
+    /// call's position, and no `Calls` reference.
+    #[test]
+    fn lua_configured_loader_call_is_an_import_not_a_call() {
+        let src = "Require(\"Script/Activity/ActivityMgrC.lua\")\nlocal ui = Include \"ui.button\"\nreturn ui\n";
+        let (nodes, refs) = run_with_loaders("client.lua", src, &["Require", "Include"]);
+        let import = node(&nodes, NodeKind::Import, "Script/Activity/ActivityMgrC.lua");
+        assert_eq!(
+            import.signature.as_deref(),
+            Some("Require(\"Script/Activity/ActivityMgrC.lua\")")
+        );
+        assert_eq!((import.start_line, import.start_column), (1, 0));
+        let imports = refs_named(&refs, "Script/Activity/ActivityMgrC.lua");
+        assert_eq!(imports.len(), 1, "{refs:#?}");
+        assert_eq!(imports[0].reference_kind, EdgeKind::Imports);
+        assert_eq!(imports[0].from_node_id, "file:client.lua");
+        assert_eq!((imports[0].line, imports[0].col), (1, 0));
+        assert!(has_node(&nodes, NodeKind::Import, "ui.button"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "ui.button"));
+        assert!(
+            !refs.iter().any(|r| r.reference_kind == EdgeKind::Calls
+                && matches!(r.reference_name.as_str(), "Require" | "Include")),
+            "{refs:#?}"
+        );
+    }
+
+    /// A dotted loader matches the call's whole path of names, however it is
+    /// spaced or commented; a method call, a bracket index, a call's result
+    /// or a shorter or longer path is no loader call.
+    #[test]
+    fn lua_dotted_loader_matches_its_whole_path() {
+        let src = "Script.Load(\"a\")\nScript . Load(\"b\")\nScript--[[x]].Load(\"c\")\nScript:Load(\"d\")\nScript[\"Load\"](\"e\")\nLoad(\"f\")\nGame.Script.Load(\"g\")\nScript.Load.Now(\"h\")\n";
+        let (nodes, refs) = run_with_loaders("boot.lua", src, &["Script.Load"]);
+        for module in ["a", "b", "c"] {
+            assert!(has_node(&nodes, NodeKind::Import, module), "{module}");
+            assert!(has_ref(&refs, EdgeKind::Imports, module), "{module}");
+        }
+        for module in ["d", "e", "f", "g", "h"] {
+            assert!(!has_node(&nodes, NodeKind::Import, module), "{module}");
+            assert!(!has_ref(&refs, EdgeKind::Imports, module), "{module}");
+        }
+        assert!(!has_ref(&refs, EdgeKind::Calls, "Script.Load"), "{refs:#?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "Load"), "{refs:#?}");
+    }
+
+    /// Only one plain string literal names a loader's module: the first
+    /// argument, the others unread. Anything else is the call it was.
+    #[test]
+    fn lua_loader_needs_one_plain_string_literal() {
+        let src = "Require(\"a\" .. \"b\")\nRequire(name)\nRequire((\"paren\"))\nRequire{\"table\"}\nRequire(\"\")\nRequire()\nRequire(\"   \")\nRequire(\"first\", \"second\")\nRequire [[long.form]]\nRequire '\\x41'\nRequire(--[[note]] \"commented\")\n";
+        let (nodes, refs) = run_with_loaders("main.lua", src, &["Require"]);
+        let imported: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            imported,
+            ["first", "long.form", "\\x41", "commented"],
+            "{nodes:#?}"
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "Require")
+                .map(|r| r.line)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7],
+            "{refs:#?}"
+        );
+    }
+
+    /// A Luau backtick string is no literal, interpolated or not.
+    #[test]
+    fn luau_interpolated_or_backtick_string_is_no_loader_literal() {
+        let src = "Require(`m{x}`)\nRequire(`plain`)\nRequire(\"quoted\")\n";
+        let (nodes, refs) = run_with_loaders("main.luau", src, &["Require"]);
+        let imported: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(imported, ["quoted"], "{nodes:#?}");
+        assert_eq!(
+            refs.iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "Require")
+                .count(),
+            2,
+            "{refs:#?}"
+        );
+    }
+
+    /// A loader name is matched as written, case included.
+    #[test]
+    fn lua_loader_names_are_case_sensitive() {
+        let src = "Require(\"a\")\nrequire(\"b\")\nREQUIRE(\"c\")\nrequIre(\"d\")\n";
+        let (nodes, refs) = run_with_loaders("main.lua", src, &["Require"]);
+        assert!(has_node(&nodes, NodeKind::Import, "a"));
+        assert!(
+            has_node(&nodes, NodeKind::Import, "b"),
+            "require stays itself"
+        );
+        assert!(!has_node(&nodes, NodeKind::Import, "c"));
+        assert!(!has_node(&nodes, NodeKind::Import, "d"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "REQUIRE"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "requIre"));
+    }
+
+    /// With no loader configured, and under one the source never calls, a
+    /// file's extraction is what it was.
+    #[test]
+    fn lua_extraction_without_loaders_is_unchanged() {
+        let src = "local http = require(\"net.http\")\nRequire(\"x\")\nlocal function f()\n  Require(\"y\")\n  return require(\"z\")\nend\nreturn f\n";
+        let plain = extract_source("main.lua", src, Some(Language::Lua));
+        for loaders in [&[][..], &["Include"][..], &["require"][..]] {
+            let (nodes, refs) = run_with_loaders("main.lua", src, loaders);
+            assert_eq!(nodes, plain.nodes, "{loaders:?}");
+            assert_eq!(refs, plain.unresolved_references, "{loaders:?}");
+        }
+    }
+
+    /// A loader call is an import exactly where a `require` is (#1617
+    /// asked for imports; upstream's `require` is one only where the main
+    /// walk reaches it): a top-level statement, a declaration's value, a
+    /// call nested in it, a function value's body inside a declaration, a
+    /// top-level block. In a function's body it stays a call, as `require`
+    /// does. `require` rewritten as a loader gives the same nodes and
+    /// references, names aside.
+    #[test]
+    fn lua_loader_matches_require_in_every_position() {
+        let with_require = "require(\"top\")\nlocal a = require(\"value\")\nlocal b = wrap(require(\"nested\"))\nlocal f = function() return require(\"fvalue\") end\nlocal function g()\n  return require(\"body\")\nend\nif ready then\n  require(\"block\")\nend\nlocal M = {}\nfunction M.h()\n  require(\"method\")\nend\nreturn M\n";
+        let with_loader = with_require.replace("require", "Require");
+        for (file, language) in [("pos.lua", Language::Lua), ("pos.luau", Language::Luau)] {
+            let plain = extract_source(file, with_require, Some(language));
+            let (nodes, refs) = run_with_loaders(file, &with_loader, &["Require"]);
+            let renamed = |text: String| text.replace("require", "Require");
+            assert_eq!(
+                renamed(format!("{:#?}", plain.nodes)),
+                format!("{nodes:#?}"),
+                "{file}"
+            );
+            assert_eq!(
+                renamed(format!("{:#?}", plain.unresolved_references)),
+                format!("{refs:#?}"),
+                "{file}"
+            );
+            let imported: Vec<&str> = nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Import)
+                .map(|n| n.name.as_str())
+                .collect();
+            assert_eq!(
+                imported,
+                ["top", "value", "nested", "fvalue", "block"],
+                "{file}"
+            );
+            let calls: Vec<i64> = refs
+                .iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "Require")
+                .map(|r| r.line)
+                .collect();
+            assert_eq!(calls, [4, 6, 13], "{file}: {refs:#?}");
+        }
     }
 
     // ---- Objective-C class_implementation ----
