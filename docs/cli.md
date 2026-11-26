@@ -1229,14 +1229,16 @@ daemon mode when several agents or editor windows need the same live index.
 ### Live file watch
 
 The daemon watches the project for file changes and re-indexes automatically.
-Changes are debounced before the re-index triggers. On WSL2, watching files under
-`/mnt/` is automatically disabled because recursive `fs.watch` is too slow on
-those paths; the reason is surfaced in the log. On such a Windows drive WSL also
-keeps its own index: SQLite's locking does not hold across the Windows/WSL
-bridge, so with `CODEGRAPH_DIR` unset an existing `.codegraph-wsl/` is used, then
-an existing `.codegraph/codegraph.db` is kept, and otherwise a fresh index goes
-in `.codegraph-wsl/` (`init` says so). A disk I/O error on a shared
-`.codegraph/` index explains how to give WSL its own.
+Changes are debounced before the re-index triggers: a save of one or two files
+re-indexes after a 300 ms quiet window (the debounce, when that is shorter), a
+larger burst after the whole debounce, and every event restarts the wait. On
+WSL2, watching files under `/mnt/` is automatically disabled because recursive
+`fs.watch` is too slow on those paths; the reason is surfaced in the log. On
+such a Windows drive WSL also keeps its own index: SQLite's locking does not
+hold across the Windows/WSL bridge, so with `CODEGRAPH_DIR` unset an existing
+`.codegraph-wsl/` is used, then an existing `.codegraph/codegraph.db` is kept,
+and otherwise a fresh index goes in `.codegraph-wsl/` (`init` says so). A disk
+I/O error on a shared `.codegraph/` index explains how to give WSL its own.
 
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
@@ -1345,7 +1347,7 @@ Three escape hatches:
 | `CODEGRAPH_DAEMON_RETRY_MS`         | `5000`       | ≥0; `0` disables              | How long a cold-start stdio session waits before starting or re-attaching the shared daemon after its connection was lost; doubles after each miss. Empty, malformed, or negative values use the default                                                                                           |
 | `CODEGRAPH_DAEMON_RETRY_MAX_MS`     | `300000`     | ≥ `CODEGRAPH_DAEMON_RETRY_MS` | Cap for that doubling wait                                                                                                                                                                                                                                                                         |
 | `CODEGRAPH_DAEMON_INSTALL_CHECK_MS` | `30000`      | ≥0; `0` disables              | How often a daemon checks whether its own executable was replaced or removed, and then drains and exits. Empty or malformed values use the default                                                                                                                                                 |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`       | `2000`       | 100–60000                     | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`       | `2000`       | 100–60000                     | File-change debounce window before a re-index triggers; one or two changed files wait at most 300 ms                                                                                                                                                                                               |
 | `CODEGRAPH_WATCH_SENTINEL_MS`       | `60000`      | 0 or 1000–3600000             | Windows only: how often an idle watcher checks the index for changes no event reported; `0` disables. Empty or malformed values use the default                                                                                                                                                    |
 | `CODEGRAPH_NO_WATCH`                | —            | —                             | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
 | `CODEGRAPH_FORCE_WATCH`             | —            | —                             | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |

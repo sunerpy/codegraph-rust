@@ -1458,6 +1458,15 @@ the directory's real path does not change (`watcher.rs`).
   reported as RECOVERING until that reconcile commits. An event naming a
   directory the watcher knows walks only the new directories it finds below
   it (`watcher.rs`).
+- **The quick window (table 9.1 row 7, upstream #1397).** colby syncs one or
+  two pending files after `max(100, min(300, debounce))` ms. The port waits
+  `min(300 ms, debounce)`: the floor is not applied, so the wait never
+  exceeds a debounce configured below it (the environment and config values
+  are clamped to at least 100 ms already). A pending path counts as one file
+  whether it is a file's own path or an alias of it (`queue_with_aliases`),
+  and a burst that owes a full reconcile (a removed directory, a control
+  file, a sign of dropped events) waits the whole debounce (`watcher.rs`,
+  `quiet_window`).
 
 ### Diagnostics
 

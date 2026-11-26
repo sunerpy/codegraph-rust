@@ -1032,6 +1032,12 @@ pub struct WatchOptions {
     /// Override for the sentinel's check. Defaults to the delta `codegraph
     /// status` reports; tests inject a script.
     drift_check_fn: Option<DriftCheckFn>,
+    /// How long a burst of at most [`QUICK_SYNC_MAX_PENDING`] files waits
+    /// before its sync, when that is shorter than the debounce (upstream
+    /// #1397's quick fire, [`quiet_window`]). Defaults to
+    /// [`QUICK_SYNC_QUIET`]; `None` makes every burst wait the whole debounce,
+    /// for tests that hold their events pending.
+    quick_window: Option<Duration>,
 }
 
 /// How often a watcher paused by lock contention retries its full reconcile,
@@ -1044,6 +1050,36 @@ pub const LOCK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 /// mass rename is cheaper to diff once, and the full scan also repairs anything
 /// the burst's events failed to report.
 const SCOPED_SYNC_MAX_PENDING: usize = 500;
+
+/// At most this many pending files sync after the quick window instead of
+/// the whole debounce (upstream #1397's `QUICK_SYNC_MAX_PENDING`): a save of
+/// one or two files.
+const QUICK_SYNC_MAX_PENDING: usize = 2;
+
+/// The quick window (upstream #1397's `QUICK_SYNC_QUIET_MS`).
+const QUICK_SYNC_QUIET: Duration = Duration::from_millis(300);
+
+/// How long the watcher waits after an event before it syncs: a burst of at
+/// most [`QUICK_SYNC_MAX_PENDING`] files waits `quick` or the debounce,
+/// whichever is shorter; a larger burst, a burst that owes a full
+/// reconcile, or a watcher without a quick window waits the whole debounce.
+/// Every event restarts the wait either way, so the sync still follows the
+/// burst's last event. KEEP-RUST: upstream's 100 ms floor is not applied,
+/// so the wait never exceeds a debounce configured below it (the env and
+/// config values are clamped to at least 100 ms already).
+fn quiet_window(
+    pending: usize,
+    full_sync_pending: bool,
+    debounce: Duration,
+    quick: Option<Duration>,
+) -> Duration {
+    match quick {
+        Some(quick) if pending <= QUICK_SYNC_MAX_PENDING && !full_sync_pending => {
+            debounce.min(quick)
+        }
+        _ => debounce,
+    }
+}
 
 /// Env var name: milliseconds between drift-sentinel checks of an idle watcher
 /// on Windows (default 60000); `0` turns the sentinel off. Other platforms run
@@ -1101,6 +1137,7 @@ impl Default for WatchOptions {
             lock_recovery_interval: LOCK_RECOVERY_INTERVAL,
             drift_sentinel: drift_sentinel_from_env(),
             drift_check_fn: None,
+            quick_window: Some(QUICK_SYNC_QUIET),
         }
     }
 }
@@ -1272,6 +1309,7 @@ impl ProjectWatcher {
         let health_key = project_root.clone();
         let lock_contention_budget = options.lock_contention_budget;
         let lock_recovery_interval = options.lock_recovery_interval;
+        let quick_window = options.quick_window;
         // Capture directory identity before registering the backend. Windows emits
         // `RemoveKind::Any` after deletion, so this pre-event snapshot is the only
         // deterministic way to distinguish a known directory from an extensionless
@@ -1434,6 +1472,7 @@ impl ProjectWatcher {
                 drift_sentinel,
                 drift_check_fn,
                 control_paths,
+                quick_window,
             });
             loop_finished.store(true, Ordering::SeqCst);
         });
@@ -1762,6 +1801,8 @@ struct EventLoopCtx {
     drift_check_fn: DriftCheckFn,
     /// The control inputs the index records (W5-06), refreshed by each sync.
     control_paths: crate::control_inputs::RecordedInputs,
+    /// [`WatchOptions::quick_window`].
+    quick_window: Option<Duration>,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -1787,6 +1828,7 @@ fn event_loop(ctx: EventLoopCtx) {
         drift_sentinel,
         drift_check_fn,
         mut control_paths,
+        quick_window,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -2130,8 +2172,17 @@ fn event_loop(ctx: EventLoopCtx) {
                 // its own cadence; a burst of edits must not poll the other writer.
                 if !pending.is_empty() && !degraded.is_recovering() {
                     // Resetting the timer on every event ports the upstream exactly-once
-                    // burst semantics (`upstream sync/watcher.ts:529-540`).
-                    deadline = Some(Instant::now() + runtime_scope.debounce);
+                    // burst semantics (`upstream sync/watcher.ts:529-540`); a save of
+                    // one or two files waits only the quick window (#1397).
+                    deadline = Some(
+                        Instant::now()
+                            + quiet_window(
+                                pending.len(),
+                                full_sync_pending,
+                                runtime_scope.debounce,
+                                quick_window,
+                            ),
+                    );
                 }
             }
             Some(LoopMessage::WatchError(err)) => {
@@ -2776,6 +2827,7 @@ mod tests {
             dir.path(),
             WatchOptions {
                 debounce: Duration::from_secs(30),
+                quick_window: None,
                 inert_for_tests: true,
                 db_path: Some(db.clone()),
                 sync_fn: Some(sync_fn),
@@ -2866,6 +2918,7 @@ mod tests {
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let mut options = live_project_options(dir.path());
         options.debounce = Duration::from_secs(30);
+        options.quick_window = None;
         options.inert_for_tests = true;
         options.on_sync_complete = Some(Arc::new(move |outcome| {
             outcome_tx.send(outcome).unwrap();
@@ -2935,6 +2988,7 @@ mod tests {
         let (error_tx, error_rx) = mpsc::channel();
         let mut options = live_project_options(dir.path());
         options.debounce = Duration::from_secs(30);
+        options.quick_window = None;
         options.inert_for_tests = true;
         options.sync_fn = Some(Arc::new(move |_| {
             incremental_counter.fetch_add(1, AtomicOrdering::SeqCst);
@@ -2979,6 +3033,7 @@ mod tests {
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let mut options = live_project_options(dir.path());
         options.debounce = Duration::from_secs(30);
+        options.quick_window = None;
         options.inert_for_tests = true;
         options.on_sync_complete = Some(Arc::new(move |outcome| {
             outcome_tx.send(outcome).unwrap();
@@ -3042,6 +3097,7 @@ mod tests {
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let mut options = live_project_options(dir.path());
         options.debounce = Duration::from_secs(30);
+        options.quick_window = None;
         options.inert_for_tests = true;
         options.on_sync_complete = Some(Arc::new(move |outcome| {
             outcome_tx.send(outcome).unwrap();
@@ -3097,6 +3153,7 @@ mod tests {
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let mut options = live_project_options(dir.path());
         options.debounce = Duration::from_secs(30);
+        options.quick_window = None;
         options.inert_for_tests = true;
         options.on_sync_complete = Some(Arc::new(move |outcome| {
             outcome_tx.send(outcome).unwrap();
@@ -3241,6 +3298,7 @@ mod tests {
             dir.path(),
             WatchOptions {
                 debounce: Duration::from_secs(30),
+                quick_window: None,
                 inert_for_tests: true,
                 sync_fn: Some(sync_fn),
                 full_sync_fn: Some(full_sync_fn),
@@ -3305,6 +3363,7 @@ mod tests {
             dir.path(),
             WatchOptions {
                 debounce: Duration::from_secs(30),
+                quick_window: None,
                 inert_for_tests: true,
                 full_sync_fn: Some(full_sync_fn),
                 ..WatchOptions::default()
@@ -3650,6 +3709,93 @@ mod tests {
         watcher.stop();
     }
 
+    // Table 9.1 row 7 (upstream c74e8b0, #1397): one or two pending files
+    // wait the quick window, or the debounce when that is shorter; more files,
+    // a burst owing a full reconcile, or no quick window wait the debounce.
+    #[test]
+    fn quiet_window_is_quick_for_one_or_two_files_only() {
+        let debounce = Duration::from_secs(2);
+        let quick = Some(QUICK_SYNC_QUIET);
+        assert_eq!(quiet_window(1, false, debounce, quick), QUICK_SYNC_QUIET);
+        assert_eq!(quiet_window(2, false, debounce, quick), QUICK_SYNC_QUIET);
+        assert_eq!(quiet_window(3, false, debounce, quick), debounce);
+        assert_eq!(quiet_window(1, true, debounce, quick), debounce);
+        assert_eq!(quiet_window(1, false, debounce, None), debounce);
+        let short = Duration::from_millis(150);
+        assert_eq!(quiet_window(1, false, short, quick), short);
+    }
+
+    /// A watcher whose sync reports each call's paths on a channel, with
+    /// `debounce` and the default quick window.
+    fn quick_fire_watcher(
+        dir: &crate::sync::tests::TestDir,
+        debounce: Duration,
+    ) -> (ProjectWatcher, mpsc::Receiver<Vec<String>>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            tx.lock().unwrap().send(paths).unwrap();
+            Ok(SyncOutcome::default())
+        });
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce,
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        (watcher, rx)
+    }
+
+    // A single saved file syncs after the quick window, long before a 30 s
+    // debounce would let it.
+    #[test]
+    fn one_saved_file_syncs_after_the_quick_window() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-quick-fire");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, synced) = quick_fire_watcher(&dir, Duration::from_secs(30));
+        watcher.ingest_event_for_tests("src/alpha.ts");
+        let paths = synced
+            .recv_timeout(Duration::from_secs(10))
+            .expect("one pending file syncs after the quick window");
+        assert_eq!(paths, vec!["src/alpha.ts".to_string()]);
+        watcher.stop();
+    }
+
+    // Three pending files are a burst: they wait the whole debounce, so no
+    // sync comes in the quick window's time.
+    #[test]
+    fn three_saved_files_wait_the_whole_debounce() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-quick-burst");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let (watcher, synced) = quick_fire_watcher(&dir, Duration::from_millis(1500));
+        watcher.ingest_event_for_tests("src/alpha.ts");
+        watcher.ingest_event_for_tests("src/beta.ts");
+        watcher.ingest_event_for_tests("src/gamma.ts");
+        assert!(
+            synced.recv_timeout(Duration::from_millis(900)).is_err(),
+            "three pending files must not sync in the quick window"
+        );
+        let paths = synced
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the burst syncs once the debounce passes");
+        assert_eq!(
+            paths,
+            vec![
+                "src/alpha.ts".to_string(),
+                "src/beta.ts".to_string(),
+                "src/gamma.ts".to_string(),
+            ]
+        );
+        watcher.stop();
+    }
+
     #[test]
     fn pending_files_snapshot_reflects_ingested_events_before_debounce() {
         let _env = crate::test_env::env_guard();
@@ -3661,6 +3807,7 @@ mod tests {
             dir.path(),
             WatchOptions {
                 debounce: Duration::from_secs(30),
+                quick_window: None,
                 inert_for_tests: true,
                 db_path: Some(db),
                 ..WatchOptions::default()

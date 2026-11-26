@@ -601,7 +601,8 @@ other request, and the daemon's handler answers it with
 The daemon runs a file watcher (`codegraph-watch`) that live-reindexes changed
 files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
-rebuild rather than many. A burst of more than 500 paths, or any sign that the
+rebuild rather than many; a save of one or two files waits only a 300 ms quiet
+window, or the debounce when that is shorter. A burst of more than 500 paths, or any sign that the
 OS dropped events, runs one full project reconcile instead (see
 [`cli.md`](cli.md#live-file-watch)). The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
