@@ -2,7 +2,7 @@
 //! order, the merge, and the replacement (upstream `synthesizeCallbackEdges`
 //! and `SynthesisStage`).
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
 use codegraph_core::node_id::hash_content;
-use codegraph_core::source_file::{SourceText, read_source_file};
+use codegraph_core::source_file::{SourceText, oversize_stamp, read_source_file};
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_extract::ExtractOptions;
 use codegraph_store::Store;
@@ -19,13 +19,18 @@ use codegraph_store::queries::{MethodHeader, NodeSpan, ReferenceSite};
 use rayon::prelude::*;
 
 use super::context::ViewContext;
-use super::inputs::{self, Inputs, UnindexedReader};
+use super::footprint::{
+    GateInput, PassRecord, Predicate, Recorder, STAGE_RECORD_SCHEME, Slice, StageRecord, TextGate,
+    keys,
+};
+use super::inputs::{INPUTS_KEY, Inputs, UnindexedReader};
 use super::{
-    angular, arkui, c_fnptr, callback, dispatch, erlang, framework, go, go_dispatch, go_func_field,
-    goframe, iface, is_synthesized, jsx, links, nix, react_native, registry, sveltekit, tier, vue,
+    PASS_KEY_PREFIX, STAGE_KEY, angular, arkui, c_fnptr, callback, dispatch, erlang, framework, go,
+    go_dispatch, go_func_field, goframe, iface, is_synthesized, jsx, links, nix, react_native,
+    registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
-use crate::frameworks::route_href::RouteTables;
+use crate::frameworks::route_href::{RouteTableObserver, RouteTables};
 
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,6 +43,19 @@ pub struct StageStats {
     /// The edges it inserted: the merged ones whose identity no base edge
     /// holds and that no stored synthesized edge already equals.
     pub inserted: usize,
+    /// The prerequisite steps and passes that ran, one bit each in registry
+    /// order ([`step_names`]): the prerequisite steps first, then the
+    /// passes. A step whose language gate is closed has no bit.
+    pub rerun: u64,
+    /// The steps whose recorded output a sync kept instead of running them
+    /// (W9-00 row 27).
+    pub reused: usize,
+}
+
+/// The prerequisite steps' and the passes' names in registry order: bit `i`
+/// of [`StageStats::rerun`] is the `i`-th.
+pub fn step_names() -> impl Iterator<Item = &'static str> {
+    PREREQUISITES.iter().chain(PASSES).map(|(name, _, _)| *name)
 }
 
 /// How long each part of one stage run took (W9-00a), for
@@ -250,8 +268,9 @@ const PASSES: &[(&str, Gate, Pass)] = &[
 
 /// Compute every synthesized edge over `store`'s base graph and replace the
 /// stored ones with them in one transaction, reading the files the index
-/// does not hold within `options`' scan scope, and record what it read
-/// beside the index (W7-17b). The marker is the caller's.
+/// does not hold within `options`' scan scope. The same transaction records
+/// what the stage read beside the index (W7-17b) and what each step read
+/// and emitted (W9-00 row 27). The marker is the caller's.
 pub fn run_stage(
     store: &mut Store,
     project_root: &Path,
@@ -269,18 +288,21 @@ pub fn run_stage_timed(
     let mut timings = StageTimings::default();
     let mut view = View::new(store, project_root, options.max_file_size);
     view.unindexed = Some(UnindexedReader::new(project_root, options));
-    let (edges, read) = synthesize_in(view, &mut timings)?;
+    let output = synthesize_in(view, &mut timings)?;
     let started = Instant::now();
-    let (removed, inserted) = store.replace_synthesized_edges(&edges)?;
-    timings.replace = started.elapsed();
-    let started = Instant::now();
-    inputs::write(store, &read)?;
+    let rows = output.rows(options)?;
     timings.inputs = started.elapsed();
+    let started = Instant::now();
+    let (removed, inserted) =
+        store.replace_synthesized_edges_and_rows(&output.edges, &[PASS_KEY_PREFIX], &rows)?;
+    timings.replace = started.elapsed();
     Ok((
         StageStats {
-            edges: edges.len(),
+            edges: output.edges.len(),
             removed,
             inserted,
+            rerun: output.rerun,
+            reused: 0,
         },
         timings,
     ))
@@ -294,42 +316,163 @@ pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Res
         View::new(store, project_root, max_file_size),
         &mut StageTimings::default(),
     )?
-    .0)
+    .edges)
 }
 
-/// The stage over `view`, with what it read beside the index, timing its
-/// parts into `timings`.
-fn synthesize_in(mut view: View<'_>, timings: &mut StageTimings) -> Result<(Vec<Edge>, Inputs)> {
+/// The rows a stage run over `store` would write beside its edges
+/// ([`StageOutput::rows`]), computed without writing anything: the control
+/// the record tests compare with.
+#[doc(hidden)]
+pub fn stage_rows(
+    store: &Store,
+    project_root: &Path,
+    options: &ExtractOptions,
+) -> Result<Vec<(String, String)>> {
+    let mut view = View::new(store, project_root, options.max_file_size);
+    view.unindexed = Some(UnindexedReader::new(project_root, options));
+    synthesize_in(view, &mut StageTimings::default())?.rows(options)
+}
+
+/// Each step whose gate opens over `store`, run alone in a view of its own
+/// after the prerequisite steps before it (whose overlay it reads, and whose
+/// reads are not its own), with the row its record would be: what a stage
+/// run records for the step whatever other steps share its view's caches
+/// (W9-00 row 27's control of the footprints).
+#[doc(hidden)]
+pub fn records_alone(
+    store: &Store,
+    project_root: &Path,
+    options: &ExtractOptions,
+) -> Result<Vec<(String, String)>> {
+    let languages: HashSet<Language> = store.file_languages()?.into_iter().collect();
+    let steps: Vec<&(&str, Gate, Pass)> = PREREQUISITES.iter().chain(PASSES).collect();
+    let mut rows = Vec::new();
+    for (index, (name, gate, run)) in steps.iter().enumerate() {
+        if !gate(&languages) {
+            continue;
+        }
+        let mut view = View::new(store, project_root, options.max_file_size);
+        view.unindexed = Some(UnindexedReader::new(project_root, options));
+        for (at, (_, gate, step)) in PREREQUISITES.iter().enumerate() {
+            if at < index && gate(&languages) {
+                let made = step(&view)?;
+                view.overlay.extend(made);
+            }
+        }
+        view.recorder.begin_pass();
+        let made = run(&view)?;
+        let record = PassRecord::new(&made, &view.recorder.end_pass());
+        rows.push((format!("{PASS_KEY_PREFIX}{name}"), record.to_row()?));
+    }
+    Ok(rows)
+}
+
+/// What one stage run made: its edges, what it read beside the index, the
+/// indexed files' languages, and each step's record, in run order.
+pub(super) struct StageOutput {
+    pub(super) edges: Vec<Edge>,
+    pub(super) read: Inputs,
+    pub(super) languages: Vec<String>,
+    pub(super) records: Vec<(&'static str, PassRecord)>,
+    /// The steps that ran, one bit each in registry order
+    /// ([`StageStats::rerun`]).
+    pub(super) rerun: u64,
+}
+
+impl StageOutput {
+    /// The `project_metadata` rows the run writes: [`STAGE_KEY`], one
+    /// [`PASS_KEY_PREFIX`] row a step that ran, and [`INPUTS_KEY`].
+    pub(super) fn rows(&self, options: &ExtractOptions) -> Result<Vec<(String, String)>> {
+        let stage = StageRecord {
+            scheme: STAGE_RECORD_SCHEME,
+            engine: super::VERSION.to_string(),
+            build: super::BUILD_IDENTITY.to_string(),
+            schema: codegraph_store::migrations::CURRENT_SCHEMA_VERSION,
+            options: options_digest(options),
+            languages: self.languages.clone(),
+            passes: self
+                .records
+                .iter()
+                .map(|(name, _)| (*name).to_string())
+                .collect(),
+        };
+        let mut rows = vec![(STAGE_KEY.to_string(), serde_json::to_string(&stage)?)];
+        for (name, record) in &self.records {
+            rows.push((format!("{PASS_KEY_PREFIX}{name}"), record.to_row()?));
+        }
+        rows.push((INPUTS_KEY.to_string(), serde_json::to_string(&self.read)?));
+        Ok(rows)
+    }
+}
+
+/// The digest of the options the stage reads: the size bound of the files
+/// it reads and the scan scope of the files the index does not hold, never
+/// the project's place on disk.
+pub(super) fn options_digest(options: &ExtractOptions) -> String {
+    hash_content(&format!(
+        "max_file_size={}\ninclude={:?}\nexclude={:?}\nignore_dirs={:?}\nignore_paths={:?}\n",
+        options.max_file_size,
+        options.include,
+        options.exclude,
+        options.ignore_dirs,
+        options.ignore_paths,
+    ))
+}
+
+/// The stage over `view`, with what it read beside the index and each
+/// step's record, timing its parts into `timings`.
+fn synthesize_in(mut view: View<'_>, timings: &mut StageTimings) -> Result<StageOutput> {
     let started = Instant::now();
     view.read_texts()?;
     let languages = view.file_languages()?;
     timings.read = started.elapsed();
     let mut edges = Vec::new();
-    for (name, gate, step) in PREREQUISITES {
+    let mut records = Vec::new();
+    let mut rerun = 0_u64;
+    for (at, (name, gate, step)) in PREREQUISITES.iter().enumerate() {
         if gate(&languages) {
             let started = Instant::now();
+            view.recorder.begin_pass();
             let made = step(&view)?;
+            records.push((*name, PassRecord::new(&made, &view.recorder.end_pass())));
             view.overlay.extend(made.iter().cloned());
             edges.extend(made);
+            rerun |= 1 << at;
             timings.passes.push((*name, started.elapsed()));
         }
     }
     let mut passes = Vec::with_capacity(PASSES.len());
-    for (name, gate, pass) in PASSES {
+    for (at, (name, gate, pass)) in PASSES.iter().enumerate() {
         if gate(&languages) {
             let started = Instant::now();
-            passes.push(pass(&view)?);
+            view.recorder.begin_pass();
+            let made = pass(&view)?;
+            records.push((*name, PassRecord::new(&made, &view.recorder.end_pass())));
+            passes.push(made);
+            rerun |= 1 << (PREREQUISITES.len() + at);
             timings.passes.push((*name, started.elapsed()));
         }
     }
     let read = view
         .unindexed
+        .take()
         .map(UnindexedReader::into_inputs)
         .unwrap_or_default();
     let started = Instant::now();
     let edges = combine(edges, passes);
     timings.merge = started.elapsed();
-    Ok((edges, read))
+    let mut languages: Vec<String> = languages
+        .iter()
+        .map(|language| language.as_str().to_string())
+        .collect();
+    languages.sort();
+    Ok(StageOutput {
+        edges,
+        read,
+        languages,
+        records,
+        rerun,
+    })
 }
 
 /// The stage's output: the prerequisite steps' edges as they are (upstream
@@ -389,7 +532,35 @@ fn edge_end_order(end: impl Fn(&Edge) -> &str) -> impl Fn(&Edge, &Edge) -> Order
     move |a, b| (end(a), a.line, a.col).cmp(&(end(b), b.line, b.col))
 }
 
-/// What a pass reads: the base graph and the indexed files' text.
+/// What the view reads of a file (see [`View::text`]).
+#[derive(Clone)]
+pub(super) enum Read {
+    /// Its text, as the index holds it.
+    Text(Arc<str>),
+    /// No text, the same every time while the files table holds what it
+    /// holds: no row, or the row of a file over the size bound (or not
+    /// source) that still reads as its row says.
+    Absent,
+    /// A file whose row the disk no longer matches, or that could not be
+    /// read (H2): read as absent, never sliced by its old nodes' lines.
+    Drifted,
+}
+
+/// The files table, read once, by path.
+struct FileTable {
+    records: Vec<FileRecord>,
+    by_path: HashMap<String, usize>,
+}
+
+/// The node kinds of [`Store::classes_and_members_by_file_paths`].
+const CLASS_AND_MEMBER_KINDS: [&str; 3] = ["class", "method", "property"];
+/// The node kinds of [`Store::layouts_and_callables_by_file_path`].
+const LAYOUT_AND_CALLABLE_KINDS: [&str; 4] = ["struct", "union", "function", "method"];
+/// The node kinds of [`Store::enclosing_candidates_by_file_path`].
+const ENCLOSING_KINDS: [&str; 3] = ["function", "method", "component"];
+
+/// What a pass reads: the base graph and the indexed files' text, each read
+/// recorded into the pass's footprint (W9-00 row 27, `footprint.rs`).
 pub(super) struct View<'a> {
     store: &'a Store,
     project_root: PathBuf,
@@ -397,30 +568,40 @@ pub(super) struct View<'a> {
     /// The edges of the stage's [`PREREQUISITES`], which the later steps
     /// and the passes read beside the base graph's.
     overlay: Overlay,
-    texts: RefCell<HashMap<String, Option<Arc<str>>>>,
-    /// The indexed files the files table flags as generated, read with the
-    /// texts.
-    generated: RefCell<HashSet<String>>,
+    texts: RefCell<HashMap<String, Read>>,
+    /// Every indexed file's row, read the first time a pass walks them.
+    files: OnceCell<FileTable>,
     /// The reader of the files the index does not hold, when the stage may
     /// read them ([`run_stage`]; never under [`synthesize`]).
     unindexed: Option<UnindexedReader>,
     /// The routers' route tables of this stage run, each built the first
     /// time a pass asks for it through a [`ViewContext`] (W7-18a).
     route_tables: Arc<RouteTables>,
+    /// What each step reads.
+    recorder: Arc<Recorder>,
 }
 
 impl<'a> View<'a> {
     pub(super) fn new(store: &'a Store, project_root: &Path, max_file_size: u64) -> Self {
+        let recorder = Arc::new(Recorder::default());
         Self {
             store,
             project_root: project_root.to_path_buf(),
             max_file_size,
             overlay: Overlay::default(),
             texts: RefCell::new(HashMap::new()),
-            generated: RefCell::new(HashSet::new()),
+            files: OnceCell::new(),
             unindexed: None,
-            route_tables: Arc::default(),
+            route_tables: Arc::new(RouteTables::observed(
+                Arc::clone(&recorder) as Arc<dyn RouteTableObserver>
+            )),
+            recorder,
         }
+    }
+
+    /// The recorder of what the step running reads.
+    pub(super) fn recorder(&self) -> &Recorder {
+        &self.recorder
     }
 
     /// The view as the [`crate::types::ResolutionContext`] a router's table,
@@ -444,7 +625,13 @@ impl<'a> View<'a> {
     /// [`UnindexedReader::text`] reads and records it; `None` when the
     /// stage reads no such file.
     pub(super) fn unindexed_text(&self, path: &str) -> Option<Arc<str>> {
-        self.unindexed.as_ref()?.text(path)
+        let reader = self.unindexed.as_ref()?;
+        let text = reader.text(path);
+        if let Some(relative) = UnindexedReader::relative(path) {
+            let hash = text.as_deref().map(hash_content);
+            self.recorder.unindexed(&relative, hash.as_deref());
+        }
+        text
     }
 
     /// The project-relative path an unindexed `path` is read under, `None`
@@ -453,21 +640,27 @@ impl<'a> View<'a> {
         UnindexedReader::relative(path)
     }
 
-    /// The project root the files are read from.
-    pub(super) fn project_root(&self) -> &Path {
-        &self.project_root
+    /// The Go modules of the `go.mod` files above `files`, read from disk
+    /// within the root: Go's control inputs (`control_inputs.rs`), which a
+    /// sync that sees one change recomputes the stage whole for.
+    pub(super) fn go_modules(&self, files: &[String]) -> Vec<crate::types::GoModule> {
+        self.recorder.key(keys::files());
+        crate::context::load_go_modules_pub(&self.project_root.to_string_lossy(), files)
     }
 
     /// Whether the files table flags `file` as generated (upstream
     /// `generatedPredicateFor`'s stored half; its path half is
     /// [`codegraph_core::file_class::is_generated_file`]).
     pub(super) fn is_flagged_generated(&self, file: &str) -> bool {
-        self.generated.borrow().contains(file)
+        self.recorder.key(keys::file_row(file));
+        self.file_record(file)
+            .is_some_and(|stored| stored.generated)
     }
 
     /// The base edges of `kind` into `target`, and the overlay's, by source,
     /// line and column.
     pub(super) fn edges_into(&self, target: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
+        self.recorder.key(keys::edges_into(target, kind.as_str()));
         let mut edges: Vec<Edge> = self
             .store
             .edges_by_target_kind(target, Some(kind))?
@@ -482,6 +675,7 @@ impl<'a> View<'a> {
     /// The base edges of `kind` out of `source`, and the overlay's, by
     /// target, line and column.
     pub(super) fn edges_from(&self, source: &str, kind: EdgeKind) -> Result<Vec<Edge>> {
+        self.recorder.key(keys::edges_from(source, kind.as_str()));
         let mut edges: Vec<Edge> = self
             .store
             .edges_by_source_kind(source, Some(kind))?
@@ -502,6 +696,11 @@ impl<'a> View<'a> {
         targets: &[String],
         kind: EdgeKind,
     ) -> Result<HashMap<String, Vec<Edge>>> {
+        let keys: Vec<u64> = targets
+            .iter()
+            .map(|target| keys::edges_into(target, kind.as_str()))
+            .collect();
+        self.recorder.keys(&keys);
         let mut by_end: HashMap<String, Vec<Edge>> = HashMap::new();
         for edge in self.store.edges_by_targets_kind(targets, kind)? {
             if !is_synthesized(&edge) {
@@ -525,12 +724,19 @@ impl<'a> View<'a> {
     /// stored synthesized ones, as [`Self::edges_into_each`] reads them
     /// (W7-21's cost revision). The base edges come with one query that
     /// reads their sources' languages, neither every edge into a target nor
-    /// a caller's whole row.
+    /// a caller's whole row. A caller whose language moves under its id is
+    /// no edge change, so that is read too.
     pub(super) fn called_from(
         &self,
         targets: &[String],
         languages: &[Language],
     ) -> Result<HashSet<String>> {
+        let mut keys: Vec<u64> = targets
+            .iter()
+            .map(|target| keys::edges_into(target, EdgeKind::Calls.as_str()))
+            .collect();
+        keys.push(keys::language_move());
+        self.recorder.keys(&keys);
         let mut called: HashSet<String> = self
             .store
             .calls_into_from_languages(targets, languages)?
@@ -546,6 +752,8 @@ impl<'a> View<'a> {
             .collect();
         if !overlaid.is_empty() {
             let callers: Vec<String> = overlaid.iter().map(|edge| edge.source.clone()).collect();
+            let keys: Vec<u64> = callers.iter().map(|caller| keys::node(caller)).collect();
+            self.recorder.keys(&keys);
             let callers = self.store.nodes_by_ids(&callers)?;
             for edge in overlaid {
                 if callers
@@ -566,6 +774,11 @@ impl<'a> View<'a> {
         sources: &[String],
         kind: EdgeKind,
     ) -> Result<HashMap<String, Vec<Edge>>> {
+        let keys: Vec<u64> = sources
+            .iter()
+            .map(|source| keys::edges_from(source, kind.as_str()))
+            .collect();
+        self.recorder.keys(&keys);
         let mut by_end: HashMap<String, Vec<Edge>> = HashMap::new();
         for edge in self.store.edges_by_sources_kind(sources, kind)? {
             if !is_synthesized(&edge) {
@@ -586,6 +799,7 @@ impl<'a> View<'a> {
 
     /// Every base edge of `kind`, and the overlay's.
     pub(super) fn edges_of_kind(&self, kind: EdgeKind) -> Result<Vec<Edge>> {
+        self.recorder.key(keys::edges_of_kind(kind.as_str()));
         let mut edges: Vec<Edge> = self
             .store
             .edges_by_kind(kind)?
@@ -597,16 +811,20 @@ impl<'a> View<'a> {
     }
 
     pub(super) fn node(&self, id: &str) -> Result<Option<Node>> {
+        self.recorder.key(keys::node(id));
         Ok(self.store.node_by_id(id)?)
     }
 
     /// The nodes of `ids` that exist, by id, read with one query a chunk.
     pub(super) fn nodes(&self, ids: &[String]) -> Result<HashMap<String, Node>> {
+        let keys: Vec<u64> = ids.iter().map(|id| keys::node(id)).collect();
+        self.recorder.keys(&keys);
         Ok(self.store.nodes_by_ids(ids)?)
     }
 
     /// The nodes whose qualified name is `qualified`, in [`node_order`].
     pub(super) fn nodes_qualified(&self, qualified: &str) -> Result<Vec<Node>> {
+        self.recorder.key(keys::qualified(qualified));
         let mut nodes = self.store.nodes_by_qualified_name(qualified)?;
         nodes.sort_by(node_order);
         Ok(nodes)
@@ -619,6 +837,10 @@ impl<'a> View<'a> {
         language: Language,
         decorator: &str,
     ) -> Result<Vec<Node>> {
+        self.recorder.predicate(Predicate::Decorator {
+            language: language.as_str().to_string(),
+            pattern: format!("%\"{decorator}\"%"),
+        });
         let mut nodes = self.store.nodes_with_decorator(language, decorator)?;
         nodes.sort_by(node_order);
         Ok(nodes)
@@ -626,9 +848,18 @@ impl<'a> View<'a> {
 
     /// The nodes of `file`, by line and id (upstream `getNodesByFile`).
     pub(super) fn nodes_in_file(&self, file: &str) -> Result<Vec<Node>> {
+        self.recorder.key(keys::file_nodes(file));
         let mut nodes = self.store.nodes_by_file_path(file)?;
         nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
         Ok(nodes)
+    }
+
+    fn record_file_kinds<'f>(&self, files: impl IntoIterator<Item = &'f str>, kinds: &[&str]) {
+        let mut keys = Vec::new();
+        for file in files {
+            keys.extend(kinds.iter().map(|kind| keys::file_kind(file, kind)));
+        }
+        self.recorder.keys(&keys);
     }
 
     /// The classes, methods and properties of each of `files`, by file, in
@@ -638,6 +869,7 @@ impl<'a> View<'a> {
         &self,
         files: &[String],
     ) -> Result<HashMap<String, Vec<Node>>> {
+        self.record_file_kinds(files.iter().map(String::as_str), &CLASS_AND_MEMBER_KINDS);
         let mut by_file: HashMap<String, Vec<Node>> = HashMap::new();
         for node in self.store.classes_and_members_by_file_paths(files)? {
             by_file
@@ -654,6 +886,7 @@ impl<'a> View<'a> {
     /// The structs, unions, functions and methods of [`Self::nodes_in_file`],
     /// in the same order, read without the others (W7-17a).
     pub(super) fn layouts_and_callables_in_file(&self, file: &str) -> Result<Vec<Node>> {
+        self.record_file_kinds([file], &LAYOUT_AND_CALLABLE_KINDS);
         let mut nodes = self.store.layouts_and_callables_by_file_path(file)?;
         nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
         Ok(nodes)
@@ -664,9 +897,22 @@ impl<'a> View<'a> {
     /// revision): `enclosing_fn` over them gives what it gives over every
     /// node of the file.
     pub(super) fn callables_in_file(&self, file: &str) -> Result<Vec<Node>> {
+        self.record_file_kinds([file], &ENCLOSING_KINDS);
         let mut nodes = self.store.enclosing_candidates_by_file_path(file)?;
         nodes.sort_by(|a, b| (a.start_line, &a.id).cmp(&(b.start_line, &b.id)));
         Ok(nodes)
+    }
+
+    fn record_kinds_in(&self, kinds: &[&str], languages: &[Language]) {
+        let mut keys = Vec::new();
+        for kind in kinds {
+            keys.extend(
+                languages
+                    .iter()
+                    .map(|language| keys::kind_in(kind, language.as_str())),
+            );
+        }
+        self.recorder.keys(&keys);
     }
 
     /// The nodes of `kinds` written in `languages`, in [`node_order`]
@@ -676,6 +922,8 @@ impl<'a> View<'a> {
         kinds: &[NodeKind],
         languages: &[Language],
     ) -> Result<Vec<Node>> {
+        let names: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
+        self.record_kinds_in(&names, languages);
         let mut nodes = self.store.nodes_of_kinds_in_languages(kinds, languages)?;
         nodes.sort_by(node_order);
         Ok(nodes)
@@ -688,6 +936,8 @@ impl<'a> View<'a> {
         kinds: &[NodeKind],
         languages: &[Language],
     ) -> Result<Vec<NodeSpan>> {
+        let names: Vec<&str> = kinds.iter().map(|kind| kind.as_str()).collect();
+        self.record_kinds_in(&names, languages);
         let mut spans = self
             .store
             .node_spans_of_kinds_in_languages(kinds, languages)?;
@@ -701,6 +951,7 @@ impl<'a> View<'a> {
     /// [`node_order`]: [`Self::nodes_of_kinds_in`]'s methods, five fields of
     /// each (W7-21's cost revision).
     pub(super) fn method_headers_in(&self, languages: &[Language]) -> Result<Vec<MethodHeader>> {
+        self.record_kinds_in(&[NodeKind::Method.as_str()], languages);
         let mut headers = self.store.method_headers_in_languages(languages)?;
         headers.sort_by(|a, b| {
             (&a.file_path, a.start_line, &a.id).cmp(&(&b.file_path, b.start_line, &b.id))
@@ -715,6 +966,10 @@ impl<'a> View<'a> {
         kind: NodeKind,
         text: &str,
     ) -> Result<Vec<Node>> {
+        self.recorder.predicate(Predicate::Signature {
+            node_kind: kind.as_str().to_string(),
+            text: text.to_string(),
+        });
         let mut nodes = self.store.nodes_of_kind_whose_signature_holds(kind, text)?;
         nodes.sort_by(node_order);
         Ok(nodes)
@@ -722,6 +977,7 @@ impl<'a> View<'a> {
 
     /// The nodes of `kind`, in [`node_order`] (upstream `getNodesByKind`).
     pub(super) fn nodes_of_kind(&self, kind: NodeKind) -> Result<Vec<Node>> {
+        self.recorder.key(keys::kind(kind.as_str()));
         let mut nodes = self.store.nodes_by_kind(kind)?;
         nodes.sort_by(node_order);
         Ok(nodes)
@@ -729,6 +985,7 @@ impl<'a> View<'a> {
 
     /// The nodes named `name`, in [`node_order`].
     pub(super) fn nodes_named(&self, name: &str) -> Result<Vec<Node>> {
+        self.recorder.key(keys::name(name));
         let mut nodes = self.store.nodes_by_name(name)?;
         nodes.sort_by(node_order);
         Ok(nodes)
@@ -742,6 +999,12 @@ impl<'a> View<'a> {
         likes: &[&str],
         names: &[&str],
     ) -> Result<Vec<Node>> {
+        let owned = |values: &[&str]| values.iter().map(|value| (*value).to_string()).collect();
+        self.recorder.predicate(Predicate::Callables {
+            globs: owned(globs),
+            likes: owned(likes),
+            names: owned(names),
+        });
         let mut nodes = self.store.callables_named_like(globs, likes, names)?;
         nodes.sort_by(callable_order);
         Ok(nodes)
@@ -750,19 +1013,29 @@ impl<'a> View<'a> {
     /// The functions and methods written in `languages`: the methods, then
     /// the functions.
     pub(super) fn callables_in_languages(&self, languages: &[Language]) -> Result<Vec<Node>> {
+        self.record_kinds_in(
+            &[NodeKind::Function.as_str(), NodeKind::Method.as_str()],
+            languages,
+        );
         let mut nodes = self.store.callables_in_languages(languages)?;
         nodes.sort_by(callable_order);
         Ok(nodes)
     }
 
     /// The languages of the indexed files (upstream
-    /// `getDistinctFileLanguages`).
+    /// `getDistinctFileLanguages`): the stage's, which open the passes'
+    /// gates, so no step's.
     fn file_languages(&self) -> Result<HashSet<Language>> {
         Ok(self.store.file_languages()?.into_iter().collect())
     }
 
     /// The indexed files of `languages`, by path.
     pub(super) fn files_of_languages(&self, languages: &[Language]) -> Result<Vec<String>> {
+        let keys: Vec<u64> = languages
+            .iter()
+            .map(|language| keys::files_of(language.as_str()))
+            .collect();
+        self.recorder.keys(&keys);
         let mut files = Vec::new();
         for language in languages {
             files.extend(self.store.file_paths_of_language(*language)?);
@@ -774,6 +1047,7 @@ impl<'a> View<'a> {
 
     /// Every indexed file, by path (upstream `getAllFilePaths`).
     pub(super) fn files(&self) -> Result<Vec<String>> {
+        self.recorder.key(keys::files());
         let mut files = self.store.file_paths()?;
         files.sort();
         Ok(files)
@@ -782,12 +1056,15 @@ impl<'a> View<'a> {
     /// Every unresolved reference of `kind`, in row order: what resolution
     /// left of it.
     pub(super) fn unresolved_refs_of_kind(&self, kind: EdgeKind) -> Result<Vec<UnresolvedRef>> {
+        self.recorder.key(keys::refs_of_kind(kind.as_str()));
         Ok(self.store.unresolved_refs_of_kind(kind)?)
     }
 
     /// The stored references (`unresolved_refs` and `resolved_refs`) at
     /// `site`.
     pub(super) fn refs_at(&self, site: ReferenceSite) -> Result<Vec<UnresolvedRef>> {
+        self.recorder
+            .key(keys::site(&site.from_node_id, site.line, site.col));
         Ok(self
             .store
             .stored_refs_at_sites(&[site].into_iter().collect())?)
@@ -797,64 +1074,171 @@ impl<'a> View<'a> {
     /// modification time are the recorded ones, or its content hashes to the
     /// recorded hash (the MCP engine's freshness probe). A file that drifted
     /// since it was indexed is read as absent, never sliced by its old
-    /// nodes' lines; the sync that reindexes it recomputes the stage.
+    /// nodes' lines, and the step that read it is not kept for a later sync
+    /// (H2): the sync that reindexes it recomputes the step.
     pub(super) fn text(&self, file: &str) -> Option<Arc<str>> {
+        self.recorder.key(keys::text(file));
+        match self.read(file) {
+            Read::Text(text) => Some(text),
+            Read::Absent => None,
+            Read::Drifted => {
+                self.recorder.taint();
+                None
+            }
+        }
+    }
+
+    /// Lines `start..=end` of `file`'s [`Self::text`], as [`slice_lines`]
+    /// reads them. Only the lines are recorded, with their hash, so a change
+    /// elsewhere in the file keeps the step.
+    pub(super) fn text_lines(&self, file: &str, start: i64, end: i64) -> Option<String> {
+        self.lines(file, start, end, false)
+    }
+
+    /// Line `line` of `file`'s [`Self::text`], as `split('\n').nth(line - 1)`
+    /// reads it, recorded as [`Self::text_lines`] records its lines.
+    pub(super) fn text_line(&self, file: &str, line: i64) -> Option<String> {
+        self.lines(file, line, line, true)
+    }
+
+    fn lines(&self, file: &str, start: i64, end: i64, line: bool) -> Option<String> {
+        match self.read(file) {
+            Read::Text(text) => {
+                let lines = read_lines(&text, start, end, line);
+                self.recorder.slice(Slice {
+                    path: file.to_string(),
+                    start,
+                    end,
+                    line,
+                    hash: lines.as_deref().map(hash_content),
+                });
+                lines
+            }
+            Read::Absent => {
+                self.recorder.key(keys::text(file));
+                None
+            }
+            Read::Drifted => {
+                self.recorder.key(keys::text(file));
+                self.recorder.taint();
+                None
+            }
+        }
+    }
+
+    /// The indexed files of `gate`'s scope that `keep` keeps, by path, with
+    /// their texts, of those whose text `gate` passes under `flags`. Only the
+    /// files it passes are recorded: a file it fails is read and dropped,
+    /// and a later sync asks the gate again of a changed file.
+    pub(super) fn gated_texts(
+        &self,
+        gate: &'static TextGate,
+        flags: u32,
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, Arc<str>)>> {
+        let table = self.file_table()?;
+        let mut passed = Vec::new();
+        for stored in &table.records {
+            if !(gate.scope)(&stored.path, stored.language) || !keep(&stored.path) {
+                continue;
+            }
+            match self.read(&stored.path) {
+                Read::Text(text) => {
+                    let input = GateInput { text: &text, flags };
+                    if (gate.check)(&input) {
+                        passed.push((stored.path.clone(), text));
+                    }
+                }
+                Read::Absent => {}
+                Read::Drifted => self.recorder.taint(),
+            }
+        }
+        let contributors: Vec<String> = passed.iter().map(|(path, _)| path.clone()).collect();
+        self.recorder.gate(gate.name, flags, &contributors);
+        Ok(passed)
+    }
+
+    /// What the view reads of `file`, cached for the stage run.
+    pub(super) fn read(&self, file: &str) -> Read {
         if let Some(cached) = self.texts.borrow().get(file) {
             return cached.clone();
         }
-        let text = self.read_fresh(file);
+        let read = match self.file_record(file) {
+            Some(stored) => fresh_text(&self.project_root, &stored, self.max_file_size),
+            None => Read::Absent,
+        };
         self.texts
             .borrow_mut()
-            .insert(file.to_string(), text.clone());
-        text
+            .insert(file.to_string(), read.clone());
+        read
     }
 
-    fn read_fresh(&self, file: &str) -> Option<Arc<str>> {
-        let stored = self.store.file_by_path(file).ok().flatten()?;
-        fresh_text(&self.project_root, &stored, self.max_file_size)
+    /// `file`'s row of the files table, if it has one.
+    pub(super) fn file_record(&self, file: &str) -> Option<FileRecord> {
+        if let Some(table) = self.files.get() {
+            return table.by_path.get(file).map(|&at| table.records[at].clone());
+        }
+        self.store.file_by_path(file).ok().flatten()
+    }
+
+    fn file_table(&self) -> Result<&FileTable> {
+        if self.files.get().is_none() {
+            let mut records = self.store.all_files()?;
+            records.sort_by(|a, b| a.path.cmp(&b.path));
+            let by_path = records
+                .iter()
+                .enumerate()
+                .map(|(at, stored)| (stored.path.clone(), at))
+                .collect();
+            let _ = self.files.set(FileTable { records, by_path });
+        }
+        Ok(self.files.get().expect("the files table was read above"))
     }
 
     /// Every indexed file's [`Self::text`], read at once before the steps
     /// and the passes (W7-15p): the file records in one query, the files in
-    /// parallel, and the records' generated flags kept. The event-emitter
-    /// pass reads every indexed file in each stage, so this reads no file the
-    /// passes would not; a path the files table lacks is still read when
-    /// asked for.
-    fn read_texts(&self) -> Result<()> {
+    /// parallel. The event-emitter pass reads every indexed file in each
+    /// stage, so this reads no file the passes would not; a path the files
+    /// table lacks is still read when asked for.
+    pub(super) fn read_texts(&self) -> Result<()> {
         let root = &self.project_root;
         let max_file_size = self.max_file_size;
-        let files = self.store.all_files()?;
-        self.generated.borrow_mut().extend(
-            files
-                .iter()
-                .filter(|stored| stored.generated)
-                .map(|stored| stored.path.clone()),
-        );
-        let texts: Vec<(String, Option<Arc<str>>)> = files
-            .into_par_iter()
-            .map(|stored| {
-                let text = fresh_text(root, &stored, max_file_size);
-                (stored.path, text)
-            })
+        let table = self.file_table()?;
+        let texts: Vec<(String, Read)> = table
+            .records
+            .par_iter()
+            .map(|stored| (stored.path.clone(), fresh_text(root, stored, max_file_size)))
             .collect();
         self.texts.borrow_mut().extend(texts);
         Ok(())
     }
 }
 
-/// The text of `stored`'s file while it is what the index holds (see
-/// [`View::text`]): read only when its size is in the bound, and kept when its
-/// size and modification time are the recorded ones or its content hashes to
-/// the recorded hash.
-fn fresh_text(project_root: &Path, stored: &FileRecord, max_file_size: u64) -> Option<Arc<str>> {
-    let (metadata, source) = read_source_file(
+/// Lines `start..=end` of `text` as [`slice_lines`] reads them, or line
+/// `start` as `split('\n').nth(start - 1)` does (`line`).
+pub(super) fn read_lines(text: &str, start: i64, end: i64, line: bool) -> Option<String> {
+    if line {
+        usize::try_from(start - 1)
+            .ok()
+            .and_then(|at| text.split('\n').nth(at))
+            .map(str::to_string)
+    } else {
+        slice_lines(text, start, end)
+    }
+}
+
+/// What the view reads of `stored`'s file (see [`View::text`]): its text
+/// when it is read within the size bound and its size and modification time
+/// are the recorded ones or its content hashes to the recorded hash; absent
+/// for a file over the bound or not source that still reads as its row
+/// says; drifted otherwise.
+fn fresh_text(project_root: &Path, stored: &FileRecord, max_file_size: u64) -> Read {
+    let Ok((metadata, source)) = read_source_file(
         &project_root.join(&stored.path),
         &stored.path,
         max_file_size,
-    )
-    .ok()?;
-    let SourceText::Text(text) = source else {
-        return None;
+    ) else {
+        return Read::Drifted;
     };
     let stat_matches = stored.size == metadata.len() as i64
         && metadata
@@ -862,10 +1246,28 @@ fn fresh_text(project_root: &Path, stored: &FileRecord, max_file_size: u64) -> O
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .is_some_and(|since| since.as_millis() as i64 == stored.modified_at);
-    if !stat_matches && stored.content_hash != hash_content(&text) {
-        return None;
+    match source {
+        SourceText::Text(text) => {
+            if !stat_matches && stored.content_hash != hash_content(&text) {
+                return Read::Drifted;
+            }
+            Read::Text(Arc::from(text))
+        }
+        SourceText::Oversize(size) => {
+            if stat_matches || stored.content_hash == hash_content(&oversize_stamp(size)) {
+                Read::Absent
+            } else {
+                Read::Drifted
+            }
+        }
+        SourceText::MpegTransportStream => {
+            if stat_matches {
+                Read::Absent
+            } else {
+                Read::Drifted
+            }
+        }
     }
-    Some(Arc::from(text))
 }
 
 /// The prerequisite steps' edges, indexed by each end.
@@ -1720,6 +2122,253 @@ mod tests {
         let passes: Duration = timings.passes.iter().map(|(_, took)| *took).sum();
         let sum = timings.read + passes + timings.merge + timings.replace + timings.inputs;
         assert!(sum <= wall, "parts {sum:?} over the stage's {wall:?}");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `path` written with `text` and indexed as it is.
+    fn indexed(store: &Store, dir: &Path, path: &str, text: &str) {
+        let full = dir.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, text).unwrap();
+        let metadata = std::fs::metadata(&full).unwrap();
+        store
+            .upsert_file(&FileRecord {
+                path: path.to_string(),
+                content_hash: hash_content(text),
+                language: Language::TypeScript,
+                size: metadata.len() as i64,
+                modified_at: metadata
+                    .modified()
+                    .unwrap()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                indexed_at: 0,
+                node_count: 0,
+                errors: Vec::new(),
+                generated: false,
+            })
+            .unwrap();
+    }
+
+    fn holds(footprint: &super::super::footprint::Footprint, key: u64) -> bool {
+        footprint.keys.contains(&key)
+    }
+
+    /// Each read of the base graph records the key of what would change its
+    /// answer, the pattern lookups their patterns, and an empty answer as
+    /// much as a full one.
+    #[test]
+    fn each_read_records_what_would_change_it() {
+        let (mut store, dir) = temp_store("record-reads");
+        store
+            .upsert_nodes(&[function("a", "src/a.ts"), function("b", "src/b.ts")])
+            .unwrap();
+        indexed(&store, &dir, "src/a.ts", "export function a() {}\n");
+        let view = View::new(&store, &dir, 1 << 20);
+        view.recorder.begin_pass();
+        view.node("a").unwrap();
+        view.node("missing").unwrap();
+        view.nodes_named("b").unwrap();
+        view.nodes_in_file("src/b.ts").unwrap();
+        view.callables_in_file("src/a.ts").unwrap();
+        view.nodes_of_kinds_in(&[NodeKind::Class], &[Language::Kotlin])
+            .unwrap();
+        view.edges_into("a", EdgeKind::Calls).unwrap();
+        view.edges_from("b", EdgeKind::References).unwrap();
+        view.edges_of_kind(EdgeKind::Implements).unwrap();
+        view.files().unwrap();
+        view.files_of_languages(&[Language::Tsx]).unwrap();
+        view.text("src/a.ts").unwrap();
+        assert!(view.text("src/none.ts").is_none());
+        assert!(!view.is_flagged_generated("src/a.ts"));
+        view.callables_named_like(&["on[A-Z]*"], &["%emit%"], &["watch"])
+            .unwrap();
+        let footprint = view.recorder.end_pass();
+        for key in [
+            keys::node("a"),
+            keys::node("missing"),
+            keys::name("b"),
+            keys::file_nodes("src/b.ts"),
+            keys::file_kind("src/a.ts", "function"),
+            keys::file_kind("src/a.ts", "component"),
+            keys::kind_in("class", "kotlin"),
+            keys::edges_into("a", "calls"),
+            keys::edges_from("b", "references"),
+            keys::edges_of_kind("implements"),
+            keys::files(),
+            keys::files_of("tsx"),
+            keys::text("src/a.ts"),
+            keys::text("src/none.ts"),
+            keys::file_row("src/a.ts"),
+        ] {
+            assert!(holds(&footprint, key), "{key:016x}");
+        }
+        assert!(!holds(&footprint, keys::text("src/b.ts")));
+        assert_eq!(
+            footprint.predicates.iter().cloned().collect::<Vec<_>>(),
+            [Predicate::Callables {
+                globs: vec!["on[A-Z]*".to_string()],
+                likes: vec!["%emit%".to_string()],
+                names: vec!["watch".to_string()],
+            }]
+        );
+        assert!(footprint.reusable());
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A gated scan records the files its check passes and nothing of the
+    /// ones it fails, not even the file list; lines record their hash, not
+    /// the file.
+    #[test]
+    fn a_gate_records_what_it_passes_and_lines_their_hash() {
+        let (store, dir) = temp_store("record-gates");
+        indexed(&store, &dir, "src/bus.ts", "bus.emit('saved');\n");
+        indexed(&store, &dir, "src/plain.ts", "export const x = 1;\n");
+        indexed(&store, &dir, "src/lines.ts", "one\ntwo\nthree\n");
+        let view = View::new(&store, &dir, 1 << 20);
+        view.recorder.begin_pass();
+        let passed = view
+            .gated_texts(&callback::EMITTER_GATE, 0, |_| true)
+            .unwrap();
+        assert_eq!(
+            passed
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/bus.ts"]
+        );
+        assert_eq!(
+            view.text_lines("src/lines.ts", 2, 3).as_deref(),
+            Some("two\nthree")
+        );
+        assert_eq!(view.text_line("src/lines.ts", 1).as_deref(), Some("one"));
+        assert_eq!(view.text_line("src/lines.ts", 9), None);
+        let footprint = view.recorder.end_pass();
+        assert_eq!(
+            footprint.gates.get(&("emitter".to_string(), 0)),
+            Some(&["src/bus.ts".to_string()].into_iter().collect())
+        );
+        assert!(footprint.keys.is_empty(), "{:?}", footprint.keys);
+        let slices: Vec<(i64, i64, bool, Option<String>)> = footprint
+            .slices
+            .iter()
+            .map(|slice| (slice.start, slice.end, slice.line, slice.hash.clone()))
+            .collect();
+        assert_eq!(
+            slices,
+            [
+                (1, 1, true, Some(hash_content("one"))),
+                (2, 3, false, Some(hash_content("two\nthree"))),
+                (9, 9, true, None),
+            ]
+        );
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An indexed file that drifted since it was indexed taints the step
+    /// that reads it, through a plain read, a gated scan or its lines (H2);
+    /// a file over the size bound that still reads as its row says does
+    /// not, nor does a path the index does not hold.
+    #[test]
+    fn a_drifted_file_taints_its_reader() {
+        let (store, dir) = temp_store("record-drift");
+        indexed(&store, &dir, "src/drift.ts", "bus.emit('a');\n");
+        indexed(&store, &dir, "src/big.ts", &"x".repeat(64));
+        std::fs::write(dir.join("src/drift.ts"), "bus.emit('b'); // moved\n").unwrap();
+        let read = |reads: &dyn Fn(&View<'_>)| {
+            let view = View::new(&store, &dir, 32);
+            view.recorder.begin_pass();
+            reads(&view);
+            view.recorder.end_pass()
+        };
+        assert!(read(&|view| assert!(view.text("src/drift.ts").is_none())).tainted);
+        assert!(
+            read(&|view| {
+                view.gated_texts(&callback::EMITTER_GATE, 0, |_| true)
+                    .unwrap();
+            })
+            .tainted
+        );
+        assert!(read(&|view| assert!(view.text_lines("src/drift.ts", 1, 1).is_none())).tainted);
+        let calm = read(&|view| {
+            assert!(view.text("src/big.ts").is_none());
+            assert!(view.text("src/unindexed.ts").is_none());
+        });
+        assert!(!calm.tainted && calm.reusable());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A probe on disk or a directory listing through the view's context
+    /// keeps the step from a later sync; the tier pass's indexed-only probe
+    /// reads the files table and does not.
+    #[test]
+    fn an_untracked_read_keeps_no_step() {
+        use crate::types::ResolutionContext;
+        let (store, dir) = temp_store("record-untracked");
+        indexed(&store, &dir, "src/a.ts", "export const a = 1;\n");
+        let view = View::new(&store, &dir, 1 << 20);
+        view.recorder.begin_pass();
+        assert!(view.context().indexed_files_only().file_exists("src/a.ts"));
+        let indexed_only = view.recorder.end_pass();
+        assert!(indexed_only.reusable());
+        assert!(holds(&indexed_only, keys::file_row("src/a.ts")));
+        view.recorder.begin_pass();
+        assert!(view.context().file_exists("src/a.ts"));
+        let probed = view.recorder.end_pass();
+        assert!(!probed.reusable());
+        view.recorder.begin_pass();
+        view.context().list_directories("src");
+        assert!(!view.recorder.end_pass().reusable());
+        drop(view);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The records are a function of the base graph and the files: two
+    /// stage runs over the same index write the same rows, and each step run
+    /// alone in a view of its own records what it records in the stage, so
+    /// no read leaks through a cache the steps share.
+    #[test]
+    fn records_are_deterministic_and_each_step_alone_reads_the_same() {
+        let (mut store, dir) = temp_store("record-alone");
+        let mut save = function("save", "src/bus.ts");
+        save.end_line = 3;
+        let mut handle = function("handle", "src/bus.ts");
+        handle.start_line = 4;
+        handle.end_line = 4;
+        store
+            .upsert_nodes(&[save, handle, function("plain", "src/plain.ts")])
+            .unwrap();
+        indexed(
+            &store,
+            &dir,
+            "src/bus.ts",
+            "function save() {\n  bus.emit('saved');\n}\nfunction handle() { bus.on('saved', handle); }\n",
+        );
+        indexed(&store, &dir, "src/plain.ts", "export function plain() {}\n");
+        indexed(
+            &store,
+            &dir,
+            "src/view.tsx",
+            "export const V = () => <Child />;\n",
+        );
+        let options = ExtractOptions::default();
+        let first = stage_rows(&store, &dir, &options).unwrap();
+        let second = stage_rows(&store, &dir, &options).unwrap();
+        assert_eq!(first, second);
+        let in_stage: Vec<(String, String)> = first
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(PASS_KEY_PREFIX))
+            .collect();
+        assert!(in_stage.len() > 10, "{}", in_stage.len());
+        assert_eq!(records_alone(&store, &dir, &options).unwrap(), in_stage);
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

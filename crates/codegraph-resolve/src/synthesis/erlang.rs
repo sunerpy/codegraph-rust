@@ -17,6 +17,7 @@ use regex::Regex;
 use serde_json::json;
 
 use super::dispatch::synthesized;
+use super::footprint::TextGate;
 use super::stage::{LineAt, View, enclosing_fn};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 
@@ -150,6 +151,23 @@ fn qualified_arity(qualified_name: &str) -> Option<usize> {
     arity.parse().ok()
 }
 
+/// The behaviour pass's first scan: an Erlang source (of a module, which the
+/// pass checks first) that declares a callback.
+pub(super) static CALLBACK_GATE: TextGate = TextGate {
+    name: "erlang-callback",
+    scope: |path, _| is_erlang_source(path),
+    check: |input| input.text.contains("-callback"),
+};
+
+/// The behaviour pass's second scan: an Erlang source that calls through a
+/// variable module. The pass narrows it by the declared callbacks' names
+/// (`may_dispatch`), which this check is a necessary condition of.
+pub(super) static DISPATCH_GATE: TextGate = TextGate {
+    name: "erlang-dispatch",
+    scope: |path, _| is_erlang_source(path),
+    check: |input| VARIABLE_MODULE_CALL.is_match(input.text),
+};
+
 /// Erlang behaviour dispatch (`erlangBehaviourDispatchEdges`): each
 /// `Var:fn(args)` site whose name and arity exactly one in-repo behaviour
 /// declares reaches each implementer's exported `fn` of that arity, at most
@@ -165,25 +183,15 @@ pub(super) fn behaviour_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
             .entry(module.file_path.as_str())
             .or_insert(module);
     }
-    let files = view.files()?;
-
     // Pass 1: every behaviour's callbacks, by `name/arity`.
     let mut declaring: HashMap<String, Vec<&Node>> = HashMap::new();
     let mut callback_names: HashSet<String> = HashSet::new();
-    for file in &files {
-        if !is_erlang_source(file) {
-            continue;
-        }
+    let declared = view.gated_texts(&CALLBACK_GATE, 0, |file| module_by_file.contains_key(file))?;
+    for (file, content) in &declared {
         let Some(behaviour) = module_by_file.get(file.as_str()).copied() else {
             continue;
         };
-        let Some(content) = view.text(file) else {
-            continue;
-        };
-        if !content.contains("-callback") {
-            continue;
-        }
-        let safe = strip_comments_for_regex(&content, CommentLang::Erlang);
+        let safe = strip_comments_for_regex(content, CommentLang::Erlang);
         for captures in CALLBACK_DECL.captures_iter(&safe) {
             let whole = captures.get(0).expect("the whole match");
             let raw = &captures[1];
@@ -245,14 +253,9 @@ pub(super) fn behaviour_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
         .collect();
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for file in &files {
-        if !is_erlang_source(file) {
-            continue;
-        }
-        let Some(content) = view.text(file) else {
-            continue;
-        };
-        if !VARIABLE_MODULE_CALL.is_match(&content) || !may_dispatch(&content, &needles) {
+    for (file, content) in view.gated_texts(&DISPATCH_GATE, 0, |_| true)? {
+        let file = &file;
+        if !may_dispatch(&content, &needles) {
             continue;
         }
         let safe = strip_comments_for_regex(&content, CommentLang::Erlang);

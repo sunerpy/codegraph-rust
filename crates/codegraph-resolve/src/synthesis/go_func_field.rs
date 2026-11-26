@@ -39,7 +39,6 @@ use serde_json::{Map, Value};
 use super::MAX_CALLBACKS_PER_CHANNEL;
 use super::dispatch::synthesized;
 use super::stage::{View, enclosing_fn};
-use crate::context::load_go_modules_pub;
 use crate::frameworks::js_scan::{JS_SPACE, is_js_space, js_trim};
 use crate::go_packages::go_module_package_dir;
 use crate::go_scope::{GoScopeIndex, blank_go_code};
@@ -1548,7 +1547,7 @@ pub(super) fn func_field_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let is_generated = |file: &str| view.is_flagged_generated(file) || is_generated_file(file);
     let mut reader = Reader {
         view,
-        modules: load_go_modules_pub(&view.project_root().to_string_lossy(), &all_files),
+        modules: view.go_modules(&all_files),
         masked: RefCell::default(),
         scopes: RefCell::default(),
         imports: RefCell::default(),

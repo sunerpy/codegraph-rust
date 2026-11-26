@@ -887,9 +887,30 @@ pub(crate) fn decode_segment(seg: &str) -> String {
 #[derive(Default)]
 pub struct RouteTables {
     tables: Mutex<HashMap<&'static str, Arc<dyn Any + Send + Sync>>>,
+    /// Told when a table is built and read again: the synthesis stage's
+    /// recorder keeps what a build read with the table (W9-00 row 27).
+    observer: Option<Arc<dyn RouteTableObserver>>,
+}
+
+/// What [`RouteTables`] tells the reader of its tables.
+pub(crate) trait RouteTableObserver: Send + Sync {
+    /// `router`'s table starts to be built.
+    fn building(&self, router: &'static str);
+    /// `router`'s table is built.
+    fn built(&self, router: &'static str);
+    /// `router`'s built table is handed out again.
+    fn reused(&self, router: &'static str);
 }
 
 impl RouteTables {
+    /// Tables whose builds and reads `observer` is told of.
+    pub(crate) fn observed(observer: Arc<dyn RouteTableObserver>) -> Self {
+        Self {
+            tables: Mutex::default(),
+            observer: Some(observer),
+        }
+    }
+
     /// `router`'s table, built by `build` the first time this pass asks.
     pub(crate) fn get_or_build<T: Any + Send + Sync>(
         &self,
@@ -901,9 +922,18 @@ impl RouteTables {
             .get(router)
             .and_then(|table| Arc::clone(table).downcast::<T>().ok())
         {
+            if let Some(observer) = &self.observer {
+                observer.reused(router);
+            }
             return table;
         }
+        if let Some(observer) = &self.observer {
+            observer.building(router);
+        }
         let table = Arc::new(build());
+        if let Some(observer) = &self.observer {
+            observer.built(router);
+        }
         tables.insert(router, Arc::clone(&table) as Arc<dyn Any + Send + Sync>);
         table
     }

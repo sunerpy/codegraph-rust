@@ -14,7 +14,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::MAX_CALLBACKS_PER_CHANNEL;
-use super::stage::{View, node_order, slice_lines};
+use super::stage::{View, node_order};
 
 /// A React class component's state update (`this.setState(…)`).
 static SET_STATE: LazyLock<Regex> =
@@ -138,10 +138,9 @@ fn rerender_edges(
             if method.id == target.id {
                 continue;
             }
-            let Some(content) = view.text(&method.file_path) else {
-                continue;
-            };
-            let Some(source) = slice_lines(&content, method.start_line, method.end_line) else {
+            let Some(source) =
+                view.text_lines(&method.file_path, method.start_line, method.end_line)
+            else {
                 continue;
             };
             if !update.is_match(&source) || !seen.insert((method.id.clone(), target.id.clone())) {

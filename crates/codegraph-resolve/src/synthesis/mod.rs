@@ -34,6 +34,7 @@ mod callback;
 mod context;
 mod dispatch;
 mod erlang;
+mod footprint;
 mod framework;
 mod go;
 mod go_dispatch;
@@ -54,7 +55,10 @@ mod vue;
 // `path.posix`, for the Laravel resolver's route-file mounts too (W7-19d).
 pub(crate) use c_fnptr::{posix_dirname, posix_normalize};
 pub use inputs::{INPUTS_KEY, Inputs, inputs_changed, recorded as recorded_inputs};
-pub use stage::{StageStats, StageTimings, run_stage, run_stage_timed, synthesize};
+pub use stage::{
+    StageStats, StageTimings, records_alone, run_stage, run_stage_timed, stage_rows, step_names,
+    synthesize,
+};
 
 use anyhow::Result;
 use codegraph_core::types::Edge;
@@ -69,6 +73,22 @@ pub const VERSION_KEY: &str = "synthesis_version";
 
 /// The marker's value; a change to what the passes produce moves it.
 pub const VERSION: &str = "23";
+
+/// `project_metadata` key of what the pass records were written by and for
+/// (W9-00 row 27): the engine's [`VERSION`], the [`BUILD_IDENTITY`], the
+/// schema version, the options the stage reads, the indexed languages and
+/// the steps that ran.
+pub const STAGE_KEY: &str = "synthesis_passes";
+
+/// `project_metadata` key prefix of each step's record, `synthesis_pass:` and
+/// its upstream name: its raw output and what it read.
+pub const PASS_KEY_PREFIX: &str = "synthesis_pass:";
+
+/// The build that writes the records: the package version and a digest of
+/// the sources the stage's output follows from, taken when it is compiled
+/// (`build.rs`), so a binary built from other sources trusts no record this
+/// one wrote, and the CLI and an in-process sync of one build agree (H3).
+pub const BUILD_IDENTITY: &str = env!("CODEGRAPH_SYNTHESIS_BUILD");
 
 /// The edges one channel, class or declaration links at most (upstream
 /// `MAX_CALLBACKS_PER_CHANNEL`).

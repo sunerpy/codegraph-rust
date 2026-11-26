@@ -681,6 +681,32 @@ first, and the watcher hands an event for a recorded path to the next sync. A
 row that does not parse counts as changed; an index without the row has an
 older marker and recomputes anyway. It is not a canonical surface.
 
+`synthesis_passes` and `synthesis_pass:{pass}` record what each run of the
+synthesis stage read and emitted (W9-00 row 27). `synthesis_passes` is a JSON
+object: the record scheme, the engine's `synthesis_version` value, the build
+identity (the package version and a digest of the sources the stage's output
+follows from, taken when the binary is compiled), the schema version, a digest
+of the options the stage reads (`indexing.max_file_size` and the scan scope of
+the files beside the index), the indexed files' languages, and the
+prerequisite steps and passes that ran, in order. Each step that ran has a
+`synthesis_pass:{pass}` row under its upstream name: its raw output (its
+edges in the order it emitted them, before the merge) and its footprint: the
+sorted 64-bit hashes of the keys its reads named (a node by id, a file's
+nodes, a name, a qualified or lower-cased name, a kind in a language, the
+edges of a kind into or out of a node, a site's references, the file list, a
+file's row or text), its pattern lookups (`GLOB` and `LIKE` name patterns, a
+signature or decorator that holds a string), the files each of its per-file
+text checks passed, the lines it read with their hash, the files it read
+beside the index with their hash, and what keeps it from being reused: a
+probe on disk, a directory listing or a table built from the store through
+the stage's resolution context, a file that drifted since it was indexed, or
+a record over 32 MiB, which keeps no output. Every run of the stage (a full
+index, a migration, a sync) writes them with its edges and
+`synthesis_unindexed_inputs` in one transaction, dropping the rows of the
+steps that did not run. Nothing reads them yet. They are not a canonical
+surface; the sync matrix checks that a sync leaves them as a fresh index
+writes them.
+
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
 `resolved_refs` are what extracting it again gives, with the references of the
 cross-file nodes in it (the routes of React Router tables, which no single

@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 use codegraph_core::types::{Language, Node, NodeKind};
 
+use super::footprint::keys;
 use super::stage::View;
 use crate::context::{StoreResolutionContext, reads_re_exports_as_typescript};
 use crate::frameworks::route_href::RouteTables;
@@ -83,6 +84,17 @@ impl<'v, 'a> ViewContext<'v, 'a> {
     pub(super) fn indexed_files_only(mut self) -> Self {
         self.indexed_only = true;
         self
+    }
+
+    fn key(&self, key: u64) {
+        self.view.recorder().key(key);
+    }
+
+    /// A read the view cannot see into: a probe on disk, a directory
+    /// listing, or a table built from the store's rows and files, so the
+    /// step reading it is not kept for a later sync (W9-00 row 27).
+    fn untracked(&self, what: &'static str) {
+        self.view.recorder().untracked(what);
     }
 }
 
@@ -159,55 +171,68 @@ impl ResolutionContext for ViewContext<'_, '_> {
     // ---- Everything else, from the store context ----
 
     fn get_nodes_in_file(&self, file_path: &str) -> Vec<Node> {
+        self.key(keys::file_nodes(file_path));
         self.store.get_nodes_in_file(file_path)
     }
 
     fn get_nodes_in_file_shared(&self, file_path: &str) -> Vec<Arc<Node>> {
+        self.key(keys::file_nodes(file_path));
         self.store.get_nodes_in_file_shared(file_path)
     }
 
     fn get_nodes_by_name(&self, name: &str) -> Vec<Node> {
+        self.key(keys::name(name));
         self.store.get_nodes_by_name(name)
     }
 
     fn get_nodes_by_name_shared(&self, name: &str) -> Vec<Arc<Node>> {
+        self.key(keys::name(name));
         self.store.get_nodes_by_name_shared(name)
     }
 
     fn get_nodes_by_qualified_name(&self, qualified_name: &str) -> Vec<Node> {
+        self.key(keys::qualified(qualified_name));
         self.store.get_nodes_by_qualified_name(qualified_name)
     }
 
     fn get_nodes_by_qualified_name_shared(&self, qualified_name: &str) -> Vec<Arc<Node>> {
+        self.key(keys::qualified(qualified_name));
         self.store
             .get_nodes_by_qualified_name_shared(qualified_name)
     }
 
     fn get_nodes_by_kind(&self, kind: NodeKind) -> Vec<Node> {
+        self.key(keys::kind(kind.as_str()));
         self.store.get_nodes_by_kind(kind)
     }
 
     fn get_nodes_by_kind_shared(&self, kind: NodeKind) -> Vec<Arc<Node>> {
+        self.key(keys::kind(kind.as_str()));
         self.store.get_nodes_by_kind_shared(kind)
     }
 
     fn known_node_names(&self) -> Vec<String> {
+        self.key(keys::names());
         self.store.known_node_names()
     }
 
     fn file_exists(&self, file_path: &str) -> bool {
         if self.indexed_only {
+            self.key(keys::file_row(file_path));
             self.store.is_indexed_file(file_path)
         } else {
+            self.untracked("file_exists");
             self.store.file_exists(file_path)
         }
     }
 
     fn is_indexed_file(&self, file_path: &str) -> bool {
+        self.key(keys::file_row(file_path));
         self.store.is_indexed_file(file_path)
     }
 
     fn file_has_exported_node(&self, file_path: &str) -> bool {
+        self.key(keys::file_nodes(file_path));
         self.store.file_has_exported_node(file_path)
     }
 
@@ -220,30 +245,37 @@ impl ResolutionContext for ViewContext<'_, '_> {
     }
 
     fn get_all_files(&self) -> Vec<String> {
+        self.key(keys::files());
         self.store.get_all_files()
     }
 
     fn get_all_files_shared(&self) -> Arc<Vec<String>> {
+        self.key(keys::files());
         self.store.get_all_files_shared()
     }
 
     fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
+        self.key(keys::files());
         self.store.get_files_by_basename_shared(basename)
     }
 
     fn get_nodes_by_lower_name(&self, lower_name: &str) -> Vec<Node> {
+        self.key(keys::lower_name(&lower_name.to_ascii_lowercase()));
         self.store.get_nodes_by_lower_name(lower_name)
     }
 
     fn get_nodes_by_lower_name_shared(&self, lower_name: &str) -> Vec<Arc<Node>> {
+        self.key(keys::lower_name(&lower_name.to_ascii_lowercase()));
         self.store.get_nodes_by_lower_name_shared(lower_name)
     }
 
     fn get_node_by_id(&self, id: &str) -> Option<Node> {
+        self.key(keys::node(id));
         self.store.get_node_by_id(id)
     }
 
     fn get_node_by_id_shared(&self, id: &str) -> Option<Arc<Node>> {
+        self.key(keys::node(id));
         self.store.get_node_by_id_shared(id)
     }
 
@@ -276,6 +308,7 @@ impl ResolutionContext for ViewContext<'_, '_> {
     }
 
     fn list_directories(&self, dir: &str) -> Vec<String> {
+        self.untracked("list_directories");
         self.store.list_directories(dir)
     }
 
@@ -284,58 +317,72 @@ impl ResolutionContext for ViewContext<'_, '_> {
     }
 
     fn get_cpp_include_dirs(&self) -> Vec<String> {
+        self.untracked("get_cpp_include_dirs");
         self.store.get_cpp_include_dirs()
     }
 
     fn python_write_index(&self) -> Arc<crate::python_globals::PythonWriteIndex> {
+        self.untracked("python_write_index");
         self.store.python_write_index()
     }
 
     fn cpp_namespace_tables(&self) -> Arc<crate::cpp_namespaces::CppNamespaceTables> {
+        self.untracked("cpp_namespace_tables");
         self.store.cpp_namespace_tables()
     }
 
     fn kotlin_tables(&self) -> Arc<crate::kotlin_scope::KotlinTables> {
+        self.untracked("kotlin_tables");
         self.store.kotlin_tables()
     }
 
     fn spring_tables(&self) -> Arc<crate::frameworks::spring::SpringTables> {
+        self.untracked("spring_tables");
         self.store.spring_tables()
     }
 
     fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        self.untracked("drupal_tables");
         self.store.drupal_tables()
     }
 
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
+        self.untracked("scala_tables");
         self.store.scala_tables()
     }
 
     fn csharp_tables(&self) -> Arc<crate::csharp_types::CsharpTables> {
+        self.untracked("csharp_tables");
         self.store.csharp_tables()
     }
 
     fn member_tables(&self) -> Arc<crate::member_types::MemberTables> {
+        self.untracked("member_tables");
         self.store.member_tables()
     }
 
     fn ruby_tables(&self) -> Arc<crate::ruby_scope::RubyTables> {
+        self.untracked("ruby_tables");
         self.store.ruby_tables()
     }
 
     fn php_tables(&self) -> Arc<crate::php_scope::PhpTables> {
+        self.untracked("php_tables");
         self.store.php_tables()
     }
 
     fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
+        self.untracked("lua_tables");
         self.store.lua_tables()
     }
 
     fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
+        self.untracked("dart_tables");
         self.store.dart_tables()
     }
 
     fn dart_libraries(&self) -> Arc<crate::dart_libraries::DartLibraries> {
+        self.untracked("dart_libraries");
         self.store.dart_libraries()
     }
 
@@ -348,22 +395,27 @@ impl ResolutionContext for ViewContext<'_, '_> {
     }
 
     fn cfml_tables(&self) -> Arc<crate::cfml_scope::CfmlTables> {
+        self.untracked("cfml_tables");
         self.store.cfml_tables()
     }
 
     fn swift_tables(&self) -> Arc<crate::swift_type_visibility::SwiftTables> {
+        self.untracked("swift_tables");
         self.store.swift_tables()
     }
 
     fn objc_tables(&self) -> Arc<crate::objc_scope::ObjcTables> {
+        self.untracked("objc_tables");
         self.store.objc_tables()
     }
 
     fn go_tables(&self) -> Arc<crate::go_packages::GoTables> {
+        self.untracked("go_tables");
         self.store.go_tables()
     }
 
     fn solidity_tables(&self) -> Arc<crate::solidity_scope::SolidityTables> {
+        self.untracked("solidity_tables");
         self.store.solidity_tables()
     }
 
@@ -374,27 +426,33 @@ impl ResolutionContext for ViewContext<'_, '_> {
         start: i64,
         end: i64,
     ) -> Option<(i64, i64)> {
+        self.key(keys::file_nodes(file_path));
         self.store
             .enclosing_function_lines(file_path, qualified, start, end)
     }
 
     fn file_callables(&self, file_path: &str) -> Arc<FileCallables> {
+        self.key(keys::file_nodes(file_path));
         self.store.file_callables(file_path)
     }
 
     fn file_methods(&self, file_path: &str) -> Arc<FileMethods> {
+        self.key(keys::file_nodes(file_path));
         self.store.file_methods(file_path)
     }
 
     fn has_callable_named(&self, qualified: &str) -> bool {
+        self.key(keys::qualified(qualified));
         self.store.has_callable_named(qualified)
     }
 
     fn method_files(&self, name: &str) -> Option<Arc<HashSet<String>>> {
+        self.key(keys::name(name));
         self.store.method_files(name)
     }
 
     fn name_matcher_tables(&self) -> Arc<NameMatcherTables> {
+        self.untracked("name_matcher_tables");
         self.store.name_matcher_tables()
     }
 }

@@ -91,8 +91,10 @@ fn read(root: &Path, scope: &ScanScope, max_file_size: u64, relative: &str) -> O
     Some(Arc::from(text))
 }
 
-/// Record what a stage run read beside the index.
-pub(super) fn write(store: &Store, inputs: &Inputs) -> Result<()> {
+/// Record what a stage run read beside the index, as the stage's own
+/// transaction does (`stage.rs`).
+#[cfg(test)]
+fn write(store: &Store, inputs: &Inputs) -> Result<()> {
     store.set_project_metadata(INPUTS_KEY, &serde_json::to_string(inputs)?)?;
     Ok(())
 }

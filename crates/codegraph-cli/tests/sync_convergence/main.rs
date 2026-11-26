@@ -501,6 +501,10 @@ fn run_case(name: &str, case: &Case) {
         "frameworks_",
         "dart_pubspec",
         "synthesis_unindexed_inputs",
+        // What each synthesis step read and emitted (W9-00 row 27): a step a
+        // sync kept must hold what a fresh index records for it, so this
+        // compares every kept output and footprint byte for byte.
+        "synthesis_pass",
         // The Play routes marker (W7-19c).
         "play_routes",
         // The Laravel and Drupal lane markers (W7-19d).

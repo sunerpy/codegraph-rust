@@ -12,6 +12,7 @@ use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind};
 use serde_json::json;
 
 use super::dispatch::synthesized;
+use super::footprint::TextGate;
 use super::stage::View;
 use crate::frameworks::js_scan::is_js_space;
 use crate::name_matcher::crosses_code_boundary;
@@ -46,6 +47,21 @@ pub(super) fn gate(languages: &HashSet<Language>) -> bool {
     .any(|language| languages.contains(language))
 }
 
+/// The JSX pass's per-file check (upstream's JSX-file gate): a tsx, jsx or
+/// JavaScript file holding a `</` or a `/>`. No JSX element is written
+/// without one, so a file holding neither has no tag, and its nodes and
+/// edges go unread (most of a large project's `.js` files).
+pub(super) static JSX_GATE: TextGate = TextGate {
+    name: "jsx",
+    scope: |_, language| {
+        matches!(
+            language,
+            Language::Tsx | Language::Jsx | Language::JavaScript
+        )
+    },
+    check: |input| input.text.contains("</") || input.text.contains("/>"),
+};
+
 /// One JSX tag: where it is, its name, the node its static reference comes
 /// from and the node that reference reaches.
 struct Tag {
@@ -67,16 +83,7 @@ pub(super) fn jsx_render_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     // The files that can write JSX (upstream `JSX_FAMILY`): tsx, jsx and
     // JavaScript, whose tags the walker records (`extract_jsx_component_ref`,
     // W7-28).
-    for file in view.files_of_languages(&[Language::Tsx, Language::Jsx, Language::JavaScript])? {
-        let Some(content) = view.text(&file) else {
-            continue;
-        };
-        // Upstream's JSX-file gate: no JSX element is written without a `</`
-        // or a `/>`, so a file holding neither has no tag, and its nodes and
-        // edges go unread (most of a large project's `.js` files).
-        if !(content.contains("</") || content.contains("/>")) {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&JSX_GATE, 0, |_| true)? {
         #[cfg(test)]
         tests::note_read(&file);
         let nodes = view.nodes_in_file(&file)?;

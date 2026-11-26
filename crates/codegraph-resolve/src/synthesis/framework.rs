@@ -34,7 +34,8 @@ use regex::Regex;
 use serde_json::json;
 
 use super::dispatch::synthesized;
-use super::stage::{LineAt, View, enclosing_fn, slice_lines};
+use super::footprint::TextGate;
+use super::stage::{LineAt, View, enclosing_fn};
 use crate::frameworks::js_scan::{JS_SPACE, is_js_space, js_trim};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 
@@ -246,10 +247,8 @@ pub(super) fn redux_thunk_edges(view: &View<'_>) -> Result<Vec<Edge>> {
         {
             continue;
         }
-        let Some(content) = view.text(&thunk.file_path) else {
-            continue;
-        };
-        let Some(source) = slice_lines(&content, thunk.start_line, thunk.end_line) else {
+        let Some(source) = view.text_lines(&thunk.file_path, thunk.start_line, thunk.end_line)
+        else {
             continue;
         };
         if source.is_empty() {
@@ -445,6 +444,28 @@ fn only_component(nodes: &[Node]) -> Option<&Node> {
     components.next().is_none().then_some(first)
 }
 
+/// The Pinia pass's first scan: a store-pass file that defines a store.
+pub(super) static PINIA_FACTORY_GATE: TextGate = TextGate {
+    name: "pinia-factory",
+    scope: |path, _| STORE_PASS_FILE.is_match(path),
+    check: |input| input.text.contains("defineStore"),
+};
+
+/// The Pinia pass's second scan: a store-pass file that names a store.
+pub(super) static PINIA_USE_GATE: TextGate = TextGate {
+    name: "pinia-use",
+    scope: |path, _| STORE_PASS_FILE.is_match(path),
+    check: |input| input.text.contains("Store"),
+};
+
+/// The Vuex pass's per-file check: a store-pass file that dispatches or
+/// commits.
+pub(super) static VUEX_GATE: TextGate = TextGate {
+    name: "vuex",
+    scope: |path, _| STORE_PASS_FILE.is_match(path),
+    check: |input| input.text.contains("dispatch(") || input.text.contains("commit("),
+};
+
 /// The Pinia pass (`piniaStoreEdges`): an action called on the store a file
 /// binds (`const cart = useCartStore(); cart.add(…)`) links from the
 /// function around the call to the action, the one function of the name in
@@ -453,23 +474,12 @@ fn only_component(nodes: &[Node]) -> Option<&Node> {
 /// file, bind nothing (KEEP-RUST, hard invariant 6: upstream's later one
 /// wins).
 pub(super) fn pinia_store_edges(view: &View<'_>) -> Result<Vec<Edge>> {
-    let files: Vec<String> = view
-        .files()?
-        .into_iter()
-        .filter(|file| STORE_PASS_FILE.is_match(file))
-        .collect();
     // Each factory's file, read in the text as written, comments too, as
     // upstream reads it.
     let mut factories: HashMap<String, Option<String>> = HashMap::new();
-    for file in &files {
-        let Some(content) = view.text(file) else {
-            continue;
-        };
-        if !content.contains("defineStore") {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&PINIA_FACTORY_GATE, 0, |_| true)? {
         for captures in PINIA_FACTORY.captures_iter(&content) {
-            name_once(&mut factories, &captures[1], file);
+            name_once(&mut factories, &captures[1], &file);
         }
     }
     let factories = named_once(factories);
@@ -478,13 +488,8 @@ pub(super) fn pinia_store_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     }
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for file in &files {
-        let Some(content) = view.text(file) else {
-            continue;
-        };
-        if !content.contains("Store") {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&PINIA_USE_GATE, 0, |_| true)? {
+        let file = &file;
         let safe = strip_comments_for_regex(&content, store_pass_comments(file));
         let mut bound: HashMap<String, Option<String>> = HashMap::new();
         for captures in PINIA_BIND.captures_iter(&safe) {
@@ -552,16 +557,7 @@ pub(super) fn vuex_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut store_files: HashMap<String, bool> = HashMap::new();
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for file in view.files()? {
-        if !STORE_PASS_FILE.is_match(&file) {
-            continue;
-        }
-        let Some(content) = view.text(&file) else {
-            continue;
-        };
-        if !content.contains("dispatch(") && !content.contains("commit(") {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&VUEX_GATE, 0, |_| true)? {
         let safe = strip_comments_for_regex(&content, store_pass_comments(&file));
         let nodes = view.callables_in_file(&file)?;
         let fallback = only_component(&nodes);
@@ -677,6 +673,38 @@ fn files_ending(view: &View<'_>, language: Language, suffix: &str) -> Result<Vec
         .collect())
 }
 
+/// The Celery pass's per-file check: a Python `.py` file that delays or
+/// applies a task.
+pub(super) static CELERY_GATE: TextGate = TextGate {
+    name: "celery",
+    scope: |path, language| language == Language::Python && path.ends_with(".py"),
+    check: |input| {
+        !input.text.is_empty()
+            && (input.text.contains(".delay(") || input.text.contains(".apply_async("))
+    },
+};
+
+/// The Sidekiq pass's per-file check: a Ruby `.rb` file that enqueues a job.
+pub(super) static SIDEKIQ_GATE: TextGate = TextGate {
+    name: "sidekiq",
+    scope: |path, language| language == Language::Ruby && path.ends_with(".rb"),
+    check: |input| !input.text.is_empty() && SIDEKIQ_ENQUEUE.is_match(input.text),
+};
+
+/// The Spring pass's per-file check: a Java `.java` file that publishes an
+/// event or listens to one.
+pub(super) static SPRING_GATE: TextGate = TextGate {
+    name: "spring",
+    scope: |path, language| language == Language::Java && path.ends_with(".java"),
+    check: |input| {
+        !input.text.is_empty()
+            && (input.text.contains(".publishEvent(")
+                || input.text.contains("@EventListener")
+                || input.text.contains("@TransactionalEventListener")
+                || SPRING_APPLICATION_LISTENER.is_match(input.text))
+    },
+};
+
 /// The Celery pass (`celeryDispatchEdges`): the function around each
 /// `task.delay(…)` or `task.apply_async(…)` links to the task, a Python
 /// function under a task decorator, at most [`FILE_FANOUT_CAP`] a file.
@@ -684,15 +712,7 @@ pub(super) fn celery_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut tasks: HashMap<String, bool> = HashMap::new();
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for file in files_ending(view, Language::Python, ".py")? {
-        let Some(content) = view.text(&file) else {
-            continue;
-        };
-        if content.is_empty()
-            || (!content.contains(".delay(") && !content.contains(".apply_async("))
-        {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&CELERY_GATE, 0, |_| true)? {
         let safe = strip_comments_for_regex(&content, CommentLang::Python);
         let lines = LineAt::new(&safe, 1);
         let nodes = view.callables_in_file(&file)?;
@@ -794,13 +814,7 @@ fn decorated_as_task(lines: &[&str], start: i64) -> bool {
 pub(super) fn spring_event_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut listeners: HashMap<String, Vec<Node>> = HashMap::new();
     let mut publishers: Vec<String> = Vec::new();
-    for file in files_ending(view, Language::Java, ".java")? {
-        let Some(content) = view.text(&file) else {
-            continue;
-        };
-        if content.is_empty() {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&SPRING_GATE, 0, |_| true)? {
         if content.contains(".publishEvent(") {
             publishers.push(file.clone());
         }
@@ -1101,13 +1115,7 @@ pub(super) fn sidekiq_dispatch_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut performs: HashMap<String, Option<Node>> = HashMap::new();
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for file in files_ending(view, Language::Ruby, ".rb")? {
-        let Some(content) = view.text(&file) else {
-            continue;
-        };
-        if content.is_empty() || !SIDEKIQ_ENQUEUE.is_match(&content) {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&SIDEKIQ_GATE, 0, |_| true)? {
         let safe = strip_comments_for_regex(&content, CommentLang::Ruby);
         let lines = LineAt::new(&safe, 1);
         let nodes = view.callables_in_file(&file)?;

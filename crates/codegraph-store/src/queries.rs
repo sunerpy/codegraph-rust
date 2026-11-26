@@ -1253,6 +1253,19 @@ impl Store {
         &mut self,
         edges: &[Edge],
     ) -> rusqlite::Result<(usize, usize)> {
+        self.replace_synthesized_edges_and_rows(edges, &[], &[])
+    }
+
+    /// [`Self::replace_synthesized_edges`], and in the same transaction the
+    /// `project_metadata` rows whose key starts with one of `cleared` deleted
+    /// and each of `rows` written: the synthesis stage's records of what it
+    /// read beside its edges (W9-00 row 27).
+    pub fn replace_synthesized_edges_and_rows(
+        &mut self,
+        edges: &[Edge],
+        cleared: &[&str],
+        rows: &[(String, String)],
+    ) -> rusqlite::Result<(usize, usize)> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1316,6 +1329,20 @@ impl Store {
             .map(|((edge, _), _)| *edge)
             .collect();
         let inserted = insert_edge_refs_in(&tx, &rest)?;
+        for prefix in cleared {
+            tx.execute(
+                "DELETE FROM project_metadata WHERE substr(key, 1, ?2) = ?1",
+                params![prefix, prefix.chars().count() as i64],
+            )?;
+        }
+        let now = now_millis();
+        for (key, value) in rows {
+            tx.execute(
+                "INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, value, now],
+            )?;
+        }
         tx.commit()?;
         Ok((stale.len(), inserted))
     }

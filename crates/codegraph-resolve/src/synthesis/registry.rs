@@ -15,6 +15,7 @@ use regex::Regex;
 use serde_json::json;
 
 use super::dispatch::synthesized;
+use super::footprint::TextGate;
 use super::stage::{LineAt, View, enclosing_fn};
 use crate::frameworks::js_scan::JS_SPACE;
 use crate::strip_comments::strip_js_comments_keeping_offsets;
@@ -87,72 +88,14 @@ static ENTRY: LazyLock<Regex> = LazyLock::new(|| {
 pub(super) fn object_registry_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut edges = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for file in view.files()? {
-        if !JS_FILE.is_match(&file) {
-            continue;
-        }
-        let Some(content) = view.text(&file) else {
+    for (file, content) in view.gated_texts(&REGISTRY_GATE, 0, |_| true)? {
+        let Some(Scan {
+            dispatches,
+            registries,
+        }) = scan(&content)
+        else {
             continue;
         };
-        if content.is_empty() || !COMPUTED_ACCESS.is_match(&content) || minified(&content) {
-            continue;
-        }
-        let safe = strip_js_comments_keeping_offsets(&content);
-        let lines = LineAt::new(&safe, 1);
-
-        let mut dispatches: Vec<(String, i64, Option<String>)> = Vec::new();
-        for captures in DISPATCH.captures_iter(&safe) {
-            let whole = captures.get(0).expect("match");
-            let end = utf16_window_end(&content, whole.start(), CHAIN_WINDOW);
-            let window = &safe[whole.start()..end];
-            let chained = CHAINED_AFTER_CALL
-                .captures(window)
-                .or_else(|| CHAINED.captures(window))
-                .map(|chain| chain[1].to_string());
-            dispatches.push((captures[1].to_string(), lines.line(whole.start()), chained));
-        }
-        if dispatches.is_empty() {
-            continue;
-        }
-        let refs: HashSet<&str> = dispatches
-            .iter()
-            .map(|(reference, _, _)| without_this(reference))
-            .collect();
-
-        // Each dispatched name's first object literal of at least two
-        // handler names.
-        let mut registries: HashMap<String, (Vec<String>, i64)> = HashMap::new();
-        let mut at = 0;
-        while let Some(captures) = ASSIGN.captures_at(&safe, at) {
-            let whole = captures.get(0).expect("match");
-            let name = match captures.get(1) {
-                Some(declared) => declared,
-                None => {
-                    let assigned = captures.get(2).expect("assigned name");
-                    if !name_starts_here(&safe, assigned.start()) {
-                        at = next_char(&safe, whole.start());
-                        continue;
-                    }
-                    assigned
-                }
-            };
-            at = whole.end();
-            let target = without_this(name.as_str());
-            if !refs.contains(target) || registries.contains_key(target) {
-                continue;
-            }
-            let Some(body) = brace_body(&safe, whole.end() - 1) else {
-                continue;
-            };
-            let names = entry_names(body);
-            if names.len() >= MIN_ENTRIES {
-                registries.insert(target.to_string(), (names, lines.line(whole.start())));
-            }
-        }
-        if registries.is_empty() {
-            continue;
-        }
-
         let nodes = view.nodes_in_file(&file)?;
         for (reference, line, chained) in &dispatches {
             let Some((names, registered)) = registries.get(without_this(reference)) else {
@@ -191,6 +134,91 @@ pub(super) fn object_registry_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     }
     Ok(edges)
 }
+
+/// What one file's text dispatches and registers: each `<ref>[<key>](…)`
+/// with its line and the method chained after it, and each dispatched
+/// name's first object literal of at least [`MIN_ENTRIES`] handler names,
+/// with its line.
+struct Scan {
+    dispatches: Vec<(String, i64, Option<String>)>,
+    registries: HashMap<String, (Vec<String>, i64)>,
+}
+
+/// The registry pass's text-only reading of one file: `None` for a file
+/// without a dispatch or without a registry of a dispatched name, whose
+/// nodes the pass never reads.
+fn scan(content: &str) -> Option<Scan> {
+    if content.is_empty() || !COMPUTED_ACCESS.is_match(content) || minified(content) {
+        return None;
+    }
+    let safe = strip_js_comments_keeping_offsets(content);
+    let lines = LineAt::new(&safe, 1);
+
+    let mut dispatches: Vec<(String, i64, Option<String>)> = Vec::new();
+    for captures in DISPATCH.captures_iter(&safe) {
+        let whole = captures.get(0).expect("match");
+        let end = utf16_window_end(content, whole.start(), CHAIN_WINDOW);
+        let window = &safe[whole.start()..end];
+        let chained = CHAINED_AFTER_CALL
+            .captures(window)
+            .or_else(|| CHAINED.captures(window))
+            .map(|chain| chain[1].to_string());
+        dispatches.push((captures[1].to_string(), lines.line(whole.start()), chained));
+    }
+    if dispatches.is_empty() {
+        return None;
+    }
+    let refs: HashSet<&str> = dispatches
+        .iter()
+        .map(|(reference, _, _)| without_this(reference))
+        .collect();
+
+    // Each dispatched name's first object literal of at least two handler
+    // names.
+    let mut registries: HashMap<String, (Vec<String>, i64)> = HashMap::new();
+    let mut at = 0;
+    while let Some(captures) = ASSIGN.captures_at(&safe, at) {
+        let whole = captures.get(0).expect("match");
+        let name = match captures.get(1) {
+            Some(declared) => declared,
+            None => {
+                let assigned = captures.get(2).expect("assigned name");
+                if !name_starts_here(&safe, assigned.start()) {
+                    at = next_char(&safe, whole.start());
+                    continue;
+                }
+                assigned
+            }
+        };
+        at = whole.end();
+        let target = without_this(name.as_str());
+        if !refs.contains(target) || registries.contains_key(target) {
+            continue;
+        }
+        let Some(body) = brace_body(&safe, whole.end() - 1) else {
+            continue;
+        };
+        let names = entry_names(body);
+        if names.len() >= MIN_ENTRIES {
+            registries.insert(target.to_string(), (names, lines.line(whole.start())));
+        }
+    }
+    if registries.is_empty() {
+        return None;
+    }
+    Some(Scan {
+        dispatches,
+        registries,
+    })
+}
+
+/// The registry pass's per-file check: a JavaScript-family file whose text
+/// [`scan`] reads a dispatch and its registry in.
+pub(super) static REGISTRY_GATE: TextGate = TextGate {
+    name: "registry",
+    scope: |path, _| JS_FILE.is_match(path),
+    check: |input| scan(input.text).is_some(),
+};
 
 /// Whether `content` reads as a minified bundle: more than [`MINIFIED_LINE`]
 /// UTF-16 units a line on average, as upstream measures a string's length.

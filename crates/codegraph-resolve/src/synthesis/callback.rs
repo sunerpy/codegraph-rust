@@ -14,7 +14,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::MAX_CALLBACKS_PER_CHANNEL;
-use super::stage::{LineAt, View, enclosing_fn, slice_lines};
+use super::footprint::TextGate;
+use super::stage::{LineAt, View, enclosing_fn};
 
 /// A registrar's name: `onUpdate`, `subscribe`, `addListener`, ...
 static REGISTRAR_NAME: LazyLock<Regex> = LazyLock::new(|| {
@@ -99,10 +100,7 @@ pub(super) fn field_edges(view: &View<'_>) -> Result<Vec<Edge>> {
         if !is_registrar && !is_dispatcher {
             continue;
         }
-        let Some(content) = view.text(&node.file_path) else {
-            continue;
-        };
-        let Some(source) = slice_lines(&content, node.start_line, node.end_line) else {
+        let Some(source) = view.text_lines(&node.file_path, node.start_line, node.end_line) else {
             continue;
         };
         if is_registrar && let Some(field) = registrar_field(&source) {
@@ -142,13 +140,10 @@ pub(super) fn field_edges(view: &View<'_>) -> Result<Vec<Edge>> {
             let Some(caller) = view.node(&call.source)? else {
                 continue;
             };
-            let Some(text) = view.text(&caller.file_path) else {
+            let Some(source_line) = view.text_line(&caller.file_path, line) else {
                 continue;
             };
-            let Some(source_line) = text.split('\n').nth((line - 1) as usize) else {
-                continue;
-            };
-            let Some(captures) = argument.captures(source_line) else {
+            let Some(captures) = argument.captures(&source_line) else {
                 continue;
             };
             let written = &captures[1];
@@ -259,10 +254,7 @@ pub(super) fn closure_collection_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     let mut dispatchers: Ordered<String, Vec<(Node, i64)>> = Ordered::default();
     let mut registrars: Ordered<String, Vec<(Node, i64)>> = Ordered::default();
     for node in view.callables_in_languages(&[Language::Swift, Language::Kotlin])? {
-        let Some(content) = view.text(&node.file_path) else {
-            continue;
-        };
-        let Some(source) = slice_lines(&content, node.start_line, node.end_line) else {
+        let Some(source) = view.text_lines(&node.file_path, node.start_line, node.end_line) else {
             continue;
         };
         let has_for_each = source.contains(".forEach");
@@ -361,6 +353,26 @@ fn add_registrar(
     add_member(channels, field, node, line);
 }
 
+fn has_emit(content: &str) -> bool {
+    [".emit(", ".fire(", ".dispatchEvent("]
+        .iter()
+        .any(|call| content.contains(call))
+}
+
+fn has_on(content: &str) -> bool {
+    [".on(", ".once(", ".addListener("]
+        .iter()
+        .any(|call| content.contains(call))
+}
+
+/// The emitter pass's per-file check: every file, the ones that write an
+/// emit or a registration.
+pub(super) static EMITTER_GATE: TextGate = TextGate {
+    name: "emitter",
+    scope: |_, _| true,
+    check: |input| has_emit(input.text) || has_on(input.text),
+};
+
 /// String-keyed emitter channels (`eventEmitterEdges`): the function holding
 /// `x.emit('e')` reaches the handler `y.on('e', handler)` registers, an event
 /// with too many handlers or dispatchers skipped.
@@ -368,19 +380,9 @@ pub(super) fn event_emitter_edges(view: &View<'_>) -> Result<Vec<Edge>> {
     // event -> dispatcher ids; event -> handler id -> registration site.
     let mut emits: Ordered<String, Ordered<String, ()>> = Ordered::default();
     let mut handlers: Ordered<String, Ordered<String, String>> = Ordered::default();
-    for file in view.files()? {
-        let Some(content) = view.text(&file) else {
-            continue;
-        };
-        let has_emit = [".emit(", ".fire(", ".dispatchEvent("]
-            .iter()
-            .any(|call| content.contains(call));
-        let has_on = [".on(", ".once(", ".addListener("]
-            .iter()
-            .any(|call| content.contains(call));
-        if !has_emit && !has_on {
-            continue;
-        }
+    for (file, content) in view.gated_texts(&EMITTER_GATE, 0, |_| true)? {
+        let has_emit = has_emit(&content);
+        let has_on = has_on(&content);
         let nodes = view.nodes_in_file(&file)?;
         let lines = LineAt::new(&content, 1);
         if has_emit {

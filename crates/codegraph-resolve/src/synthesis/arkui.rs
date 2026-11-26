@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::MAX_CALLBACKS_PER_CHANNEL;
 use super::dispatch::{place, synthesized};
-use super::stage::{LineAt, View, slice_lines};
+use super::stage::{LineAt, View};
 use crate::strip_comments::strip_js_comments_keeping_offsets;
 
 /// Whether the project has ArkTS files, which every pass here reads.
@@ -254,10 +254,9 @@ pub(super) fn state_build_edges(view: &View<'_>) -> Result<Vec<Edge>> {
             if method.kind != NodeKind::Method || method.id == build.id {
                 continue;
             }
-            let Some(content) = view.text(&method.file_path) else {
-                continue;
-            };
-            let Some(source) = slice_lines(&content, method.start_line, method.end_line) else {
+            let Some(source) =
+                view.text_lines(&method.file_path, method.start_line, method.end_line)
+            else {
                 continue;
             };
             if source.is_empty()
