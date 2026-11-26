@@ -905,6 +905,32 @@ remain are KEEP-RUST:
   here orders candidates itself (upstream CG-33), and the synthesis stage belongs
   to the follow-up pull request (W7-14 to W7-18).
 
+The v0.56.0 OD-4 parity run (2026-11-26) built upstream `e8ddc4e2` the same way
+(`npm ci --ignore-scripts`, `tsc`, `npm run copy-assets`, on 2026-11-25; a fresh
+`tsc` build matched the `dist` it ran byte for byte, and its copied assets match
+`src`), ran its `codegraph init -y` under Node 22.23.2 on a copy of the fixture
+with a private home directory and telemetry and the update check off, and
+compared that database with this golden through `bench --graph-diff`. A fresh
+Rust index of the fixture is identical to this golden, so the comparison is with
+the current Rust output. The compared copy again gained an empty
+`reference_subkind` column; upstream has every other column the canonical form
+reads. Nodes, files and unresolved references are identical, so both rows above
+still match upstream. The 11 edges that are not `contains` edges differ only by
+the `refName` stamp, and `refKind: "calls"` on Python's `Greeter()`; their
+endpoints, kind, position, confidence and `resolvedBy` match. The schema differs
+as above, plus one index: upstream's migration 16 (#2630) adds
+`idx_unresolved_failed_module_member`, another partial index over the `status`
+and `name_tail` columns this `unresolved_refs` does not have, and the 2026-10-22
+audit records that Rust needs no counterpart (pass B row 24 of
+[`POST_V1_6_2_MAIN_2026-10-22.md`](upstream-sync/POST_V1_6_2_MAIN_2026-10-22.md)).
+`idx_nodes_kind` still indexes `kind` alone: the synthesis stage (W7-14) sorts
+the nodes of a kind it walks into upstream's `(file_path, start_line, id)` order
+itself (`node_order` in `crates/codegraph-resolve/src/synthesis/stage.rs`).
+Classed as an unported row of that audit (a), a documented KEEP-RUST difference
+(b) or a defect of v0.56.0 (c), every difference is (b): the stamps and the
+schema items are the four KEEP-RUST items above, and the new index belongs to
+the second.
+
 ### Metal fixture
 
 A fifth golden fixture, `reference/golden/metal/`, guards Metal Shading Language
