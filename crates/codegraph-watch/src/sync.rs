@@ -125,6 +125,60 @@ pub struct SyncOutcome {
     pub changed_records: Option<Vec<(String, Option<FileRecord>)>>,
 }
 
+/// How long each part of one incremental sync took (W9-00a), for
+/// `CODEGRAPH_PHASE_TIMINGS`. Kept beside [`SyncOutcome`], which compares as a
+/// result. The six parts follow one another, so they sum to the sync.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SyncTimings {
+    /// Taking the index lease, opening the index, and scanning the project.
+    pub scan: Duration,
+    /// Re-extracting and writing the changed files, and the lanes' change
+    /// checks that come before the framework pass.
+    pub files: Duration,
+    /// The framework per-file extract and cross-file finalization.
+    pub frameworks: Duration,
+    /// Refreshing the dependents' references, re-resolving, writing the lane
+    /// rows and markers, and the orphan sweep.
+    pub resolve: Duration,
+    /// The synthesis inputs check, and the stage when its marker is away.
+    pub synthesis: Duration,
+    /// Reading back the changed records, recording the links and the git
+    /// state, and finishing the mutation.
+    pub finish: Duration,
+    /// The synthesis stage's own parts, when it ran.
+    pub stage: Option<codegraph_resolve::synthesis::StageTimings>,
+}
+
+impl SyncTimings {
+    /// The six parts by name, in the order the sync runs them.
+    pub fn parts(&self) -> [(&'static str, Duration); 6] {
+        [
+            ("scan", self.scan),
+            ("files", self.files),
+            ("frameworks", self.frameworks),
+            ("resolve", self.resolve),
+            ("synthesis", self.synthesis),
+            ("finish", self.finish),
+        ]
+    }
+}
+
+/// The time since the last lap: the parts of [`SyncTimings`].
+struct Lap(Instant);
+
+impl Lap {
+    fn now() -> Self {
+        Self(Instant::now())
+    }
+
+    fn take(&mut self) -> Duration {
+        let now = Instant::now();
+        let lap = now.saturating_duration_since(self.0);
+        self.0 = now;
+        lap
+    }
+}
+
 /// Read-only difference between the current project scope and the persisted
 /// file inventory. Paths are root-relative, sorted, and mutually exclusive.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -268,6 +322,7 @@ pub fn sync_project_once_cancellable(
     let paths = index_paths(project_root)?;
     let scope = ProjectScope::load(project_root, &paths)?;
     sync_project_once_with_scope(project_root, &paths, &scope, Some(cancel), |_, _| {})
+        .map(|(outcome, _)| outcome)
 }
 
 /// Like [`sync_project_once`] but invokes `on_progress(done, total)` after each
@@ -278,6 +333,16 @@ pub fn sync_project_once_with_progress(
     project_root: impl AsRef<Path>,
     on_progress: impl FnMut(usize, usize),
 ) -> Result<SyncOutcome> {
+    sync_project_once_with_progress_timed(project_root, on_progress).map(|(outcome, _)| outcome)
+}
+
+/// [`sync_project_once_with_progress`], and how long each part of the sync
+/// took (W9-00a): `None` when the index was rebuilt instead, as an outdated
+/// or interrupted one is.
+pub fn sync_project_once_with_progress_timed(
+    project_root: impl AsRef<Path>,
+    on_progress: impl FnMut(usize, usize),
+) -> Result<(SyncOutcome, Option<SyncTimings>)> {
     let project_root = project_root.as_ref();
     let paths = index_paths(project_root)?;
     let scope = ProjectScope::load(project_root, &paths)?;
@@ -290,11 +355,12 @@ fn sync_project_once_with_scope(
     scope: &ProjectScope,
     cancel: Option<&SyncCancellation>,
     mut on_progress: impl FnMut(usize, usize),
-) -> Result<SyncOutcome> {
+) -> Result<(SyncOutcome, Option<SyncTimings>)> {
     let options = &scope.options;
     let include = options.include.clone();
     let exclude = options.exclude.clone();
     let started = Instant::now();
+    let mut timings = SyncTimings::default();
 
     // CLASSIFY BEFORE MUTATING A ROW (frozen plan lines 557-565). The gate takes
     // the ONE outer exclusive lease, classifies under it, and either hands back
@@ -329,6 +395,7 @@ fn sync_project_once_with_scope(
             // tail is deterministic regardless of the query's ordering.
             absent.sort();
             candidates.extend(absent);
+            timings.scan = started.elapsed();
 
             let outcome = sync_paths_with_store(
                 &mut store,
@@ -341,13 +408,16 @@ fn sync_project_once_with_scope(
                 &exclude,
                 started,
                 on_progress,
+                &mut timings,
             )?;
+            let mut tail = Lap::now();
             record_followed_links(&store, &scan.links)?;
             if let Some(capture) = git_capture {
                 capture.record(&store, project_root, options, !scan.links.is_empty())?;
             }
             store.finish_current_mutation()?;
-            Ok(outcome)
+            timings.finish += tail.take();
+            Ok((outcome, Some(timings)))
         }
         SyncWriter::MigrationRequired(authorization) => crate::migrate::migrate_project(
             project_root,
@@ -356,7 +426,8 @@ fn sync_project_once_with_scope(
             scope,
             started,
             &mut on_progress,
-        ),
+        )
+        .map(|outcome| (outcome, None)),
     }
 }
 
@@ -608,6 +679,7 @@ fn sync_changed_paths_current_scope(
                 &exclude,
                 started,
                 |_, _| {},
+                &mut SyncTimings::default(),
             )?;
             store.finish_current_mutation()?;
             Ok(outcome)
@@ -635,7 +707,9 @@ fn sync_paths_with_store(
     exclude: &[String],
     started: std::time::Instant,
     mut on_progress: impl FnMut(usize, usize),
+    timings: &mut SyncTimings,
 ) -> Result<SyncOutcome> {
+    let mut lap = Lap::now();
     let policy = WatchPolicy::with_config(
         project_root,
         &scope.options.ignore_dirs,
@@ -1719,6 +1793,7 @@ fn sync_paths_with_store(
         if tests::FAIL_BEFORE_FRAMEWORK_REFS.with(std::cell::Cell::get) {
             bail!("injected sync failure before the changed files' framework references");
         }
+        timings.files += lap.take();
         // Re-run framework per-file extract for reindexed files whose framework
         // nodes/refs were dropped on re-extraction (upstream tree-sitter.ts:4796-4819).
         if resolver.has_framework_resolvers() {
@@ -1759,6 +1834,7 @@ fn sync_paths_with_store(
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
+        timings.frameworks += lap.take();
         // The Play actions whose candidates the changes moved (W7-19c), read
         // once the framework nodes are back: the unresolved ones retry by
         // their whole names, which no tail ceiling bounds, and the resolved
@@ -2131,6 +2207,13 @@ fn sync_paths_with_store(
             stored_refs_marker.as_deref(),
         )?;
     }
+    // A sync with nothing to resolve spent its time on the files alone.
+    let rest = lap.take();
+    if block {
+        timings.resolve += rest;
+    } else {
+        timings.files += rest;
+    }
 
     // Orphan sweep (#1187, upstream index.ts:645-682): a full-index resolution
     // pass killed mid-run leaves the refs it never reached parked in
@@ -2149,6 +2232,7 @@ fn sync_paths_with_store(
         outcome.pending_refs_resolved = stats.resolved;
         outcome.pending_refs_unresolved = stats.unresolved;
     }
+    timings.resolve += lap.take();
 
     // A file the last stage run read beside the index (W7-17b) that reads
     // differently now, its text, its presence or its scan scope changed,
@@ -2172,13 +2256,16 @@ fn sync_paths_with_store(
         if tests::FAIL_BEFORE_SYNTHESIS.with(std::cell::Cell::get) {
             bail!("injected sync failure before synthesis");
         }
-        codegraph_resolve::synthesis::run_stage(store, project_root, &scope.options)?;
+        let (_, stage) =
+            codegraph_resolve::synthesis::run_stage_timed(store, project_root, &scope.options)?;
+        timings.stage = Some(stage);
         #[cfg(test)]
         if tests::FAIL_BEFORE_SYNTHESIS_MARKER.with(std::cell::Cell::get) {
             bail!("injected sync failure before the synthesis marker");
         }
         codegraph_resolve::synthesis::write_marker(store)?;
     }
+    timings.synthesis += lap.take();
 
     outcome.duration_ms = started.elapsed().as_millis();
     let mut changed_paths: Vec<String> = reindexed.into_iter().collect();
@@ -2186,6 +2273,7 @@ fn sync_paths_with_store(
     outcome.changed_records = Some(changed_records(store, &changed_paths)?);
     outcome.changed_paths = changed_paths;
     outcome.control_paths = Some(crate::control_inputs::recorded_paths(store)?);
+    timings.finish += lap.take();
     Ok(outcome)
 }
 

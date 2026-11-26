@@ -35,6 +35,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Read-only deferred-pass intent returned by [`ReferenceResolver::resolve_one_pure`]
 /// instead of the deferred-list pushes [`ReferenceResolver::resolve_one`] performs, so
@@ -396,6 +397,58 @@ pub enum ResolutionObservation {
         processed: u64,
         total: u64,
     },
+    /// Where the run spent its time, sent once after the last pass.
+    Timings(ResolutionTimings),
+}
+
+/// Where one batched-resolution run spent its time (W9-00a): each part summed
+/// over the batches. Measuring is a few clock reads per batch, so it is always
+/// on; the CLI prints it under `CODEGRAPH_PHASE_TIMINGS=1`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResolutionTimings {
+    /// Arming the incomplete-resolution marker, warming the caches, and
+    /// counting the references and nodes.
+    pub setup: Duration,
+    /// Reading each batch of unresolved references.
+    pub read: Duration,
+    /// Building each batch's resolution context: the node snapshot and the
+    /// inheritance adjacency on the first batch, the adjacency's copy on each.
+    pub snapshot: Duration,
+    /// Resolving the batch's references.
+    pub resolve: Duration,
+    /// Turning the resolved references into edges.
+    pub create_edges: Duration,
+    /// Inserting the edges and folding the new inheritance edges into the
+    /// adjacency.
+    pub insert_edges: Duration,
+    /// Moving the resolved rows from `unresolved_refs` to `resolved_refs`.
+    pub move_refs: Duration,
+    /// The WAL valve: its size check, and its fold when the WAL is over it.
+    pub wal_fold: Duration,
+    /// The #750 conformance pass after the batches.
+    pub conformance: Duration,
+    /// The #808 deferred `this`-member pass after the batches.
+    pub this_members: Duration,
+    /// The batches the run read, as [`BatchedRunTelemetry::batches`] counts.
+    pub batches: usize,
+}
+
+impl ResolutionTimings {
+    /// Every part by its name, in the order the run reaches them.
+    pub fn parts(&self) -> [(&'static str, Duration); 10] {
+        [
+            ("setup", self.setup),
+            ("read", self.read),
+            ("snapshot", self.snapshot),
+            ("resolve", self.resolve),
+            ("create_edges", self.create_edges),
+            ("insert_edges", self.insert_edges),
+            ("move_refs", self.move_refs),
+            ("wal_fold", self.wal_fold),
+            ("conformance", self.conformance),
+            ("this_members", self.this_members),
+        ]
+    }
 }
 
 /// What the detected resolvers' cross-file passes want changed in a store
@@ -3599,6 +3652,8 @@ impl ReferenceResolver {
         mut on_progress: impl FnMut(u64, u64),
         mut on_observation: impl FnMut(ResolutionObservation),
     ) -> anyhow::Result<(ResolutionResult, BatchedRunTelemetry)> {
+        let mut timings = ResolutionTimings::default();
+        let setup_started = Instant::now();
         // Incomplete-resolution marker (#1187): armed BEFORE the first batch and
         // cleared only after the deferred passes complete below. An interrupted
         // run (crash / Ctrl-C / #1122 watchdog kill) leaves it set, so the next
@@ -3622,6 +3677,7 @@ impl ReferenceResolver {
             streaming,
             wal_checkpoints: 0,
         };
+        timings.setup = setup_started.elapsed();
         on_observation(ResolutionObservation::Setup {
             node_count: node_count as u64,
             reference_count: total_refs,
@@ -3657,12 +3713,14 @@ impl ReferenceResolver {
         let mut cursor: i64 = 0;
         let mut wiring_phase = true;
         loop {
+            let started = Instant::now();
             let batch = store.unresolved_refs_batch_by_kinds(
                 cursor,
                 batch_size,
                 &WIRING_KINDS,
                 wiring_phase,
             )?;
+            timings.read += started.elapsed();
             if batch.is_empty() {
                 if wiring_phase {
                     wiring_phase = false;
@@ -3682,9 +3740,15 @@ impl ReferenceResolver {
                 // context. Prior batches' inheritance edges are already committed
                 // (persisted at the bottom of this loop), so `get_supertypes`
                 // reads them straight from the store — no snapshot, no adjacency.
+                let started = Instant::now();
                 let context = self.store_context(store);
-                self.resolve_all(&batch, &context)
+                timings.snapshot += started.elapsed();
+                let started = Instant::now();
+                let result = self.resolve_all(&batch, &context);
+                timings.resolve += started.elapsed();
+                result
             } else {
+                let started = Instant::now();
                 let base = match &node_snapshot {
                     Some(snapshot) => snapshot,
                     None => {
@@ -3698,10 +3762,17 @@ impl ReferenceResolver {
                 // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
                 // (matches the old per-chunk full rebuild's observable state).
                 let chunk_ctx = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
-                self.resolve_chunk_parallel(&batch, &chunk_ctx)
+                timings.snapshot += started.elapsed();
+                let started = Instant::now();
+                let result = self.resolve_chunk_parallel(&batch, &chunk_ctx);
+                timings.resolve += started.elapsed();
+                result
             };
 
+            let started = Instant::now();
             let edges = self.create_edges(&result.resolved, store);
+            timings.create_edges += started.elapsed();
+            let started = Instant::now();
             if !edges.is_empty() {
                 store.insert_edges(&edges)?;
             }
@@ -3719,11 +3790,13 @@ impl ReferenceResolver {
                     }
                 }
             }
+            timings.insert_edges += started.elapsed();
 
             // Per-batch deletion (peak-memory bound on large graphs) is precise
             // because the key is `row_id`: a batch can only delete rows it read, so
             // neither a later batch's row nor a sibling call site sharing this
             // row's (from,name,kind) tuple is reachable from here.
+            let started = Instant::now();
             let batch_row_ids: Vec<i64> = result
                 .resolved
                 .iter()
@@ -3738,6 +3811,7 @@ impl ReferenceResolver {
             if !batch_row_ids.is_empty() {
                 store.delete_resolved_unresolved_refs(&batch_row_ids)?;
             }
+            timings.move_refs += started.elapsed();
 
             // WAL valve in the resolution write loop (#1212 port / resolution-loop
             // half of #1231): fold the WAL back into the main DB once it grows past
@@ -3745,9 +3819,11 @@ impl ReferenceResolver {
             // — not just spill-replay. TRUNCATE is row-neutral, so index output stays
             // byte-identical. `CODEGRAPH_NO_WAL_DEFER=1` keeps SQLite's default
             // autocheckpoint; the valve is then a cheap size check.
+            let started = Instant::now();
             if store.checkpoint_wal_if_over(wal_valve_bytes)? {
                 telemetry.wal_checkpoints += 1;
             }
+            timings.wal_fold += started.elapsed();
 
             aggregate.stats.total += result.stats.total;
             aggregate.stats.resolved += result.stats.resolved;
@@ -3757,6 +3833,7 @@ impl ReferenceResolver {
             }
 
             telemetry.batches += 1;
+            timings.batches += 1;
             processed += batch.len() as u64;
             on_observation(ResolutionObservation::BatchComplete {
                 batch: telemetry.batches,
@@ -3768,11 +3845,16 @@ impl ReferenceResolver {
 
         // #750 conformance pass then #808 supertype pass, after implements/extends
         // edges exist (index.ts:508-511).
+        let started = Instant::now();
         self.resolve_chained_calls_via_conformance(store)?;
+        timings.conformance = started.elapsed();
+        let started = Instant::now();
         self.resolve_deferred_this_member_refs(store)?;
+        timings.this_members = started.elapsed();
 
         // Full pass completed: clear the #1187 marker set at the top.
         store.clear_resolution_incomplete()?;
+        on_observation(ResolutionObservation::Timings(timings));
 
         Ok((aggregate, telemetry))
     }
@@ -5891,6 +5973,10 @@ mod tests {
             )
             .expect("batched");
         assert_eq!(last_total, 1);
+        let Some(ResolutionObservation::Timings(timings)) = observations.pop() else {
+            panic!("the last observation is the run's timings: {observations:?}");
+        };
+        assert_eq!(timings.batches, 1);
         assert_eq!(
             observations,
             vec![
@@ -5907,6 +5993,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The run's timings arrive once, last, on both paths: their parts sum to
+    /// no more than the run took, and they count the batches the telemetry
+    /// counts (W9-00a).
+    #[test]
+    fn batched_run_reports_its_timings_once_within_its_wall_time() {
+        let dir = fresh_fixture_dir("timings");
+        let files = write_cross_batch_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+        for (label, streaming_threshold) in [("snapshot", usize::MAX), ("streaming", 0)] {
+            let (mut store, db) = index_java_fixture(&format!("timings-{label}"), &dir, &files);
+            let mut resolver = ReferenceResolver::new(root.clone());
+            let mut observations = Vec::new();
+            let started = Instant::now();
+            let (_result, telemetry) = resolver
+                .resolve_and_persist_batched_inner(
+                    &mut store,
+                    1,
+                    streaming_threshold,
+                    u64::MAX,
+                    |_, _| {},
+                    |observation| observations.push(observation),
+                )
+                .expect("batched");
+            let wall = started.elapsed();
+            assert!(telemetry.batches >= 2, "{label}: one batch per reference");
+            let timings: Vec<ResolutionTimings> = observations
+                .iter()
+                .filter_map(|observation| match observation {
+                    ResolutionObservation::Timings(timings) => Some(*timings),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(timings.len(), 1, "{label}: {observations:?}");
+            assert!(
+                matches!(observations.last(), Some(ResolutionObservation::Timings(_))),
+                "{label}: the timings come last"
+            );
+            let timings = timings[0];
+            assert_eq!(timings.batches, telemetry.batches, "{label}");
+            let sum: Duration = timings.parts().iter().map(|(_, part)| *part).sum();
+            assert!(
+                sum <= wall,
+                "{label}: parts {sum:?} over the run's {wall:?}"
+            );
+            assert!(timings.read > Duration::ZERO, "{label}: batches were read");
+            assert!(
+                timings.resolve > Duration::ZERO,
+                "{label}: batches resolved"
+            );
+            let _ = std::fs::remove_file(&db);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

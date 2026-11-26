@@ -1422,3 +1422,13 @@ the directory's real path does not change (`watcher.rs`).
   reported as RECOVERING until that reconcile commits. An event naming a
   directory the watcher knows walks only the new directories it finds below
   it (`watcher.rs`).
+
+### Diagnostics
+
+- **Phase timings (W9-00a).** colby prints `[phase-timing] <label>: <ms>ms`
+  lines on stderr when `CODEGRAPH_SYNTH_TIMINGS` is set (since `a2f3c31`).
+  The port prints `codegraph-phase\t<command>\t<phase>\t<microseconds>` when
+  `CODEGRAPH_PHASE_TIMINGS=1`, under its own phase names, in microseconds
+  because a synthesis pass on a small project takes well under a
+  millisecond; it does not read colby's variable (`diagnostics.rs`, the
+  [CLI reference](../cli.md#index-diagnostics)).

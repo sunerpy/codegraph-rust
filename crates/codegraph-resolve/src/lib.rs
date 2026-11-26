@@ -89,7 +89,9 @@ pub mod workspace_packages;
 pub use context::StoreResolutionContext;
 pub use framework::FrameworkResolver;
 pub use name_matcher::CASE_INSENSITIVE_LANGUAGES;
-pub use resolver::{CrossFileApplied, CrossFilePlan, ReferenceResolver, ResolutionObservation};
+pub use resolver::{
+    CrossFileApplied, CrossFilePlan, ReferenceResolver, ResolutionObservation, ResolutionTimings,
+};
 pub use snapshot_context::{EdgeAdjacency, SnapshotResolutionContext, build_edge_adjacency};
 pub use types::{
     AlsoTarget, EdgeShape, FrameworkResolverExtractionResult, ImportMapping, ReExport, RefView,

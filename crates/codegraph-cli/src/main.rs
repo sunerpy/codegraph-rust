@@ -1896,26 +1896,27 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
         "{spinner:.green} Syncing {pos}/{len} files ({elapsed})",
     );
     let mut bar_len_set = false;
-    let outcome = codegraph_watch::sync_project_once_with_progress(&project, |done, total| {
-        if !bar_len_set {
-            bar.set_length(total as u64);
-            bar_len_set = true;
-        }
-        bar.set_position(done as u64);
-        if let Some(sink) = &diagnostic_sink {
-            sink.emit(
-                "heartbeat",
-                json!({
-                    "scheduled": total,
-                    "active": usize::from(done < total),
-                    "parsed": done,
-                    "buffered": 0,
-                    "persisted": done,
-                    "nextExpected": done,
-                }),
-            );
-        }
-    })?;
+    let (outcome, sync_timings) =
+        codegraph_watch::sync_project_once_with_progress_timed(&project, |done, total| {
+            if !bar_len_set {
+                bar.set_length(total as u64);
+                bar_len_set = true;
+            }
+            bar.set_position(done as u64);
+            if let Some(sink) = &diagnostic_sink {
+                sink.emit(
+                    "heartbeat",
+                    json!({
+                        "scheduled": total,
+                        "active": usize::from(done < total),
+                        "parsed": done,
+                        "buffered": 0,
+                        "persisted": done,
+                        "nextExpected": done,
+                    }),
+                );
+            }
+        })?;
     finish_phase(&bar, "Synced files");
     diagnostic_run.relocate_to_index_root(paths.current_root());
     let emit_file_complete =
@@ -1974,6 +1975,16 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
                     );
                 }
             }
+        }
+    }
+    if let Some(timings) = &sync_timings
+        && diagnostic_run.timings_enabled()
+    {
+        for (part, took) in timings.parts() {
+            diagnostic_run.phase_part(&format!("sync.{part}"), took);
+        }
+        if let Some(stage) = &timings.stage {
+            print_stage_timings(&diagnostic_run, stage);
         }
     }
     diagnostic_run.phase_end(
@@ -5811,6 +5822,46 @@ fn phase_spinner(label: &str, quiet: bool) -> ProgressBar {
     bar
 }
 
+/// The synthesis stage's parts as phase-timing lines, `synthesis.<part>`,
+/// each pass under its upstream name (W9-00a).
+fn print_stage_timings(run: &DiagnosticRun, stage: &codegraph_resolve::synthesis::StageTimings) {
+    if !run.timings_enabled() {
+        return;
+    }
+    run.phase_part("synthesis.read", stage.read);
+    for (pass, took) in &stage.passes {
+        run.phase_part(&format!("synthesis.{pass}"), *took);
+    }
+    run.phase_part("synthesis.merge", stage.merge);
+    run.phase_part("synthesis.replace", stage.replace);
+    run.phase_part("synthesis.inputs", stage.inputs);
+}
+
+/// Adds the time from [`BusyTimer::start`] to its drop to a total, when it
+/// measures: the index writer's busy time, which every early return of the
+/// consumer still counts.
+struct BusyTimer<'a> {
+    started: Option<std::time::Instant>,
+    total: &'a mut std::time::Duration,
+}
+
+impl<'a> BusyTimer<'a> {
+    fn start(measure: bool, total: &'a mut std::time::Duration) -> Self {
+        Self {
+            started: measure.then(std::time::Instant::now),
+            total,
+        }
+    }
+}
+
+impl Drop for BusyTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            *self.total += started.elapsed();
+        }
+    }
+}
+
 fn finish_phase(bar: &ProgressBar, label: &str) {
     if bar.is_hidden() {
         return;
@@ -6269,6 +6320,11 @@ fn index_project_inner(
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
     let persist_tracker = tracker.clone();
+    // The single writer's busy time, measured only when it is printed
+    // (`CODEGRAPH_PHASE_TIMINGS=1`): parse_write less it is the time the
+    // writer waited for parsed files.
+    let measure_store_busy = diagnostic_run.timings_enabled();
+    let mut store_busy = std::time::Duration::ZERO;
     let parse_result = run_ordered_parallel_window(
         files.len(),
         PARSE_REORDER_WINDOW,
@@ -6387,6 +6443,7 @@ fn index_project_inner(
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
+            let _busy = BusyTimer::start(measure_store_busy, &mut store_busy);
             let Some((
                 relative,
                 file,
@@ -6531,6 +6588,7 @@ fn index_project_inner(
             "filesErrored": files_errored,
         }),
     );
+    diagnostic_run.phase_part("parse_write.store_busy", store_busy);
 
     let scan_files = bar.position() - files_not_source;
     finish_phase(
@@ -6741,6 +6799,7 @@ fn index_project_inner(
     diagnostic_run.phase_start("reference_resolution");
     let resolution_started = std::time::Instant::now();
     let resolution_sink = diagnostic_run.sink();
+    let mut resolution_timings = None;
     resolver.resolve_and_persist_batched_with_observer(
         &mut store,
         RESOLVE_BATCH_ROWS,
@@ -6756,6 +6815,10 @@ fn index_project_inner(
             }
         },
         |observation| {
+            if let codegraph_resolve::ResolutionObservation::Timings(timings) = observation {
+                resolution_timings = Some(timings);
+                return;
+            }
             let Some(sink) = &resolution_sink else {
                 return;
             };
@@ -6786,6 +6849,8 @@ fn index_project_inner(
                         "total": total,
                     }),
                 ),
+                // Kept above, for the phase-timing lines.
+                codegraph_resolve::ResolutionObservation::Timings(_) => {}
             }
         },
     )?;
@@ -6797,17 +6862,26 @@ fn index_project_inner(
         resolution_started.elapsed(),
         json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
     );
+    if let Some(timings) = resolution_timings
+        && diagnostic_run.timings_enabled()
+    {
+        for (part, took) in timings.parts() {
+            diagnostic_run.phase_part(&format!("reference_resolution.{part}"), took);
+        }
+    }
     // The dispatch edges no reference names, over the finished base graph
     // (W7-14).
     diagnostic_run.phase_start("synthesis");
     let synthesis_started = std::time::Instant::now();
-    let synthesis = codegraph_resolve::synthesis::run_stage(&mut store, project, &options)?;
+    let (synthesis, stage_timings) =
+        codegraph_resolve::synthesis::run_stage_timed(&mut store, project, &options)?;
     codegraph_resolve::synthesis::write_marker(&store)?;
     diagnostic_run.phase_end(
         "synthesis",
         synthesis_started.elapsed(),
         json!({ "edges": synthesis.inserted }),
     );
+    print_stage_timings(&diagnostic_run, &stage_timings);
     // Every reference is now in `unresolved_refs` or `resolved_refs`
     // (W5-09e).
     codegraph_watch::resolved_refs::write_marker(&store, &options, &framework_context)?;

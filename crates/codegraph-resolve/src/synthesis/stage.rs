@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
 use codegraph_core::node_id::hash_content;
@@ -38,6 +38,24 @@ pub struct StageStats {
     /// The edges it inserted: the merged ones whose identity no base edge
     /// holds and that no stored synthesized edge already equals.
     pub inserted: usize,
+}
+
+/// How long each part of one stage run took (W9-00a), for
+/// `CODEGRAPH_PHASE_TIMINGS`. Kept beside [`StageStats`], which compares as a
+/// result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StageTimings {
+    /// Reading the indexed files' text and the project's languages.
+    pub read: Duration,
+    /// Each prerequisite step and pass that ran, by its upstream name, in run
+    /// order; a pass its gate closes does not run and is not listed.
+    pub passes: Vec<(&'static str, Duration)>,
+    /// Merging and sorting the passes' edges.
+    pub merge: Duration,
+    /// Replacing the stored synthesized edges with the merged ones.
+    pub replace: Duration,
+    /// Recording the files the stage read beside the index.
+    pub inputs: Duration,
 }
 
 /// A pass: the edges it synthesizes over the view, in its own order.
@@ -239,48 +257,79 @@ pub fn run_stage(
     project_root: &Path,
     options: &ExtractOptions,
 ) -> Result<StageStats> {
+    Ok(run_stage_timed(store, project_root, options)?.0)
+}
+
+/// [`run_stage`], and how long each of its parts took (W9-00a).
+pub fn run_stage_timed(
+    store: &mut Store,
+    project_root: &Path,
+    options: &ExtractOptions,
+) -> Result<(StageStats, StageTimings)> {
+    let mut timings = StageTimings::default();
     let mut view = View::new(store, project_root, options.max_file_size);
     view.unindexed = Some(UnindexedReader::new(project_root, options));
-    let (edges, read) = synthesize_in(view)?;
+    let (edges, read) = synthesize_in(view, &mut timings)?;
+    let started = Instant::now();
     let (removed, inserted) = store.replace_synthesized_edges(&edges)?;
+    timings.replace = started.elapsed();
+    let started = Instant::now();
     inputs::write(store, &read)?;
-    Ok(StageStats {
-        edges: edges.len(),
-        removed,
-        inserted,
-    })
+    timings.inputs = started.elapsed();
+    Ok((
+        StageStats {
+            edges: edges.len(),
+            removed,
+            inserted,
+        },
+        timings,
+    ))
 }
 
 /// Every synthesized edge over `store`'s base graph: each prerequisite
 /// step's, and each pass's merged in registry order, sorted. It reads the
 /// indexed files only, never a file the index does not hold.
 pub fn synthesize(store: &Store, project_root: &Path, max_file_size: u64) -> Result<Vec<Edge>> {
-    Ok(synthesize_in(View::new(store, project_root, max_file_size))?.0)
+    Ok(synthesize_in(
+        View::new(store, project_root, max_file_size),
+        &mut StageTimings::default(),
+    )?
+    .0)
 }
 
-/// The stage over `view`, with what it read beside the index.
-fn synthesize_in(mut view: View<'_>) -> Result<(Vec<Edge>, Inputs)> {
+/// The stage over `view`, with what it read beside the index, timing its
+/// parts into `timings`.
+fn synthesize_in(mut view: View<'_>, timings: &mut StageTimings) -> Result<(Vec<Edge>, Inputs)> {
+    let started = Instant::now();
     view.read_texts()?;
     let languages = view.file_languages()?;
+    timings.read = started.elapsed();
     let mut edges = Vec::new();
-    for (_, gate, step) in PREREQUISITES {
+    for (name, gate, step) in PREREQUISITES {
         if gate(&languages) {
+            let started = Instant::now();
             let made = step(&view)?;
             view.overlay.extend(made.iter().cloned());
             edges.extend(made);
+            timings.passes.push((*name, started.elapsed()));
         }
     }
     let mut passes = Vec::with_capacity(PASSES.len());
-    for (_, gate, pass) in PASSES {
+    for (name, gate, pass) in PASSES {
         if gate(&languages) {
+            let started = Instant::now();
             passes.push(pass(&view)?);
+            timings.passes.push((*name, started.elapsed()));
         }
     }
     let read = view
         .unindexed
         .map(UnindexedReader::into_inputs)
         .unwrap_or_default();
-    Ok((combine(edges, passes), read))
+    let started = Instant::now();
+    let edges = combine(edges, passes);
+    timings.merge = started.elapsed();
+    Ok((edges, read))
 }
 
 /// The stage's output: the prerequisite steps' edges as they are (upstream
@@ -1629,5 +1678,49 @@ mod tests {
         assert_eq!(at(8), Some("line"));
         assert_eq!(at(9), Some("outer"));
         assert_eq!(at(11), None);
+    }
+
+    /// A timed stage lists each step and pass its gates open, once each and
+    /// in run order, and its parts sum to no more than the run took
+    /// (W9-00a).
+    #[test]
+    fn a_timed_stage_lists_each_pass_that_ran_once_in_order() {
+        let (mut store, dir) = temp_store("timed");
+        let text = "export function a() {}\n";
+        std::fs::write(dir.join("a.ts"), text).unwrap();
+        store
+            .upsert_file(&FileRecord {
+                path: "a.ts".to_string(),
+                content_hash: hash_content(text),
+                language: Language::TypeScript,
+                size: text.len() as i64,
+                modified_at: 0,
+                indexed_at: 0,
+                node_count: 1,
+                errors: Vec::new(),
+                generated: false,
+            })
+            .unwrap();
+        store.upsert_nodes(&[function("a", "a.ts")]).unwrap();
+        let started = Instant::now();
+        let (_stats, timings) =
+            run_stage_timed(&mut store, &dir, &ExtractOptions::default()).unwrap();
+        let wall = started.elapsed();
+        let languages: HashSet<Language> = [Language::TypeScript].into_iter().collect();
+        let expected: Vec<&str> = PREREQUISITES
+            .iter()
+            .chain(PASSES)
+            .filter(|(_, gate, _)| gate(&languages))
+            .map(|(name, _, _)| *name)
+            .collect();
+        let ran: Vec<&str> = timings.passes.iter().map(|(name, _)| *name).collect();
+        assert_eq!(ran, expected);
+        assert!(ran.contains(&"fieldEdges"), "{ran:?}");
+        assert!(!ran.contains(&"goImplements"), "{ran:?}");
+        let passes: Duration = timings.passes.iter().map(|(_, took)| *took).sum();
+        let sum = timings.read + passes + timings.merge + timings.replace + timings.inputs;
+        assert!(sum <= wall, "parts {sum:?} over the stage's {wall:?}");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

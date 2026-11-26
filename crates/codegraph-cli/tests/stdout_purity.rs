@@ -339,3 +339,66 @@ fn context_stdout_is_the_answer_and_notices_go_to_stderr() {
         assert!(stderr.lines().any(|line| line == notice), "{stderr:?}");
     }
 }
+
+/// The stdout of `codegraph <args>` in `cwd`, one entry per line reduced to its
+/// first word, and its stderr; `CODEGRAPH_PHASE_TIMINGS=1` when `timings`.
+fn stdout_words_and_stderr(cwd: &Path, args: &[&str], timings: bool) -> (Vec<String>, String) {
+    let mut command = Command::new(bin());
+    command
+        .current_dir(cwd)
+        .args(args)
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_HTTP_REGISTRY_DIR", cwd.join("http-registry"))
+        .env("CODEGRAPH_MCP_REGISTRY_DIR", cwd.join("mcp-registry"));
+    if timings {
+        command.env("CODEGRAPH_PHASE_TIMINGS", "1");
+    } else {
+        command.env_remove("CODEGRAPH_PHASE_TIMINGS");
+    }
+    let output = command.output().expect("run codegraph");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "{args:?}: {stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("codegraph-phase\t"),
+        "{args:?} printed a phase line on stdout: {stdout}"
+    );
+    let words = stdout
+        .lines()
+        .map(|line| line.split_whitespace().next().unwrap_or("").to_string())
+        .collect();
+    (words, stderr)
+}
+
+/// `CODEGRAPH_PHASE_TIMINGS=1` (W9-00a) writes to stderr only: `init` and
+/// `sync` print the same stdout lines with it as without it.
+#[test]
+fn phase_timings_leave_init_and_sync_stdout_unchanged() {
+    let mut stdouts = Vec::new();
+    for timings in [false, true] {
+        let home = TestDir::new(if timings { "timings-on" } else { "timings-off" });
+        let project = home.path().join("mini");
+        copy_tree(&mini_fixture(), &project);
+        let project_arg = project.to_str().unwrap();
+        let (init, init_stderr) =
+            stdout_words_and_stderr(home.path(), &["init", project_arg], timings);
+        std::fs::write(
+            project.join("src/math.ts"),
+            "export function add(a: number, b: number) { return a + b; }\n\
+             export function twice(a: number) { return add(a, a); }\n",
+        )
+        .unwrap();
+        let (sync, sync_stderr) =
+            stdout_words_and_stderr(home.path(), &["sync", project_arg], timings);
+        for stderr in [&init_stderr, &sync_stderr] {
+            assert_eq!(
+                stderr.contains("codegraph-phase\t"),
+                timings,
+                "phase lines on stderr exactly when asked for: {stderr}"
+            );
+        }
+        stdouts.push((init, sync));
+    }
+    assert_eq!(stdouts[0], stdouts[1]);
+}

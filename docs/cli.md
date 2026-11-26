@@ -1351,6 +1351,7 @@ Three escape hatches:
 | `CODEGRAPH_FORCE_WATCH`             | —            | —                             | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
 | `CODEGRAPH_NO_WAL_DEFER`            | —            | `1` enables opt-out           | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |
 | `CODEGRAPH_WAL_VALVE_MB`            | `256`        | >0; invalid→default           | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning                                                                                                                                                                                             |
+| `CODEGRAPH_PHASE_TIMINGS`           | —            | `1` enables                   | Print one stderr line per timed phase of `init`, `index`, and `sync`, in microseconds (see [Index diagnostics](#index-diagnostics))                                                                                                                                                                |
 | `CODEGRAPH_MCP_TOOL_TIMEOUT_SECS`   | `60`         | ≥0; `0` disables              | How long an MCP client waits for one tool call, in seconds; past it the call returns an `isError` result while its work finishes in the background. Empty or malformed values use the default                                                                                                      |
 | `CODEGRAPH_MCP_REGISTRY_DIR`        | —            | —                             | Override the stdio MCP registry directory read by `mcp list`                                                                                                                                                                                                                                       |
 | `CODEGRAPH_UI`                      | —            | `1` enables                   | Enable the browser viewer commands `ui` / `web` (preview); otherwise they are refused and hidden from `--help`                                                                                                                                                                                     |
@@ -1518,6 +1519,48 @@ tombstone, whose `init` recovery would refuse such an index.
 parse, resolution, or persistence decisions. See
 [`troubleshooting.md`](troubleshooting.md) for the event schema, privacy
 boundary, slow-file watchdog behavior, and the files to attach to a report.
+
+`CODEGRAPH_PHASE_TIMINGS=1` makes the same three commands print one stderr
+line per timed phase as the phase ends, with or without `--debug` and
+`--quiet`. Each line has four fields separated by tabs (`\t` below):
+
+```text
+codegraph-phase\t<command>\t<phase>\t<microseconds>
+```
+
+`<command>` is `init`, `index`, or `sync`, and `<microseconds>` is an integer.
+Each phase name appears once per command:
+
+- `init` and `index` report the ten phases of the JSONL log (`scan`,
+  `parse_write`, `node_write`, `edge_write`, `reference_write`,
+  `framework_extract`, `framework_finalize`, `reference_resolution`,
+  `synthesis`, `publish`) and these parts of them:
+  - `parse_write.store_busy`: the time the single index writer spent storing
+    the parsed files; the rest of `parse_write` it waited for them;
+  - `reference_resolution.<part>`, each summed over the batches: `setup`
+    (the incomplete marker, the cache warm-up, the counts), `read` (reading a
+    batch of references), `snapshot` (each batch's resolution context, the
+    node snapshot included), `resolve`, `create_edges`, `insert_edges`,
+    `move_refs` (moving the resolved rows to `resolved_refs`), `wal_fold` (the
+    WAL valve), and the two passes after the batches, `conformance` and
+    `this_members`;
+  - `synthesis.<part>`: `read` (the indexed files' text), one line for each
+    prerequisite step and pass that ran, under its upstream name (for example
+    `synthesis.fieldEdges`; a pass whose language gate is closed does not run
+    and prints nothing), then `merge`, `replace`, and `inputs`.
+- `sync` reports `sync`, its six consecutive parts `sync.scan` (the index
+  lease, opening the index, and the scan), `sync.files` (re-extracting and
+  writing the changed files, and the change checks before the framework
+  pass), `sync.frameworks` (the framework extract and cross-file
+  finalization), `sync.resolve` (the dependents' references, re-resolution,
+  the lane rows and markers, and the orphan sweep), `sync.synthesis`, and
+  `sync.finish`, and the stage's `synthesis.<part>` lines when the stage ran.
+  A sync that rebuilds an outdated index prints only `sync`.
+
+The parts are printed only on stderr, never into the JSONL log, so its
+`phase_end` durations still add up to the command. Stdout and the index are
+the same with the variable as without it; unset, or set to anything but `1`,
+no line is printed.
 
 ### `--prompt-hook` detail
 
