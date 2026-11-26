@@ -1563,6 +1563,9 @@ pub struct ReferenceResolver {
     /// index.ts:209 / #750). A `Mutex` for the same `Sync` reason as
     /// `deferred_this_member_refs`; pushed only from serial code.
     deferred_chain_refs: std::sync::Mutex<Vec<RefView>>,
+    /// The project's custom Lua module loaders and roots, handed to every
+    /// context the resolver builds ([`Self::with_lua_loaders`]).
+    lua_loaders: Arc<codegraph_extract::LuaLoaders>,
 }
 
 impl ReferenceResolver {
@@ -1586,6 +1589,7 @@ impl ReferenceResolver {
             type_parameters: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
+            lua_loaders: codegraph_extract::LuaLoaders::empty(),
         }
     }
 
@@ -1595,6 +1599,15 @@ impl ReferenceResolver {
     #[must_use]
     pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
         self.max_file_size = max_file_size;
+        self
+    }
+
+    /// Resolve Lua `require`s and loader calls under the addressed project's
+    /// custom Lua module settings (`ExtractOptions::lua_loaders`, #1617), in
+    /// every context the resolver builds.
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: Arc<codegraph_extract::LuaLoaders>) -> Self {
+        self.lua_loaders = lua_loaders;
         self
     }
 
@@ -1608,6 +1621,7 @@ impl ReferenceResolver {
             .with_max_file_size(self.max_file_size)
             .with_recorded_class_heads(self.recorded_heads_stale.clone())
             .with_recorded_bridge_rows(self.recorded_bridge_stale.clone())
+            .with_lua_loaders(Arc::clone(&self.lua_loaders))
     }
 
     /// Read class heads from the store's class-head rows for every file but
@@ -3755,7 +3769,8 @@ impl ReferenceResolver {
                         base_adjacency = (*build_edge_adjacency(store)?).clone();
                         node_snapshot.insert(
                             SnapshotResolutionContext::from_store(store, &self.project_root)?
-                                .with_max_file_size(self.max_file_size),
+                                .with_max_file_size(self.max_file_size)
+                                .with_lua_loaders(Arc::clone(&self.lua_loaders)),
                         )
                     }
                 };

@@ -3904,7 +3904,18 @@ fn resolve_rust_module_file(
 }
 
 /// Lua / Luau `require("a.b.c")` dotted module path → module file. Ports
-/// `resolveLuaRequire`.
+/// `resolveLuaRequire`: the dots become slashes, and the first of `p.lua`,
+/// `p.luau`, `p/init.lua`, `p/init.luau` an indexed file ends with wins, the
+/// file sharing the longest path prefix with the requiring one, unless that
+/// is the requiring file itself.
+///
+/// A project's custom Lua module settings (#1617, W9-02) add two rules of
+/// this port's own ahead of it, for a loader call and a `require` alike:
+/// with any setting, the literal as written is the first candidate, a Lua
+/// or Luau file only (`Require("Script/Foo.lua")`, OD-B83); and each module
+/// root, in the order written, is looked in for each candidate in turn
+/// before the search over the whole project. A project without settings
+/// resolves exactly as before.
 pub(crate) fn resolve_lua_require(
     reference: &RefView,
     context: &dyn ResolutionContext,
@@ -3918,20 +3929,54 @@ pub(crate) fn resolve_lua_require(
     } else {
         name.clone()
     };
+    let loaders = context.lua_loaders();
     let suffixes = [
         format!("{base}.lua"),
         format!("{base}.luau"),
         format!("{base}/init.lua"),
         format!("{base}/init.luau"),
     ];
+    // Each candidate, and whether it is the literal as written, which only
+    // a Lua or Luau file answers.
+    let literal = loaders.is_configured().then_some((name.as_str(), true));
+    let candidates: Vec<(&str, bool)> = literal
+        .into_iter()
+        .chain(suffixes.iter().map(|suffix| (suffix.as_str(), false)))
+        .collect();
+    let resolved = |file_node: &Node| {
+        ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        )
+    };
+    for root in loaders.module_roots() {
+        for &(candidate, lua_only) in &candidates {
+            let path = if root.is_empty() {
+                candidate.to_string()
+            } else {
+                format!("{root}/{candidate}")
+            };
+            if path == reference.file_path || !context.is_indexed_file(&path) {
+                continue;
+            }
+            if let Some(file_node) = lua_module_file_node(&path, lua_only, context) {
+                return Some(resolved(&file_node));
+            }
+        }
+    }
     let shared = |a: &str, b: &str| -> usize {
         a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
     };
-    for suffix in &suffixes {
+    for &(candidate, lua_only) in &candidates {
         // The files the suffix names, read once per pass (W5-09).
-        let mut matches: Vec<String> = crate::lua_scope::lua_require_matches(suffix, context)
+        let mut matches: Vec<String> = crate::lua_scope::lua_require_matches(candidate, context)
             .as_ref()
             .clone();
+        if lua_only {
+            matches.retain(|path| lua_module_file_node(path, true, context).is_some());
+        }
         if matches.is_empty() {
             continue;
         }
@@ -3940,20 +3985,26 @@ pub(crate) fn resolve_lua_require(
         if best == &reference.file_path {
             continue;
         }
-        if let Some(file_node) = context
-            .get_nodes_in_file_shared(best)
-            .into_iter()
-            .find(|n| n.kind == NodeKind::File)
-        {
-            return Some(ResolvedRef::new(
-                reference.clone(),
-                file_node.id.clone(),
-                0.9,
-                ResolvedBy::Import,
-            ));
+        if let Some(file_node) = lua_module_file_node(best, false, context) {
+            return Some(resolved(&file_node));
         }
     }
     None
+}
+
+/// The file node of `path`, of a Lua or Luau file when `lua_only`.
+fn lua_module_file_node(
+    path: &str,
+    lua_only: bool,
+    context: &dyn ResolutionContext,
+) -> Option<std::sync::Arc<Node>> {
+    context
+        .get_nodes_in_file_shared(path)
+        .into_iter()
+        .find(|node| {
+            node.kind == NodeKind::File
+                && (!lua_only || matches!(node.language, Language::Lua | Language::Luau))
+        })
 }
 
 #[cfg(test)]
@@ -3985,6 +4036,8 @@ mod tests {
         cpp_include_dirs: Vec<String>,
         /// Files on disk that the index does not hold (a `node_modules` file).
         disk_only_files: BTreeSet<String>,
+        /// The project's custom Lua module settings (W9-02).
+        lua_loaders: codegraph_extract::LuaLoaders,
     }
 
     impl ResolutionContext for TestContext {
@@ -4065,6 +4118,9 @@ mod tests {
         }
         fn get_cpp_include_dirs(&self) -> Vec<String> {
             self.cpp_include_dirs.clone()
+        }
+        fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+            &self.lua_loaders
         }
     }
 
@@ -6682,6 +6738,198 @@ export default defaultTarget;
         );
         let resolved = resolve_via_import(&r, &ctx).expect("resolves");
         assert_eq!(resolved.target_node_id, "file:game/lib/mod.lua");
+    }
+
+    /// A context over `files` (each a Lua file unless its extension says
+    /// otherwise) under the Lua settings `roots` and `loaders` (W9-02).
+    fn lua_context(files: &[&str], loaders: &[&str], roots: &[&str]) -> TestContext {
+        TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: files.iter().map(|file| file.to_string()).collect(),
+            nodes: files
+                .iter()
+                .map(|file| {
+                    let language = if file.ends_with(".luau") {
+                        Language::Luau
+                    } else if file.ends_with(".lua") {
+                        Language::Lua
+                    } else if file.ends_with(".xml") {
+                        Language::Xml
+                    } else {
+                        Language::Unknown
+                    };
+                    file_node(file, language)
+                })
+                .collect(),
+            lua_loaders: codegraph_extract::LuaLoaders::merge(
+                Some(&serde_json::json!({"loader_functions": loaders, "module_roots": roots})),
+                None,
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn lua_target(ctx: &TestContext, name: &str, from: &str) -> Option<String> {
+        resolve_lua_require(
+            &reference(name, EdgeKind::Imports, from, Language::Lua),
+            ctx,
+        )
+        .map(|resolved| resolved.target_node_id)
+    }
+
+    /// W9-02: a module root is looked in before the project-wide search,
+    /// which would take the file nearer the requiring one.
+    #[test]
+    fn resolve_lua_require_prefers_a_module_root() {
+        let files = ["game/util.lua", "Script/util.lua", "game/main.lua"];
+        let plain = lua_context(&files, &[], &[]);
+        assert_eq!(
+            lua_target(&plain, "util", "game/main.lua").as_deref(),
+            Some("file:game/util.lua")
+        );
+        let rooted = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&rooted, "util", "game/main.lua").as_deref(),
+            Some("file:Script/util.lua")
+        );
+        // `.` is the project root.
+        let files = ["util.lua", "game/util.lua", "game/main.lua"];
+        let rooted = lua_context(&files, &[], &["."]);
+        assert_eq!(
+            lua_target(&rooted, "util", "game/main.lua").as_deref(),
+            Some("file:util.lua")
+        );
+    }
+
+    /// W9-02: the roots are tried in the order written, each candidate in
+    /// turn within a root.
+    #[test]
+    fn resolve_lua_require_tries_roots_in_their_order() {
+        let files = [
+            "A/ui/button.lua",
+            "B/ui/button.lua",
+            "B/ui/button/init.lua",
+            "main.lua",
+        ];
+        for (roots, expected) in [
+            (["A", "B"], "file:A/ui/button.lua"),
+            (["B", "A"], "file:B/ui/button.lua"),
+        ] {
+            let ctx = lua_context(&files, &[], &roots);
+            assert_eq!(
+                lua_target(&ctx, "ui.button", "main.lua").as_deref(),
+                Some(expected),
+                "{roots:?}"
+            );
+        }
+        // Within a root, `p.lua` comes before `p/init.lua`; a later root's
+        // `p.lua` does not come before an earlier root's `p/init.lua`.
+        let files = ["A/ui/button/init.lua", "B/ui/button.lua", "main.lua"];
+        let ctx = lua_context(&files, &[], &["A", "B"]);
+        assert_eq!(
+            lua_target(&ctx, "ui.button", "main.lua").as_deref(),
+            Some("file:A/ui/button/init.lua")
+        );
+    }
+
+    /// W9-02: when no root holds the module, the project-wide search
+    /// resolves it as before.
+    #[test]
+    fn resolve_lua_require_falls_back_when_no_root_holds_the_module() {
+        let files = ["lib/util.lua", "Script/other.lua", "main.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "util", "main.lua").as_deref(),
+            Some("file:lib/util.lua")
+        );
+        assert_eq!(lua_target(&ctx, "missing", "main.lua"), None);
+    }
+
+    /// W9-02: under a root, the requiring file itself is skipped for the
+    /// next candidate, as the project-wide search skips it.
+    #[test]
+    fn resolve_lua_require_skips_its_own_file_under_a_root() {
+        let files = ["Script/util.lua", "Script/util/init.lua", "lib/util.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "util", "Script/util.lua").as_deref(),
+            Some("file:Script/util/init.lua")
+        );
+        let files = ["Script/util.lua", "lib/util.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "util", "Script/util.lua").as_deref(),
+            None,
+            "the project-wide search skips its own file too, as upstream's does"
+        );
+    }
+
+    /// OD-B83: a literal is read as the file path it is written as only in a
+    /// project with Lua settings, before the dotted candidates; without
+    /// them `foo.lua` stays the module `foo/lua`.
+    #[test]
+    fn resolve_lua_require_reads_a_file_literal_only_with_settings() {
+        let files = [
+            "Script/Activity/ActivityMgrC.lua",
+            "foo.lua",
+            "foo/lua.lua",
+            "main.lua",
+        ];
+        let plain = lua_context(&files, &[], &[]);
+        assert_eq!(
+            lua_target(&plain, "Script/Activity/ActivityMgrC.lua", "main.lua"),
+            None
+        );
+        assert_eq!(
+            lua_target(&plain, "foo.lua", "main.lua").as_deref(),
+            Some("file:foo/lua.lua")
+        );
+        for configured in [
+            lua_context(&files, &["Require"], &[]),
+            lua_context(&files, &[], &["Lib"]),
+        ] {
+            assert_eq!(
+                lua_target(&configured, "Script/Activity/ActivityMgrC.lua", "main.lua").as_deref(),
+                Some("file:Script/Activity/ActivityMgrC.lua")
+            );
+            assert_eq!(
+                lua_target(&configured, "foo.lua", "main.lua").as_deref(),
+                Some("file:foo.lua")
+            );
+        }
+        // Under a root, the literal too, before the dotted candidates.
+        let files = ["Script/Foo.lua", "Script/Foo/lua.lua", "main.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "Foo.lua", "main.lua").as_deref(),
+            Some("file:Script/Foo.lua")
+        );
+    }
+
+    /// OD-B83: only a Lua or Luau file answers a literal read as written; a
+    /// file of another language is no module.
+    #[test]
+    fn resolve_lua_require_takes_a_file_literal_only_when_it_is_lua() {
+        let files = [
+            "Script/Foo.xml",
+            "Script/Bar.luau",
+            "lib/Script/Foo.xml",
+            "main.lua",
+        ];
+        let ctx = lua_context(&files, &["Require"], &["."]);
+        assert_eq!(lua_target(&ctx, "Script/Foo.xml", "main.lua"), None);
+        assert_eq!(
+            lua_target(&ctx, "Script/Bar.luau", "main.lua").as_deref(),
+            Some("file:Script/Bar.luau")
+        );
+        // A non-Lua match does not hide a Lua one the search finds.
+        let files = ["a/Foo.cfg", "b/Foo.cfg", "main.lua"];
+        let mut ctx = lua_context(&files, &["Require"], &[]);
+        ctx.nodes[1].language = Language::Lua;
+        assert_eq!(
+            lua_target(&ctx, "Foo.cfg", "main.lua").as_deref(),
+            Some("file:b/Foo.cfg")
+        );
     }
 
     #[test]

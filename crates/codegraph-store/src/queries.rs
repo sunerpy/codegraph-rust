@@ -3002,6 +3002,25 @@ impl Store {
         rows.collect()
     }
 
+    /// The sites of every Lua and Luau `imports` reference, resolved (an
+    /// `imports` edge out of a Lua node) or parked in `unresolved_refs`,
+    /// sorted and deduplicated, an edge with no line or column as its whole
+    /// file: a sync whose custom Lua module roots changed resolves them again
+    /// (W9-02). One scan of the `imports` edges and one of the parked
+    /// references; it runs only for such a sync.
+    pub fn lua_import_sites(&self) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.file_path, e.source, e.line, e.col FROM edges e \
+             JOIN nodes n ON n.id = e.source \
+             WHERE e.kind = 'imports' AND n.language IN ('lua', 'luau') \
+             UNION SELECT file_path, from_node_id, line, col FROM unresolved_refs \
+             WHERE reference_kind = 'imports' AND language IN ('lua', 'luau') \
+             ORDER BY 1, 2, 3, 4",
+        )?;
+        let rows = stmt.query_map([], row_to_file_reference_site)?;
+        rows.collect()
+    }
+
     /// The files holding a Terraform reference through a module's boundary
     /// (`module.M:file`, `module.M:var.X`, `module.M:output.O`,
     /// `module.M:remote-output.O`), resolved or not, sorted: a sync that

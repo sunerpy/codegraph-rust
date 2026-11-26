@@ -336,7 +336,8 @@ pub(crate) fn migrate_project(
     drop(refs);
 
     let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
-        .with_max_file_size(options.max_file_size);
+        .with_max_file_size(options.max_file_size)
+        .with_lua_loaders(std::sync::Arc::clone(&options.lua_loaders));
     {
         let context = resolver.store_context(rebuild.store());
         resolver.initialize(&context);

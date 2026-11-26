@@ -1443,9 +1443,9 @@ server observes edits on the next search/explore call.
 ### Custom Lua module loaders (`[lua]`)
 
 A Lua code base that loads its modules through a function of its own,
-`Require("Script/Activity/ActivityMgrC")` or `Include "ui.button"`, where other
-code calls `require`, names those functions in the `[lua]` table of
-`config.toml`:
+`Require("Script/Activity/ActivityMgrC.lua")` or `Include "ui.button"`, where
+other code calls `require`, names those functions, and the folders its modules
+are looked up in first, in the `[lua]` table of `config.toml`:
 
 ```toml
 [app]
@@ -1453,6 +1453,7 @@ name = "my-game"
 
 [lua]
 loader_functions = ["Require", "Include"]
+module_roots = ["Script"]
 ```
 
 The compatibility JSON form is the `lua` object of `.codegraph/codegraph.json`:
@@ -1460,10 +1461,14 @@ The compatibility JSON form is the `lua` object of `.codegraph/codegraph.json`:
 ```json
 {
   "lua": {
-    "loaderFunctions": ["Require", "Include"]
+    "loaderFunctions": ["Require", "Include"],
+    "moduleRoots": ["Script"]
   }
 }
 ```
+
+These rules are this port's own: upstream issue #1617 asked for loader
+functions and has no implementation upstream.
 
 Sources and precedence:
 
@@ -1482,6 +1487,12 @@ Validation never stops indexing:
   (`[A-Za-z_][A-Za-z0-9_]*`, then any `.` and another), ASCII, matched as
   written: case counts and nothing is trimmed. A name written twice counts
   once.
+- A module root is a folder inside the project, relative to its root and
+  written with `/`: one leading `./` and one trailing `/` are dropped, and `.`
+  (or `./`, or an empty string) is the project root itself. A root that is
+  absolute (`/x`, `C:`), holds a `\`, or has an empty, `.` or `..` segment is
+  refused. Roots are compared as text, never looked up on disk, and one
+  written twice counts once.
 - An element that is not a valid name, a key that is not an array, an unknown
   key, and a `lua` entry that is not a table are each ignored with one warning
   on stderr naming the file, the key and the element. stdout is unaffected.
@@ -1500,18 +1511,49 @@ What a loader call is:
   setting.
 - A loader call is extracted as a `require` is: an `import` node named the
   literal, an `imports` reference of that name, and no `calls` reference. The
-  literal is resolved as a `require` of the same string is.
-- It is one where a `require` is one: a top-level statement, a top-level
-  block, and anywhere in the value of a top-level declaration or assignment (a
-  function written there keeps its call too). In the body of a function
-  declared with `function`, a loader call stays a `calls` reference, as a
-  `require` there does.
+  literal is resolved as a `require` of the same string is (below).
+- It is one where a `require` is one: anywhere outside the body of a named
+  function (`function f()`, `local function f()`, `function M.f()`), so in a
+  top-level statement or block and in an anonymous callback such as busted's
+  `describe("…", function() … end)`; a function value written in a top-level
+  declaration or assignment keeps it as its call too. In a named function's
+  body a loader call stays a `calls` reference, as a `require` there does.
+
+How a module is found, for a loader call and a `require` alike (the resolver
+cannot tell them apart):
+
+- The candidates are the literal with its dots read as `/` (`ui.button` is
+  `ui/button`) and `.lua`, `.luau`, `/init.lua` or `/init.luau` appended, in
+  that order. In a project with any `[lua]` setting, one valid loader or one
+  valid root, the literal as written comes first, and only a Lua or Luau file
+  answers it: `Require("Script/Activity/ActivityMgrC.lua")` is that file.
+  Without settings, `require("foo.lua")` is the module `foo/lua`, as upstream
+  reads it.
+- Each module root is looked in first, in the order written, each candidate in
+  turn: the indexed file at `<root>/<candidate>` (the candidate itself for the
+  project root) wins, unless it is the requiring file.
+- Then the whole project, as without settings: for each candidate in turn, the
+  indexed files whose path is the candidate or ends with `/<candidate>`, the
+  one sharing the longest path prefix with the requiring file winning; when
+  that is the requiring file itself, the next candidate is tried.
+- A module no candidate finds stays an unresolved `imports` reference.
+
+A call through a `local` alias of a loader call (`local m = Require("m")`) is
+followed into the module only when the loader is a single name ending in
+`require`, `Require`, `import`, `Import` or `_module` after at least one other
+character (`myRequire`, `reload_module`), the names upstream's alias rule reads
+beside `require`; an alias of another loader's call (`Require`, `Include`,
+`Script.Load`) is not followed.
 
 Every full index records the settings it ran under, a project naming no loader
 included. A sync compares them with the current settings before it changes
 anything: when the loader names changed, every Lua and Luau file is extracted
 and resolved again, and a sync that stops partway leaves the next one to do it.
-A running watcher reloads either file on change and runs one full reconcile.
+When only the roots changed, nothing is extracted again: every Lua and Luau
+import is resolved again where it is written, and every Lua file whose `local`
+aliases `require` a module is resolved again whole, since a call through such
+an alias follows the module. A running watcher reloads either file on change
+and runs one full reconcile.
 
 ### Extraction-version upgrades
 

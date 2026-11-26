@@ -532,7 +532,11 @@ persisted. A sync reads it before its first change and, when the current
 settings differ, deletes it before anything changes. A sync that finds it
 missing or unreadable, or naming other loaders, extracts every Lua and Luau
 file again (chosen by the language of its file row) and resolves them whole.
-It is not a canonical surface.
+One that finds only other roots, their order included, extracts nothing: it
+resolves every Lua and Luau `imports` reference again at its site (the
+`imports` edges out of Lua nodes and the parked Lua `imports` rows), and
+every unchanged Lua file whose module row's `reads` is not empty, or whose row
+cannot be read, again whole. It is not a canonical surface.
 
 The case-folded lane stores no rows, only its marker:
 `case_folded_names_version` (1) is written by a full index, a migration and

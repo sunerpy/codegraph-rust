@@ -1002,7 +1002,8 @@ fn sync_paths_with_store(
         || loaders_change != crate::lua_modules::LoadersChange::Same
         || crate::control_inputs::frameworks_unchecked(store)?;
     let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
-        .with_max_file_size(scope.options.max_file_size);
+        .with_max_file_size(scope.options.max_file_size)
+        .with_lua_loaders(Arc::clone(&scope.options.lua_loaders));
     let mut frameworks = Vec::new();
     let mut frameworks_changed = false;
     if block {
@@ -1592,6 +1593,24 @@ fn sync_paths_with_store(
             dependent_fallbacks.insert(file.clone());
         }
         changed_names.note_all(lua.names.iter().cloned());
+        // A change of the custom Lua module roots alone moves where a Lua
+        // import resolves, and what an alias through one names (W9-02):
+        // every Lua import goes back by its site, and every Lua file whose
+        // aliases `require` a module goes back whole. Nothing is extracted
+        // again: the roots decide no extraction.
+        if loaders_change == crate::lua_modules::LoadersChange::Roots {
+            for found in store.lua_import_sites()? {
+                if !reindexed.contains(&found.file_path) {
+                    merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, found);
+                }
+            }
+            let skip =
+                |path: &str| reindexed.contains(path) || changed_names.removed_files.contains(path);
+            for file in crate::lua_modules::alias_readers(store, &skip)? {
+                dependent_sites.remove(&file);
+                dependent_fallbacks.insert(file);
+            }
+        }
         // A CamelCase path receiver is an outside type unless the project
         // declares a type, trait or alias of its name (upstream #2177): the
         // unchanged Rust files writing a name that came or went as a
@@ -1758,7 +1777,8 @@ fn sync_paths_with_store(
                 store,
                 project_root.to_string_lossy(),
             )
-            .with_max_file_size(scope.options.max_file_size);
+            .with_max_file_size(scope.options.max_file_size)
+            .with_lua_loaders(Arc::clone(&scope.options.lua_loaders));
             for resolved in store.resolved_imports_naming(&path_keys)? {
                 if reindexed.contains(&resolved.file_path)
                     || dependent_fallbacks.contains(&resolved.file_path)
@@ -2272,7 +2292,7 @@ fn sync_paths_with_store(
     if store.is_resolution_incomplete()? {
         // The sweep writes base edges: the synthesized ones go stale first.
         codegraph_resolve::synthesis::withdraw_marker(store)?;
-        let stats = sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
+        let stats = sweep_orphaned_refs(project_root, store, &scope.options)?;
         outcome.pending_refs_processed = stats.total;
         outcome.pending_refs_resolved = stats.resolved;
         outcome.pending_refs_unresolved = stats.unresolved;
@@ -2667,10 +2687,11 @@ fn merge_dependent_site(
 fn sweep_orphaned_refs(
     project_root: &Path,
     store: &mut Store,
-    max_file_size: u64,
+    options: &ExtractOptions,
 ) -> Result<codegraph_resolve::ResolutionStats> {
-    let mut resolver =
-        ReferenceResolver::new(project_root.to_string_lossy()).with_max_file_size(max_file_size);
+    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
+        .with_max_file_size(options.max_file_size)
+        .with_lua_loaders(Arc::clone(&options.lua_loaders));
     {
         let context = resolver.store_context(store);
         resolver.initialize(&context);
@@ -7876,6 +7897,146 @@ pub(crate) mod tests {
             outcome.changed_paths.is_empty(),
             "{:?}",
             outcome.changed_paths
+        );
+    }
+
+    const LUA_LIB_UTIL: (&str, &str) = (
+        "lib/util.lua",
+        "local M = {}\nfunction M.clamp(v)\n  return v\nend\nreturn M\n",
+    );
+    const LUA_SCRIPT_UTIL: (&str, &str) = (
+        "Script/util.lua",
+        "local M = {}\nfunction M.clamp(v)\n  return v + 1\nend\nreturn M\n",
+    );
+    const LUA_ALIAS_READER: (&str, &str) = (
+        "main.lua",
+        "local clamp = require(\"util\").clamp\n\nlocal function run()\n  return clamp(1)\nend\n\nreturn run\n",
+    );
+    const LUA_PLAIN_REQUIRE: (&str, &str) = ("plain.lua", "require(\"util\")\nreturn {}\n");
+    const LUA_LIB_ROOT: (&str, &str) = (
+        ".codegraph/config.toml",
+        "[app]\nname = \"lua-roots\"\n\n[lua]\nmodule_roots = [\"lib\"]\n",
+    );
+
+    /// W9-02: a change of the Lua module roots alone extracts nothing
+    /// again: each Lua import goes back by its site, and each Lua file whose
+    /// aliases `require` a module goes back whole, so the call through the
+    /// alias follows the import to the root's module, as a fresh index has
+    /// it.
+    #[test]
+    fn a_root_change_reresolves_imports_by_site_and_alias_readers_whole() {
+        let dir = TestDir::new("lua-roots-change");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            LUA_LIB_UTIL,
+            LUA_SCRIPT_UTIL,
+            LUA_ALIAS_READER,
+            LUA_PLAIN_REQUIRE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let reaches = |db: &Path, file: &str| {
+            edge_projection(db)
+                .iter()
+                .any(|edge| edge.starts_with("main.lua:run -[calls]-> ") && edge.contains(file))
+        };
+        assert!(
+            reaches(&db, "Script/util.lua:"),
+            "{:#?}",
+            edge_projection(&db)
+        );
+        take_dependent_refreshes();
+
+        write_files(dir.path(), &[LUA_LIB_ROOT]);
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            outcome.changed_paths.is_empty(),
+            "{:?}",
+            outcome.changed_paths
+        );
+        let refreshed: Vec<(String, bool)> = take_dependent_refreshes()
+            .into_iter()
+            .map(|refresh| (refresh.file, refresh.whole))
+            .collect();
+        assert_eq!(
+            refreshed,
+            vec![
+                ("main.lua".to_string(), true),
+                ("plain.lua".to_string(), false),
+            ]
+        );
+        assert!(reaches(&db, "lib/util.lua:"), "{:#?}", edge_projection(&db));
+        let mut fresh = vec![LUA_LIB_ROOT];
+        fresh.extend(initial);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("lua-roots-change-fresh", &fresh)
+        );
+    }
+
+    /// W9-02: the orphan sweep resolves under the project's Lua module
+    /// roots, as the full index it heals does.
+    #[test]
+    fn the_orphan_sweep_reads_the_lua_roots() {
+        let dir = TestDir::new("lua-roots-sweep");
+        let db = default_db_path(dir.path()).unwrap();
+        let initial = [
+            LUA_LIB_ROOT,
+            LUA_LIB_UTIL,
+            LUA_SCRIPT_UTIL,
+            LUA_PLAIN_REQUIRE,
+        ];
+        write_files(dir.path(), &initial);
+        sync_changed_paths(dir.path(), &db, initial.iter().map(|(path, _)| *path)).unwrap();
+        let expected = edge_projection(&db);
+        assert!(
+            expected
+                .iter()
+                .any(|edge| edge.starts_with("plain.lua:plain.lua -[imports]-> lib/util.lua:")),
+            "{expected:#?}"
+        );
+        {
+            // An interrupted resolution: the import parked again, its edge
+            // gone.
+            let store = Store::open(&db).unwrap();
+            let conn = store.connection();
+            let moved = conn
+                .execute(
+                    "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, \
+                     line, col, candidates, file_path, language, reference_subkind) \
+                     SELECT from_node_id, reference_name, reference_kind, line, col, candidates, \
+                     file_path, language, reference_subkind FROM resolved_refs \
+                     WHERE file_path = 'plain.lua' AND reference_kind = 'imports'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(moved, 1);
+            conn.execute(
+                "DELETE FROM resolved_refs WHERE file_path = 'plain.lua' AND reference_kind = 'imports'",
+                [],
+            )
+            .unwrap();
+            let dropped = conn
+                .execute(
+                    "DELETE FROM edges WHERE kind = 'imports' AND source = 'file:plain.lua'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(dropped, 1);
+            store.set_resolution_incomplete().unwrap();
+        }
+        assert_ne!(edge_projection(&db), expected);
+        sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(edge_projection(&db), expected);
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("lua-roots-sweep-fresh", &initial)
         );
     }
 

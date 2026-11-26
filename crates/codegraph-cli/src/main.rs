@@ -6737,8 +6737,9 @@ fn index_project_inner(
     diagnostic_run.phase_start("framework_extract");
     let framework_started = std::time::Instant::now();
     let pb = phase_spinner("Detecting frameworks", quiet);
-    let mut resolver =
-        ReferenceResolver::new(project.to_string_lossy()).with_max_file_size(options.max_file_size);
+    let mut resolver = ReferenceResolver::new(project.to_string_lossy())
+        .with_max_file_size(options.max_file_size)
+        .with_lua_loaders(std::sync::Arc::clone(&options.lua_loaders));
     // Detect frameworks then run their per-file extract (route/component/handler
     // nodes + refs) BEFORE resolution, mirroring the upstream tree-sitter.ts:4796-4819
     // framework-extraction pass feeding the resolution pipeline.

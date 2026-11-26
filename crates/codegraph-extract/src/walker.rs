@@ -11407,12 +11407,12 @@ M:assignedFn()
     /// asked for imports; upstream's `require` is one only where the main
     /// walk reaches it): a top-level statement, a declaration's value, a
     /// call nested in it, a function value's body inside a declaration, a
-    /// top-level block. In a function's body it stays a call, as `require`
-    /// does. `require` rewritten as a loader gives the same nodes and
-    /// references, names aside.
+    /// top-level block, an anonymous callback. In a named function's body
+    /// it stays a call, as `require` does. `require` rewritten as a loader
+    /// gives the same nodes and references, names aside.
     #[test]
     fn lua_loader_matches_require_in_every_position() {
-        let with_require = "require(\"top\")\nlocal a = require(\"value\")\nlocal b = wrap(require(\"nested\"))\nlocal f = function() return require(\"fvalue\") end\nlocal function g()\n  return require(\"body\")\nend\nif ready then\n  require(\"block\")\nend\nlocal M = {}\nfunction M.h()\n  require(\"method\")\nend\nreturn M\n";
+        let with_require = "require(\"top\")\nlocal a = require(\"value\")\nlocal b = wrap(require(\"nested\"))\nlocal f = function() return require(\"fvalue\") end\nlocal function g()\n  return require(\"body\")\nend\nif ready then\n  require(\"block\")\nend\nlocal M = {}\nfunction M.h()\n  require(\"method\")\nend\ndescribe(\"d\", function()\n  require(\"callback\")\nend)\nreturn M\n";
         let with_loader = with_require.replace("require", "Require");
         for (file, language) in [("pos.lua", Language::Lua), ("pos.luau", Language::Luau)] {
             let plain = extract_source(file, with_require, Some(language));
@@ -11435,7 +11435,7 @@ M:assignedFn()
                 .collect();
             assert_eq!(
                 imported,
-                ["top", "value", "nested", "fvalue", "block"],
+                ["top", "value", "nested", "fvalue", "block", "callback"],
                 "{file}"
             );
             let calls: Vec<i64> = refs

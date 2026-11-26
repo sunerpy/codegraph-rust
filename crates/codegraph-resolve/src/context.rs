@@ -49,6 +49,9 @@ pub struct StoreResolutionContext<'a> {
     /// The store's bridge-facts rows by path, read the first time a bridge
     /// asks.
     bridge_rows: std::cell::OnceCell<Arc<BridgeRows>>,
+    /// The project's custom Lua module loaders and roots
+    /// ([`Self::with_lua_loaders`]); none by default.
+    lua_loaders: Arc<codegraph_extract::LuaLoaders>,
 }
 
 /// Each file's bridge facts as its `rn_bridge_surface:` row records them.
@@ -207,7 +210,17 @@ impl<'a> StoreResolutionContext<'a> {
             recorded_heads_stale: None,
             recorded_bridge_stale: None,
             bridge_rows: std::cell::OnceCell::new(),
+            lua_loaders: codegraph_extract::LuaLoaders::empty(),
         }
+    }
+
+    /// Resolve Lua `require`s and loader calls under the addressed
+    /// project's custom Lua module settings (#1617): its module roots are
+    /// looked in first, and a literal is read as a file path as written too.
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: Arc<codegraph_extract::LuaLoaders>) -> Self {
+        self.lua_loaders = lua_loaders;
+        self
     }
 
     /// Read files up to the addressed project's extraction limit
@@ -896,6 +909,10 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .lua_tables
                 .get_or_insert_with(|| Arc::new(crate::lua_scope::LuaTables::new())),
         )
+    }
+
+    fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+        &self.lua_loaders
     }
 
     fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {

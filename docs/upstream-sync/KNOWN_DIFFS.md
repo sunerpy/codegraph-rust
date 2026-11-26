@@ -277,6 +277,42 @@ differ:
 - CLI only. colby's other entry point is its JavaScript library API
   (`CodeGraph.buildContext`); neither side has an MCP context tool.
 
+## Custom Lua module loaders (Rust-original, #1617)
+
+colby issue #1617 asks for Lua loader functions (`{"lua": {"loaderFunctions":
+["Require", "Include"]}}`, a game client calling `Require("Script/…/X.lua")`
+691 times) and has no implementation in colby, so every rule of the port's
+[custom Lua module loaders](../cli.md#custom-lua-module-loaders-lua) is its
+own (OD-11). Against the issue and colby's `require` handling:
+
+- The JSON object is read from `.codegraph/codegraph.json`, where this port
+  reads `codegraph.json` for its extensions too; the issue's file sits at the
+  project root.
+- The `[lua]` table of `config.toml`, its per-key precedence over the JSON
+  object, and `APP_CONFIG` replacing the project's `config.toml` have no colby
+  counterpart.
+- `module_roots` is this port's reading of the issue's "any configured
+  roots": the roots are looked in first, in the order written, each
+  candidate in turn, and colby's whole-project suffix search follows. They
+  order a `require` as well as a loader call.
+- A loader name may be dotted (`Script.Load`), is matched case-sensitively
+  by the call's whole path of names, and must follow the Lua name rule; a
+  root must be a project-relative folder (`.` is the project root). An
+  invalid element is dropped with a warning, the tolerance colby's
+  `project-config.ts` applies to its own keys.
+- A loader call is an import exactly where this port makes a `require` one,
+  outside the bodies of named functions (anonymous callbacks included); in a
+  named function's body it stays a call, as a `require` there does here and
+  in colby, so not every one of the issue's call sites becomes an import.
+- A literal carrying an extension (`Script/Foo.lua`) is read as the file path
+  it is written as only in a project with `[lua]` settings, and only a Lua or
+  Luau file answers it (OD-B83); colby's `resolveLuaRequire` turns every dot
+  into `/`, so without settings `require("foo.lua")` stays the module
+  `foo/lua` here too.
+- A call through a `local` alias of a loader call is followed only for a
+  loader whose name colby's alias rule reads beside `require` (`myRequire`,
+  `reload_module`); following other loaders' aliases is left for later.
+
 ## Kept different on purpose (KEEP-RUST)
 
 Where the port reads a shape differently from colby on purpose, the decision is

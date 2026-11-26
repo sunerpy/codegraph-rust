@@ -749,6 +749,13 @@ pub trait ResolutionContext {
         Arc::new(crate::lua_scope::LuaTables::new())
     }
 
+    /// The project's custom Lua module loaders and module roots (#1617,
+    /// W9-02) a `require` and a loader call are resolved under. The default
+    /// names none: a project without `[lua]` settings.
+    fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+        codegraph_extract::LuaLoaders::unconfigured()
+    }
+
     /// The Dart hierarchy memo for the pass (upstream #2145): declaration
     /// heads, supertypes by name and call-site hierarchies. Contexts that
     /// live for one resolution pass keep one; the default builds a fresh one

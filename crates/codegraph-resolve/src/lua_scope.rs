@@ -1004,8 +1004,16 @@ impl LuaModuleRow {
 
 /// The module paths a `require` of `module` can load (upstream
 /// `resolveLuaRequire`'s suffixes): `a.b` is `a/b.lua`, `a/b.luau`,
-/// `a/b/init.lua` or `a/b/init.luau`, under any folder.
+/// `a/b/init.lua` or `a/b/init.luau`, under any folder, a module root's
+/// included; and, for a project with custom Lua module settings, `module`
+/// as written (`Script/Foo.lua`, W9-02). A superset: a project without
+/// settings never reads a literal as written, and its dependents are only
+/// re-resolved the more.
 pub fn lua_module_may_be(module: &str, file_path: &str) -> bool {
+    let named = |suffix: &str| file_path == suffix || file_path.ends_with(&format!("/{suffix}"));
+    if named(module) {
+        return true;
+    }
     let base = module.replace('.', "/");
     ["lua", "luau"].iter().any(|extension| {
         [
@@ -1013,7 +1021,7 @@ pub fn lua_module_may_be(module: &str, file_path: &str) -> bool {
             format!("{base}/init.{extension}"),
         ]
         .iter()
-        .any(|suffix| file_path == suffix || file_path.ends_with(&format!("/{suffix}")))
+        .any(|suffix| named(suffix))
     })
 }
 

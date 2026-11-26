@@ -274,6 +274,41 @@ pub fn lua_loader_target_appears() -> Case {
         .edge_after("file:main.lua", "imports", "file:ui/button.lua")
 }
 
+/// W9-02: under a module root, a file that appears comes ahead of the one
+/// the project-wide search linked, though it is only a later candidate
+/// (`util/init.lua` after `util.lua`) and shares no name with it: the
+/// resolved import is read again under the roots (W7-27). `plain.lua` has
+/// no alias, so no Lua lane reaches it; `main.lua`'s alias call follows.
+pub fn lua_module_root_target_appears_and_takes_over() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Lua])
+        .file(".codegraph/config.toml", LUA_SCRIPT_ROOT_CONFIG)
+        .file("Other/util.lua", LUA_UTIL_PLUS_ONE)
+        .file("main.lua", LUA_CLAMP_ALIAS)
+        .file("plain.lua", "require(\"util\")\nreturn {}\n")
+        .write("Script/util/init.lua", LUA_UTIL_PLUS_TWO)
+        .edge_before("file:plain.lua", "imports", "file:Other/util.lua")
+        .edge_before("file:main.lua", "imports", "file:Other/util.lua")
+        .edge_before("function run", "calls", "method M::clamp @Other/util.lua")
+        .edge_after("file:plain.lua", "imports", "file:Script/util/init.lua")
+        .edge_after("file:main.lua", "imports", "file:Script/util/init.lua")
+        .edge_after(
+            "function run",
+            "calls",
+            "method M::clamp @Script/util/init.lua",
+        )
+        .no_edge_after("file:plain.lua", "imports", "file:Other/util.lua")
+}
+
+/// W9-02 (OD-B83): a loader's literal that names a file as written parks
+/// until that file appears, then links it.
+pub fn lua_file_literal_target_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Lua])
+        .file(".codegraph/config.toml", LUA_LOADER_CONFIG)
+        .file("client.lua", "Require(\"Script/Foo.lua\")\nreturn {}\n")
+        .write("Script/Foo.lua", LUA_BUTTON)
+        .edge_after("file:client.lua", "imports", "file:Script/Foo.lua")
+}
+
 /// Upstream #2263 and #2392 (1): a side-effect import names a file, so one
 /// that names no file yet parks and links it when it appears (it used to bind
 /// its own import statement).
@@ -5635,6 +5670,32 @@ pub fn lua_local_function_made_global_reaches_its_callers_in_another_file() -> C
         .edge_after("file:spec/plugin_spec.lua", "calls", "function helper")
 }
 
+/// W9-02: an alias through a configured loader whose literal names a file
+/// as written (`myRequire("lib/m.lua")`, a loader the alias rule reads by
+/// its `…Require` name) reaches the member that file starts handing out: the
+/// Lua lane reads the literal as the file's path.
+pub fn lua_alias_through_a_file_literal_reaches_a_new_export() -> Case {
+    Case::new(Change::ReexportEdit, &[Language::Lua])
+        .file(
+            ".codegraph/config.toml",
+            "[app]\nname = \"matrix\"\n\n[lua]\nloader_functions = [\"myRequire\"]\n",
+        )
+        .file(
+            "lib/m.lua",
+            "local function impl()\n  return 1\nend\n\nreturn {\n}\n",
+        )
+        .file(
+            "main.lua",
+            "local f = myRequire(\"lib/m.lua\").f\n\nlocal function run()\n  return f()\nend\n\nreturn run\n",
+        )
+        .write(
+            "lib/m.lua",
+            "local function impl()\n  return 1\nend\n\nreturn {\n  f = impl,\n}\n",
+        )
+        .edge_throughout("file:main.lua", "imports", "file:lib/m.lua")
+        .edge_after("function run", "calls", "function impl")
+}
+
 /// Upstream #2188 (W4-LUA-01): a call through `local cp = phases.check`
 /// reaches the function the module starts handing out under `check`, though
 /// no node of the module changes.
@@ -10087,6 +10148,33 @@ pub fn luau_loader_functions_appear_in_config_toml() -> Case {
         .file("main.luau", "Require(\"ui.button\")\nreturn {}\n")
         .write(".codegraph/config.toml", LUA_LOADER_CONFIG)
         .edge_after("file:main.luau", "imports", "file:ui/button.luau")
+}
+
+const LUA_SCRIPT_ROOT_CONFIG: &str =
+    "[app]\nname = \"matrix\"\n\n[lua]\nmodule_roots = [\"Script\"]\n";
+const LUA_LIB_ROOT_CONFIG: &str = "[app]\nname = \"matrix\"\n\n[lua]\nmodule_roots = [\"lib\"]\n";
+const LUA_UTIL_PLUS_ONE: &str =
+    "local M = {}\n\nfunction M.clamp(value)\n  return value + 1\nend\n\nreturn M\n";
+const LUA_UTIL_PLUS_TWO: &str =
+    "local M = {}\n\nfunction M.clamp(value)\n  return value + 2\nend\n\nreturn M\n";
+const LUA_CLAMP_ALIAS: &str = "local clamp = require(\"util\").clamp\n\nlocal function run()\n  return clamp(5)\nend\n\nreturn run\n";
+
+/// W9-02: a module root that appears in `config.toml` moves a `require`
+/// to the root's module, and the call through its alias with it, though no
+/// Lua file changed: the import goes back by its site, the alias's reader
+/// whole. (The project-wide search took `Script/util.lua`, the first of two
+/// files equally far from `main.lua`.)
+pub fn lua_module_roots_change_moves_a_require_and_the_calls_through_it() -> Case {
+    Case::new(Change::ControlFile, &[Language::Lua])
+        .file("lib/util.lua", LUA_UTIL_PLUS_ONE)
+        .file("Script/util.lua", LUA_UTIL_PLUS_TWO)
+        .file("main.lua", LUA_CLAMP_ALIAS)
+        .write(".codegraph/config.toml", LUA_LIB_ROOT_CONFIG)
+        .edge_before("file:main.lua", "imports", "file:Script/util.lua")
+        .edge_before("function run", "calls", "method M::clamp @Script/util.lua")
+        .edge_after("file:main.lua", "imports", "file:lib/util.lua")
+        .edge_after("function run", "calls", "method M::clamp @lib/util.lua")
+        .no_edge_after("function run", "calls", "method M::clamp @Script/util.lua")
 }
 
 pub fn lua_extension_override_appears_in_codegraph_json() -> Case {

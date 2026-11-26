@@ -305,6 +305,9 @@ pub struct SnapshotResolutionContext {
     /// Empty until the resolver installs a chunk's map (T4); an empty map yields
     /// the same result the store context gives before any such edge exists.
     edges: EdgeAdjacency,
+    /// The project's custom Lua module loaders and roots
+    /// ([`Self::with_lua_loaders`]); none by default.
+    lua_loaders: Arc<codegraph_extract::LuaLoaders>,
 }
 
 impl SnapshotResolutionContext {
@@ -461,6 +464,7 @@ impl SnapshotResolutionContext {
             caches: Arc::new(SnapshotCaches::new()),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             edges: Arc::new(HashMap::new()),
+            lua_loaders: codegraph_extract::LuaLoaders::empty(),
         })
     }
 
@@ -493,7 +497,17 @@ impl SnapshotResolutionContext {
             caches: Arc::clone(&self.caches),
             max_file_size: self.max_file_size,
             edges,
+            lua_loaders: Arc::clone(&self.lua_loaders),
         }
+    }
+
+    /// Resolve Lua `require`s and loader calls under the addressed project's
+    /// custom Lua module settings (#1617), as
+    /// [`crate::context::StoreResolutionContext::with_lua_loaders`] does.
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: Arc<codegraph_extract::LuaLoaders>) -> Self {
+        self.lua_loaders = lua_loaders;
+        self
     }
 
     /// Read files up to the addressed project's extraction limit
@@ -850,6 +864,10 @@ impl ResolutionContext for SnapshotResolutionContext {
                 .lua_tables
                 .get_or_init(|| Arc::new(crate::lua_scope::LuaTables::new())),
         )
+    }
+
+    fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+        &self.lua_loaders
     }
 
     fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {

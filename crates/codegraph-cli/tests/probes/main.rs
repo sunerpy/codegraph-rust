@@ -15024,6 +15024,215 @@ mod lua {
         assert_unresolved!(indexed, "file:main.lua" => calls => "Require");
         assert_unresolved!(indexed, "file:main.lua" => calls => "Include");
     }
+
+    /// A `.codegraph/config.toml` with `lines` in its `[lua]` table.
+    fn lua_config(lines: &str) -> String {
+        format!("[app]\nname = \"w902\"\n\n[lua]\n{lines}\n")
+    }
+
+    /// W9-02 (#1617, OD-B83): the issue's example. In a project with Lua
+    /// settings a literal that names a file as written,
+    /// `Require("Script/Activity/ActivityMgrC.lua")`, is that file, before
+    /// the dotted reading (`Script/Activity/ActivityMgrC/lua.lua`).
+    #[test]
+    fn w902_a_file_literal_is_looked_up_as_written() {
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                &lua_config("loader_functions = [\"Require\"]"),
+            )
+            .file(
+                "Script/Activity/ActivityMgrC.lua",
+                "local M = {}\nfunction M.open()\n  return 1\nend\nreturn M\n",
+            )
+            .file("Script/Activity/ActivityMgrC/lua.lua", "return {}\n")
+            .file(
+                "client.lua",
+                "Require(\"Script/Activity/ActivityMgrC.lua\")\nreturn {}\n",
+            )
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "client.lua"),
+            vec!["file -> Script/Activity/ActivityMgrC.lua".to_string()],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// W9-02: the module roots are looked in before the whole project, in
+    /// the order written; the project-wide search would take the file
+    /// nearest the requiring one.
+    #[test]
+    fn w902_module_roots_come_first_in_their_order() {
+        let files = [
+            ("game/ui/button.lua", "return {}\n"),
+            ("A/ui/button.lua", "return {}\n"),
+            ("B/ui/button.lua", "return {}\n"),
+            ("game/main.lua", "Require(\"ui.button\")\nreturn {}\n"),
+        ];
+        let index = |roots: &str| {
+            files
+                .iter()
+                .fold(
+                    Project::new().file(
+                        ".codegraph/config.toml",
+                        &lua_config(&format!(
+                            "loader_functions = [\"Require\"]\nmodule_roots = [{roots}]"
+                        )),
+                    ),
+                    |project, (path, text)| project.file(path, text),
+                )
+                .index()
+        };
+        for (roots, target) in [
+            ("", "game/ui/button.lua"),
+            ("\"A\", \"B\"", "A/ui/button.lua"),
+            ("\"B\", \"A\"", "B/ui/button.lua"),
+        ] {
+            let project = index(roots);
+            assert_eq!(
+                imports_from(project.graph(), "game/main.lua"),
+                vec![format!("file -> {target}")],
+                "roots [{roots}]\n{}",
+                project.graph().report()
+            );
+        }
+    }
+
+    /// W9-02: a root that does not hold the module leaves the project-wide
+    /// search to find it.
+    #[test]
+    fn w902_a_module_root_without_the_module_falls_back() {
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                &lua_config("loader_functions = [\"Require\"]\nmodule_roots = [\"Script\"]"),
+            )
+            .file("Script/other.lua", "return {}\n")
+            .file("lib/ui/button.lua", "return {}\n")
+            .file("main.lua", "Require(\"ui.button\")\nreturn {}\n")
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "main.lua"),
+            vec!["file -> lib/ui/button.lua".to_string()],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// W9-02: the roots order a `require` too: the resolver cannot tell one
+    /// from a loader call, and the setting says where the project's modules
+    /// live. So does the alias a `require` names, and a call through it.
+    #[test]
+    fn w902_module_roots_also_order_require() {
+        let project = Project::new()
+            .file(".codegraph/config.toml", &lua_config("module_roots = [\"Script\"]"))
+            .file(
+                "game/util.lua",
+                "local M = {}\nfunction M.clamp(v)\n  return v\nend\nreturn M\n",
+            )
+            .file(
+                "Script/util.lua",
+                "local M = {}\nfunction M.clamp(v)\n  return v + 1\nend\nreturn M\n",
+            )
+            .file(
+                "game/main.lua",
+                "local clamp = require(\"util\").clamp\n\nlocal function run()\n  return clamp(1)\nend\n\nreturn run\n",
+            )
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "game/main.lua"),
+            vec!["file -> Script/util.lua".to_string()],
+            "{}",
+            project.graph().report()
+        );
+        assert_eq!(
+            calls_from(project.graph(), "game/main.lua"),
+            vec!["Script/util.lua: M::clamp".to_string()],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// W9-02: `.` is the project root, the literal looked up from there
+    /// first (the issue's "against the project root").
+    #[test]
+    fn w902_the_dot_root_is_the_project_root() {
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                &lua_config("loader_functions = [\"Require\"]\nmodule_roots = [\"./\"]"),
+            )
+            .file("ui/button.lua", "return {}\n")
+            .file("game/ui/button.lua", "return {}\n")
+            .file("game/main.lua", "Require(\"ui.button\")\nreturn {}\n")
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "game/main.lua"),
+            vec!["file -> ui/button.lua".to_string()],
+            "{}",
+            project.graph().report()
+        );
+    }
+
+    /// OD-B83: without Lua settings nothing moves: `require("foo.lua")`
+    /// still loads the module `foo/lua`, as upstream's resolver reads it,
+    /// and a file named `foo.lua` beside it is no candidate.
+    #[test]
+    fn w902_require_without_lua_settings_is_unchanged() {
+        let project = Project::new()
+            .file("foo.lua", "return {}\n")
+            .file("foo/lua.lua", "return {}\n")
+            .file("main.lua", "require(\"foo.lua\")\nreturn {}\n")
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "main.lua"),
+            vec!["file -> foo/lua.lua".to_string()],
+            "{}",
+            project.graph().report()
+        );
+        let configured = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                &lua_config("module_roots = [\"lib\"]"),
+            )
+            .file("foo.lua", "return {}\n")
+            .file("foo/lua.lua", "return {}\n")
+            .file("main.lua", "require(\"foo.lua\")\nreturn {}\n")
+            .index();
+        assert_eq!(
+            imports_from(configured.graph(), "main.lua"),
+            vec!["file -> foo.lua".to_string()],
+            "a project with settings reads the literal as written first\n{}",
+            configured.graph().report()
+        );
+    }
+
+    /// W9-02: `config.toml`'s `module_roots` replaces `codegraph.json`'s
+    /// `moduleRoots` whole, while `codegraph.json`'s `loaderFunctions`
+    /// still applies: the keys merge one by one.
+    #[test]
+    fn w902_toml_and_json_roots_merge_per_key() {
+        let project = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                &lua_config("module_roots = [\"B\"]"),
+            )
+            .file(
+                ".codegraph/codegraph.json",
+                "{\"lua\": {\"loaderFunctions\": [\"Include\"], \"moduleRoots\": [\"A\"]}}\n",
+            )
+            .file("A/ui/button.lua", "return {}\n")
+            .file("B/ui/button.lua", "return {}\n")
+            .file("main.lua", "Include(\"ui.button\")\nreturn {}\n")
+            .index();
+        assert_eq!(
+            imports_from(project.graph(), "main.lua"),
+            vec!["file -> B/ui/button.lua".to_string()],
+            "{}",
+            project.graph().report()
+        );
+    }
 }
 
 mod r {

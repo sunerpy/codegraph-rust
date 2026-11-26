@@ -106,6 +106,22 @@ pub(crate) fn withdraw_loaders(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// The Lua files whose aliases `require` a module (their row's `reads`),
+/// but `skip`, and any whose row cannot be read: what an alias through them
+/// names follows a module root, so a change of the roots re-resolves them
+/// whole.
+pub(crate) fn alias_readers(store: &Store, skip: &dyn Fn(&str) -> bool) -> Result<Vec<String>> {
+    Ok(store
+        .project_metadata_with_prefix(MODULE_ROW_KEY_PREFIX)?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let path = key.strip_prefix(MODULE_ROW_KEY_PREFIX)?.to_string();
+            let reads = LuaModuleRow::decode(&value).is_none_or(|row| !row.reads.is_empty());
+            (reads && !skip(&path)).then_some(path)
+        })
+        .collect())
+}
+
 /// The indexed Lua and Luau files, by the language their rows record, but
 /// `skip`: what a change of the loader names extracts again.
 pub(crate) fn every_lua_file(store: &Store, skip: &dyn Fn(&str) -> bool) -> Result<Vec<String>> {
@@ -543,5 +559,12 @@ mod tests {
             "kong/pdk/phases_x.lua"
         ));
         assert!(!lua_module_may_be("phases", "kong/pdk/myphases.lua"));
+        // Under a module root, and a literal read as the path it is written
+        // as (W9-02).
+        assert!(lua_module_may_be("util", "Script/util.lua"));
+        assert!(lua_module_may_be("Script/Foo.lua", "Script/Foo.lua"));
+        assert!(lua_module_may_be("Foo.lua", "Script/Foo.lua"));
+        assert!(lua_module_may_be("Script/Foo.lua", "Game/Script/Foo.lua"));
+        assert!(!lua_module_may_be("Foo.lua", "Script/MyFoo.lua"));
     }
 }
