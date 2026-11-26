@@ -19,6 +19,7 @@ use tree_sitter::Parser;
 use crate::ext_config::ExtensionOverrides;
 use crate::lang::{cpp_code_mask, spec_for_language};
 use crate::links::LinkWalk;
+use crate::lua_loaders::LuaLoaders;
 use crate::walker::TreeSitterWalker;
 use codegraph_core::source_file::{SourceText, read_source_file};
 
@@ -46,6 +47,11 @@ pub struct ExtractOptions {
     /// before. Passed explicitly instead of discovered, so two projects handled
     /// by one process can never see each other's overrides.
     pub extensions: Arc<ExtensionOverrides>,
+    /// The addressed project's custom Lua module loaders and module roots
+    /// (#1617), merged from its `config.toml` `[lua]` table and its
+    /// `codegraph.json` `lua` object ([`LuaLoaders::merge`]). Empty by
+    /// default, and for a project that names none.
+    pub lua_loaders: Arc<LuaLoaders>,
 }
 
 /// Coarse, read-only extraction stages for diagnostics.
@@ -86,6 +92,7 @@ impl Default for ExtractOptions {
             include: indexing.include,
             parallel: true,
             extensions: ExtensionOverrides::empty(),
+            lua_loaders: LuaLoaders::empty(),
         }
     }
 }
@@ -93,9 +100,15 @@ impl Default for ExtractOptions {
 impl ExtractOptions {
     /// Build the scan/extract options for ONE project from its own immutable
     /// [`Config`] and extension overrides. This is the only shape production
-    /// callers use; nothing here consults a process-global value.
+    /// callers use; nothing here consults a process-global value. The Lua
+    /// loader settings are validated here, each dropped part named in a
+    /// warning on stderr.
     #[must_use]
     pub fn for_project(config: &Config, extensions: Arc<ExtensionOverrides>) -> Self {
+        let lua_loaders = Arc::new(LuaLoaders::merge(
+            config.lua.as_ref(),
+            extensions.lua_block(),
+        ));
         Self {
             max_file_size: config.indexing.max_file_size,
             ignore_dirs: config.indexing.ignore_dirs.clone(),
@@ -104,6 +117,7 @@ impl ExtractOptions {
             include: config.indexing.include.clone(),
             parallel: true,
             extensions,
+            lua_loaders,
         }
     }
 }
@@ -149,7 +163,7 @@ pub fn builtin_language_for_ext(ext: &str) -> Option<Language> {
         "sol" => Language::Solidity,
         "nix" => Language::Nix,
         "tf" | "tfvars" | "tofu" => Language::Terraform,
-        "erl" | "hrl" => Language::Erlang,
+        "erl" | "hrl" | "escript" => Language::Erlang,
         "cfc" | "cfm" | "cfs" => Language::Cfml,
         "yml" | "yaml" => Language::Yaml,
         "twig" => Language::Twig,
@@ -181,10 +195,23 @@ pub fn detect_language_with(
 ) -> Language {
     let path = file_path.as_ref();
     let normalized = normalize_path(path);
+    // A Play routes file has no extension (`conf/routes`) or a made-up one
+    // (`conf/api.routes`): it is indexed as a YAML file, which makes no
+    // symbols, so the Play framework resolver extracts its routes (upstream
+    // `isPlayRoutesFile`, first in `detectLanguage`).
+    if is_play_routes_file(&normalized) {
+        return Language::Yaml;
+    }
     // A Shopify theme's JSON template or section group is Liquid, and only
     // inside a theme under the project root (upstream #2393).
     if crate::embedded::shopify::is_shopify_liquid_json(&normalized, overrides.project_root()) {
         return Language::Liquid;
+    }
+    // An OTP application resource file holds Erlang terms; its last
+    // extension (`.src`) is too generic for the table (upstream
+    // `isErlangAppFile`, #1169).
+    if is_erlang_app_file(&normalized) {
+        return Language::Erlang;
     }
     if let Some(language) = crate::embedded::detect_embedded_language(&normalized) {
         return language;
@@ -205,6 +232,23 @@ pub fn detect_language_with(
         return language;
     }
     Language::Unknown
+}
+
+/// Whether `path` is an OTP application resource file, `<app>.app.src` or
+/// its compiled `<app>.app`, by its whole suffix in any case (upstream
+/// `isErlangAppFile`): the Erlang extractor reads its application tuple.
+pub fn is_erlang_app_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".app") || lower.ends_with(".app.src")
+}
+
+/// Whether `path` (project-relative, `/`-separated) is a Play routes file:
+/// `conf/routes`, one under a project's `conf/` (`app/conf/routes`), or any
+/// `*.routes` include (upstream `isPlayRoutesFile` in `grammars.ts`, the same
+/// from `025ebc88` to `e8ddc4e2`; the suffix is matched case-sensitively, as
+/// upstream's `endsWith`).
+pub fn is_play_routes_file(path: &str) -> bool {
+    path == "conf/routes" || path.ends_with("/conf/routes") || path.ends_with(".routes")
 }
 
 /// The language `file_path` is indexed as, given its `source`: the language
@@ -430,6 +474,27 @@ pub fn extract_source_with_observer(
     source: &str,
     language: Option<Language>,
     overrides: &ExtensionOverrides,
+    observer: impl FnMut(ExtractionStage),
+) -> ExtractionResult {
+    extract_source_with_settings(
+        file_path,
+        source,
+        language,
+        overrides,
+        LuaLoaders::unconfigured(),
+        observer,
+    )
+}
+
+/// [`extract_source_with_observer`] under one project's Lua loader settings
+/// too ([`ExtractOptions::lua_loaders`]): a call of a configured loader is a
+/// module import, as `require` is.
+fn extract_source_with_settings(
+    file_path: &str,
+    source: &str,
+    language: Option<Language>,
+    overrides: &ExtensionOverrides,
+    lua_loaders: &LuaLoaders,
     mut observer: impl FnMut(ExtractionStage),
 ) -> ExtractionResult {
     let start = Instant::now();
@@ -513,6 +578,7 @@ pub fn extract_source_with_observer(
     let parse_has_error = tree.root_node().has_error();
     let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
         .with_raw_source(source)
+        .with_lua_loaders(lua_loaders)
         .extract(start.elapsed().as_millis() as i64);
     // A CommonJS `require('./x')` is a file import, as ESM's `import` is
     // (upstream #2263).
@@ -591,9 +657,14 @@ pub fn extraction_of(
     observer: impl FnMut(ExtractionStage),
 ) -> ExtractionResult {
     match source {
-        SourceText::Text(text) => {
-            extract_source_with_observer(relative_path, text, None, &options.extensions, observer)
-        }
+        SourceText::Text(text) => extract_source_with_settings(
+            relative_path,
+            text,
+            None,
+            &options.extensions,
+            &options.lua_loaders,
+            observer,
+        ),
         SourceText::Oversize(size) => size_skip_result(relative_path, *size, options.max_file_size),
         SourceText::MpegTransportStream => ExtractionResult {
             nodes: Vec::new(),
@@ -679,6 +750,78 @@ pub fn scan_membership(
     relative: &str,
     dir: bool,
 ) -> Membership {
+    ScanScope::new(root, options).membership(relative, dir, false)
+}
+
+/// The scan's rules for one root and its options, read once (the root
+/// `.gitignore` and `.git/info/exclude` with them), judging single paths as
+/// [`scan_membership`] does. The synthesis stage asks it about the files an
+/// `#include` names that the index does not hold (W7-17b).
+pub struct ScanScope {
+    root: PathBuf,
+    ignore_dirs: Vec<String>,
+    reserved_roots: std::collections::BTreeSet<PathBuf>,
+    ignore_paths: Vec<String>,
+    exclude: Vec<String>,
+    include: Vec<String>,
+    gitignore: RootGitignore,
+    overrides: Arc<ExtensionOverrides>,
+}
+
+impl ScanScope {
+    pub fn new(root: &Path, options: &ExtractOptions) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            ignore_dirs: options.ignore_dirs.clone(),
+            reserved_roots: codegraph_core::IndexPaths::reserved_index_roots(
+                root,
+                std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+            ),
+            ignore_paths: options.ignore_paths.clone(),
+            exclude: options.exclude.clone(),
+            include: options.include.clone(),
+            gitignore: RootGitignore::load(root),
+            overrides: Arc::clone(&options.extensions),
+        }
+    }
+
+    /// Whether the scan's ignore model admits `relative` as a file, whatever
+    /// its extension: [`scan_membership`]'s verdict on a file, without its
+    /// question whether the file is extractable source.
+    pub fn admits_file(&self, relative: &str) -> Membership {
+        self.membership(relative, false, true)
+    }
+
+    fn membership(&self, relative: &str, dir: bool, any_extension: bool) -> Membership {
+        let ignored_dirs = self
+            .ignore_dirs
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let pattern_sets: Vec<&[String]> = vec![&self.ignore_paths, &self.exclude];
+        let include = IncludeSet::new(&self.include, &self.exclude);
+        let rules = ScanRules {
+            root: &self.root,
+            ignored_dirs: &ignored_dirs,
+            reserved_roots: &self.reserved_roots,
+            pattern_sets: &pattern_sets,
+            gitignore: &self.gitignore,
+            include: &include,
+            overrides: &self.overrides,
+        };
+        membership_by(&rules, relative, dir, any_extension)
+    }
+}
+
+/// [`scan_membership`]'s walk under `rules`; with `any_extension` a file the
+/// ignore model admits is admitted whether or not it is extractable source.
+fn membership_by(
+    rules: &ScanRules<'_>,
+    relative: &str,
+    dir: bool,
+    any_extension: bool,
+) -> Membership {
+    let root = rules.root;
     let components = relative
         .split('/')
         .filter(|component| !component.is_empty())
@@ -686,27 +829,6 @@ pub fn scan_membership(
     if components.is_empty() || components.iter().any(|c| *c == "." || *c == "..") {
         return Membership::Rejected;
     }
-    let ignored_dirs = options
-        .ignore_dirs
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let gitignore = RootGitignore::load(root);
-    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude];
-    let include = IncludeSet::new(&options.include, &options.exclude);
-    let reserved_roots = codegraph_core::IndexPaths::reserved_index_roots(
-        root,
-        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
-    );
-    let rules = ScanRules {
-        root,
-        ignored_dirs: &ignored_dirs,
-        reserved_roots: &reserved_roots,
-        pattern_sets: &pattern_sets,
-        gitignore: &gitignore,
-        include: &include,
-        overrides: &options.extensions,
-    };
     let mut parent = root.to_path_buf();
     let mut above = GitignoreAncestry::default();
     for (index, name) in components.iter().enumerate() {
@@ -732,7 +854,9 @@ pub fn scan_membership(
                 return Membership::Rejected;
             }
             return match rules.decide(&partial, false, above) {
-                EntryDecision::File { extractable: true } => Membership::Admitted,
+                EntryDecision::File { extractable } if extractable || any_extension => {
+                    Membership::Admitted
+                }
                 _ => Membership::Rejected,
             };
         }
@@ -1405,6 +1529,46 @@ fn normalize_path(path: impl AsRef<Path>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// One project's options carry its Lua loader settings, `config.toml`'s
+    /// keys replacing `codegraph.json`'s whole (#1617); a project naming
+    /// none has the empty settings.
+    #[test]
+    fn for_project_merges_the_lua_settings() {
+        use super::{Config, ExtensionOverrides, ExtractOptions};
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-engine-lua-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("codegraph.json");
+        std::fs::write(
+            &json,
+            r#"{"lua": {"loaderFunctions": ["Include"], "moduleRoots": ["Lib"]}}"#,
+        )
+        .unwrap();
+        let extensions = ExtensionOverrides::load_from_file(&json);
+        let config = Config {
+            lua: Some(serde_json::json!({"loader_functions": ["Require"]})),
+            ..Config::default()
+        };
+        let options = ExtractOptions::for_project(&config, std::sync::Arc::clone(&extensions));
+        assert_eq!(options.lua_loaders.loader_functions(), ["Require"]);
+        assert_eq!(options.lua_loaders.module_roots(), ["Lib"]);
+
+        let options = ExtractOptions::for_project(&Config::default(), extensions);
+        assert_eq!(options.lua_loaders.loader_functions(), ["Include"]);
+        assert_eq!(options.lua_loaders.module_roots(), ["Lib"]);
+
+        let options = ExtractOptions::for_project(&Config::default(), ExtensionOverrides::empty());
+        assert!(!options.lua_loaders.is_configured());
+        assert!(!ExtractOptions::default().lua_loaders.is_configured());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn missing_symbols_classifies_stored_rows_like_upstream() {
         use codegraph_core::types::FileRecord;
@@ -1861,6 +2025,38 @@ mod tests {
         assert_eq!(detect_language("src/lib.rs"), Language::Rust);
     }
 
+    /// A Play routes file is a YAML file (upstream `isPlayRoutesFile`): the
+    /// root's `conf/routes`, a project's under it, any `*.routes` include,
+    /// the suffix case-sensitive; the scan indexes it as a file only.
+    #[test]
+    fn play_routes_files_are_yaml_files() {
+        for path in [
+            "conf/routes",
+            "play-java-hello/conf/routes",
+            "conf/api.routes",
+            "modules/admin.routes",
+        ] {
+            assert!(is_play_routes_file(path), "{path}");
+            assert_eq!(detect_language(path), Language::Yaml, "{path}");
+            assert!(
+                is_extractable_source_path(path, &ExtensionOverrides::default()),
+                "{path}"
+            );
+        }
+        for path in [
+            "routes",
+            "xconf/routes",
+            "conf/routes.txt",
+            "conf/ROUTES",
+            "conf/api.ROUTES",
+            "config/routes",
+        ] {
+            assert!(!is_play_routes_file(path), "{path}");
+        }
+        assert_eq!(detect_language("conf/routes.txt"), Language::Unknown);
+        assert_eq!(detect_language("xconf/routes"), Language::Unknown);
+    }
+
     #[test]
     fn gd_uid_sidecar_never_becomes_file_record() {
         assert_eq!(
@@ -1910,6 +2106,19 @@ mod tests {
     fn erlang_extensions_map_to_erlang() {
         assert_eq!(detect_language("m.erl"), Language::Erlang);
         assert_eq!(detect_language("defs.hrl"), Language::Erlang);
+    }
+
+    /// W7-24d: an escript, and an OTP application resource file by its whole
+    /// suffix, in any case (upstream `isErlangAppFile`), are Erlang; a bare
+    /// `.src` is nothing.
+    #[test]
+    fn w724d_escripts_and_app_resource_files_are_erlang() {
+        assert_eq!(detect_language("bin/tool.escript"), Language::Erlang);
+        assert_eq!(detect_language("src/sample.app.src"), Language::Erlang);
+        assert_eq!(detect_language("ebin/sample.app"), Language::Erlang);
+        assert_eq!(detect_language("src/SAMPLE.APP.SRC"), Language::Erlang);
+        assert_eq!(detect_language("notes.src"), Language::Unknown);
+        assert_eq!(detect_language("app"), Language::Unknown);
     }
 
     #[test]

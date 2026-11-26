@@ -35,6 +35,12 @@ pub struct Config {
     pub indexing: IndexingConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+    /// The `[lua]` table as written (custom Lua module loaders, #1617):
+    /// kept raw so a mistyped table never fails the rest of the file, and
+    /// validated, merged with `codegraph.json`'s `lua` object, by
+    /// `codegraph_extract::lua_loaders`.
+    #[serde(default)]
+    pub lua: Option<serde_json::Value>,
 }
 
 /// Application settings.
@@ -281,6 +287,7 @@ impl Default for Config {
             },
             indexing: IndexingConfig::default(),
             watch: WatchConfig::default(),
+            lua: None,
         }
     }
 }
@@ -458,6 +465,49 @@ name = "my-project"
         assert_eq!(cfg.watch.debounce_ms, 2000); // default
         assert!(cfg.indexing.exclude.is_empty()); // off by default
         assert!(cfg.indexing.deprioritize.is_empty()); // ranking-only, off by default
+    }
+
+    /// The `[lua]` table is kept as written, whatever its shape (#1617): a
+    /// mistyped one never fails the rest of the file. It is validated where
+    /// it is read.
+    #[test]
+    fn a_lua_table_of_any_shape_never_fails_the_config() {
+        let base = "[app]\nname = \"p\"\n\n[indexing]\nmax_file_size = 2097152\n";
+        let cfg: Config = toml::from_str(base).expect("should parse");
+        assert_eq!(cfg.lua, None);
+        assert_eq!(Config::default().lua, None);
+        for (lua, expected) in [
+            (
+                "[lua]\nloader_functions = [\"Require\", \"Include\"]\nmodule_roots = [\"Script\"]\n",
+                serde_json::json!({
+                    "loader_functions": ["Require", "Include"],
+                    "module_roots": ["Script"],
+                }),
+            ),
+            (
+                "[lua]\nloader_functions = \"Require\"\nmodule_roots = 3\n",
+                serde_json::json!({"loader_functions": "Require", "module_roots": 3}),
+            ),
+            (
+                "[lua]\nloader_functions = [1, true, 2.5, { a = 1 }, [\"x\"]]\nloaderFunctions = []\n",
+                serde_json::json!({
+                    "loader_functions": [1, true, 2.5, {"a": 1}, ["x"]],
+                    "loaderFunctions": [],
+                }),
+            ),
+            ("lua = \"Require\"\n", serde_json::json!("Require")),
+            ("lua = [\"Require\"]\n", serde_json::json!(["Require"])),
+        ] {
+            // A top-level key must come before the first table.
+            let text = if lua.starts_with('[') {
+                format!("{base}\n{lua}")
+            } else {
+                format!("{lua}{base}")
+            };
+            let cfg: Config = toml::from_str(&text).unwrap_or_else(|err| panic!("{text}: {err}"));
+            assert_eq!(cfg.lua, Some(expected), "{text}");
+            assert_eq!(cfg.indexing.max_file_size, 2097152, "{text}");
+        }
     }
 
     #[test]

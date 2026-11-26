@@ -660,16 +660,13 @@ fn explore_matches_golden_structural() {
         .unwrap();
     let at = resp["result"]["content"][0]["text"].as_str().unwrap();
 
-    // The `Found N symbols` count is RWR-relevance-driven (the reference implementation prunes the
-    // import seed; our simplified seeding keeps it) — a documented Tier-2 diff.
-    // Drop that line, then compare the line-SET (peer ordering + header symbol
-    // order are documented diffs). Everything else — the section headers, the
+    // Compare the line-SET (peer ordering + header symbol order are documented
+    // diffs). Everything else — the summary, the section headers, the
     // blast-radius entries, and every verbatim source line — must match.
     let normalize = |t: &str| -> Vec<String> {
         let mut lines: Vec<String> = t
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .filter(|l| !l.starts_with("Found "))
             .map(|l| normalize_header_line(l.to_string()))
             .collect();
         lines.sort();
@@ -678,7 +675,7 @@ fn explore_matches_golden_structural() {
     assert_eq!(
         normalize(gt),
         normalize(at),
-        "explore text (excluding the relevance-driven symbol count) must match the golden\nGOLDEN:\n{gt}\n\nACTUAL:\n{at}"
+        "explore text must match the golden\nGOLDEN:\n{gt}\n\nACTUAL:\n{at}"
     );
 
     // The verbatim source section must be byte-identical (modulo file-header

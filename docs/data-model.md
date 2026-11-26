@@ -45,6 +45,18 @@ Schema version and extraction version are independent. A DDL change needs a
 schema migration; a change in graph meaning may need an extraction-version move
 even when DDL is unchanged.
 
+A database whose `schema_versions` records a version above this binary's was
+written by a newer codegraph, and this binary neither reads, writes nor replaces
+it. Reads, `status`, a sync, an MCP session, a daemon, `init` and `index --force`
+refuse it before they change a byte. The check sees what the database's next
+opener would see, including a version that is only in an un-checkpointed
+write-ahead log: where a log may exist, the main file and the log's committed
+frames are read into memory and checked there, as SQLite's recovery would apply
+them, so no `-wal` or `-shm` is created or folded. A database whose version cannot
+be read is refused as well. A rebuild still replaces a file that is not a SQLite
+database at all. `uninit --force` skips the schema check and removes such an
+index from the states it accepts (current, building, outdated, uninitialized).
+
 ## Application tables
 
 ### `schema_versions`
@@ -78,6 +90,12 @@ even when DDL is unchanged.
 The ordinary symbol ID formula is documented in
 [`equivalence.md`](equivalence.md). Framework-created nodes with an explicitly
 documented compatibility ID are the exception, not a second general formula.
+The React Native, Expo modules and Fabric bridges' nodes take upstream's ids
+(W7-21): an Objective-C method a module exports to JavaScript
+`rn-export:{file}:{module}.{jsName}`, an Expo module's function, property or
+constant `expo-module:{file}:{module}:{name}:{line}`, a view component
+`fabric-component:{file}:{name}:{line}` and a prop of it
+`fabric-prop:{file}:{prop}:{line}`.
 
 ### `edges`
 
@@ -95,7 +113,78 @@ A synthesized edge, one the resolver infers rather than reads from a call site
 `provenance = 'heuristic'` and a `metadata` object with `synthesizedBy` (the pass
 that made it) and, when the wiring happens elsewhere, `registeredAt`
 (`path:line` of the registration). Consumers such as the type hierarchy and the
-named-symbol flow recognize synthesized edges by that provenance value.
+named-symbol flow recognize synthesized edges by that provenance value. The
+one exception is `go-method-contains`: its `contains` edge from a Go type to a
+method of its package declared outside the type's file has no provenance, as
+a parsed `contains` edge has, and only its `synthesizedBy` marks it. Only the
+synthesis stage writes them: it replaces the edges whose metadata names
+`synthesizedBy` in one transaction, keeping the row and id of each one it
+makes again unchanged, and a sync's reference-site queries and
+deletions leave such edges alone, so the rest of the graph is what a fresh index
+resolves before any synthesized edge exists.
+
+A link pass's `navigates` edge (W7-18a: `next-link`, `react-router-link`,
+`tanstack-link`, `vue-router-link`, `sveltekit-link`, `expo-router-return`)
+carries `href`, the destination as the arm that named the route writes it (a
+template's hole `${…}`), `navMethod` (`link`, `a`, `navigate` or `redirect`,
+and for `expo-router-return` the navigation call's own method: `push`,
+`replace`, `navigate` or `dismissTo`) and `registeredAt`, the `path:line` of
+the link or, for `expo-router-return`, of the navigation call. A Vue link to
+a route by its name carries `by: "name"`, the name as its `href`. Its `line`
+is the link's; an `expo-router-return` edge goes from the helper and its
+`line` and `col` are the literal's in the helper's body, `col` in UTF-16 code
+units, while the other link edges have no column.
+
+The SvelteKit passes' `calls` edges (W7-18b) have no column. A
+`sveltekit-load` edge goes from a `+page` or `+layout` component to a hook of
+its loader at the component's `line`, with `via`, the hook's name, and
+`registeredAt`, the hook's `path:line`; a `sveltekit-page` edge goes from a
+page route to its own file's component at the component's `line`, with
+`registeredAt`, the file's path.
+
+The Vue template pass's `calls` edges (W7-18c) go from a `.vue` file's
+component, at its `line`, with no column: a `jsx-render` edge to what a tag
+renders, with `via`, the tag as written (`el-button`, `MediaCard`), and a
+`vue-handler` edge to a handler, with `event`, the event it is bound to
+(`click`), and, for a member a composable returns, `via`, the composable's
+name.
+
+The Angular template pass's edges (W7-18d) go from a component's class with
+no column, at the tag's line in an inline template and at the class's for a
+template file, and carry `registeredAt`, the `path:line` the template, or
+for a `routerLink:` field the class, writes it at: an `angular-template`
+`calls` edge to a child component, with `via`, the tag; an `angular-event`
+`calls` edge to a method, with `via`, the event (`(click)`), and `trigger`,
+`{"kind": "prop", "name": "(click)", "of": "button"}` with the element the
+binding is written on; an `angular-binding` `calls` or `references` edge to
+a member, with `via`, the binding as written (`[name]`, <span v-pre>`{{ }}`</span>, `*ngIf`,
+`@if`, `@let`) and `fnRef: true` for a function handed over; and an
+`angular-router-link` `navigates` edge to a route, with `href`, `navMethod`
+`routerLink` and, for a template's link, `template: true`.
+
+The tier passes' `calls` edges (W7-20) carry the call's `line` and `col`,
+`col` in UTF-16 code units, `channel`, the wire crossed, and `callee`, the
+call as written without white space or a trailing type argument. An
+`http-client` edge goes from the function making a client call to the route
+its path reaches, with `channel` `http`, `tier` `client→server`, `method`,
+`href`, the path joined to its client's base URL (a hole as `${…}`), and
+`registeredAt`, the route's `path:line`. A `queue-job` edge goes from the
+function adding a job to a consumer, with `channel` `queue`, `event`, the
+job's name, `queue` when the producer or the consumer names one, and
+`registeredAt`, the `path:line` of the consumer's registration. An
+`event-bus` edge goes from the function emitting an event to a handler, with
+`channel` `event` for a bus and `socket` for a socket, `event`, a socket's
+`tier` (`client→server` or `server→client`), and `registeredAt`, the
+handler's registration. A `test-request` edge goes from a test method, or a
+Pest file's file node, to the route its request names, with `channel`
+`http`, `method`, `href` and `registeredAt`, and no `tier`; the viewer leaves
+these out of a node's fan-in.
+
+An edge a framework resolver made (`resolvedBy: "framework"`) names that
+resolver in `metadata.framework` (`react`, `vue`, `nuxt`, `nestjs`, `godot`, `tauri`),
+as a synthesized edge names its pass. When one reference reaches several
+targets, only the edge to the first carries it; the others carry the metadata
+the resolver gave each.
 
 A value reference is a `references` edge the extractor emits from a symbol to a
 constant or variable of the same file that the symbol reads (upstream #895,
@@ -169,8 +258,11 @@ table empty and writes no marker.
 | ----------- | ---------------- | ------------------------------------------------------------- |
 | `file_path` | TEXT primary key | a file that fed a synthesis pass; cascades with `files(path)` |
 
-A sync reads it to tell whether a deleted or edited file changes synthesized
-edges, so it can recompute them without re-reading every file (migration 9).
+Migration 9 creates it for upstream's per-file recompute gate. This engine
+never writes the table, which stays empty: what each synthesis step read,
+the files the index does not hold included, is recorded in `project_metadata`
+instead (`synthesis_pass:{pass}` and `synthesis_unindexed_inputs`, below), and
+a sync decides step by step from those.
 
 ### `project_metadata`
 
@@ -183,15 +275,19 @@ edges, so it can recompute them without re-reading every file (migration 9).
 Module-surface rows record what other files' resolution reads from a
 JavaScript-family module's own text, which no node records: its re-exports and
 export aliases, the CommonJS default, whether it has an `export default`
-statement, the names its export lists give, whether it is a sealed module, and a
-Vue or Svelte component's `<script>` blocks. `js_module_surface:<path>` holds the
-JSON `{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
-those facts, the specifiers the module forwards, and every project file they
+statement, each of its own exports that leads to an import (the binding it
+names, the constants that binding holds in turn, the import's specifier and
+imported name, as React reads them for a tag imported from the module), the
+names its export lists give, whether it is a sealed module, and a Vue or Svelte
+component's `<script>` blocks. `js_module_surface:<path>` holds the JSON
+`{"digest", "sources", "targets"}`: the sha256 of the canonical encoding of
+those facts, the specifiers the module forwards (its re-exports' and those
+imports'), and every project file they
 resolved to when the row was written, in each language an import following them
 can be written in (TypeScript, TSX, JavaScript, JSX, Vue, Svelte, Astro, ArkTS
 order extensions differently), sorted. A file whose surface is the default one
 (an ES module none of whose text another file reads) has no row.
-`js_module_surface_version` records the row format (2).
+`js_module_surface_version` records the row format (3).
 
 A full index and a migration write every row and the marker once the file rows
 are stored, before resolution. A sync withdraws the marker before its first
@@ -426,6 +522,22 @@ or a row it cannot read, withdraws the marker before changing anything,
 re-resolves every Lua file and rebuilds the rows, even with nothing changed.
 Neither is a canonical surface.
 
+`lua_loaders` records the project's custom Lua module loaders (`config.toml`
+`[lua]`, `codegraph.json` `lua`) as the JSON
+`{"loaderFunctions": [...], "moduleRoots": [...]}`: the loader names sorted,
+each once, and the module roots in the order written, each once, `""` for the
+project root. A full index and a migration write it, for a project naming
+neither too (two empty arrays), and so does every sync whose resolution is
+persisted. A sync reads it before its first change and, when the current
+settings differ, deletes it before anything changes. A sync that finds it
+missing or unreadable, or naming other loaders, extracts every Lua and Luau
+file again (chosen by the language of its file row) and resolves them whole.
+One that finds only other roots, their order included, extracts nothing: it
+resolves every Lua and Luau `imports` reference again at its site (the
+`imports` edges out of Lua nodes and the parked Lua `imports` rows), and
+every unchanged Lua file whose module row's `reads` is not empty, or whose row
+cannot be read, again whole. It is not a canonical surface.
+
 The case-folded lane stores no rows, only its marker:
 `case_folded_names_version` (1) is written by a full index, a migration and
 every sync whose resolution is persisted, and withdrawn with the others before
@@ -444,11 +556,191 @@ persisted, and withdrawn with the others before a sync's first change. A sync
 that finds it missing or at another version re-resolves every Rust file. It is
 not a canonical surface.
 
+The Play routes lane stores no rows, only its marker: `play_routes_version` (1)
+is written by a full index, a migration and every sync whose resolution is
+persisted, and withdrawn with the others before a sync's first change. A sync
+that finds it missing or at another version re-resolves every Play routes file.
+It is not a canonical surface.
+
+The Laravel and Drupal lanes store no rows either, only their markers:
+`laravel_routes_version` (1) and `drupal_refs_version` (1) are written by a full
+index, a migration and every sync whose resolution is persisted, and withdrawn
+with the others before a sync's first change. A sync that finds
+`laravel_routes_version` missing or at another version re-resolves every file
+holding a Laravel route's reference, and one that so finds `drupal_refs_version`
+every Drupal routing file and every file holding a `hook_X` reference. They are
+not a canonical surface.
+
+The Rails lane stores no rows either, only its marker `rails_routes_version` (1),
+written by a full index, a migration and every sync whose resolution is persisted,
+and withdrawn with the others before a sync's first change. A sync that finds it
+missing or at another version re-resolves every file holding a Rails route's
+reference. It is not a canonical surface.
+
+The Vapor lane stores no rows either, only its marker `vapor_routes_version` (1),
+written by a full index, a migration and every sync whose resolution is persisted,
+and withdrawn with the others before a sync's first change. A sync that finds it
+missing or at another version re-resolves every file holding a Swift route's
+reference. It is not a canonical surface.
+
+The Rust crate roots lane stores no rows either, only its marker
+`rust_crate_roots_version` (1), written by a full index, a migration and every sync
+whose resolution is persisted, and withdrawn with the others before a sync's first
+change. A sync that finds it missing or at another version re-resolves every Rust
+file. It is not a canonical surface.
+
+The bridge lane (W7-21) keeps one row per file holding a fact the React Native,
+Expo modules and Swift–Objective-C bridges read, `rn_bridge_surface:{path}`: a
+JSON object with a `.m` or `.mm` file's `exports` (`RCT_EXPORT_METHOD` and
+`RCT_REMAP_METHOD`) and `externs` (`RCT_EXTERN_*`), each with its `module`, the
+Swift `class` an `RCT_EXTERN` entry names, its `js_name` and its `native_kw`; a
+JavaScript-family file's `aliases`, the `[local, module]` pairs `NativeModules`
+binds; a `.java` or `.kt` file's `jvm_exports`, its `[module, method]`
+`@ReactMethod`s; a `.ts` or `.tsx` file's `turbo_spec`, the module a
+TurboModule spec registers and its methods; the `expo` bindings
+(`requireNativeModule` and its optional form) of a file holding
+`NativeModule`, its `locals`, `default_export` and `named_exports`, each with
+its `module` and its type argument's `type_name`; and a Swift file's `swift_methods`, each
+method or function as `[name, qualified name, exposed to Objective-C]`. A
+file holding none has no row. A full index and a migration write every row; a
+sync writes the rows of the files it changed last, drops those of files that
+went or hold none any more, and its resolution reads the rows of the files it
+did not change. The marker `rn_bridges_version` (1) is written by a full
+index, a migration and every sync whose resolution is persisted, and withdrawn
+with the others before a sync's first change. A sync that finds it missing or
+at another version rebuilds every row and re-resolves every JavaScript-family,
+Swift and Objective-C file of a project a bridge resolver is detected in.
+They are not a canonical surface.
+
+The import-binding lane (W7-31, OD-B72) keeps one row per text file of the
+languages with a module surface and per Python file, `binding_facts:<path>`:
+the sha256 of a canonical encoding of what resolution reads from the file
+when another file's reference goes through an import binding into it. That
+is its import mappings as resolution extracts them from the whole text, in
+order; each module-level constant or variable with its kind, name, export
+flag and full source lines; and the kind, name and export flag of each
+module-level declaration that shares its name with another, these two in the
+order the store lists a file's nodes. A full index and a migration write
+every row. A sync withdraws a file's row before it re-extracts or removes
+the file and writes the new row after its resolution is persisted; a missing
+row counts as moved, so the lane keeps no marker. They are not a canonical
+surface; the sync matrix checks that a sync leaves them as a fresh index
+writes them.
+
+The Terraform wiring lane keeps one row per Terraform file declaring a module,
+a variable or an output, `terraform_wiring:{path}`: a JSON object whose
+`entries` list those declarations in the order of their lines, each with its
+qualified `name` and, as the module bridge reads its lines, a module block's
+`source`, `component` and `component_var` (the `X` of `component = var.X`)
+and a variable's `default`; a field the lines do not write is left out. A
+file declaring none has no row. A full index and a migration write every
+row; a sync writes the rows of the files it changed last and drops those of
+files that went or declare none any more. A sync re-resolves whole every file
+holding a `module.M:` reference only when a changed file's row moved, a
+`.tf` or `.tofu` file came or went or gained or lost its file node, or the
+marker is missing. The marker `terraform_wiring_version` (1) is written by a
+full index, a migration and every sync whose resolution is persisted, and
+withdrawn with the others before a sync's first change. A sync that finds it
+missing or at another version rebuilds every row and re-resolves every file
+holding a `module.M:` reference. They are not a canonical surface.
+
+Control-input rows record what resolution reads of the project's control
+files, which are no source files: `control_inputs:<kind>`, one row for each kind
+(`js`, `csharp`, `rust`, `go`, `python`, `jvm`, `php`, `ruby`, `dotnet` and
+`swift`), holds a JSON object from each input's path (project-relative, or the
+absolute path its reader used for one outside the project) to the sha256 of its
+text or of a listed folder's names, `null` for one that is missing.
+`frameworks_detected` holds the detected frameworks, sorted, and, when a
+framework runs only in its own apps, a digest of where it runs. A full index, a
+migration and every sync write the rows, last. `control_inputs_version` (1) is
+withdrawn and restored with the other markers, and `frameworks_version` (1) only
+by a sync that re-extracts for a framework change. Which files each kind reads,
+and what a sync re-reads and re-resolves when one moves, is in
+[`architecture.md`](architecture.md#daemon-and-watch-lifecycle). They are not a
+canonical surface.
+
+`synthesis_version` (24) vouches that the synthesized edges are the synthesis
+stage's output over the current base graph and the files it read beside the
+index. A full index and a migration write it after the stage. A sync withdraws
+it before its first change, before a lane bootstrap's first write, before the
+orphan sweep, and when a file `synthesis_unindexed_inputs` records reads
+differently, and, when it changed the index, bootstrapped a lane, swept, or
+found the marker missing or at another version, runs the stage and writes the
+marker back as its last write. A build before version 24 recomputed the stage
+whole without touching the step records below, so the value tells a record of
+this engine from edges such a build wrote: the first sync of an index another
+version marked runs the stage whole. It is not a canonical surface.
+
+`synthesis_unindexed_inputs` records the files the stage read beside the index
+(W7-17b): a JSON object, sorted by path, from each project-relative path the
+index does not hold that an indexed C or C++ file's `#include "…"` or an
+Angular component's `templateUrl` (W7-18d) led the stage to, to the SHA-256 of the text it read there, or `null` where it read nothing:
+no file, a path the scan's ignore rules, `.gitignore` or configuration keep
+out, one through a symbolic link, or a file over `indexing.max_file_size`. A
+path that would leave the project root is never probed nor recorded. Every run
+of the stage writes the row, `{}` when it read nothing beside the index; a sync
+that kept steps writes it only when it changed. Each
+sync that finds the marker current reads every recorded path again the same way
+first, and the watcher hands an event for a recorded path to the next sync. A
+row that does not parse counts as changed; an index without the row has an
+older marker and recomputes anyway. It is not a canonical surface.
+
+`synthesis_passes`, `synthesis_pass:{pass}` and `synthesis_pass:{pass}:edges`
+record what each run of the synthesis stage read and emitted (W9-00 row 27).
+`synthesis_passes` is a JSON object: the record scheme, the engine's
+`synthesis_version` value, the build identity (the package version and a digest
+of the sources the stage's output follows from, taken when the binary is
+compiled), the schema version, a digest of the options the stage reads
+(`indexing.max_file_size` and the scan scope of the files beside the index), the
+indexed files' languages, and the prerequisite steps and passes that ran, in
+order. Each step that ran has two rows under its upstream name.
+`synthesis_pass:{pass}` is its footprint, a JSON object with its record version:
+the sorted 64-bit hashes of the keys its reads named (a node by id, a file's
+nodes, a name, a qualified or lower-cased name, a kind in a language, the edges
+of a kind into or out of a node, a site's references, the file list, a file's
+row or text), its pattern lookups (`GLOB` and `LIKE` name patterns, a signature
+or decorator that holds a string), the files each of its per-file text checks
+passed, the lines it read with their hash, the files it read beside the index
+with their hash, what keeps it from being reused (a probe on disk, a directory
+listing or a table built from the store through the stage's resolution context,
+a file that drifted since it was indexed, or a footprint and output over 32 MiB
+together, which keep no output), and the byte length and SHA-256 of the stored
+text of the step's `synthesis_pass:{pass}:edges` row. That row is the step's raw
+output: the JSON array of its edges in the order it emitted them, before the
+merge (`[]` for a record that keeps none), as a raw deflate stream (miniz_oxide
+at a fixed level, so equal outputs give equal rows) in standard base64. Every
+run of the stage (a full index, a migration, a sync) writes them with its edges
+and `synthesis_unindexed_inputs` in one transaction, dropping the rows of the
+steps that did not run; a sync that kept steps rewrites only the rows of the
+steps that ran and changed (an output row only when its hash moved), leaves a
+kept step's rows as they are, and writes `synthesis_unindexed_inputs`, when it
+changed, as the union of the kept steps' recorded reads and the others' new
+ones. A sync that found the marker current when it began reads the footprint
+rows (see `architecture.md`, Synthesis) and checks that each output row is there
+with the length its footprint row names, which SQLite reads from the row's
+header without its text; it reads an output row only to merge a kept output or
+to compare a prerequisite step's new output with its last, and uses it only when
+its length and hash are the ones named and it decodes. A footprint row that is
+missing, does not read, or has another version (the earlier single-row layout,
+which kept the output inside the record, among them), or an output row that is
+missing, of another length or, once read, another text, or that does not decode
+(base64, inflate, JSON), runs the stage whole. A step keeps its recorded output
+when its record is reusable and none of the sync's changed rows, changed files
+or files beside the index moves what it read. They are not a canonical surface;
+the sync matrix checks that a sync leaves every one of them, the output rows'
+text included, as a fresh index writes them.
+
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
-`resolved_refs` are what extracting it again gives. Its value is `1:` and the
+`resolved_refs` are what extracting it again gives, with the references of the
+cross-file nodes in it (the routes of React Router tables, which no single
+file's extraction makes and a sync's re-extraction of the file merges in). Its value is `1:` and the
 sha256 of the inputs that decide what an unchanged file's extraction yields:
 the extension overrides, `max_file_size`, the Godot DSL configuration, the
-extraction version and the `frameworks_detected` row. Only a full index (`init`,
+extraction version and the `frameworks_detected` row. The Lua loader names
+decide a Lua file's extraction too but are left out: a sync that finds other
+names in the `lua_loaders` row, or no row, extracts every Lua file again before
+any dependent is resolved, so no Lua file is resolved from rows another set of
+names extracted. Only a full index (`init`,
 `index`, the rebuild of an outdated index) writes it, once resolution and
 framework finalization are persisted. A sync reads it before its first change,
 withdraws it with the other markers at that change, and writes it back once the

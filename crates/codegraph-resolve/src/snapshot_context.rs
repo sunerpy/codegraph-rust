@@ -30,7 +30,7 @@
 use crate::context::{DEFAULT_CACHE_LIMIT, order_candidates};
 use crate::import_resolver;
 use crate::package_manifests::{ManifestScope, read_manifest_scope};
-use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::path_aliases::{AliasMap, load_directory_aliases, load_project_aliases};
 use crate::pathutil;
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
@@ -176,12 +176,14 @@ struct SnapshotCaches {
     import_mappings: BoundedFileMemo<Arc<Vec<ImportMapping>>>,
     re_exports: BoundedFileMemo<Arc<Vec<ReExport>>>,
     /// Filesystem existence probes for paths the snapshot does not know: the
-    /// same candidates are probed from every importing file, and the tree does
-    /// not change within a pass (upstream `fileExistsMemo`).
+    /// same paths are probed again and again, and the tree does not change
+    /// within a pass (upstream `fileExistsMemo`).
     fs_exists: BoundedFileMemo<bool>,
     /// Each directory's package.json / Deno import-map scope (upstream
     /// #2128 `manifestScopes`).
     manifest_scopes: BoundedFileMemo<Arc<ManifestScope>>,
+    /// Each directory's nearest aliases below the root (upstream #2165).
+    dir_aliases: BoundedFileMemo<Option<AliasMap>>,
     /// Each file's functions and methods by qualified name (W5-08).
     function_scopes: BoundedFileMemo<Arc<crate::name_matcher::FileCallables>>,
     /// Each file's methods by owner and name (W5-08).
@@ -194,6 +196,10 @@ struct SnapshotCaches {
     cpp_namespace_tables: OnceLock<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
     /// The Kotlin tables for the run (upstream #2172).
     kotlin_tables: OnceLock<Arc<crate::kotlin_scope::KotlinTables>>,
+    /// The Spring config keys for the run (W7-19c).
+    spring_tables: OnceLock<Arc<crate::frameworks::spring::SpringTables>>,
+    /// The Drupal hook implementations for the run (W7-19d).
+    drupal_tables: OnceLock<Arc<crate::frameworks::drupal::DrupalTables>>,
     scala_tables: OnceLock<Arc<crate::scala_scope::ScalaTables>>,
     csharp_tables: OnceLock<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: OnceLock<Arc<crate::member_types::MemberTables>>,
@@ -207,6 +213,9 @@ struct SnapshotCaches {
     objc_tables: OnceLock<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: OnceLock<Arc<crate::go_packages::GoTables>>,
     solidity_tables: OnceLock<Arc<crate::solidity_scope::SolidityTables>>,
+    route_tables: OnceLock<Arc<crate::frameworks::route_href::RouteTables>>,
+    /// The Cargo workspace's crates for the run (W7-19h).
+    cargo_workspace_crates: OnceLock<Arc<crate::frameworks::cargo_workspace::CrateMap>>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -223,12 +232,15 @@ impl SnapshotCaches {
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             manifest_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            dir_aliases: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             function_scopes: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             file_methods: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             name_matcher_tables: OnceLock::new(),
             python_write_index: OnceLock::new(),
             cpp_namespace_tables: OnceLock::new(),
             kotlin_tables: OnceLock::new(),
+            spring_tables: OnceLock::new(),
+            drupal_tables: OnceLock::new(),
             scala_tables: OnceLock::new(),
             csharp_tables: OnceLock::new(),
             member_tables: OnceLock::new(),
@@ -242,6 +254,8 @@ impl SnapshotCaches {
             objc_tables: OnceLock::new(),
             go_tables: OnceLock::new(),
             solidity_tables: OnceLock::new(),
+            route_tables: OnceLock::new(),
+            cargo_workspace_crates: OnceLock::new(),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -291,9 +305,24 @@ pub struct SnapshotResolutionContext {
     /// Empty until the resolver installs a chunk's map (T4); an empty map yields
     /// the same result the store context gives before any such edge exists.
     edges: EdgeAdjacency,
+    /// The project's custom Lua module loaders and roots
+    /// ([`Self::with_lua_loaders`]); none by default.
+    lua_loaders: Arc<codegraph_extract::LuaLoaders>,
 }
 
 impl SnapshotResolutionContext {
+    /// The nearest aliases from the first of `dirs` (a walk from
+    /// [`crate::path_aliases::nearest_alias_walk`]) upward: that directory's
+    /// own, else the next one's. A directory's parent is another key, so the
+    /// memo never re-enters the entry it is filling.
+    fn nearest_aliases_from(&self, dirs: &[&str]) -> Option<AliasMap> {
+        let (dir, above) = dirs.split_first()?;
+        self.caches.dir_aliases.get_or_init(dir, || {
+            load_directory_aliases(&std::path::Path::new(&self.snapshot.project_root).join(dir))
+                .or_else(|| self.nearest_aliases_from(above))
+        })
+    }
+
     /// Build the WHOLE-RUN snapshot from the live `store` rooted at
     /// `project_root`, with an empty per-chunk edge map.
     ///
@@ -435,6 +464,7 @@ impl SnapshotResolutionContext {
             caches: Arc::new(SnapshotCaches::new()),
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             edges: Arc::new(HashMap::new()),
+            lua_loaders: codegraph_extract::LuaLoaders::empty(),
         })
     }
 
@@ -467,7 +497,17 @@ impl SnapshotResolutionContext {
             caches: Arc::clone(&self.caches),
             max_file_size: self.max_file_size,
             edges,
+            lua_loaders: Arc::clone(&self.lua_loaders),
         }
+    }
+
+    /// Resolve Lua `require`s and loader calls under the addressed project's
+    /// custom Lua module settings (#1617), as
+    /// [`crate::context::StoreResolutionContext::with_lua_loaders`] does.
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: Arc<codegraph_extract::LuaLoaders>) -> Self {
+        self.lua_loaders = lua_loaders;
+        self
     }
 
     /// Read files up to the addressed project's extraction limit
@@ -556,6 +596,9 @@ impl ResolutionContext for SnapshotResolutionContext {
     fn file_exists(&self, file_path: &str) -> bool {
         // Known-file fast path then filesystem fallback (matches the store
         // context: store-known files, normalized variant, then FS probe).
+        // Import resolution asks `is_indexed_file` of its candidates instead
+        // (W7-27), so only the callers that are not import resolution read
+        // the fallback.
         if self.snapshot.known_file_paths.contains(file_path) {
             return true;
         }
@@ -727,6 +770,10 @@ impl ResolutionContext for SnapshotResolutionContext {
         self.snapshot.project_aliases.clone()
     }
 
+    fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+        self.nearest_aliases_from(&crate::path_aliases::nearest_alias_walk(from_file))
+    }
+
     fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
         self.snapshot.workspace_packages.clone()
     }
@@ -752,6 +799,22 @@ impl ResolutionContext for SnapshotResolutionContext {
             self.caches
                 .kotlin_tables
                 .get_or_init(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn spring_tables(&self) -> Arc<crate::frameworks::spring::SpringTables> {
+        Arc::clone(
+            self.caches
+                .spring_tables
+                .get_or_init(|| Arc::new(crate::frameworks::spring::SpringTables::new())),
+        )
+    }
+
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        Arc::clone(
+            self.caches
+                .drupal_tables
+                .get_or_init(|| Arc::new(crate::frameworks::drupal::DrupalTables::new())),
         )
     }
 
@@ -801,6 +864,10 @@ impl ResolutionContext for SnapshotResolutionContext {
                 .lua_tables
                 .get_or_init(|| Arc::new(crate::lua_scope::LuaTables::new())),
         )
+    }
+
+    fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+        &self.lua_loaders
     }
 
     fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
@@ -857,6 +924,10 @@ impl ResolutionContext for SnapshotResolutionContext {
                 .solidity_tables
                 .get_or_init(|| Arc::new(crate::solidity_scope::SolidityTables::new())),
         )
+    }
+
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::clone(self.caches.route_tables.get_or_init(Default::default))
     }
 
     fn enclosing_function_lines(
@@ -918,6 +989,21 @@ impl ResolutionContext for SnapshotResolutionContext {
         Arc::clone(&self.snapshot.rust_crates)
     }
 
+    fn list_directories(&self, dir: &str) -> Vec<String> {
+        crate::frameworks::cargo_workspace::list_directories_within(
+            &self.snapshot.project_root,
+            dir,
+        )
+    }
+
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        Arc::clone(
+            self.caches
+                .cargo_workspace_crates
+                .get_or_init(|| Arc::new(crate::frameworks::cargo_workspace::crate_map(self))),
+        )
+    }
+
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
         self.caches
             .re_exports
@@ -930,8 +1016,9 @@ impl ResolutionContext for SnapshotResolutionContext {
                 Arc::new(match self.read_file_cached(file_path) {
                     Some(text) => {
                         // Re-key on the BARREL file's own extension (matches the
-                        // store context: js-family files parse as TypeScript).
-                        let lang = if crate::context::is_js_family_path_pub(file_path) {
+                        // store context: js-family and `.ets` files parse as
+                        // TypeScript).
+                        let lang = if crate::context::reads_re_exports_as_typescript(file_path) {
                             Language::TypeScript
                         } else {
                             language
@@ -1044,6 +1131,50 @@ mod tests {
             }])
             .unwrap();
         store
+    }
+
+    /// W7-09a (upstream #2165): the snapshot reads a file's nearest aliases
+    /// as the store context does, from the first directory up whose own
+    /// config declares `paths`, and none below the root's.
+    #[test]
+    fn a_snapshot_reads_the_nearest_configs_aliases() {
+        let root = temp_root("nearest-aliases");
+        std::fs::create_dir_all(root.join("apps/web/src/pages")).unwrap();
+        std::fs::write(
+            root.join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/src/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        let store = Store::open(&root.join("index.db")).expect("open");
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        for file in [
+            "apps/web/src/pages/a.tsx",
+            "apps/web/src/b.tsx",
+            "apps/web/c.ts",
+        ] {
+            let web = ctx
+                .get_nearest_aliases(file)
+                .expect("the web app's aliases");
+            assert!(web.base_url.ends_with("/apps/web"), "{file}");
+        }
+        assert!(ctx.get_nearest_aliases("apps/other/a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("a.ts").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// W7-07: a snapshot's routers share one set of route tables.
+    #[test]
+    fn a_snapshot_keeps_one_set_of_route_tables() {
+        let root = temp_root("route-tables");
+        let store = Store::open(&root.join("index.db")).expect("open");
+        let ctx = SnapshotResolutionContext::from_store(&store, root.to_str().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&ctx.route_tables(), &ctx.route_tables()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// W5-08: the snapshot context answers a declaration's enclosing

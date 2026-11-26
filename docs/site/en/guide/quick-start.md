@@ -279,3 +279,5 @@ Each of them takes `--json` for scripts.
 - [Connect a coding agent](agents.md) so it can ask these questions itself.
 - [Open the browser viewer](viewer.md) to read the same index visually.
 - [Keep the index current](keeping-current.md) as you edit.
+- [Gather a task's context](../../../cli.md#codegraph-context--task-context-as-markdown-or-json) with `codegraph context`, as Markdown or JSON, for scripts
+  and other tools.

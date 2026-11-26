@@ -5,7 +5,8 @@
     "line": 25,
     "metadata": {
       "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "framework": "terraform",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "variable:60a98b4d776ea6b99ec109f16565e238",
@@ -17,7 +18,8 @@
     "line": 29,
     "metadata": {
       "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "framework": "terraform",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "variable:20d776b47f45d7da835d4d4e82010d17",
@@ -29,7 +31,8 @@
     "line": 21,
     "metadata": {
       "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "framework": "terraform",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "module:6387ce4b696974e8905686ae83527943",
@@ -41,7 +44,8 @@
     "line": 9,
     "metadata": {
       "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "framework": "terraform",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "constant:60a0bf4de8e88ec795bc637f794b133e",
@@ -53,7 +57,8 @@
     "line": 15,
     "metadata": {
       "confidence": 0.95,
-      "resolvedBy": "qualified-name"
+      "framework": "terraform",
+      "resolvedBy": "framework"
     },
     "provenance": null,
     "source": "class:9ea649776b48847a71f06911daf0119e",

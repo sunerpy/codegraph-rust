@@ -105,7 +105,9 @@ pub use swift::SWIFT_SPEC;
 pub use terraform::TERRAFORM_SPEC;
 pub(crate) use terraform::{
     TerraformBlockDecl, collect_terraform_references, describe_terraform_block,
-    read_terraform_block_header, terraform_block_body,
+    find_terraform_string_lit, read_terraform_block_header, terraform_attribute_expression,
+    terraform_attribute_name, terraform_block_body, terraform_provider_selection,
+    terraform_string_attr, terraform_string_lit_value,
 };
 pub use tsx::TSX_SPEC;
 pub use typescript::TYPESCRIPT_SPEC;

@@ -9,10 +9,17 @@
 //! (codegraph-graph traversal/query, codegraph-store) with tool logic kept
 //! sync. Output is byte-aligned to the upstream at Tier-2 structural; the un-ported
 //! explore heuristics are documented in `KNOWN_DIFFS.md`.
+//!
+//! The same engine builds the CLI's `codegraph context` answer
+//! ([`engine::CodeGraphEngine::build_context`], [`context`]); upstream has no
+//! context tool either.
 
+pub mod context;
 pub mod dynamic_boundaries;
 pub mod engine;
 pub mod explore_budget;
+pub(crate) mod explore_gather;
+pub(crate) mod explore_rank;
 pub mod instructions;
 pub mod project_services;
 pub mod protocol;

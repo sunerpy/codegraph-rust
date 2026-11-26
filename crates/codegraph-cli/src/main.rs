@@ -556,6 +556,33 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    // Upstream flags/output: upstream bin/codegraph.ts b635dd46 1421-1478.
+    /// Build context for a task: relevant symbols, relationships, and code
+    /// blocks, as Markdown or JSON. Its entry points come from the same
+    /// deterministic search as `explore`. NO LLM.
+    Context {
+        /// The task, in words; they are joined with spaces.
+        #[arg(required = true, value_name = "TASK")]
+        task: Vec<String>,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument (it would join the task).
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// Output format: markdown or json
+        #[arg(short = 'f', long, default_value = "markdown", value_name = "FORMAT")]
+        format: String,
+        /// Maximum number of symbols to include
+        #[arg(
+            short = 'n',
+            long = "max-nodes",
+            value_name = "NUMBER",
+            allow_hyphen_values = true
+        )]
+        max_nodes: Option<String>,
+        /// Omit code blocks (structure only)
+        #[arg(long = "no-code")]
+        no_code: bool,
+    },
     // Upstream flags/output: upstream bin/codegraph.ts:1864-1870, 1871-1920.
     // `--global`/`--local` are convenience aliases for `--location` (task spec).
     Install {
@@ -867,6 +894,13 @@ fn run(cli: Cli) -> Result<()> {
             json,
             strict,
         } => cmd_node(target, path, file, symbols_only, json, strict),
+        Command::Context {
+            task,
+            path,
+            format,
+            max_nodes,
+            no_code,
+        } => cmd_context(&task, path, &format, max_nodes.as_deref(), no_code),
         Command::Install {
             target,
             location,
@@ -1862,26 +1896,27 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
         "{spinner:.green} Syncing {pos}/{len} files ({elapsed})",
     );
     let mut bar_len_set = false;
-    let outcome = codegraph_watch::sync_project_once_with_progress(&project, |done, total| {
-        if !bar_len_set {
-            bar.set_length(total as u64);
-            bar_len_set = true;
-        }
-        bar.set_position(done as u64);
-        if let Some(sink) = &diagnostic_sink {
-            sink.emit(
-                "heartbeat",
-                json!({
-                    "scheduled": total,
-                    "active": usize::from(done < total),
-                    "parsed": done,
-                    "buffered": 0,
-                    "persisted": done,
-                    "nextExpected": done,
-                }),
-            );
-        }
-    })?;
+    let (outcome, sync_timings) =
+        codegraph_watch::sync_project_once_with_progress_timed(&project, |done, total| {
+            if !bar_len_set {
+                bar.set_length(total as u64);
+                bar_len_set = true;
+            }
+            bar.set_position(done as u64);
+            if let Some(sink) = &diagnostic_sink {
+                sink.emit(
+                    "heartbeat",
+                    json!({
+                        "scheduled": total,
+                        "active": usize::from(done < total),
+                        "parsed": done,
+                        "buffered": 0,
+                        "persisted": done,
+                        "nextExpected": done,
+                    }),
+                );
+            }
+        })?;
     finish_phase(&bar, "Synced files");
     diagnostic_run.relocate_to_index_root(paths.current_root());
     let emit_file_complete =
@@ -1942,6 +1977,31 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             }
         }
     }
+    if let Some(timings) = &sync_timings
+        && diagnostic_run.timings_enabled()
+    {
+        for (part, took) in timings.parts() {
+            diagnostic_run.phase_part(&format!("sync.{part}"), took);
+        }
+        if let Some(stage) = &timings.stage {
+            print_stage_timings(&diagnostic_run, stage);
+        }
+    }
+    // Which synthesis steps the sync ran and how many kept their recorded
+    // output (W9-00 row 27), when it ran the stage.
+    let (synthesis_rerun, synthesis_reused) = match &outcome.synthesis {
+        Some(stats) => (
+            serde_json::Value::from(
+                codegraph_resolve::synthesis::step_names()
+                    .enumerate()
+                    .filter(|(at, _)| stats.rerun & (1 << at) != 0)
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>(),
+            ),
+            serde_json::Value::from(stats.reused),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
     diagnostic_run.phase_end(
         "sync",
         sync_started.elapsed(),
@@ -1950,6 +2010,8 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             "filesReindexed": outcome.files_reindexed,
             "filesSkipped": outcome.files_skipped_unchanged,
             "filesRemoved": outcome.files_removed,
+            "synthesisRerun": synthesis_rerun,
+            "synthesisReused": synthesis_reused,
         }),
     );
     if !quiet {
@@ -2149,6 +2211,69 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
                 println!(
                     "\nRecovery: run `{recovery}` to rebuild the index; only `init` removes the uninit tombstone."
                 );
+            }
+            return Ok(());
+        }
+        // A database a newer codegraph wrote (OD-19) is unreadable here, and
+        // nothing may write it; report which versions disagree instead of
+        // failing like a read.
+        Err(
+            error @ codegraph_store::StoreError::FutureSchema {
+                found,
+                supported,
+                discard_with_uninit,
+                ..
+            },
+        ) => {
+            if json_output {
+                let mut status = json!({
+                    "initialized": false,
+                    "version": VERSION,
+                    "projectPath": project,
+                    "indexPath": index_root,
+                    "lastIndexed": null,
+                    "dbPath": db,
+                    "dbExists": db_exists,
+                    "dbSizeBytes": db_size,
+                    "extractionStatus": "current",
+                    "extractionStatusDetail": error.to_string(),
+                    "recoveryCommand": null,
+                    "legacyIndexPresent": legacy_index_present,
+                    "legacyIndexPaths": legacy_index_paths,
+                    "daemonRunning": daemon_running,
+                    "daemonPidPath": daemon_pid_path,
+                    "daemonSocketPath": daemon_socket_path,
+                    "daemonLogPath": daemon_log_path,
+                });
+                if wal_size > 0 {
+                    status["walSizeBytes"] = json!(wal_size);
+                }
+                print_json(&status)?;
+            } else {
+                println!("\nCodeGraph Status\n");
+                println!("Project: {}\n", project.display());
+                println!(
+                    "State:   current (schema {found} is newer than this binary's {supported})"
+                );
+                println!("Index Statistics:");
+                println!("  DB Size:   {:.2} MB", db_size as f64 / 1024.0 / 1024.0);
+                print_wal_status(wal_size, db_size);
+                println!("\n  DB Path:   {}", db.display());
+                println!(
+                    "  Daemon:    {}",
+                    if daemon_running { "running" } else { "stopped" }
+                );
+                if discard_with_uninit {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph, or run `codegraph uninit --force {}` and then `codegraph init {}` to discard and rebuild it.",
+                        project.display(),
+                        project.display()
+                    );
+                } else {
+                    println!(
+                        "\nRecovery: a newer CodeGraph wrote this index. Upgrade CodeGraph to use it."
+                    );
+                }
             }
             return Ok(());
         }
@@ -5159,6 +5284,45 @@ fn cmd_node(
     print_engine_result("node", &target, &result, json_output, strict)
 }
 
+/// `codegraph context <task...>` (W9-01): colby's command
+/// (`src/bin/codegraph.ts` b635dd46 1421-1478). The format and `--max-nodes`
+/// are checked before the project, as there, with colby's sentences behind
+/// the CLI's `Error:` (OD-B81); the project is resolved as every read command
+/// resolves it. The answer alone goes to stdout; a notice (auto-sync not
+/// healthy, code left out for drift) goes to stderr.
+fn cmd_context(
+    task: &[String],
+    path: Option<PathBuf>,
+    format: &str,
+    max_nodes: Option<&str>,
+    no_code: bool,
+) -> Result<()> {
+    use codegraph_mcp::context::{
+        ContextFormat, ContextOptions, max_nodes_message, parse_max_nodes, unknown_format_message,
+    };
+    let Some(format) = ContextFormat::parse(format) else {
+        bail!("{}", unknown_format_message(format));
+    };
+    let mut options = ContextOptions {
+        format,
+        include_code: !no_code,
+        ..ContextOptions::default()
+    };
+    if let Some(raw) = max_nodes {
+        options.max_nodes =
+            parse_max_nodes(raw).ok_or_else(|| anyhow!("{}", max_nodes_message(raw)))?;
+    }
+    let project = resolve_required_project(path)?;
+    let built = codegraph_mcp::CodeGraphEngine::open(&project)
+        .and_then(|engine| engine.build_context(&task.join(" "), &options))
+        .context("Context build failed")?;
+    for notice in &built.notices {
+        eprintln!("warning: {notice}");
+    }
+    println!("{}", built.output);
+    Ok(())
+}
+
 /// Decide whether a `codegraph node <target>` argument names an indexed FILE (→
 /// file-view mode) or a SYMBOL (→ symbol mode). A path separator or a match
 /// against an indexed file path means file mode; a bare identifier is a symbol.
@@ -5675,6 +5839,55 @@ fn phase_spinner(label: &str, quiet: bool) -> ProgressBar {
     bar
 }
 
+/// The synthesis stage's parts as phase-timing lines, `synthesis.<part>`,
+/// each pass under its upstream name (W9-00a).
+fn print_stage_timings(run: &DiagnosticRun, stage: &codegraph_resolve::synthesis::StageTimings) {
+    if !run.timings_enabled() {
+        return;
+    }
+    run.phase_part("synthesis.read", stage.read);
+    if stage.reusing {
+        run.phase_part("synthesis.decide", stage.decide);
+    }
+    for (pass, took) in &stage.passes {
+        run.phase_part(&format!("synthesis.{pass}"), *took);
+    }
+    for (pass, took) in &stage.kept {
+        run.phase_part(&format!("synthesis.{pass}.reused"), *took);
+    }
+    run.phase_part("synthesis.merge", stage.merge);
+    run.phase_part("synthesis.replace", stage.replace);
+    if let Some(took) = stage.restore {
+        run.phase_part("synthesis.restore", took);
+    }
+    run.phase_part("synthesis.inputs", stage.inputs);
+}
+
+/// Adds the time from [`BusyTimer::start`] to its drop to a total, when it
+/// measures: the index writer's busy time, which every early return of the
+/// consumer still counts.
+struct BusyTimer<'a> {
+    started: Option<std::time::Instant>,
+    total: &'a mut std::time::Duration,
+}
+
+impl<'a> BusyTimer<'a> {
+    fn start(measure: bool, total: &'a mut std::time::Duration) -> Self {
+        Self {
+            started: measure.then(std::time::Instant::now),
+            total,
+        }
+    }
+}
+
+impl Drop for BusyTimer<'_> {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            *self.total += started.elapsed();
+        }
+    }
+}
+
 fn finish_phase(bar: &ProgressBar, label: &str) {
     if bar.is_hidden() {
         return;
@@ -6099,6 +6312,10 @@ fn index_project_inner(
         Option<codegraph_resolve::lua_scope::LuaModuleRow>,
         Option<codegraph_resolve::dart_scope::HeadRow>,
         Option<codegraph_resolve::dart_libraries::LibraryRow>,
+        Option<codegraph_watch::rn_bridges::BridgeFacts>,
+        // The binding-facts digest lane B compares (W7-31, OD-B72).
+        Option<String>,
+        Option<codegraph_watch::terraform_wiring::WiringRow>,
     )>;
     let mut surfaces: Vec<(String, ModuleSurface)> = Vec::new();
     let mut namespace_scans: Vec<(String, codegraph_watch::cpp_namespace_rows::NamespaceScan)> =
@@ -6117,14 +6334,23 @@ fn index_project_inner(
     let mut go_rows: Vec<(String, codegraph_resolve::go_packages::HeadRow)> = Vec::new();
     let mut php_rows: Vec<(String, codegraph_resolve::php_scope::HeadRow)> = Vec::new();
     let mut class_head_rows: Vec<(String, codegraph_watch::class_heads::HeadsRow)> = Vec::new();
+    let mut bridge_rows: Vec<(String, codegraph_watch::rn_bridges::BridgeFacts)> = Vec::new();
+    let mut terraform_rows: Vec<(String, codegraph_watch::terraform_wiring::WiringRow)> =
+        Vec::new();
     let mut lua_rows: Vec<(String, codegraph_resolve::lua_scope::LuaModuleRow)> = Vec::new();
     let mut dart_rows: Vec<(String, codegraph_resolve::dart_scope::HeadRow)> = Vec::new();
     let mut dart_library_rows: Vec<(String, codegraph_resolve::dart_libraries::LibraryRow)> =
         Vec::new();
+    let mut binding_facts_rows: Vec<(String, String)> = Vec::new();
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
     let persist_tracker = tracker.clone();
+    // The single writer's busy time, measured only when it is printed
+    // (`CODEGRAPH_PHASE_TIMINGS=1`): parse_write less it is the time the
+    // writer waited for parsed files.
+    let measure_store_busy = diagnostic_run.timings_enabled();
+    let mut store_busy = std::time::Duration::ZERO;
     let parse_result = run_ordered_parallel_window(
         files.len(),
         PARSE_REORDER_WINDOW,
@@ -6204,6 +6430,16 @@ fn index_project_inner(
             let lua_row = codegraph_watch::lua_modules::row_of(language, &source, &result.nodes);
             let dart_row = codegraph_watch::dart_heads::row_of(language, &source, &result.nodes);
             let dart_library_row = codegraph_watch::dart_libraries::row_of(language, &source);
+            let bridge_row = codegraph_watch::rn_bridges::row_of(relative, &source, &result.nodes);
+            let binding_facts_row = codegraph_watch::binding_facts::row_of(
+                relative,
+                language,
+                &source,
+                &result.nodes,
+                &result.edges,
+            );
+            let terraform_row =
+                codegraph_watch::terraform_wiring::row_of(language, &source, &result.nodes);
             Ok(Some((
                 relative.clone(),
                 file,
@@ -6226,10 +6462,14 @@ fn index_project_inner(
                 lua_row,
                 dart_row,
                 dart_library_row,
+                bridge_row,
+                binding_facts_row,
+                terraform_row,
             )))
         },
         |buffered| buffer_tracker.buffered(buffered),
         |index, payload| {
+            let _busy = BusyTimer::start(measure_store_busy, &mut store_busy);
             let Some((
                 relative,
                 file,
@@ -6252,6 +6492,9 @@ fn index_project_inner(
                 lua_row,
                 dart_row,
                 dart_library_row,
+                bridge_row,
+                binding_facts_row,
+                terraform_row,
             )) = payload
             else {
                 files_not_source += 1;
@@ -6343,6 +6586,15 @@ fn index_project_inner(
             if let Some(row) = dart_library_row {
                 dart_library_rows.push((relative.clone(), row));
             }
+            if let Some(row) = bridge_row {
+                bridge_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = binding_facts_row {
+                binding_facts_rows.push((relative.clone(), row));
+            }
+            if let Some(row) = terraform_row {
+                terraform_rows.push((relative.clone(), row));
+            }
             if let Some(surface) = surface {
                 surfaces.push((relative, surface));
             }
@@ -6362,6 +6614,7 @@ fn index_project_inner(
             "filesErrored": files_errored,
         }),
     );
+    diagnostic_run.phase_part("parse_write.store_busy", store_busy);
 
     let scan_files = bar.position() - files_not_source;
     finish_phase(
@@ -6414,20 +6667,27 @@ fn index_project_inner(
     drop(php_rows);
     codegraph_watch::class_heads::write_index_rows(&store, &mut class_head_rows)?;
     drop(class_head_rows);
+    codegraph_watch::rn_bridges::write_index_rows(&store, &mut bridge_rows)?;
+    drop(bridge_rows);
+    codegraph_watch::terraform_wiring::write_index_rows(&store, &mut terraform_rows)?;
+    drop(terraform_rows);
     codegraph_watch::lua_modules::write_index_rows(&store, &mut lua_rows)?;
     drop(lua_rows);
     codegraph_watch::dart_heads::write_index_rows(&store, &mut dart_rows)?;
     drop(dart_rows);
     codegraph_watch::dart_libraries::write_index_rows(&store, &mut dart_library_rows)?;
     drop(dart_library_rows);
+    codegraph_watch::binding_facts::write_index_rows(&store, &mut binding_facts_rows)?;
+    drop(binding_facts_rows);
     codegraph_watch::dart_libraries::write_pubspec_rows(&store, project)?;
     // A fresh index leaves no C/C++ (W4-CPP-04), Java (W4-JVM-01), Kotlin
     // (W4-JVM-03), Scala (W4-SC-01), C# (W4-CS-01), member-walk (W4-CS-03)
     // Ruby (W4-RB-01), CFML (W4-CF-01), Swift (W4-SW-01), Objective-C
     // (W4-SW-04), Go (W4-GO-01), Rust receiver (W4-RS-03), PHP
     // (W4-PHP-01), case-folded (W4-PHP-03), Lua (W4-LUA-01), R base-binding
-    // (W4-R-01), Dart head (W4-DART-01) or Dart library (W4-DART-02)
-    // dependent unrefreshed.
+    // (W4-R-01), Dart head (W4-DART-01), Dart library (W4-DART-02), Play
+    // (W7-19c), Laravel or Drupal (W7-19d), Rails (W7-19e), Rust crate root
+    // (W7-19h) or bridge (W7-21) dependent unrefreshed.
     codegraph_watch::cpp_dependents::write_marker(&store)?;
     codegraph_watch::java_heads::write_marker(&store)?;
     codegraph_watch::kotlin_surfaces::write_marker(&store)?;
@@ -6446,7 +6706,18 @@ fn index_project_inner(
     codegraph_watch::class_heads::write_marker(&store)?;
     codegraph_watch::case_folded::write_marker(&store)?;
     codegraph_watch::lua_modules::write_marker(&store)?;
+    // The Lua loader settings this index is extracted and resolved under
+    // (W9-02), for a project naming none too.
+    codegraph_watch::lua_modules::write_loaders(&store, &options.lua_loaders)?;
     codegraph_watch::r_bindings::write_marker(&store)?;
+    codegraph_watch::play_routes::write_marker(&store)?;
+    codegraph_watch::laravel_routes::write_marker(&store)?;
+    codegraph_watch::drupal_refs::write_marker(&store)?;
+    codegraph_watch::rails_routes::write_marker(&store)?;
+    codegraph_watch::vapor_routes::write_marker(&store)?;
+    codegraph_watch::rn_bridges::write_marker(&store)?;
+    codegraph_watch::terraform_wiring::write_marker(&store)?;
+    codegraph_watch::rust_crate_roots::write_marker(&store)?;
     codegraph_watch::dart_heads::write_marker(&store)?;
     codegraph_watch::dart_libraries::write_marker(&store)?;
     finish_phase(&pb, "Persisted nodes");
@@ -6492,8 +6763,9 @@ fn index_project_inner(
     diagnostic_run.phase_start("framework_extract");
     let framework_started = std::time::Instant::now();
     let pb = phase_spinner("Detecting frameworks", quiet);
-    let mut resolver =
-        ReferenceResolver::new(project.to_string_lossy()).with_max_file_size(options.max_file_size);
+    let mut resolver = ReferenceResolver::new(project.to_string_lossy())
+        .with_max_file_size(options.max_file_size)
+        .with_lua_loaders(std::sync::Arc::clone(&options.lua_loaders));
     // Detect frameworks then run their per-file extract (route/component/handler
     // nodes + refs) BEFORE resolution, mirroring the upstream tree-sitter.ts:4796-4819
     // framework-extraction pass feeding the resolution pipeline.
@@ -6506,7 +6778,7 @@ fn index_project_inner(
     codegraph_watch::control_inputs::write_index_rows(
         &store,
         project,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = store
@@ -6527,6 +6799,22 @@ fn index_project_inner(
         framework_started.elapsed(),
         json!({ "enabled": resolver.has_framework_resolvers() }),
     );
+    diagnostic_run.phase_start("framework_finalize");
+    let framework_finalize_started = std::time::Instant::now();
+    let pb = phase_spinner("Finalizing frameworks", quiet);
+    // Cross-file framework finalization (NestJS RouterModule prefixes, React
+    // Router routes named after a constant, then the routes of tables
+    // another file hands React Router) BEFORE resolution, as upstream's
+    // index runs runPostExtract: a navigation call resolves against the
+    // route's final name.
+    resolver.run_post_extract(&mut store)?;
+    resolver.run_cross_file_nodes(&mut store)?;
+    finish_phase(&pb, "Finalized frameworks");
+    diagnostic_run.phase_end(
+        "framework_finalize",
+        framework_finalize_started.elapsed(),
+        json!({}),
+    );
     // Finished from INSIDE the callback on the final chunk so the retained line
     // lands before the resolver's deferred passes (which resolve refs this bar
     // does not count). The trailing finish covers the no-chunk case where the
@@ -6541,6 +6829,7 @@ fn index_project_inner(
     diagnostic_run.phase_start("reference_resolution");
     let resolution_started = std::time::Instant::now();
     let resolution_sink = diagnostic_run.sink();
+    let mut resolution_timings = None;
     resolver.resolve_and_persist_batched_with_observer(
         &mut store,
         RESOLVE_BATCH_ROWS,
@@ -6556,6 +6845,10 @@ fn index_project_inner(
             }
         },
         |observation| {
+            if let codegraph_resolve::ResolutionObservation::Timings(timings) = observation {
+                resolution_timings = Some(timings);
+                return;
+            }
             let Some(sink) = &resolution_sink else {
                 return;
             };
@@ -6586,6 +6879,8 @@ fn index_project_inner(
                         "total": total,
                     }),
                 ),
+                // Kept above, for the phase-timing lines.
+                codegraph_resolve::ResolutionObservation::Timings(_) => {}
             }
         },
     )?;
@@ -6597,18 +6892,26 @@ fn index_project_inner(
         resolution_started.elapsed(),
         json!({ "processed": resolve_bar.position(), "total": resolve_bar.length() }),
     );
-    diagnostic_run.phase_start("framework_finalize");
-    let framework_finalize_started = std::time::Instant::now();
-    let pb = phase_spinner("Finalizing frameworks", quiet);
-    // Cross-file framework finalization (NestJS RouterModule prefixing) after
-    // resolution, mirroring the upstream index.ts:358 runPostExtract.
-    resolver.run_post_extract(&mut store)?;
-    finish_phase(&pb, "Finalized frameworks");
+    if let Some(timings) = resolution_timings
+        && diagnostic_run.timings_enabled()
+    {
+        for (part, took) in timings.parts() {
+            diagnostic_run.phase_part(&format!("reference_resolution.{part}"), took);
+        }
+    }
+    // The dispatch edges no reference names, over the finished base graph
+    // (W7-14).
+    diagnostic_run.phase_start("synthesis");
+    let synthesis_started = std::time::Instant::now();
+    let (synthesis, stage_timings) =
+        codegraph_resolve::synthesis::run_stage_timed(&mut store, project, &options)?;
+    codegraph_resolve::synthesis::write_marker(&store)?;
     diagnostic_run.phase_end(
-        "framework_finalize",
-        framework_finalize_started.elapsed(),
-        json!({}),
+        "synthesis",
+        synthesis_started.elapsed(),
+        json!({ "edges": synthesis.inserted }),
     );
+    print_stage_timings(&diagnostic_run, &stage_timings);
     // Every reference is now in `unresolved_refs` or `resolved_refs`
     // (W5-09e).
     codegraph_watch::resolved_refs::write_marker(&store, &options, &framework_context)?;

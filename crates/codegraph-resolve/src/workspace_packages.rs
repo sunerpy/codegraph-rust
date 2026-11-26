@@ -7,10 +7,19 @@
 //! Scope mirrors the upstream v1: reads `workspaces` (array OR `{ packages: [...] }`)
 //! from package.json plus a minimal `pnpm-workspace.yaml`, expands one level of
 //! `*`/`**` globs, directory-based subpath resolution (`workspace-packages.ts:17-24`).
+//!
+//! HarmonyOS / OpenHarmony (ArkTS) modules are members too (W7-24a1, upstream
+//! #1186, `b635dd46` `workspace-packages.ts:67-198`): a bounded walk finds
+//! every `oh-package.json5`, and each `file:` dependency it declares names a
+//! member directory; the member's own manifest's `main` is its entry. The
+//! walk is breadth-first in name order (KEEP-RUST: upstream walks in
+//! `readdir` order, which decides what the directory budget cuts), reads no
+//! link, directory or manifest, and keeps every target and entry inside the
+//! project lexically.
 
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// What [`load_workspace_packages`] read: a file, or a directory it listed
@@ -38,8 +47,10 @@ fn note_read(input: WorkspaceInput) {
 /// Every file [`load_workspace_packages`] reads for `project_root` and every
 /// directory it lists for a glob's members, once each, in the order it first
 /// does: the root `package.json` and `pnpm-workspace.yaml`, each member's
-/// `package.json`, a missing one included. What a sync compares to know when
-/// the workspace may have moved (W5-06).
+/// `package.json`, a missing one included, and every `oh-package.json5` the
+/// ohpm walk reads (W7-24a1), so the set of manifests is part of what a sync
+/// compares. What a sync compares to know when the workspace may have moved
+/// (W5-06).
 pub fn workspace_inputs(project_root: &str) -> Vec<WorkspaceInput> {
     READS.with(|reads| *reads.borrow_mut() = Some(Vec::new()));
     let _ = load_workspace_packages(project_root);
@@ -75,17 +86,21 @@ pub struct WorkspacePackages {
     /// Ordered map keeps deterministic iteration (the upstream relies only on
     /// first-declaration-wins + longest-match, both order-independent).
     pub by_name: BTreeMap<String, String>,
+    /// Member `name` → the entry file its ohpm manifest's `main` names,
+    /// relative to the project root (posix): a bare import of the member
+    /// resolves straight to it, whatever the importer's language
+    /// (`entryByName`, upstream `b635dd46` `workspace-packages.ts:36-43`).
+    pub entry_by_name: BTreeMap<String, String>,
 }
 
 /// Load workspace member packages for `project_root`
-/// (`loadWorkspacePackages`, `workspace-packages.ts:45-61`).
+/// (`loadWorkspacePackages`, `workspace-packages.ts:45-61`), and the ohpm
+/// members (`b635dd46` 67-78).
 ///
-/// Returns `None` when the project declares no workspaces (single-package case).
+/// Returns `None` when the project declares no workspaces and no ohpm
+/// `file:` dependencies (single-package case).
 pub fn load_workspace_packages(project_root: &str) -> Option<WorkspacePackages> {
     let patterns = read_workspace_globs(project_root);
-    if patterns.is_empty() {
-        return None;
-    }
 
     let mut by_name: BTreeMap<String, String> = BTreeMap::new();
     for pattern in &patterns {
@@ -96,10 +111,198 @@ pub fn load_workspace_packages(project_root: &str) -> Option<WorkspacePackages> 
             }
         }
     }
+
+    // HarmonyOS/OpenHarmony (ArkTS) modular projects: every module's
+    // oh-package.json5 declares its local siblings as `"data": "file:../../
+    // core/data"` dependencies, and code imports the bare name. A workspace
+    // member of the same name keeps its directory.
+    let root = Path::new(project_root);
+    let mut entry_by_name: BTreeMap<String, String> = BTreeMap::new();
+    for (name, dir) in collect_ohpm_file_deps(root) {
+        if by_name.contains_key(&name) {
+            continue;
+        }
+        if let Some(entry) = read_ohpm_main(root, &dir) {
+            entry_by_name.insert(name.clone(), entry);
+        }
+        by_name.insert(name, dir);
+    }
+
     if by_name.is_empty() {
         return None;
     }
-    Some(WorkspacePackages { by_name })
+    Some(WorkspacePackages {
+        by_name,
+        entry_by_name,
+    })
+}
+
+/// The ohpm manifest's file name.
+pub const OHPM_MANIFEST: &str = "oh-package.json5";
+/// How deep the walk descends below the project root (upstream
+/// `OHPM_WALK_MAX_DEPTH`).
+const OHPM_WALK_MAX_DEPTH: usize = 6;
+/// How many directories the walk reads at most (upstream
+/// `OHPM_WALK_DIR_BUDGET`).
+const OHPM_WALK_DIR_BUDGET: usize = 8000;
+/// The directories the walk never enters, besides every dot directory
+/// (upstream `OHPM_SKIP_DIRS`).
+const OHPM_SKIP_DIRS: [&str; 10] = [
+    "node_modules",
+    "oh_modules",
+    ".git",
+    ".codegraph",
+    ".hvigor",
+    ".preview",
+    "build",
+    "dist",
+    "out",
+    "oh-package-lock.json5",
+];
+
+/// Scan the project for `oh-package.json5` manifests and collect their
+/// `file:` dependencies as members: dependency name → target directory
+/// (project-relative posix) (`collectOhpmFileDeps`, `b635dd46` 106-177). A
+/// name two manifests point at different directories is dropped entirely; a
+/// target outside the project is no member.
+fn collect_ohpm_file_deps(project_root: &Path) -> BTreeMap<String, String> {
+    collect_ohpm_file_deps_within(project_root, OHPM_WALK_DIR_BUDGET)
+}
+
+/// [`collect_ohpm_file_deps`] reading at most `budget` directories.
+fn collect_ohpm_file_deps_within(project_root: &Path, budget: usize) -> BTreeMap<String, String> {
+    let mut by_name: BTreeMap<String, String> = BTreeMap::new();
+    let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::from([(String::new(), 0)]);
+    let mut visited = 0usize;
+    while let Some((relative, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > budget {
+            break;
+        }
+        let dir = if relative.is_empty() {
+            project_root.to_path_buf()
+        } else {
+            project_root.join(&relative)
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // `DirEntry::file_type` does not follow links: a linked directory is
+        // never entered and a linked manifest never read.
+        let mut entries: Vec<(String, std::fs::FileType)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                Some((name, entry.file_type().ok()?))
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, file_type) in entries {
+            if file_type.is_dir() {
+                if depth >= OHPM_WALK_MAX_DEPTH
+                    || name.starts_with('.')
+                    || OHPM_SKIP_DIRS.contains(&name.as_str())
+                {
+                    continue;
+                }
+                let child = if relative.is_empty() {
+                    name
+                } else {
+                    format!("{relative}/{name}")
+                };
+                queue.push_back((child, depth + 1));
+                continue;
+            }
+            if name != OHPM_MANIFEST || !file_type.is_file() {
+                continue;
+            }
+            for (dependency, target) in read_ohpm_file_deps(&dir.join(&name)) {
+                let Some(target) = project_relative(&relative, &target) else {
+                    continue; // escapes the project
+                };
+                match by_name.get(&dependency) {
+                    None => {
+                        if !ambiguous.contains(&dependency) {
+                            by_name.insert(dependency, target);
+                        }
+                    }
+                    Some(existing) if *existing != target => {
+                        by_name.remove(&dependency);
+                        ambiguous.insert(dependency);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    by_name
+}
+
+/// `relative` (a manifest's project-relative directory) joined with `path`,
+/// normalized, or `None` when the result leaves the project lexically. The
+/// project root itself is `""`, as upstream's `path.relative` gives it.
+fn project_relative(relative: &str, path: &str) -> Option<String> {
+    let joined = if relative.is_empty() {
+        path.to_string()
+    } else {
+        format!("{relative}/{path}")
+    };
+    let normalized = crate::pathutil::lexical_relative(&joined)?;
+    Some(if normalized == "." {
+        String::new()
+    } else {
+        normalized
+    })
+}
+
+/// The JSON of the ohpm manifest at `path`, read only when it is a regular
+/// file, no link, within the default file-size limit (stat first), with its
+/// JSON5 comments and trailing commas stripped; `None` otherwise or when it
+/// does not parse (KEEP-RUST: upstream's jsonc-parser recovers a partial
+/// value from a malformed file, this reads nothing).
+fn read_ohpm_manifest(path: &Path) -> Option<Value> {
+    note_read(WorkspaceInput::File(path.to_path_buf()));
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > codegraph_core::config::DEFAULT_MAX_FILE_SIZE {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&crate::path_aliases::strip_jsonc(&text)).ok()
+}
+
+/// One manifest's `file:` dependencies as `(name, target)` pairs
+/// (`readOhpmFileDeps`, `b635dd46` 179-198).
+fn read_ohpm_file_deps(manifest: &Path) -> Vec<(String, String)> {
+    let Some(Value::Object(dependencies)) =
+        read_ohpm_manifest(manifest).and_then(|json| json.get("dependencies").cloned())
+    else {
+        return Vec::new();
+    };
+    dependencies
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let target = value.as_str()?.strip_prefix("file:")?.trim();
+            (!target.is_empty()).then(|| (name, target.to_string()))
+        })
+        .collect()
+}
+
+/// The entry file member directory `dir`'s manifest names in `main`,
+/// project-relative, or `None` when the manifest, the field or a target
+/// inside the project is missing (`readOhpmMain`, `b635dd46` 86-104).
+fn read_ohpm_main(project_root: &Path, dir: &str) -> Option<String> {
+    let manifest = if dir.is_empty() {
+        project_root.join(OHPM_MANIFEST)
+    } else {
+        project_root.join(dir).join(OHPM_MANIFEST)
+    };
+    let json = read_ohpm_manifest(&manifest)?;
+    let main = json.get("main")?.as_str()?.trim();
+    if main.is_empty() {
+        return None;
+    }
+    project_relative(dir, main).filter(|entry| !entry.is_empty())
 }
 
 /// Rewrite a bare workspace import to a project-relative path WITHOUT extension
@@ -118,6 +321,14 @@ pub fn resolve_workspace_import(import_path: &str, ws: &WorkspacePackages) -> Op
     let best_name = best_name?;
     let dir = ws.by_name.get(best_name)?;
     let subpath = &import_path[best_name.len()..]; // '' or '/widgets'
+    // A bare member import resolves straight to the entry its manifest
+    // names (ohpm `main`, upstream `b635dd46` 220-227): the caller's
+    // as-written check hits it without extension or index guessing.
+    if subpath.is_empty()
+        && let Some(entry) = ws.entry_by_name.get(best_name)
+    {
+        return Some(entry.clone());
+    }
     Some(collapse_slashes(&format!("{dir}{subpath}")))
 }
 
@@ -475,7 +686,10 @@ mod tests {
         let mut by_name = BTreeMap::new();
         by_name.insert("@app/ui".to_string(), "packages/ui".to_string());
         by_name.insert("@app/ui-core".to_string(), "packages/ui-core".to_string());
-        WorkspacePackages { by_name }
+        WorkspacePackages {
+            by_name,
+            entry_by_name: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -514,5 +728,211 @@ mod tests {
         let ws = sample_ws();
         assert_eq!(ws.clone(), ws);
         assert!(format!("{ws:?}").contains("WorkspacePackages"));
+    }
+
+    fn write(root: &Path, relative: &str, contents: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// The two modules of upstream's ohpm test (`arkts-resolution.test.ts`
+    /// 113-153): `core/data` names its entry, `feature/goods` depends on it
+    /// by a `file:` path; both manifests are JSON5 with a comment and
+    /// trailing commas.
+    fn ohpm_project(tag: &str) -> PathBuf {
+        let root = temp_dir(tag);
+        write(
+            &root,
+            "core/data/oh-package.json5",
+            "{\n  // ohpm module manifest\n  \"name\": \"data\",\n  \"main\": \"Index.ets\",\n}\n",
+        );
+        write(
+            &root,
+            "feature/goods/oh-package.json5",
+            "{\n  \"name\": \"goods\",\n  \"dependencies\": {\n    \"data\": \"file:../../core/data\", // local module\n    \"@ohos/axios\": \"^2.0.0\",\n  },\n}\n",
+        );
+        root
+    }
+
+    /// W7-24a1, upstream `b635dd46` `workspace-packages.ts:67-78,106-198`: a
+    /// `file:` dependency of an ohpm manifest is a workspace member, named
+    /// by the dependency, and a bare import of it resolves to the entry its
+    /// own manifest's `main` names. A registry dependency stays external.
+    #[test]
+    fn w724a1_ohpm_file_dependencies_are_members_with_their_main_entry() {
+        let root = ohpm_project("ohpm-members");
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("ohpm members");
+        assert_eq!(ws.by_name.get("data"), Some(&"core/data".to_string()));
+        assert_eq!(ws.by_name.get("@ohos/axios"), None);
+        assert_eq!(
+            resolve_workspace_import("data", &ws),
+            Some("core/data/Index.ets".to_string())
+        );
+        // A subpath is under the member's directory, not under its entry.
+        assert_eq!(
+            resolve_workspace_import("data/src/x", &ws),
+            Some("core/data/src/x".to_string())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Upstream's precision rule: a name two manifests point at different
+    /// directories is dropped, not guessed; a target or an entry outside the
+    /// project is no member and no entry.
+    #[test]
+    fn w724a1_ohpm_ambiguous_or_escaping_dependencies_are_dropped() {
+        let root = temp_dir("ohpm-drop");
+        write(
+            &root,
+            "app1/oh-package.json5",
+            "{ \"dependencies\": { \"common\": \"file:../libs/common1\", \"kept\": \"file:../libs/kept\" } }",
+        );
+        write(
+            &root,
+            "app2/oh-package.json5",
+            "{ \"dependencies\": { \"common\": \"file:../libs/common2\", \"kept\": \"file:../libs/kept\", \"out\": \"file:../../elsewhere\" } }",
+        );
+        write(
+            &root,
+            "libs/kept/oh-package.json5",
+            "{ \"name\": \"kept\", \"main\": \"../../../escape/Index.ets\" }",
+        );
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("one member");
+        assert_eq!(ws.by_name.get("common"), None, "{ws:?}");
+        assert_eq!(ws.by_name.get("out"), None, "{ws:?}");
+        assert_eq!(ws.by_name.get("kept"), Some(&"libs/kept".to_string()));
+        // `main` escapes the project: the bare import names the directory.
+        assert_eq!(
+            resolve_workspace_import("kept", &ws),
+            Some("libs/kept".to_string())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The walk prunes dot, build and dependency directories and stops six
+    /// levels down (upstream `OHPM_SKIP_DIRS`, `OHPM_WALK_MAX_DEPTH`).
+    #[test]
+    fn w724a1_ohpm_walk_prunes_build_and_dependency_dirs_and_stops_at_depth_six() {
+        let root = temp_dir("ohpm-prune");
+        let manifest =
+            |name: &str| format!("{{ \"dependencies\": {{ \"{name}\": \"file:./m\" }} }}");
+        for skipped in [
+            "node_modules",
+            "oh_modules",
+            ".hvigor",
+            ".preview",
+            "build",
+            "dist",
+            "out",
+            ".git",
+        ] {
+            write(
+                &root,
+                &format!("{skipped}/oh-package.json5"),
+                &manifest(skipped),
+            );
+        }
+        write(&root, "a/b/c/d/e/f/oh-package.json5", &manifest("depth6"));
+        write(&root, "a/b/c/d/e/f/g/oh-package.json5", &manifest("depth7"));
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("the depth-6 member");
+        assert_eq!(ws.by_name.keys().collect::<Vec<_>>(), ["depth6"], "{ws:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// KEEP-RUST: the walk is breadth-first in name order, so the directory
+    /// budget cuts the same place on every file system (upstream walks in
+    /// `readdir` order).
+    #[test]
+    fn w724a1_ohpm_walk_is_in_name_order_under_the_budget() {
+        let root = temp_dir("ohpm-order");
+        write(
+            &root,
+            "a0000/oh-package.json5",
+            "{ \"dependencies\": { \"first\": \"file:../t1\" } }",
+        );
+        for index in 1..8000 {
+            std::fs::create_dir_all(root.join(format!("a{index:04}"))).unwrap();
+        }
+        write(
+            &root,
+            "zz/oh-package.json5",
+            "{ \"dependencies\": { \"last\": \"file:../t2\" } }",
+        );
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("the first member");
+        assert_eq!(ws.by_name.get("first"), Some(&"t1".to_string()));
+        assert_eq!(
+            ws.by_name.get("last"),
+            None,
+            "past the 8000-directory budget"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The walk never follows a link out of the project, whether to a
+    /// directory or to a manifest file, reads no manifest over the default
+    /// file-size limit, and takes no entry from a member's linked manifest.
+    #[cfg(unix)]
+    #[test]
+    fn w724a1_ohpm_walk_reads_no_link_and_no_oversize_manifest() {
+        let root = temp_dir("ohpm-links");
+        let outside = temp_dir("ohpm-links-outside");
+        write(
+            &outside,
+            "oh-package.json5",
+            "{ \"dependencies\": { \"linked\": \"file:./sub\" } }",
+        );
+        std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+        std::fs::create_dir_all(root.join("m")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("oh-package.json5"),
+            root.join("m/oh-package.json5"),
+        )
+        .unwrap();
+        let padding = " ".repeat(codegraph_core::config::DEFAULT_MAX_FILE_SIZE as usize);
+        write(
+            &root,
+            "big/oh-package.json5",
+            &format!("{{ \"dependencies\": {{ \"big\": \"file:./x\" }} }}{padding}"),
+        );
+        write(
+            &root,
+            "real/oh-package.json5",
+            "{ \"dependencies\": { \"real\": \"file:./x\" } }",
+        );
+        write(
+            &outside,
+            "member/oh-package.json5",
+            "{ \"main\": \"Index.ets\" }",
+        );
+        std::fs::create_dir_all(root.join("real/x")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("member/oh-package.json5"),
+            root.join("real/x/oh-package.json5"),
+        )
+        .unwrap();
+        let ws = load_workspace_packages(root.to_str().unwrap()).expect("the real member");
+        assert_eq!(ws.by_name.keys().collect::<Vec<_>>(), ["real"], "{ws:?}");
+        assert!(ws.entry_by_name.is_empty(), "{ws:?}");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Every manifest the walk reads is a workspace input, so a sync whose
+    /// manifests moved re-resolves the JavaScript family.
+    #[test]
+    fn w724a1_workspace_inputs_record_each_ohpm_manifest() {
+        let root = ohpm_project("ohpm-inputs");
+        let inputs = workspace_inputs(&root.to_string_lossy());
+        for manifest in [
+            "core/data/oh-package.json5",
+            "feature/goods/oh-package.json5",
+        ] {
+            assert!(
+                inputs.contains(&WorkspaceInput::File(root.join(manifest))),
+                "{manifest} missing from {inputs:?}"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }

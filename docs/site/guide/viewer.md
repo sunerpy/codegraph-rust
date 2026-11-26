@@ -2,7 +2,7 @@
 
 本页说明如何打开 CodeGraph 的浏览器查看器，以及每个视图的用途。
 
-查看器读取项目已有的索引，在你本机的浏览器中展示：一个符号的调用方、源码和被调用方并排显示，一个文件的大纲，一个函数到另一个函数的调用路径，按模块划分的仓库结构图，类型的继承层级，以及没有任何代码到达的符号。它目前是**预览**功能：默认关闭，需要手动开启，各视图今后仍可能调整。查看器界面只有英文。
+查看器读取项目已有的索引，在你本机的浏览器中展示：一个符号的调用方、源码和被调用方并排显示，一个文件的大纲，一个函数到另一个函数的调用路径，按模块划分的仓库结构图，类型的继承层级，没有任何代码到达的符号，应用的各个页面，以及从一个页面、一个接口或一个函数出发会发生什么。它目前是**预览**功能：默认关闭，需要手动开启，各视图今后仍可能调整。查看器界面只有英文。
 
 ## 打开查看器
 
@@ -40,6 +40,10 @@ CODEGRAPH_UI=1 codegraph ui --read-only    # 同时拒绝保存 Trail
 
 中间一栏是符号的源码，它发出的每个调用都在页边标出，并连到右侧一栏，右侧列出它调用的内容。左侧一栏按文件分组列出调用方，下方的 **Blast radius**（影响范围）统计改动会波及的范围：直接调用方、三层以内的调用方，以及其中的生产代码文件和测试文件。点击任何名称都会打开对应的符号，顶部的 Trail 栏记录你走过的路径。
 
+<ScreenFigure src="/screens/viewer-symbol-when-light.webp" dark="/screens/viewer-symbol-when-dark.webp" width="1440" height="900" alt="Angular RealWorld 应用中 FollowButtonComponent::toggleFollowing 的 Symbol 视图：中间是源码，右侧是它跳转到 /login 的导航以及对 follow 和 unfollow 的调用，每一项都标有执行条件。" caption="代码来自 Angular RealWorld 示例应用（gothinkster/angular-realworld-example-app，MIT 许可证）。" />
+
+只在某个条件下执行的调用，会在右侧一栏标出这个条件：图中跳转到 `/login` 的导航在用户未登录时执行，`follow` 在 `isAuthenticated && !this.profile.following` 时执行，`unfollow` 在另一个分支中执行。条件是从 TypeScript、JavaScript、Swift、Python、Java、Kotlin、C#、Go、C、C++ 和 Objective-C 文件的当前源码中读取的。
+
 ## Type hierarchy（类型层级）
 
 <ScreenFigure src="/screens/viewer-hierarchy-light.webp" dark="/screens/viewer-hierarchy-dark.webp" width="1440" height="900" alt="trait FrameworkResolver 的 Symbol 视图，类型层级中列出实现它的八个类型。" />
@@ -58,6 +62,10 @@ CODEGRAPH_UI=1 codegraph ui --read-only    # 同时拒绝保存 Trail
 
 Flow 回答「A 是怎样调用到 B 的」：每张卡片是一步，在发出下一次调用的那一行打开，下方的表格列出每一步的调用位置和匹配置信度。这张截图展示的是 CodeGraph 自身的 `codegraph explore` 命令调用到同时为 MCP 工具服务的引擎。如果两者之间没有调用链，视图会如实说明，并列出常见原因，例如回调或反射调用。
 
+<ScreenFigure src="/screens/viewer-flow-when-light.webp" dark="/screens/viewer-flow-when-dark.webp" width="1440" height="900" alt="Angular RealWorld 应用中从 toggleFollowing 到 follow 的 Flow 视图：两张卡片，连线上标有这次调用的执行条件，下方表格的 Runs when 一栏也列出同一个条件。" caption="代码来自 Angular RealWorld 示例应用（gothinkster/angular-realworld-example-app，MIT 许可证）。" />
+
+只在某个条件下执行的一步，会在连线上和表格的 **Runs when** 一栏标出这个条件。
+
 ## Map（结构图）
 
 <ScreenFigure src="/screens/viewer-map-light.webp" dark="/screens/viewer-map-dark.webp" width="1440" height="900" alt="crates 目录的结构图：每个 crate 是一个方框，标有符号数和文件数，按依赖关系分层，每个 crate 位于它所依赖的 crate 之上。" />
@@ -74,7 +82,17 @@ Dead code 列出索引中没有任何代码到达的符号，按大小排列。�
 
 Start 页面概括整个索引：索引包含的内容、被依赖最多的符号、执行的起点，以及覆盖范围最广的测试。**Entry points** 完整列出这些起点，已保存的 Trail 排在最前。
 
-**Screens** 和 **Steps** 需要当前版本尚未记录的信息：Screens 会显示没有找到页面跳转，Steps 会说明无法绘制步骤。[查看器参考](../../ui.md#differences-from-upstream)列出了尚未支持的内容。
+<ScreenFigure src="/screens/viewer-screens-light.webp" dark="/screens/viewer-screens-dark.webp" width="1440" height="900" alt="Angular RealWorld 应用的 Screens 视图：入口页面下方按行排列的十个页面，上方虚线框中是从多个页面发起跳转的组件，右侧列出连接最多的页面。" caption="代码来自 Angular RealWorld 示例应用（gothinkster/angular-realworld-example-app，MIT 许可证）。" />
+
+**Screens** 按用户看到的样子画出应用：每个页面一个方框，从一个页面到另一个页面的每种方式一条连线，连线上标出它发生的条件。选中一个页面会高亮它的连线。它需要客户端路由，例如 React Router、Next.js、SvelteKit、Vue Router、Angular Router 或 Expo Router；其他项目会显示没有找到页面跳转。
+
+<ScreenFigure src="/screens/viewer-steps-light.webp" dark="/screens/viewer-steps-dark.webp" width="1440" height="900" alt="Angular RealWorld 应用中从 /login 页面出发的 Steps 视图：表单的 ngSubmit 触发的处理函数 submitForm，它可能发出的两个请求，以及它通往的页面。" caption="代码来自 Angular RealWorld 示例应用（gothinkster/angular-realworld-example-app，MIT 许可证）。" />
+
+**Steps** 画出从一个页面、一个接口或一个函数出发会发生什么：触发的处理函数及其触发方式，进入原生代码或发往服务器的调用，对 store 的写入，以及离开代码的调用（例如一次请求、一次数据库写入或一个响应），每一步都标出它的执行条件。普通函数之间的调用合并在步骤之间的连线里。
+
+<ScreenFigure src="/screens/viewer-steps-order-light.webp" dark="/screens/viewer-steps-order-dark.webp" width="1440" height="900" alt="按代码顺序阅读 submitForm 的 Steps 视图：第一条连线上的提前退出检查，对 this.authType === 'login' 的判断及其 yes、no 两个分支，各自发出一个请求，两个分支最后都到达首页。" caption="代码来自 Angular RealWorld 示例应用（gothinkster/angular-realworld-example-app，MIT 许可证）。" />
+
+**In order**（按顺序）按代码的执行顺序阅读一个处理函数或接口：一条连线表示「然后」，判断框只写一次条件，从它出发的每条连线给出一个答案。[查看器参考](../../ui.md#api)说明了这两个视图读取的内容。
 
 ## 主题
 

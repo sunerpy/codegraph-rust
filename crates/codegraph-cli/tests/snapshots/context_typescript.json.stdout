@@ -1,0 +1,239 @@
+{
+  "query": "Screen callableSemanticsUniqueHelper generatorTask",
+  "summary": "Found 5 relevant code symbols across 1 files. Key entry points: generatorTask, callableSemanticsUniqueHelper, Screen. 8 relationships identified.",
+  "entryPoints": [
+    {
+      "id": "function:efc26b98460e38d61956ab45ccdbd41c",
+      "kind": "function",
+      "name": "generatorTask",
+      "qualifiedName": "generatorTask",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 12,
+      "endLine": 14,
+      "signature": "()",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:00799fe30ca74b5008645c296de83d5a",
+      "kind": "function",
+      "name": "callableSemanticsUniqueHelper",
+      "qualifiedName": "callableSemanticsUniqueHelper",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 8,
+      "endLine": 10,
+      "signature": "(): number",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "kind": "function",
+      "name": "Screen",
+      "qualifiedName": "Screen",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 16,
+      "endLine": 28,
+      "signature": "()",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    }
+  ],
+  "nodes": [
+    {
+      "id": "function:efc26b98460e38d61956ab45ccdbd41c",
+      "kind": "function",
+      "name": "generatorTask",
+      "qualifiedName": "generatorTask",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 12,
+      "endLine": 14,
+      "signature": "()",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:00799fe30ca74b5008645c296de83d5a",
+      "kind": "function",
+      "name": "callableSemanticsUniqueHelper",
+      "qualifiedName": "callableSemanticsUniqueHelper",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 8,
+      "endLine": 10,
+      "signature": "(): number",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "kind": "function",
+      "name": "Screen",
+      "qualifiedName": "Screen",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 16,
+      "endLine": 28,
+      "signature": "()",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:7ed411c680dd4dc85e7dc937bdcfe3c6",
+      "kind": "function",
+      "name": "plainHandler",
+      "qualifiedName": "Screen::plainHandler",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 17,
+      "endLine": 17,
+      "signature": "()",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:babb3e6c322e0536d55254aed669e164",
+      "kind": "function",
+      "name": "callbackHandler",
+      "qualifiedName": "Screen::callbackHandler",
+      "filePath": "callable_semantics.ts",
+      "language": "typescript",
+      "startLine": 18,
+      "endLine": 18,
+      "signature": "()",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    }
+  ],
+  "edges": [
+    {
+      "source": "function:efc26b98460e38d61956ab45ccdbd41c",
+      "target": "function:00799fe30ca74b5008645c296de83d5a",
+      "kind": "calls",
+      "line": 13,
+      "column": 8
+    },
+    {
+      "source": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "target": "function:00799fe30ca74b5008645c296de83d5a",
+      "kind": "calls",
+      "line": 25,
+      "column": 34
+    },
+    {
+      "source": "function:7ed411c680dd4dc85e7dc937bdcfe3c6",
+      "target": "function:00799fe30ca74b5008645c296de83d5a",
+      "kind": "calls",
+      "line": 17,
+      "column": 29
+    },
+    {
+      "source": "function:babb3e6c322e0536d55254aed669e164",
+      "target": "function:00799fe30ca74b5008645c296de83d5a",
+      "kind": "calls",
+      "line": 18,
+      "column": 44
+    },
+    {
+      "source": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "target": "function:7ed411c680dd4dc85e7dc937bdcfe3c6",
+      "kind": "contains"
+    },
+    {
+      "source": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "target": "function:babb3e6c322e0536d55254aed669e164",
+      "kind": "contains"
+    },
+    {
+      "source": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "target": "function:7ed411c680dd4dc85e7dc937bdcfe3c6",
+      "kind": "calls",
+      "line": 27,
+      "column": 9
+    },
+    {
+      "source": "function:4b0317e2a093194d05c58f73d1e5b715",
+      "target": "function:babb3e6c322e0536d55254aed669e164",
+      "kind": "calls",
+      "line": 27,
+      "column": 26
+    }
+  ],
+  "codeBlocks": [
+    {
+      "filePath": "callable_semantics.ts",
+      "startLine": 12,
+      "endLine": 14,
+      "language": "typescript",
+      "content": "export function* generatorTask() {\n  yield callableSemanticsUniqueHelper();\n}",
+      "nodeName": "generatorTask",
+      "nodeKind": "function"
+    },
+    {
+      "filePath": "callable_semantics.ts",
+      "startLine": 8,
+      "endLine": 10,
+      "language": "typescript",
+      "content": "function callableSemanticsUniqueHelper(): number {\n  return 1;\n}",
+      "nodeName": "callableSemanticsUniqueHelper",
+      "nodeKind": "function"
+    },
+    {
+      "filePath": "callable_semantics.ts",
+      "startLine": 16,
+      "endLine": 28,
+      "language": "typescript",
+      "content": "export function Screen() {\n  const plainHandler = () => callableSemanticsUniqueHelper();\n  const callbackHandler = useCallback(() => callableSemanticsUniqueHelper(), []);\n  const eventHandler = useEffectEvent(function () {\n    return callableSemanticsUniqueHelper();\n  });\n  const wrappedHandler = Effect.fn(\"Screen.wrapped\")(function* () {\n    yield callableSemanticsUniqueHelper();\n  });\n  const memoValue = useMemo(() => callableSemanticsUniqueHelper(), []);\n  const mappedValue = [1].map(() => callableSemanticsUniqueHelper());\n  return plainHandler() + callbackHandler() + eventHandler() + memoValue + mappedValue.length;\n}",
+      "nodeName": "Screen",
+      "nodeKind": "function"
+    },
+    {
+      "filePath": "callable_semantics.ts",
+      "startLine": 17,
+      "endLine": 17,
+      "language": "typescript",
+      "content": "  const plainHandler = () => callableSemanticsUniqueHelper();",
+      "nodeName": "plainHandler",
+      "nodeKind": "function"
+    },
+    {
+      "filePath": "callable_semantics.ts",
+      "startLine": 18,
+      "endLine": 18,
+      "language": "typescript",
+      "content": "  const callbackHandler = useCallback(() => callableSemanticsUniqueHelper(), []);",
+      "nodeName": "callbackHandler",
+      "nodeKind": "function"
+    }
+  ],
+  "relatedFiles": [
+    "callable_semantics.ts"
+  ],
+  "stats": {
+    "nodeCount": 5,
+    "edgeCount": 8,
+    "fileCount": 1,
+    "codeBlockCount": 5,
+    "totalCodeSize": 911
+  }
+}

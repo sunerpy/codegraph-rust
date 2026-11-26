@@ -30,6 +30,7 @@ graph TD
     resolve --> extract
     resolve --> store
     graph --> core
+    graph --> extract
     graph --> store
     mcp --> core
     mcp --> graph
@@ -69,7 +70,7 @@ graph TD
 | `codegraph-store`   | SQLite/FTS5 schema, migrations, persistence, queries, leases          |
 | `codegraph-resolve` | generic import/name matching and framework-aware resolution           |
 | `codegraph-graph`   | traversal, impact, query parsing, search ranking                      |
-| `codegraph-mcp`     | tool schemas/engine, rmcp stdio and streamable-HTTP transports        |
+| `codegraph-mcp`     | tool schemas/engine, `context`, rmcp stdio/streamable-HTTP transports |
 | `codegraph-watch`   | incremental reconciliation and filesystem watcher                     |
 | `codegraph-daemon`  | detached shared process, IPC, and process registries                  |
 | `codegraph-ui`      | browser viewer: loopback JSON API, live channel, embedded `ui/` build |
@@ -90,6 +91,8 @@ graph LR
     store --> resolve[generic + framework resolution]
     resolve --> edges[resolved edges]
     edges --> store
+    edges --> synth[dispatch-edge synthesis]
+    synth --> store
     store --> query[graph traversal + search]
     query --> cli[CLI]
     query --> mcp[MCP]
@@ -134,6 +137,11 @@ indexes, and migration history.
 
 `ReferenceResolver` reads the complete extracted snapshot (or the bounded
 streaming path for very large graphs), then applies deterministic strategies.
+On the snapshot path a full index resolves its references in batches, and the
+next batch resolves on the thread pool while the one before it is written; that
+batch's `extends`/`implements` edges join the snapshot's inheritance adjacency
+before the next batch's context is built, and the batches' edges are inserted in
+batch order, so the graph is the one a batch-by-batch loop writes.
 Every entry (the full index's batches, the serial pass, a sync's scoped pass)
 resolves and persists the wiring references first, imports and `extends`/
 `implements` supertypes, and the rest after them, so a call on a receiver
@@ -149,7 +157,14 @@ translation unit's own classes), never by the strategies below:
    namespace alone, a namespace import's `z.core.fn()` continues into it, and
    `import { default as X }` is the default import; a Python name imported
    from a package follows the package's named and star re-exports to its
-   definition, three modules deep);
+   definition, three modules deep; a call on a value another file exports
+   (`store.add()` after `import { store }`, with `export const store = new
+Store()` there) reaches the method of the class that file imports or
+   declares when several classes share the name, in a component's script too
+   (upstream #2644); an import, an include or a module path
+   takes the first of its candidates, in its language's order, that the index
+   holds, never a file only on disk, such as one the configuration excludes,
+   nor a directory);
 2. qualified, scoped, receiver/type, lexical, and exact-name matching (a
    receiver written as, or inferred to be, a type the project does not declare
    stops the name guesses, except that a C# call still reaches the one
@@ -173,7 +188,30 @@ an enclosing one, declares the package (a `workspace:`, `file:` or `link:`
 dependency is the repository's own, and a Deno import map counts), or it is a
 Node built-in, `@std/…`, a runtime scheme (`node:`, `npm:`, `jsr:`) or a
 framework's virtual module (`$app/…`, `astro:…`); an alias the resolver does
-not follow (`$lib/…`, `~/…`) stays the project's. Calls in Vue, Svelte and
+not follow (`$lib/…`, `~/…`) stays the project's. A JS-family import's path
+alias comes from the `tsconfig.json` or `jsconfig.json` nearest the importing
+file below the root that declares `paths` (a monorepo app's own `@/*`, upstream
+#2165), then from the root's. An ArkTS import resolves as a TypeScript one,
+with ArkTS's own extensions and ohpm's `Index.ets` entry, and a bare name an
+`oh-package.json5` `file:` dependency declares is the workspace member it
+names, which resolves to the member's `main`: a bounded walk reads every
+`oh-package.json5` of the project, and a name two manifests point at different
+directories, or a target or entry outside the project, is no member. Nix has
+no ambient cross-file namespace: a static relative path import (`import
+./x.nix`, `callPackage ./pkgs/hello`, a module's `imports = [ ./a.nix ]`)
+resolves by import alone, to the indexed file its path names or a directory's
+`default.nix`, and a name match from Nix into another file is dropped, as is
+another language's name match onto a Nix node. Terraform's scope is a module
+directory: a Terraform reference resolves only through the `terraform`
+resolver, to a declaration of its own directory, or, for a `.tfvars`
+assignment and a provider configuration, of the nearest ancestor directory; a
+module block's `:`-scoped references bridge to the entry file, variables and
+outputs of its local source directory, and a cloudposse remote-state output to
+the one directory of the component's name that declares it; a registry or git
+source stays unresolved. An Erlang `-behaviour(m)`, and each name an OTP
+application resource file writes, resolves only to an Erlang module, and a
+macro use only to a `-define` of its name, the file's own or that of the one
+header defining it. Calls in Vue, Svelte and
 Astro components follow the JS/TS rules and, like ArkTS, see the JS
 built-ins, unless the file imports its own binding of the built-in's name.
 A result that lands on
@@ -186,7 +224,14 @@ in a test suite (a test source set, a `tests/` / `spec/` / `e2e/` tree, a
 `FooTest.kt` / `test_foo.py` / `foo.test.ts` / `foo_unittest.cc` file): test
 support a project ships (`testing/`, `fakes/`, a `*-test` module) stays in
 reach, and so does a C or C++ file the reference's translation unit
-includes. A type name a declaration around the reference declares as a type
+includes. No name match reaches a route, which is named by the URL it serves: a
+Django URL that reads like a name (`path('path', …)`) answers no call or
+import of `path`, and no call's name match reaches a Spring config key, a
+YAML or Properties `constant` (upstream #1180). Nor does name matching offer
+or count the component and prop nodes a native view manager mints (an
+Objective-C Paper manager's, a Java or Kotlin one's), which share the names of
+the view class and its properties; a JavaScript-family spec's component and
+props are name-match targets. A type name a declaration around the reference declares as a type
 parameter (`class Foo<T>`, `def f[A]`, `<T> T max(`, `template <typename T>`) is
 that parameter, never a project type of its name; a Scala def's value
 parameter is that parameter, and a bare Scala type name reaches another
@@ -216,11 +261,24 @@ binding. A framework-resolved edge carries its own reachability proof and is not
 erased by ordinary source-language visibility (for example Tauri IPC to a
 private Rust command).
 
-The registered framework candidates are NestJS, React/Next.js, Vue/Nuxt, Godot,
-and Tauri, in a deliberate order. Each activates only when its detection guard
+The registered framework candidates are Laravel, Drupal, Express, NestJS, React, Vue, Godot, Tauri,
+Nuxt, React Router, TanStack Router, Next.js, Svelte, SvelteKit, Vue Router, Angular Router, Astro, Django, Flask, FastAPI, Rails, Spring, Play, the React Native bridge, Expo modules' JavaScript side, Expo Router, Go, GoFrame, Rust (axum and actix), ASP.NET, SwiftUI, UIKit, Vapor, the Swift–Objective-C bridge, Expo modules' Swift and Kotlin declarations, Fabric's view components and Terraform. Strategy 1 asks them in this order: the first to answer `>= 0.9` wins, and among lower answers the most confident, the earlier on a tie. An answer of the React Native or the Swift–Objective-C bridge below `0.9` only fills in: any other candidate whose target is in the reference's own language (TypeScript, TSX, JavaScript and JSX counting as one) takes its place, even a less confident one. A port takes the place upstream's `FRAMEWORK_RESOLVERS` gives it among its ported neighbours (Laravel and Drupal first, Express before NestJS, Astro between Angular Router and Expo Router, Django, Flask and FastAPI after Astro, Rails after FastAPI, Spring and Play after Rails, Go between Expo Router and GoFrame, Rust and ASP.NET after GoFrame, SwiftUI, UIKit and Vapor after ASP.NET, the React Native bridge and Expo modules' JavaScript side just before Expo Router, the Swift–Objective-C bridge, Expo modules and Fabric after Vapor, Terraform last), and one placed ahead of others answers below `0.9` or only for references they do not claim. Each activates only when its detection guard
 matches, and resolves only references written in its own languages (React
-and Vue their scripts', NestJS TypeScript and JavaScript, Tauri the JS-family
-`invoke` sites and Rust; Godot stays universal). Godot also extracts project/scene/resource relationships; Tauri bridges
+and Vue their scripts', Express and NestJS TypeScript and JavaScript, Django, Flask and FastAPI Python, Rails Ruby, Spring Java, Kotlin, YAML and
+Properties, Play Scala, Java and YAML, Laravel PHP, Drupal PHP and YAML, ASP.NET C# and Razor, the Go resolver Go, the `rust` resolver Rust, SwiftUI, UIKit and Vapor Swift, the React Native bridge and Expo modules' JavaScript side the JS family, the Swift–Objective-C bridge Swift and Objective-C, Expo modules and Fabric none (they extract their nodes from Swift and Kotlin, and from JS-family, Objective-C, Java and Kotlin files), Tauri the JS-family
+`invoke` sites and Rust; Godot and Astro stay universal), and a resolver's
+claim takes a reference past the name prefilter only in those languages
+(upstream `frameworksFor`, #2415); Laravel's claim takes only a Laravel
+route's references, and Drupal's only a routing file's and the `hook_X`
+names, where upstream claims the names wherever they are written. React and NestJS detect a
+dependency in any `package.json` detection reads (upstream #2395): the root's
+and up to 24 nested ones, first those one or two directories down on the path
+to an indexed file, then those deeper above JavaScript-family code
+(`src/Web/ClientApp/`), shallowest first, never one inside `node_modules`. A
+framework may name the packages its apps declare (upstream #2129); when some
+manifest declares one, its extractor runs only on files whose nearest
+`package.json` naming any such framework names it, so a router reads its own
+app in a monorepo. Nuxt names `nuxt`, `nuxt3` and `@nuxt/kit`, Next.js `next`, Vue Router `vue-router`, `nuxt` and `nuxt3`, Expo Router `expo-router`. Nuxt is detected by one of them or a `nuxt.config.*` file (upstream #2130) and reads its file routes: a `pages/` file is a screen route (a top-level `pages/index.vue` is `/`) that `calls` its own file's component (#2267), never a same-named one; `server/api/` files are endpoints and `middleware/` files functions. Vue resolves component references, compiler macros and Nuxt's auto-imports and extracts nothing. Next.js is detected by its dependency or a `next.config.*` beside a route file and reads `app/` and `pages/` file routes (F3): a page is a route named by its path (a `(group)` dropped, `[slug]` as `:slug`, `[...all]` as `:all*`) that `calls` its default export; a `route.ts` handler is one `GET /path`-style endpoint per exported method, referencing it; a `pages/api/` file is `ANY /path`; layouts, parallel and intercepting routes are none. A Next navigation call (`router.push`, `replace`, `prefetch`, `redirect`, `permanentRedirect`, `NextResponse.redirect`) under a Next app whose href names a page becomes a `navigates` edge with the `href` and `navMethod`, one per arm of a conditional; a path two apps serve goes to the calling app's page. Expo Router is detected by its dependency or an `app/_layout` beside an `app.config.*` and reads the files under `app/` (or `src/app/`) as screens (F2): a screen is a route named by its path (a `(group)` dropped, `[id]` and `[...rest]` kept, `index` the directory's own path) that `calls` its default export; layouts, `_` and `+` files other than `+not-found` are none, and a `+api` file is one `GET /path`-style endpoint per exported method (#2135). A navigation call (`router.push`, `replace`, `navigate`, `dismissTo`, or a project wrapper named like `safePush`) becomes a `navigates` edge to the screen its href names, a relative href read from the calling screen's directory; the call matches only the screens of its own Expo app (the longest directory above an `app/` that holds it), so a file under no Expo app is not read, and a path two screens of that app serve stays unresolved. React extracts only React Router routes, from `.tsx`/`.jsx` files too (components and hooks are the tree-sitter extractor's, upstream #841): a JSX-capable file's `<Route>` elements and, in a file that makes a router (`createBrowserRouter`, `createRoutesFromElements`, `useRoutes`, …), its route objects, each a route named by its path with nesting composed (F4). An index route is the page at its parent's address, a route around others is the layout they render inside (a reference whose edge carries `layout: true`), a route that renders `<Outlet />` renders nothing of its own, a `lazy: () => import('./x')` route renders the module's default export or else its `Component` export, through barrels (#2400), a loader that picks an export (`const { Page } = await import('./x'); return { Component: Page }`, a `.then` callback, `(await import('./x')).Page`, an `async lazy()` method, React Router 7's object of lazy properties) renders that export (#2480), one that hands back `Outlet` renders nothing of its own, one that hands over only a `loader` makes no page, and a path built from a constant (`paths.app.root.path`) is named from the constant's object literal before anything resolves, keeping its id; the route's language is tsx in a `.tsx` file and jsx elsewhere. A table another file hands the router is read too (#2400, #2423, #2668, #2672): from each non-test file that imports React Router and hands a table to `useRoutes` or `create*Router`, or maps an array into `<Route>`s from each item's own fields (`AppRoutes.map(({ element, ...rest }) => <Route {...rest} … />)`), the table is found where it is declared, imported or re-exported, or as what a function a value calls returns (each `return` of its own, through `useMemo`), and its route objects and the tables they name (`...authRoutes`, `children: adminRoutes`) become routes under the path they are mounted at, inside the layouts around them when the table is written in the same file; a `{ path, element }` menu nothing hands the router is none. These routes (`route:<file>:<line>:table:<path>`) are cross-file nodes: after the constant naming, a pass compares the routes every table gives now with the ones stored, inserts the new ones with their references and replaces one whose name or references changed, the edges that reached a removed one re-resolved, before anything resolves, in an index, a migration, every sync and the orphan sweep. A PascalCase module-level value a file declares is, wherever that file uses it, the component of the module its lazy wrapper loads (`Loadable(lazy(() => import('./x')))`, `dynamic(…)`, either branch of a conditional), else the function it wraps, else the declaration itself (#2420). React leaves a name the file imports to import resolution, but for a component tag imported from a module of the project: it renders what that module exports under the name, through an `index` that forwards it, past a wrapper around it (`export default observer(AppSidebar)`, `memo(Blurhash)`) or a value holding another module's component (#2563), where import resolution's answer differs or is missing. React reaches a hook or context by name only in the file that declares it (#2120, #2240). React Router is detected by `react-router`, `react-router-dom` or `react-router-native`: a navigation call (`history.push`, `history.replace`, `navigate`, `router.navigate`, `redirect`) whose href names a route of its own app (the directory above the file's first `src`, `pages`, `app` or `routes` segment, else its own) becomes a `navigates` edge with the `href` and `navMethod`, a route-config helper's href (`paths.x.getHref(id)`) and a local's static initializer read too, one edge per arm of a conditional; a path two routes of that app serve stays unresolved. TanStack Router is detected by `@tanstack/react-router`, `@tanstack/solid-router`, `@tanstack/router`, `@tanstack/react-start` or `@tanstack/start` and reads each file's own routes (F5): `createFileRoute('/posts/$postId')` names its route by the pattern, `$id` written `:id`, a bare `$` a splat, `_layout` and `(group)` segments dropped and an index's trailing `/` its parent's address, and `createRoute({ path, getParentRoute })` composes its address through the parents its file declares; a pathless layout, a root route, a route whose index child renders its address, and a file route in a file that renders `<Outlet />` or is named `*.route.tsx` are no address of their own, one address of a file is one route with its index winning, and each route `calls` the component it names. A navigation call (`navigate({ to })`, `router.navigate`, `Route.navigate`, `throw redirect({ to })`) whose `to` pattern names a route of its own app becomes a `navigates` edge with the `href` and `navMethod`; a computed `to`, a search-only navigation and a path two routes of that app serve stay unresolved. Vue Router is detected by `vue-router`, `nuxt` or `nuxt3` and reads the routes tables (F6) of a file that builds a router (`createRouter`, `new Router`, a `create*History` call), imports `vue-router`, writes a `routes` array or sits in a `router/` or `routes/` directory: a `routes: [` field or a declaration named for routes (`constantRoutes`, `const routes: RouteRecordRaw[]`, `tableRouter`) holds route objects, each entry a route of its own named by its path, a child's joined onto its parent's (`children` read only from an array written in place), that `calls` the component it names and references each parent's component as a layout (`layout: true`); a parent that a child's path claims or that redirects is a frame, not a page, and a top-level path not starting with `/` is none (#2130). The component is what the router file's import of an identifier takes (a named import the module-level node exported under that name, at its declaration or through an export list or the modules that re-export it, a default import the module's default export), or the default export of the module a lazy `() => import(…)` names, a `.vue` file's own component; the module is found as the router file resolves the import or else, for an alias, as the one file of its app whose path ends as the specifier does. A route names an identifier through a reference only Vue Router answers (`component:<name>`): where the import names a module that is not found or holds no such component, the route renders nothing, and only an identifier no import reaches is looked up by name (a declaration of the routes file, else a component of that name). A navigation call (`router.push`, `router.replace`, `this.$router.push`, `$router.push`, `navigateTo`) reaches by name the route of its own app that the table names so (`{ name: 'login' }`, an edge with `by: name`), and otherwise by its path a config route or a Nuxt page of that app. The destination is read whole: a string, a template whose holes fill whole segments (`` `/posts/${id}` ``), a conditional of them or a local initialized to one, and of an object destination only its own `name` and `path`; a concatenation (`'/redirect' + fullPath`, a comment between the two or not) or a hole sharing a segment (`` `/redirect${fullPath}` ``) reaches nothing, and a name or path two entries of the app carry stays unresolved. A bare `navigateTo` is the Vue resolver's Nuxt auto-import first, as in colby at `e8ddc4e2`: it binds to its own caller and navigates nowhere. Svelte is detected by `svelte` or `@sveltejs/kit` in the root `package.json` or by any `.svelte` file and reads a SvelteKit page's route: a `+page.svelte` under a `routes/` directory is a route named by its directory below the first `/routes/`, a `(group)` folder and a parameter's `=matcher` dropped (#2131: `[slug]` is `:slug`, `[[lang]]` `:lang?`, `[...rest]` `*rest`); a layout, error page, endpoint or loader is none. It resolves a Svelte 5 rune to its own caller, `$store` in a component to the one variable or constant of that name its file declares, an import of `$lib/x` to the file `src/lib/x` of the importing file's app (as written, or with `.ts`, `.js`, `.svelte`, `/index.ts` or `/index.js`), an import of `$app/…` or `$env/…` to its own file, as colby does, and a capitalized call to the one component of that name in the calling file's directory or below, else to the one anywhere. SvelteKit is detected by `@sveltejs/kit` in any `package.json` detection reads: a `goto(path)` or `redirect(status, path)` whose destination names a page of its own app becomes a `navigates` edge with the `href` and `navMethod`, one per arm of a conditional; the destination is read whole, as Vue Router reads it (for `goto` also a local initialized to one), and a `[[optional]]` page also serves its path without the parameter unless a page serves that path. A rest page, a computed destination, an absolute URL and a path two pages of the app serve stay unresolved. Angular Router is detected by `@angular/router` or `@angular/core` and reads the routes arrays of each TypeScript file (no declaration file) that imports `@angular/router` (upstream #2113): an array typed `Routes` or `Route[]`, handed to `RouterModule.forRoot`, `RouterModule.forChild` or `provideRouter`, a file's `export default [`, or a `const` whose array says `as Routes` or `satisfies Routes` holds route objects, their fields in any order, each child's path joined onto its parent's (`children` read only from an array written in place). Each screen is a route (`route:<file>:<line>:<path>:angular`) that references the component it renders, a `component` class through import resolution or the `@Component` class a `loadComponent` import picks (the member `.then(m => m.X)` or `(await import(…)).X` takes, else the file's default-exported component, else its only one, else its default-exported class), and references the component of each layout around it in its own file (`layout: true`; the layouts around a mount are not carried into the file it loads). A route with `children` is a layout, a screen only where no child claims its address; a `redirectTo` entry, a `**` path, a custom `matcher` and a computed path are no screens, and of two entries of a file at one path the first is the route. A file's routes are named as if the file were mounted at `/` and renamed after extraction under the path that lazy-loads the file (#2133): a `loadChildren` import, followed through barrels (an Nx library's `src/index.ts`, up to four hops) and through the routing modules an NgModule imports, a file mounted from two places under the first mount in path order, as in colby, and each file of a cycle of mounts under its own chain up to the file that repeats. A constant path segment (`internalRoutes.account.path`, an enum member, a class's static field or the object it holds, a destructured or plain alias, a `$localize` default, a `+` of strings and constants, a template whose holes are constants) is read from its declaration, through the barrels that forward it, and a constant's nested object only where it is written in place. A navigation call (`router.navigate`, `navigateByUrl`, `createUrlTree` or `parseUrl`, on `this.router` or `this._router` too) whose destination names a route of its own app becomes a `navigates` edge with the `href` and `navMethod`: the app is the nearest directory above a routes file that holds an `angular.json` or an `nx.json`, else its conventional app root, and a file under no app's root uses the only app's routes. The destination is a command array (`['/article', slug]`: a hole for each computed element, a matrix-params object ignored, and for a call a bare first segment such as `['project', 'issue', id]` read from the root), a static string, `'/editor/' + slug`, a route constant (`internalRoutes.zen.routerLink`, or one whose arrow function builds the commands), a property of the calling class, or any of those `.concat(…)`, one segment per argument; a conditional or a template is read whole, a relative arm or one that leaves the site (`//auth.example.com/login`) drops out first, and a call with `relativeTo` reaches nothing. A redirect gives its path the route it leads to, followed through the other redirects at most four hops, and `/` that no route or redirect serves takes the route of the app's root `**` redirect; a path two routes serve, or whose redirects lead to two routes, stays unresolved, and a route or a redirect whose path holds a constant the cross-file pass could not read is in no table, though its app still counts among the apps. Its templates' `routerLink`s are the synthesis stage's Angular pass's. Astro is detected by a truthy `astro` among the root `package.json`'s `dependencies` and `devDependencies` (a dev dependency overriding) or by any `.astro` file. Each `.astro`, `.ts`, `.js` or `.mjs` file under a `src/pages/` directory, but for one with a segment starting with `_` below it and a `*.config.*` file, is a route `route:<file>:<path>:1` named by its path (`index` its directory's, `[slug]` as `:slug`, `[...rest]` as `*rest`): a page `calls` its own file's component (#2267), never a same-named one, and an endpoint references each HTTP method it exports (`export const GET`, `export async function POST`). Astro resolves the `Astro` global and its members (`Astro.redirect`, `Astro.cookies.has`), which it claims ahead of the name prefilter, and an `astro:*` module import (`astro:content`, `astro:assets`, …) to their own source node, and, in a `.astro` file only (#2245), a PascalCase name it references or calls to the one component of that name whose path starts with the file's directory, else to the one component of that name in the project; two candidates resolve nothing. Express is detected by `express`, `fastify`, `koa`, `hapi` or `@hapi/hapi`, or by a file whose path holds `routes`, `controllers` or `middleware` and whose text holds `express`, `app.get` or `router.get`, and reads the routes of each `.js`, `.mjs`, `.cjs` and `.ts` file (#1957): an `app.get('/path', …)`-style call on `app` or `router` (a `use` only with a `/` path), and each method of a `router.route('/path').get(…).put(…)` chain, is a route `route:<file>:<line>:<METHOD>:<path>` named `METHOD /path`. The handler alone, the last non-empty argument (a trailing options object dropped, an array read as its last element), decides what the route references: an inline arrow, or a `function` that opens the argument, wrapped in calls or not (`asyncHandler(function …)`), lends the route the calls its body makes, each once, a member call keeping its receiver (`userService.lookup`, `c.text`; #2200, #2261), with keywords, a nested declaration's name, an expression's members and upstream's framework-noise names (`json`, `status`, `find`, …) skipped and each reply (`res.status(404).json(…)`) a call at its own line and column; any other handler is a reference to its last name. A string, template or regex literal never ends an argument (a regex told from a division by upstream's `regexLiteralEndAt` rules, its windows counted in UTF-16 code units), and neither does a comma in a type-argument list (`asyncHandler<Req, Res>(`). After extraction each mount `X.use('/prefix', …, target)` whose last argument names a project file (an inline `require('./x')`, an imported name, or one the file binds to `require('./x')`, with `.default`, `.router` or `.routes` after it or not) composes its prefix down the mount tree, and the mounted file's own Express routes are renamed `METHOD /prefix/path`, keeping their ids: a file mounted at two prefixes keeps its names, another framework's route in a mounted file keeps its name, and a route that no mount renames any more gets its file's name back, in an index and in every sync. Express resolves three name patterns, each through the one candidate of the reference's own file (#2243): a middleware name (`auth`, `cors`, `logger`, `validate…`, `…Middleware`, …) to the file's function, method, variable, constant or class of that name, never an import (#2244); `xController.m` to the method or function `m` whose path names the controller; and `xService.m` (or `Helper`, `Util`, `Utils`) to the one whose path names the service. Its answers are below `0.9`, and a pattern with two candidates answers nothing, leaving the reference to import and name resolution. NestJS takes a provider by its naming convention (`*Service`, `*Controller`, …) only from the reference's own file or the convention file beside it (#2246), and names each route by the path a request takes to it: its module's `RouterModule` prefix and its app's global prefix and URI version (#2117), where a test's `NestFactory.create` (an e2e spec) configures only its own feature's app and never one with an entry point of its own. The routes are renamed in place after extraction, keeping their ids, and a route nothing renames any more gets the name its file gives it back. This finalization runs after framework extraction and before resolution, in an index and in every sync. Django is detected by `django` (in any case) in the root `requirements.txt`, `setup.py` or `pyproject.toml`, or by a root `manage.py`; Flask by the word `flask` in a root `requirements.txt`, `pyproject.toml`, `Pipfile` or `setup.py`, or by an entry script (`app.py`, `application.py`, `main.py`, `wsgi.py` or `__init__.py`, at the root or below; the first 50 in path order) that imports `flask` and calls `Flask(`; FastAPI by the word `fastapi` in a root `requirements.txt` or `pyproject.toml`, by `FastAPI(` in a root `app.py`, `main.py` or `api.py`, or by either below the root (`950686de`): a `requirements.txt`, `requirements-dev.txt` or `pyproject.toml` at any depth, or such a script at most four path segments deep, at most 40 of them read in path order. The root files are read whether or not they are indexed. Each reads its routes from `.py` files, comments and docstrings blanked, columns and the 4,000-unit argument window counted in UTF-16 code units. Django: a `path`, `re_path` or `url` call is a route named by its URL that references the handler's last name, a trailing `.as_view(…)` or other method call dropped (`views.handler.decorated()` references `handler`), or, for `include('app.urls')`, imports that module, which import resolution maps to its `urls.py`; a DRF `router.register(r'prefix', XViewSet)` of a `…View` or `…ViewSet` is a `VIEWSET /prefix` route referencing it. Flask: an `@x.route('/path', methods=…)` decorator is `METHOD /path` with the first method it lists (`GET` without one) and references the next `def`, past other decorators; a Flask-RESTful `add_resource` (or a variant such as `add_org_resource`) makes one `ANY /path` route per path, referencing the resource class; and an `add_url_rule('/path', …)` call, or a call handing a list of paths and a `view_func=` over (a project's wrapper, #2154), makes one route per `/` path and listed method, each once, `ANY` for a class-based view and `GET` for a function when `methods=` lists nothing, referencing the target's last name. FastAPI: an `@x.get('/path')`-style decorator is `METHOD /path` (`/` for an empty path), referencing the next `def`. After extraction each FastAPI router's prefix composes down its mount tree (`bc45e907`): its own `APIRouter(prefix=…)` and each literal `X.include_router(router, prefix=…)` whose router is the file's own or, through a relative import, a module's (`items.router`) or an alias import's (an absolute import's module is not followed yet), and FastAPI's own routes are renamed `METHOD /prefix/path`, keeping their ids: a computed prefix leaves its mount out, a router mounted at two paths keeps its names, another framework's route keeps its name, and a route that nothing renames any more gets its file's name back, in an index and in every sync. Django resolves a model (`…Model`, or one capitalized word), a view (`…View` or `…ViewSet`, a class or a function) and a form (`…Form`), each preferring a file whose path holds `models`, `views` or `forms`, and claims an `…urls` module name past the name prefilter for import resolution; Flask a blueprint variable (`…_bp`, `…_blueprint`); FastAPI a router variable (`router`, `…_router`, preferring a path that holds `/routers/`, `/api/`, `/routes/` or `/endpoints/`) and, at `0.75`, a dependency function (`get_…`, `Depends…`, preferring `/dependencies/`, `/deps/` or `/core/`), the others at `0.8`, none of them for a name the reference's file imports, which import resolution answers. Their name heuristics share one pick (#2225): of the declarations of the name and the resolver's kinds that the reference can see (none inside a function body, a type nested in another file's type only from its own file, one another file may name under its language's rules, no test suite from code that is no test, and for an `extends` never the reference's own type), the one in the reference's file, else in its directory, else in a preferred folder, else in the project; a tier with two or more answers nothing and stops the search, and a pick in another code family than the reference answers nothing. Rails is detected by a root `Gemfile` naming the `rails` or `railties` gem, read whether or not it is indexed, by a root `config/application.rb`, `app/controllers/application_controller.rb` or `config/routes.rb`, or by an indexed `config/routes.rb` at any depth (an engine's), and reads each `.rb` file on its comment-stripped text (`=begin`…`=end` blocks and `#` comments blanked, strings kept). A routes file, one whose text calls `routes.draw` or that sits in a `config/routes/` directory, is read with its blocks (#2155): `namespace` prefixes the paths and controllers of the routes inside it and `scope` their paths (a leading string or `path:`) or controllers (`module:`), a `resources … do` block nests its children under the parent's `:<singular>_id`, `member` and `collection` blocks add actions to the member and collection paths, a statement whose `[` or `(` stays open takes the following lines, and `root`, a verb route (`to:` or `=>`, or bare inside a resource) and `match` (method `ANY`) are routes `route:<file>:<line>:<METHOD>:<path>:<target>` named `METHOD /path`, qualified `<file>::route:<target>` and recorded once per id. Any other `.rb` file contributes its explicit `get 'path', to: 'c#a'` routes (`route:<file>:<line>:<METHOD>:<path>`, qualified `<file>::route:<path>`) and its `resources :x` lines (seven REST routes, six for `resource`; `route:<file>:<line>:<VERB>:<controller>#<action>`, qualified `<file>::route:<controller>#<action>`). Both read `only:` and `except:` in each form Rails accepts (#2269: an array, `%i[]` or `%w()`, a symbol, a string, `:only =>`), and every route references its `controller#action` at its line, column 0. Rails resolves `controller#action` at `0.85` to the action, a Ruby method or function, in `app/controllers/<controller>_controller.rb`, else to the one in the files of the Ruby classes named for the controller's last segment (`ZonesController` for `admin/zones`), of those whose path ends with `/<controller>_controller.rb` when the controller has a module and some do; two answer nothing. A CamelCase name resolves at `0.8` to the model class in `app/models/<snake>.rb`, then `app/models/concerns/<snake>.rb`, else to the one Ruby class of its name in a path holding `app/models/`; a `…Controller` at `0.85` to the class in `app/controllers/<snake>.rb`, `app/controllers/api/<snake>.rb` or `app/controllers/api/v1/<snake>.rb`, else to the one Ruby class of its name in a path holding `controllers/`; a `…Helper` at `0.8` to the module in `app/helpers/<snake>.rb`, and a `…Service` or `…Job` to the class in `app/services/`, `app/jobs/` or `app/workers/`. Spring is detected by `spring-boot` or `springframework` in a root `pom.xml`, `build.gradle` or `build.gradle.kts`, or by an indexed `.java` file holding `@SpringBootApplication`, `@RestController`, `@Service` or `@Repository` (read 256 at a time in path order, the first batch holding one ending the scan); Play by `playframework`, `"play"`, `sbt-plugin`, `PlayScala` or `PlayJava` (ASCII letters in any case) in a root `build.sbt`, by a root `conf/routes` or `conf/application.conf`, or by any indexed Play routes file (#2156): `conf/routes`, a path ending in `/conf/routes` or one ending in `.routes`, matched case-sensitively, which is indexed as a YAML file whether or not Play is detected. The root files are read whether or not they are indexed. Spring reads its config files and the `.java` and `.kt` files, comments blanked, columns and the 600-unit method window counted in UTF-16 code units. A `@GetMapping`-style annotation (`Get`, `Post`, `Put`, `Patch`, `Delete`) or a method's `@RequestMapping` (the HTTP method its `method =` names, else `ANY`) is a route `route:<file>:<line>:<METHOD>:<path>` named `METHOD /path`, one per path of the file's first class-level `@RequestMapping` (an empty prefix without one) joined with each path it lists (`value`, `path` or the unnamed argument, each a string or a `static final String` constant of the same file; #1461, #1811), that references the first method declared (`fun name(`, or `public … name(` and the like) in the 600 units after it. A config file (`application` or `bootstrap`, with a `-profile` suffix or not, `.yml`, `.yaml` or `.properties`) holds a `constant` per leaf key, `spring-config:<file>:<line>:<key>`, qualified by its dotted key, and never its value (#722). An `@Value("${key}")` or `@ConfigurationProperties("prefix")` is a binding constant (`spring-value:…`, `spring-cp:…`) whose reference only Spring resolves: to the key spelt alike once lower-cased with `-` and `_` dropped (relaxed binding), one at `0.9` and of several the base file's (`application.yml`, `bootstrap.properties` and the like, without a profile), else the shortest file name's, at `0.75`, and for a prefix to the shortest key under it at `0.85`, of keys alike in rank the one whose file shares the most directories with the binding's; a key no config file holds, or one without a dot (#1180's gate), leaves the binding unresolved. A Java or Kotlin name other than an `extends` or `implements` is, by Spring's conventions (#1827), the declaration of that name the shared name pick above finds: a class or interface for `…Service` and `…Repository` and a class for `…Controller`, at `0.85`, preferring a `/service/`, `/repository/` or `/controller/` folder (or its plural), a class for one capitalized word at `0.7` (`/entity/`, `/model/`, `/domain/`), and a class for `…Component` or `…Config` at `0.8` (`/component/`, `/config/`); a rule whose pick answers nothing ends the conventions. Play reads each line `METHOD /path pkg.Controller.action(…)` of a routes file (`GET` to `OPTIONS`; a comment or a `->` include is none) as a Scala route `route:<file>:<line>:<METHOD>:<path>` named `METHOD /path` that references `Controller.action`, and resolves that name at `0.9` to the first method or function `action` in the file of a class `Controller`, of those classes the one whose file shares the most directories with the reference's; two at that distance, or a pick in another code family than the reference, answer nothing. Only a routes file's references are Play's, and they take no other strategy's answer: a line Play answers nothing for stays unresolved, and a `Controller.action` that Scala or Java code writes is import and name resolution's. Laravel is detected by a root `artisan` or `app/Http/Kernel.php`, read whether or not they are indexed, and reads each `.php` file holding `Route::` on its comment-stripped text (#2099): a `Route::get` call (to `options`, and `any`) is a PHP route `route:<file>:<line>:<METHOD>:<path>` named `METHOD /path`, and a `Route::resource` or `apiResource` call one named `resource:path`, each path under the prefixes of the groups around it (`Route::prefix('admin')->…->group(…)`, `Route::group(['prefix' => …], …)`; a computed prefix is the segment `{prefix}`) and qualified `<file>::route:/path`. A verb route references its handler as `Controller@action` (`[C::class, 'm']` drops C's namespace; a string `'Ns\C@m'` keeps it below `App\Http\Controllers\`, #2271), and a resource route imports its controller, its options array skipped. Each route is then renamed, keeping its id, by the prefix its file is served under: a group whose last argument is no closure mounts the file that argument names under its prefixes, a `require`, `include` or `loadRoutesFrom` under the prefixes of the groups around it, and Laravel 11's `withRouting` its `web:` file at the root and its `api:` file under `apiPrefix:` (`api` by default), a mount naming an existing `.php` file inside the project by `base_path('x')`, `__DIR__.'x'`, `dirname(__DIR__).'x'` or `'x.php'`, and read from each `routes/` file and each other `.php` file naming `routes/` or `withRouting(`; `routes/api.php` is served under `/api` when nothing mounts it and no `withRouting(using:)` loads routes by code, prefixes compose down the include tree (eight rounds at most), a file reached at two prefixes keeps its in-file paths, and every name is recomputed from the qualified name, so a mount that goes away is undone, in an index and in every sync. Laravel resolves `Controller@action` at `0.9` to the method in `app/Http/Controllers/<path>.php`, else to the one method of that name in the files of the PHP classes so named in a path holding `Controllers`, those whose file ends with a written namespace path first, and a resource route's controller at `0.9` to the one such class whose file ends with the written path, else to the only one of its name; two candidates answer nothing. Its `Model::method`, facade and helper rules, ported from upstream, answer no reference an extractor writes. Drupal is detected by a root `composer.json`, read whether or not it is indexed, whose `name` starts with `drupal/`, whose `type` starts with `drupal-` or whose `require` or `require-dev` names a `drupal/` package, or by an indexed `*.info.yml` beside a `*.routing.yml`, `.module`, `.install` or `.theme` file (#271). Each route of a `*.routing.yml`, a name line a `path:` follows, is a YAML route `route:<file>:<line>:<path>` named by its path (`/hello [GET,POST]` with a `methods:` list) and qualified `<file>::<route name>`, referencing its `_controller`, `_form`, `_entity_form`, `_entity_list` and `_entity_view` handlers; each procedural hook implementation in a `.module`, `.install`, `.theme`, `.inc` or `.php` file references `hook_X` from the function's node, by an `Implements hook_X()` docblock or, failing one, by its module's name prefix (`mymodule_form_alter` is `hook_form_alter`). Drupal resolves a routing file's `\Drupal\…\Class::method` (or a service's `name:method`) at `0.9` to the method in the file of the one PHP class so named, or of several the only one whose file holds it, and at `0.7` to the class when its file has none; a bare namespaced class at `0.85` to the one PHP class of its last segment; and `hook_X` at `0.75` to the one PHP function of a hook file whose name ends with `_X`, which a definition `function hook_X` (in an `*.api.php`) outranks at name matching's exact `0.9`. Go is detected by a root `go.mod` that reads and is not empty (one holding only spaces counts, as upstream's truthy string does), read whether or not it is indexed, or by an indexed `.go` file. It reads each `.go` file on its comment-stripped text (block and line comments blanked; interpreted, raw and rune literals kept; columns counted in UTF-16 code units): a call `x.GET("/path", handler)` on any identifier, with Gin's and Echo's `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `HEAD`, Chi's and Fiber's `Get`, `Post`, `Put`, `Patch` and `Delete`, or `net/http`'s `Handle` and `HandleFunc`, whose first argument is a string starting with `/`, is a route named `METHOD /path` (`ANY` for `Handle` and `HandleFunc`), `route:<file>:<line>:<METHOD>:<path>` qualified `<file>::route:<path>`, at the line the call starts (columns 0 to the call's length, as upstream), that references the last identifier of its handler expression at that line, column 0 (`h.Follow` is `Follow`; a function literal, read up to the call's first `)`, is its last parameter's type, `Context` for `func(c *gin.Context) {…}`, as upstream). On `Handle` and `HandleFunc` a Go 1.22 pattern, `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `HEAD`, `CONNECT` or `TRACE` and white space before the path (`"GET /users/{id}"`), names the route's method instead (`e1f339f`, #1308); a call whose first argument is neither is no route (`cache.Put("key", v)`, #1259), and a group's prefix is not applied. Go resolves a Go name written bare (#2408), never an embedded type, which name matching and the import resolver link (#2397), by its conventions, in upstream's order, each through the shared name pick among the declarations of the reference's own package, its own file's first: a function for `…Handler` or `Handle…` at `0.8`, a struct or interface for `…Service`, `…Repository` or `…Store` at `0.8`, a function for `…Middleware`, `Auth…` or `Log…` at `0.75`, and a struct, interface or type alias for a name of two or more ASCII letters that starts with a capital at `0.7`; a rule with no candidate hands over to the next, and one whose pick answers nothing ends them. GoFrame is detected by `github.com/gogf/gf` in the root `go.mod` and reads each Go file's request types (#747): a type whose first field is a `g.Meta` with a `path:` tag is a route named `METHOD /path` (`ANY` when the tag names no method), its request type qualified by the file's package kept for the synthesis stage, which joins the route to the method serving it; it resolves no reference, and an addon's routes under `addons/` are read only where a project re-includes that directory, which the default skips for Godot. Rust (the `rust` resolver, upstream `rust.ts`: axum's and actix's routes) is detected by a root `Cargo.toml`, read whether or not it is indexed. It reads each `.rs` file holding `.route`, `#[` or `web::resource` on its comment-stripped text (nested `/* */` and `//` comments blanked byte for byte, strings kept; an attribute's end column and a resource chain's window counted in UTF-16 code units) for three kinds of route, each named `METHOD /path`, `route:<file>:<line>:<METHOD>:<path>` qualified `<file>::route:<path>`: an attribute (`#[get("/users")]`, actix's and rocket's) on its line, referencing the next `fn` declared after it at that line, column 0; an axum `.route("/users", get(list_users).post(create_user))`, a route on the `.route` line for each method router at the call's top level (a `get(` inside a closure handler is none, #2359); and actix's builder API, each `web::get().to(handler)` of a `web::resource("/path")` chain on the line of its `web::get()`, else a chain's leading `.to(handler)` as `ANY` on the resource's line (the chain reaching 500 units, the next resource, or the `)` that closes the call it is an argument of), and an App-level `.route("/path", web::get().to(handler))` on its line. An axum or builder route references its handler expression's last `::` segment where that name is written, on its line and at its byte column (#2359), which the Rust scope rule reads. It resolves a Rust name by upstream's conventions, in order, the first three through the shared name pick under the Rust scope rule, so a pick is an item the reference can name and never one inside a function body (#2214, #2224): a function for `…_handler` or `handle_…` (`/handlers/`, `/handler/`, `/api/`, `/routes/`, `/controllers/`) and a struct or trait for `…Service` or `…Repository` (`/services/`, `/service/`, `/repository/`, `/domain/`) at `0.8`, and a struct for a letters-only capitalized name at `0.7` (`/models/`, `/model/`, `/entities/`, `/entity/`, `/domain/`, `/types/`); a rule with no candidate hands over to the next, and one whose pick answers nothing ends them, the module rule's too. A name of lowercase letters and underscores then names a module: the file node of the root's `src/<name>.rs` or `src/<name>/mod.rs` at `0.6`, else of the `src/lib.rs` or `src/main.rs` of the Cargo workspace crate `<name>` at `0.95` (#151), the first the index holds. The workspace's crates come from the root manifest's `[workspace] members`, read by lines and quotes as upstream reads them (a glob member walks the project's directories, sorted by name, at most six levels below its static prefix, skipping `target`, `node_modules`, `.git`, `dist`, `build` and every directory whose name starts with `.`), each named by its manifest's `[package] name` and by that name with `-` read as `_`; a member outside the project root is neither read nor listed, and a name two members give names neither. ASP.NET is detected by an indexed `.csproj` naming `Microsoft.AspNetCore`, `Microsoft.NET.Sdk.Web` or `System.Web.Mvc` (the index holds no project file, here or in upstream, unless a configuration adds one), by a root `Program.cs` holding `WebApplication`, `CreateHostBuilder` or `UseStartup`, or a root `Startup.cs`, both read whether or not they are indexed, or by an indexed controller, entry point, endpoint or extension file (`…Controller.cs`, `Program.cs`, `Startup.cs`, `…Endpoint.cs`, `…Endpoints.cs`, `…Extensions.cs`, or a file directly in an `Endpoints/` folder) whose source holds an `[ApiController]`, `[Route` or `[HttpGet`-style attribute or one of `ControllerBase`, `: Controller`, `MapControllers`, `WebApplication`, `Microsoft.AspNetCore`, `IEndpointGroup`, `EndpointGroupBase` and `RouteGroupBuilder` (read 256 at a time in path order, the first batch holding one ending the scan). It reads each `.cs` file holding `[Http`, `.Map` or `Configure` on its comment-stripped text (stripped as Java is; columns and windows counted in UTF-16 code units) for four kinds of C# route, each named `METHOD /path` and referencing its handler at its line, column 0: a verb attribute (`[HttpGet]`, `[HttpPost("{id}")]`) under the file's first class-level `[Route("…")]` prefix (a `[controller]` placeholder kept as written), `route:<file>:<line>:<METHOD>:<path>` qualified `<file>::route:<path>`, that references the first method declared in the 600 units after it; a minimal API (`app.MapGet("api/todos", GetTodos)`, its path from the root, #2158) that references its handler expression's last identifier, a lambda none; an endpoint group's handler-first call (`group.MapPost(CreateTodoItem)`, `group.MapPut(UpdateTodoItem, "{id}")`, `bc45e907`), its group the last class declared before it, served under the file's first `RoutePrefix` literal or `/<group>` and qualified `<file>::group:<group>:<METHOD>:<sub-path>`; and a FastEndpoints endpoint's verb calls (#2158), from its class's `void Configure() {` on, within 3000 units and up to the first one past that method's closing brace, one route per string literal (`{nameof(X)}` read as `X`) or, for a lone `X.Y` constant, one named `METHOD X.Y` and qualified `<file>::fastendpoint:<METHOD>:const:X.Y`, each referencing the first `HandleAsync` or `ExecuteAsync` from the class on. Each pass then renames, keeping the id, a constant route by the one value the C# classes and structs named `X` give their `const`, `static readonly` or `static` string field `Y`, and the group routes of a file with no `RoutePrefix` literal under the app's head, `/api/` in `MapGroup($"/api/{groupName}")`, which the first of the `.cs` files holding `MapGroup` (400 at most, in path order) that writes one gives; every name is recomputed from the qualified name, so a constant or head that goes away is undone, in an index and in every sync. ASP.NET resolves a C# or Razor name (a page's `@model IndexModel`, #2415) by its conventions, in upstream's order, each through the shared name pick: a class for `…Controller` (`/Controllers/`), a class or interface for `…Service` or `I…` (`/Services/`, `/Service/`, `/Application/`) and for `…Repository` (`/Repositories/`, `/Repository/`, `/Data/`, `/Infrastructure/`), at `0.85`, a class for a letters-only name at `0.7` (`/Models/`, `/Model/`, `/Entities/`, `/Entity/`, `/Domain/`), and a class for `…ViewModel` or `…Dto` at `0.8` (`/ViewModels/`, `/ViewModel/`, `/DTOs/`, `/Dto/`); a rule with no candidate hands over to the next, and one whose pick answers nothing ends them. SwiftUI is detected by an indexed `.swift` file holding `import SwiftUI` or an indexed path ending in `.xcodeproj` or `.xcworkspace` (Xcode's are directories, so the second holds only where a configuration indexes a file so named, in upstream too), UIKit by an indexed `.swift` file holding `import UIKit`, `UIViewController` or `UIView` (a comment's and `UIViewRepresentable`'s count), and Vapor by a root `Package.swift` holding `vapor`, read whether or not it is indexed, or an indexed `.swift` file holding `import Vapor`; each reads the `.swift` files 256 at a time in path order, the first batch holding one ending the scan. The three resolve only Swift names (#2242: an Objective-C reference takes no Swift convention), each by its conventions in upstream's order through the shared name pick: SwiftUI a struct for a capitalized `…View` (`/Views/`, `/View/`, `/Screens/`, `/Components/`, `/UI/`) and a class for `…ViewModel`, `…Store` or `…Manager` (`/ViewModels/`, `/ViewModel/`, `/Stores/`, `/Managers/`, `/Services/`), at `0.85`, then a struct or class for a capitalized letters-only name at `0.7` (`/Models/`, `/Model/`, `/Entities/`, `/Domain/`); UIKit a class for `…ViewController` (`/ViewControllers/`, `/ViewController/`, `/Controllers/`, `/Screens/`) at `0.85`, for `…View` (`/Views/`, `/View/`, `/UI/`, `/Components/`) at `0.8` and for `…Cell` (`/Cells/`, `/Cell/`, `/Views/`, `/TableViewCells/`, `/CollectionViewCells/`) at `0.85`, then a protocol for `…Delegate` or `…DataSource` at `0.8` in any folder (a Swift `protocol` is an interface node, so only an Objective-C `@protocol` is one); Vapor a class or struct for `…Controller` (`/Controllers/`, `/Controller/`, `/Routes/`) at `0.85`, a class for a capitalized letters-only name at `0.75` (`/Models/`, `/Model/`, `/Entities/`, `/Database/`) and a class or struct for `…Middleware` at `0.8` (`/Middleware/`, `/Middlewares/`); a rule with no candidate hands over to the next, and one whose pick answers nothing ends them. Vapor reads each `.swift` file holding `use:`, `.get`, `.post`, `.put`, `.patch`, `.delete`, `.head`, `.options`, `.webSocket` or `.on` on its comment-stripped text (stripped as Java is; columns counted in UTF-16 code units) for three kinds of Swift route, each named `METHOD /path` (`/` when the path is empty), `route:<file>:<line>:<METHOD>:<path>` qualified `<file>::route:<path>`, from column 0 to the end of its match, its path the receiver's group prefix (`let todos = routes.grouped("todos")`, `routes.group("todos") { todos in`, under the group it is made from) and its arguments' string literals: `builder.get([segments,] use: handler)` (#1547's linear pattern) and `builder.on(.POST, "x", body: …, use: handler)` (only an argument that is a string literal alone is a segment), each referencing its handler at its line, column 0, by the type the route names (`use: API.PackageController.get` as `API.PackageController@get`; `self.index`, `Self.index` and a bare `index` as `@index`; `todos.index` as `TodoController@index` where the file writes `let todos = TodoController(` or `var todos: TodoController = …(`), and a trailing closure's route (#2157: `app.get("hello") { req in … }`, `app.webSocket("chat") {` named `WS`, `routes.on(.GET, "x") {`) written as a statement of its own, with no `use:`, no `client` receiver and no `"http:` or `"https:` first argument, whose closure, paired past string literals, lends the route its calls (#2273), each `name(` or `receiver.name(` once at the route's line, column 0, but a keyword (`if`, `guard`, `switch`, `return`, …) and a bare call right after a `)`, `.` or `]`, even a line before, as upstream reads them. A handler resolves at `0.9` to a Swift method or function of its method's name on the type it names (#2106), and to nothing else when none is found: for `@m`, of the innermost class, struct, enum or protocol holding the route, its own method in the route's file, else the method of another extension of it, or, for a route outside any type, the function of that name in the route's file, else the project's one function of it; for `A.B@m`, the method whose type is `A::B`, else the one whose type ends in `::A::B`, else (an `extension A.B` names its methods `B::m`) the one in a type whose first three lines write `extension A.B`. Candidates on two types give none, and of one type's overloads only the sole one whose first lines declare a `Request` parameter is taken (Rust's own; upstream takes the earliest). Godot also extracts project/scene/resource relationships; Tauri bridges
 literal JS-family `invoke` calls to uniquely registered Rust commands. Ambiguous
 or dynamic targets remain unresolved rather than falling through to a global
 same-name guess.
@@ -229,12 +287,308 @@ The static/runtime boundaries for supported languages and Godot are documented i
 [`languages.md`](languages.md), [`godot.md`](godot.md), and the upstream-difference
 ledger in [`upstream-sync/KNOWN_DIFFS.md`](upstream-sync/KNOWN_DIFFS.md).
 
+### Synthesis
+
+After resolution, `codegraph_resolve::synthesis` adds the dispatch edges no
+reference names: a dispatcher reaching the callbacks registered elsewhere through
+a shared store (upstream `callback-synthesizer.ts`). The stage reads the base
+graph (every edge without `metadata.synthesizedBy`, the nodes,
+`resolved_refs`, and for Go the `extends` rows resolution left in
+`unresolved_refs`) and the indexed files whose size and modification time, or
+content hash, are still the ones their file rows record; a file that drifted
+since it was indexed reads as absent until its own sync. It reads every indexed
+file once before its first step, the file rows in one query and the files in
+parallel. The C function-pointer pass also reads the files an `#include "…"`
+names that the index does not hold, such as a `.def` table, and the Angular
+template pass a component's `templateUrl` template the index does not hold: a
+file within the project root that the scan's rules admit whatever its extension (the default
+ignores, the root `.gitignore`, `.git/info/exclude` and the configured
+include and exclude), reached through no symbolic link and no larger than
+`indexing.max_file_size`. The stage records every such path it probed with
+its text's hash, or null, in `synthesis_unindexed_inputs`. When the index has
+Go files it first runs upstream's two prerequisite steps, whose edges the
+passes read as base edges and the replacement writes beside the merged ones:
+a Go type's `contains` edge to each method of its package that extraction
+left with its file alone (`go-method-contains`, no provenance, as a parsed
+`contains` edge has), and a Go struct's or defined type's `implements` edge to
+each interface its method set covers, embeddings and the methods of embedded
+standard-library types included, at the interface's parameter and result
+counts (`go-implements`). It runs its passes in
+upstream's registry order, merges their edges (the first pass to pair a source
+and a target keeps the pair), and replaces the synthesized edges in one
+transaction, an edge whose identity a base edge holds being ignored while its
+pair stays taken. It writes only the difference: an edge it makes again
+unchanged keeps its row and id, the stored ones it no longer makes, or makes
+differently, go, and the new ones come, so the rows are the ones deleting
+every synthesized edge and inserting the new ones would leave, and an
+unchanged stage writes nothing. A query that lists a node's edges of one kind
+by row id can then list a kept synthesized edge before a base edge the same
+sync rewrote, as it already lists the base edges a sync rewrote after the
+ones it kept; a fresh index's stage writes into an empty set. The ported
+passes are the field observer (`callback`), the Swift and Kotlin closure
+collection (`closure-collection`),
+the string-keyed emitter (`event-emitter`), the cross-tier channels
+(`http-client`, `queue-job`, `event-bus`) and test requests (`test-request`)
+described below, and the structural ones: a React
+class component's or a Flutter `State`'s re-render (`react-render`,
+`flutter-build`), an ArkUI struct's method writing one of the struct's
+reactive properties (`@State`, `@Prop`, `@Link` and the other V1 and V2 state
+decorators) reaching its `build()` (`arkui-state`), an `@ohos.events.emitter`
+emit reaching each handler `on` or `once` registers for its statically
+recovered event key, a numeric key within its file and a named one within its
+workspace module, a key with more than eight emit or handler sites none
+(`arkui-emitter`, with `event`), a literal `router.pushUrl` or `replaceUrl`
+reaching the `@Entry` struct of its page under `src/main/ets/`, the caller's
+module's when several modules have the page (`arkui-route`), the components a function's JSX tags render
+(`jsx-render`), a C++ virtual override (`cpp-override`), a call through
+an interface or a base type reaching the same-named methods of the types that
+implement or extend it, a Go interface's unexported method only those of its
+package, and the method a Go struct's embedding promotes into it
+(`interface-impl`, with `promotedInto`), a Kotlin Multiplatform
+declaration's `actual`s (`kotlin-expect-actual`), a generated gRPC server
+stub's methods reaching the same-named methods of each hand-written Go struct
+declaring all of them (`go-grpc-stub-impl`), React Native's event channel: the
+function around a native send (`sendEventWithName:@"x"`,
+`sendEvent(withName: "x"`, `.emit("x", …)`, a `sendEvent(…, "x"` wrapper, or
+the constant naming one) reaching each JavaScript handler an `.on`, `.once`
+or `.addListener` registers for the event, by name, inline or under a
+constant, at most six of each an event (`rn-event-channel`, with `event` and
+`registeredAt`), a Fabric or Paper view component reaching the Objective-C,
+Kotlin, Java or C++ class named for it (`fabric-native-impl`, with
+`viaSuffix` and `componentName`), an Expo module function's Swift and Kotlin
+declarations reaching each other (`expo-cross-platform`, with `via`), a Java,
+Kotlin, Objective-C or C++ method that JavaScript calls reaching each method
+of its name in another of those languages, both ways (`rn-cross-platform`,
+with `via`), a Delphi form's unit
+(`pascal-form`), a MyBatis mapper method's statement (`mybatis-java-xml`),
+gin's handler-chain dispatcher (a Go method calling into a `handlers` slice
+by index) reaching each named handler a `Use`, `GET` or other registration
+passes, a shared name only when the registration's file or the project holds
+one Go function or method of it (`gin-middleware-chain`), a redux-thunk
+constant reaching each thunk or action creator its body dispatches, a name
+only when the first kind holding it (a thunk, a constant, a callable of the
+same file, any callable) holds one node of it (`redux-thunk`), each handler
+an object-literal registry maps, reached from
+a function that calls the registry with a runtime key (`object-registry`),
+a hook RTK Query generates reaching its endpoint, the one function of the
+hook's file its name names (`useLazyGetPostsQuery` names `getPosts`;
+`rtk-query`), a Pinia action called on the store a file binds
+(`const cart = useCartStore(); cart.add(…)`) reached from the function around
+the call, a name only when one file defines the factory, the file binds the
+variable to one store and the store's file holds one function of it
+(`pinia-store`), a Vuex `dispatch` or `commit` of a string key reaching the
+action or mutation its last segment names in a file that reads like a store,
+the one whose path has the key's namespace as a segment or, for a root key,
+the one of the dispatching file, else the project's only one
+(`vuex-dispatch`),
+the function around a Celery `.delay` or `.apply_async` reaching the
+decorated task (`celery-dispatch`), a Spring `publishEvent(new X(…))`
+reaching every `@EventListener`, `@TransactionalEventListener` or
+`ApplicationListener` method of `X` (`spring-event`), a MediatR `Send` or
+`Publish` reaching the `Handle` of each handler of the sent type
+(`mediatr-dispatch`), a Sidekiq `perform_async`, `perform_in` or
+`perform_at` reaching the worker's `perform`, a name only when one worker
+class has it, by its qualified name, else by its last segment
+(`sidekiq-dispatch`), an Erlang call through a variable module
+(`Mod:handle_thing(X)`) reaching each in-repo implementer's exported function
+of its name and arity when exactly one behaviour declares that callback with
+`-callback`, at most 24 implementers (`erlang-behaviour`, with `via` and
+`registeredAt`), a Laravel
+`event(new X(…))` reaching each listener's `handle` for `X`, typed or
+registered in a `$listen` map (`laravel-event`), a C or C++ call through a
+struct's function-pointer field reaching each function a table, a designated
+initializer or a field-to-field assignment registers in that field of that
+struct definition, the struct a name means read in the dispatching file's
+translation unit and an ambiguous one left unlinked, and a call through a
+bare array of function pointers reaching each function the array lists
+(`fn-pointer-dispatch`, with `via` and `registeredAt`), a GoFrame route
+reaching the controller method that takes its request type by pointer, the
+package-qualified type first and the bare one for a same-package or aliased
+parameter that is no other route's, narrowed to the controller directories
+and then to the route's own addon, one handler or none (`goframe-route`, with
+`route`, `requestType` and `registeredAt`), and a Go call through a
+struct field holding a function, reaching each function or method value a
+composite literal or an assignment puts in the field or in the func field it
+is copied from, the receiver typed by its scope at most one field or one
+embedding away (`go-func-field`, with `field`, `via` and `registeredAt`), and a Nix
+module's config write (`launchd.user.agents.yabai = …`) reaching the option
+declaration (`options.launchd.user.agents = mkOption …`) of the longest
+static prefix of its path, two to six segments, that one file declares, a
+submodule's own options registering nothing and a longest prefix two files
+declare linking nothing (`nix-option-path`, with `optionPath`).
+The link passes read navigation the routers' resolvers never see, because
+it is markup or a helper's return value rather than a call: a navigation
+fed by a helper's call (`router.push(await pick())`) reaches each Expo
+screen of the navigation's own app that a string literal in the helper's
+body names, the helper the one function of its name in the navigation's
+file, else the project's, and at most eight screens a helper and app
+(`expo-router-return`, the edge from the helper with the literal's line
+and column); a Next.js `<Link href>`, `<NextLink href>` or internal
+`<a href>` (`next-link`), a React Router `<Link to>`, `<NavLink to>`,
+`<Navigate to>`, v5 `<Redirect to>`, react-router-bootstrap's
+`<LinkContainer to>` or a `styled(Link)` or `styled(NavLink)` wrapper a
+file importing React Router declares, used where it is declared or
+imported (`react-router-link`, a `to={…}` read as a navigation call's
+argument is, else as a route-config helper's href), a TanStack `<Link to>`
+or `<Navigate to>` read as a route pattern (`tanstack-link`), a Vue
+`<router-link>`, `<RouterLink>` or `<NuxtLink>` by path or, bound to
+`{ name }`, by name (`vue-router-link`, `by: name`), and a SvelteKit
+internal `<a href>`, a `{expr}` in it a hole (`sveltekit-link`), each a
+`navigates` edge from the function or component the link is written in to
+the route its destination names in the link's app, with `href`, `navMethod`
+and `registeredAt`, at most 24 a component, a pair already drawn not
+counted again. Only a destination starting with `/` is read: a computed,
+relative or external destination, one no route serves, a path or name two
+routes of the app carry and a link in a test file draw nothing. The link
+passes read the routers' own route tables, and resolve the imports a
+route-config object or a link wrapper comes through, through a view
+context: the texts of indexed files the stage reads, no edge, and the
+store's node, file and configuration lookups for the rest, whose
+`tsconfig.json`, `jsconfig.json`, workspace and `package.json` files are
+JavaScript's control inputs, so a change to one recomputes the stage.
+The cross-tier pass joins the programs of a web app, which talk over a wire
+the graph cannot see with a string on both sides of each hop (upstream
+`tier-synthesizer.ts`). It reads each indexed JavaScript or TypeScript file
+that is no test or generated file, through its comment-stripped text
+aligned byte for byte with the source, so a column counts the source's
+UTF-16 code units. A client call inside a function (`fetch`, `$fetch`,
+`ofetch`, `axios`, `ky`, `got`, `useFetch`, `useSWR`, or a member call on a
+client: an instance `axios.create(…)` or `ky.extend(…)` binds in the file or
+in the file an import of its head resolves to, or a receiver whose last
+segment names a client and whose head and last segment name no router)
+whose first argument is a
+literal path reaches the one route node `METHOD /path` the path denotes
+(`http-client`): the path is joined to the instance's base URL, a template
+hole fills a route parameter and a hole before the path matches a route by
+its tail, while a tie, a variable URL, a path no route serves and a call on
+a registration's line draw nothing. A job a function adds to a queue, named
+by a `new Queue('…')` or `@InjectQueue('…')` binding or by a receiver shaped
+like a queue, reaches the queue's most specific consumers, at most six
+(`queue-job`): an `@Process('job')` method of the `@Processor('queue')`
+class, else its `process` method, a `new Worker('queue', handler)` or a
+`queue.process('job', handler)`. An event a function emits on a bus or a
+socket reaches the handlers of its name, at most six, an event dispatched
+more than six times drawing nothing (`event-bus`): a bus's `@OnEvent`
+handlers, globs honoured, and for a socket client's emit the server's
+`@SubscribeMessage` and `socket.on` handlers, for a socket server's the
+client's. A handler a registration names is the one function or method of
+that name in its file (several there: none), else in the file its head is
+imported from, else in the project. The test-request pass reads each Java, Kotlin or PHP test file
+the same way: a MockMvc builder in a file naming `MockMvcRequestBuilders`,
+Kotlin's MockMvc DSL, `WebTestClient`, RestAssured and `restTemplate` calls,
+a Laravel request on `$this` (`$this->postJson(…)`, `->json('POST', …)`, or
+a test's own helper whose body makes one, directly or one call deeper) and,
+in a file naming `Pest\Laravel`, Pest's request functions, each reaching
+the route its literal path names from the test method, or from the file
+node for a Pest closure (`test-request`). Both read an imported file and a
+helper's body as the view holds them, and resolve an import as resolution
+does.
+Two SvelteKit passes join the halves of a route the file system pairs: a
+`+page.svelte` or `+layout.svelte` component calls each function and method
+of the loaders beside it (`+page.server.ts`, `.server.js`, `.ts` or `.js`
+with its prefix), and their `load` and `actions` of any kind
+(`sveltekit-load`, with `via` and `registeredAt`), and each SvelteKit page
+route calls the component of its own file (`sveltekit-page`, with
+`registeredAt`); both read only paths and nodes.
+A Vue pass reads each `.vue` file's root template: a kebab-case tag
+(`<el-button>`, as `ElButton`) or a PascalCase one renders the component,
+function or class of that name, a component nested in a `components/`
+directory also under the name Nuxt auto-imports it by
+(`components/media/Card.vue` as `<MediaCard>`; `jsx-render`, with `via`, the
+tag as written); a bare `@event` or `v-on:event` handler calls the method or
+function it names, and a handler the script destructures from a composable
+(`const { close: closeSidebar } = useSidebar()`) that member of the
+composable's file (`vue-handler`, with `event` and, for a composable's member,
+`via`), at most 30 a component. A name is the one node of the file, else of
+the project; a name several nodes answer, and a name the file imports from a
+package a `package.json` declares, render and call nothing.
+An Angular pass reads, in a project that depends on `@angular/core`, the
+template of each `@Component` class of an indexed `.ts`, `.cts` or `.mts`
+file that is no declaration or test file: its `templateUrl` file, from the
+component's directory, or its inline `template:` when that is a string or
+template literal. A template file the index holds is read as it holds it,
+any other as the C pass reads an include, recorded. From the class it draws
+a `calls` edge to each child component a tag renders, the one component of
+that element selector, else the one of the parent's app (`angular-template`,
+with `via`, the tag); a `calls` edge to each of the class's own methods an
+event binding's statement calls, the last declared of that name
+(`angular-event`, with `via`, the event, and `trigger`), at most 40 children
+and 40 handlers a template; an edge to each own member a property binding,
+interpolation, structural directive, control-flow block or `@let` reads at
+render, `calls` for a call or a getter and `references` for another method,
+`fnRef` for a function handed over (`angular-binding`, with `via`, the
+binding); and a `navigates` edge to each route of the component's app that
+a `routerLink:` field of the class or a `routerLink` of the template names,
+read as a navigation call's destination is and a plain link's <span v-pre>`{{ … }}`</span> a
+hole (`angular-router-link`, with `href` and `navMethod` `routerLink`), at
+most 24 a component, the fields first. A pair already drawn is not counted
+again. Each edge carries `registeredAt`, where in the template, or for a
+field in the class, it is written, and its line is the tag's in an inline
+template and the class's for a template file.
+Each walks its candidates in upstream's order (nodes by file, line and id,
+edges by their other end, line and column); the Flutter, ArkUI, C++, interface,
+Kotlin, gRPC, React Native, Expo, MyBatis, gin, redux-thunk, RTK Query, Pinia, Vuex, Celery,
+Spring, MediatR, Sidekiq, Erlang behaviour,
+Laravel, C function-pointer, GoFrame, Go func-field, cross-tier, test-request, link, Vue, Angular, SvelteKit and Nix passes run only when the index
+has files of their languages, as upstream's gates have them. A full index and a migration run
+the stage after resolution. A sync runs it last, after the orphan sweep,
+whenever it changed the index, bootstrapped a lane, swept, found a recorded
+file the last run read beside the index reading differently (its text, its
+presence or its scan scope moved), or found the `synthesis_version` marker
+missing or at another version, and writes the marker as its last write; the
+sync's site machinery never selects or deletes a synthesized edge. The
+watcher hands an event for a recorded path to the next sync, as it does a
+control input's.
+
+Every stage run records what each step read and emitted (`synthesis_pass:{pass}`
+and its `:edges` row in `project_metadata`, `data-model.md`): the `View` and its
+resolution context, the only way a step reads the base graph, record the key of
+each lookup's rows, its pattern lookups, the files its per-file text checks pass
+(a file a check fails is read and dropped), the node lines it reads with their
+hash, and the files beside the index. A sync that finds the marker current when
+it begins, read before its first change as the lanes' markers are, turns a
+change log on: TEMP triggers on its one write connection record every `nodes`,
+`edges`, `unresolved_refs`, `resolved_refs` and `files` row it writes, old image
+and new, a synthesized edge's whole row apart from the base graph's, and the net
+change by content is read before the stage. The stage then runs step by step
+(W9-00 row 27): a step keeps its recorded raw output when its record is
+reusable, no changed row's key is among its keys, no changed node matches its
+patterns, no changed file is one its checks passed or passes its check now, its
+recorded lines read the same, and its files beside the index read as recorded; a
+prerequisite step that ran again and emitted other edges moves those edges' keys
+for the steps after it. The decision reads each step's footprint row; its raw
+output has a row of its own (the JSON deflated, in base64), read only to be
+merged and used only when it is the row the footprint row names by length and
+SHA-256. When a step runs again, the kept and the new outputs are merged and the
+stored synthesized edges replaced as a whole run does, which writes back the
+edges a re-extraction's cascade dropped. When every step keeps its output, and
+the sync removed no base edge, added no node under a new id and wrote no
+synthesized edge, the stored edges are already the merge but for the ones the
+cascade dropped: those are written back from the change log, and no output row
+is read. Only the rows of the steps that ran and changed are rewritten. The
+stage runs whole, as before, when the marker was away or another version, when
+the records were written by another build (a digest of the sources taken at
+compile time), over another schema, options, languages or steps, when a lane
+bootstrapped, a control input or the frameworks moved, the Dart manifests moved,
+the orphan sweep ran, the change log passed its cap of 100,000 images, or a
+step's record does not vouch for itself: a footprint row missing, unreadable or
+of another version, or an output row missing, of another length than named, or,
+once read, another text or one that does not decode. A step that probed the
+disk, listed a directory, read a table built from the store, or read a drifted
+file is never kept. The TEMP objects live in the connection's temporary schema
+and never reach the database file.
+
 ## Query layer
 
 `codegraph-graph` operates on persisted nodes and edges. It owns callers,
 callees, impact, paths, hierarchies, cycle detection, FTS candidates, fallback
 matching, filters, and deterministic scoring. Generated/ambient/deprioritized
-paths can affect ranking without removing graph facts.
+paths can affect ranking without removing graph facts. It also reads, from the
+caller's current source with the extractor's grammars, the conditions a call
+site runs under (`branch_guards`) and, for the viewer's Steps and Screens, the
+call as written, its arguments, what fires it, the loops around it, and a
+definition's returns, decorators and member types (`call_sites`); nothing of
+that is stored in the index.
 
 The CLI and MCP share the same query engine for `search`, `explore`, and `node`,
 so source selection, staleness handling, and relationship rendering do not drift
@@ -295,7 +649,8 @@ bursts, reloads project control files, and reconciles additions, modifications,
 deletions, and scope changes through `codegraph-watch`. A burst past 500 paths,
 a backend's sign of dropped events, or (on Windows) drift found by an idle
 sentinel escalates to one full reconcile, reported as RECOVERING until it
-commits. A sync re-resolves the references that name what it changed, a
+commits. A directory that arrives whole is walked and its files join the batch;
+one holding more than 500 escalates like a dropped event. A sync re-resolves the references that name what it changed, a
 qualified one (`User.create`) by its last segment as well (at most 500 per
 segment), and one written with `::` (an Erlang `util::double/1`, a MyBatis
 include's `app.CommonMapper::userColumns`) by the whole qualified name of a node
@@ -321,8 +676,9 @@ no node records; a changed `conftest.py`, or a module one pulls in, refreshes
 the functions under its reach that take a parameter named like one of its
 fixtures, since a fixture's return type types that parameter; a
 JavaScript-family file whose module surface moved (its re-exports, export
-aliases and lists, CommonJS default, sealed-ness or component scripts, kept as
-a digest per file in `project_metadata`), and every file that came or went,
+aliases and lists, CommonJS default, the imports its own exports forward,
+sealed-ness or component scripts, kept as a digest per file in
+`project_metadata`), and every file that came or went,
 sends the direct dependents of it and of the barrels that forward it (by the
 targets their rows recorded or what their sources resolve to now) down the
 whole-file lane and touches the names it declares, since no node records any
@@ -554,6 +910,15 @@ the change and after it, since whether such a binding is what a call of its name
 from its line, which no node records (`c <- list(f = function(x) x)`, upstream #2239); the
 `r_base_bindings_version` marker is withdrawn and restored with the others, and a sync that
 finds it missing re-resolves every R file;
+a Terraform module block's `:`-scoped references read what no node records
+and no reference's name matches: a block's `source`, `component` and
+`component = var.X` lines, a variable's `default`, the module, variable and
+output names a directory declares, and the `.tf` and `.tofu` files it holds;
+each Terraform file declaring a module, a variable or an output keeps a
+`terraform_wiring` row of those declarations, and a sync re-resolves whole
+every file holding a `module.M:` reference only when a changed file's row
+moved, a `.tf` or `.tofu` file came or went or gained or lost its file node,
+or the `terraform_wiring_version` marker is missing;
 a Lua file whose module row moved touches the name of each declaration that became or stopped
 being `local`, since a `local` is invisible outside its file, and when the digest of what an
 alias through it reads changed (its functions, its variables and their locality, in source
@@ -565,7 +930,9 @@ unchanged Lua file whose aliases or exports read a touched name through a global
 such a module, and so does a changed one for the files requiring it; the
 `lua_modules_version` marker is withdrawn and restored with the others, and a sync that finds
 it missing, or a row it cannot read, withdraws it before changing anything and re-resolves
-every Lua file;
+every Lua file; a sync whose custom Lua loader names differ from the `lua_loaders` row, or
+that finds no row, deletes the row before changing anything and extracts every Lua and Luau
+file again;
 a Rust enum variant that came, went or changed touches its enum's name, since a variant path
 reaches an enum only while it declares the variant; a Rust type, trait or alias name that came, went or changed re-resolves, in every unchanged
 Rust file whose text writes it as a path receiver (`Name::`, `Name.`), the references written
@@ -574,14 +941,153 @@ type of its name, and the `rust_receivers_version` marker is withdrawn and resto
 others; a bare Rust name's scope reads its own file's `use` items, which re-resolve with it, and the
 `Cargo.toml` files at or above it, which are no source files (a `Cargo.toml` change is the
 control-input lane's, below);
+a Spring config file (`application.yml`, `bootstrap-dev.properties`, …) that a sync of a
+Spring project rebuilds or removes re-resolves every reference a key can bind (a Java or
+Kotlin `references` whose name holds a `.` and no `::`, and each `…:prefix` one), the
+unresolved ones by their whole names and the resolved ones at their sites, since a relaxed
+spelling (`token-head` for `tokenHead`) or a second profile file's key moves a binding
+without touching its name;
+a Play routes reference `C.m` reads, in each file declaring a class `C`, the names and
+languages of its methods and functions and the file's path, so a sync of an index that
+recorded Play compares each changed file's classes and actions, in any language, before
+the change and after it, and retries each `C.m` the change moves: the unresolved ones by
+their whole names, past the 500 a tail retries, and the resolved ones at their sites, an
+edge's target naming only the action; the `play_routes_version` marker is withdrawn and
+restored with the others, and a sync that finds it missing re-resolves every Play routes
+file;
+a Laravel route's `Controller@action` and a resource route's controller wait under their
+whole names, which no new symbol's name matches, and read `app/Http/Controllers/<path>.php`,
+the PHP class names of the files whose path holds `Controllers` and those files' method
+names, so a sync of an index that recorded Laravel compares each changed such file's class
+and method names before the change and after it and retries the route references that
+read a file that moved, the unresolved ones by their whole names and the resolved ones at
+their sites; a Drupal routing file's handler reads the PHP classes of its name and their
+files' methods, and `hook_X` the PHP functions of the hook files whose name ends with
+`_X`, so a sync of an index that recorded Drupal compares each changed file's PHP class,
+method and hook function names the same way, retries the handlers naming a class of a
+file that moved and every `hook_X` a hook function that came or went answers, and
+re-resolves at their sites the resolved `hook_X` references named like a node that came
+or went (a definition outranks the implementation); the `laravel_routes_version` and
+`drupal_refs_version` markers are withdrawn and restored with the others, and a sync
+that finds one missing re-resolves every file holding a Laravel route's reference, or
+every routing file and every file holding a `hook_X` reference;
+a Rails route's `controller#action` waits under its whole name too, and reads
+`app/controllers/<controller>_controller.rb`, the Ruby class names of every file and
+those files' method and function names, so a sync of an index that recorded Rails
+compares each changed file's Ruby class, method and function names before the change
+and after it and retries the route references naming a class of a file that moved, or
+naming that file as their `app/controllers/<controller>_controller.rb`, the unresolved
+ones by their whole names and the resolved ones at their sites; the
+`rails_routes_version` marker is withdrawn and restored with the others, and a sync
+that finds it missing re-resolves every file holding a Rails route's reference;
+a Vapor route's handler (`TodoController@index`, `@index`) waits under its whole name
+too, and its choice reads the Swift methods and functions of its method's name, the
+types around them and the first lines of both, which no name moves, so a sync of an
+index that recorded Vapor reads each changed file's Swift method and function names
+before the change and after it and retries the route handlers whose method is one of
+them, the unresolved ones by their whole names and the resolved ones at their sites,
+however many; the `vapor_routes_version` marker is withdrawn and restored with the
+others, and a sync that finds it missing re-resolves every file holding a Swift route's
+reference;
+the Rust module rule's target is the file node of the root's `src/<name>.rs` or
+`src/<name>/mod.rs`, or of a workspace crate's `src/lib.rs` or `src/main.rs`, which
+no reference's name matches, so a sync of an index that recorded `rust` reads, for
+each such file it added or removed, and for each it kept whose file node came or
+went (a file over `indexing.max_file_size` is recorded without nodes), the names
+the rule may answer with it (`<name>`
+for a root module, every name and alias the workspace gives the member for a crate
+root) and retries the references of those names, the unresolved ones by their whole
+names and the resolved ones at their sites; the workspace's manifests are the Rust
+control inputs (a change to one is the control-input lane's, below); the
+`rust_crate_roots_version` marker is withdrawn and restored with the others, and a
+sync that finds it missing re-resolves every Rust file;
 an import names a file, a folder or a namespace rather than a symbol, so the parked
-imports an added file or a changed file's namespace can satisfy (by the file's
-name and stem, its folder's, or the namespace's whole name), and the parked
-references written as a path (a Liquid `{% render 'price' %}` waits under
+imports an added file, a kept file whose file node came or went across
+`indexing.max_file_size`, or a changed file's namespace can satisfy (by the
+file's name and stem, its folder's, or the namespace's whole name), and the
+parked references written as a path (a Liquid `{% render 'price' %}` waits under
 `price` for `snippets/price.liquid`), send their files
 down the whole-file re-resolution lane, which rebuilds an unchanged file's
 resolved edges and keeps what its extraction produced (`contains` edges and
-same-file value references). A call through a class name (`User.create()`)
+same-file value references). The resolved imports and path references those
+keys name are resolved again over the synced index, and one whose answer is
+not the target its edge holds (an added `api.ts` ahead of the `api/index.ts`
+that `./api` took) sends its file down that lane too, since the import's
+bindings and the calls through them follow its answer. A C or C++ translation
+unit's include walk takes each include's first indexed candidate and decides
+by what it reads whether a call is a macro expansion, so when the index holds
+a function-like macro, the files whose `#include` spells the name or stem of
+a file the sync added, removed or carried across the size limit go down the
+lane as well, with every file whose include spells one of those in turn. A
+route's reference to the module it lazily loads (React Router's
+`lazy-import:./pages/Team`, the `import:./pages/Team#TeamPage` a loader
+picks, Vue Router's and Angular's `import:<path>#<export>`, each also behind
+`layout:`) and a navigation call (`navigate('/login')`, `history.push`) name
+no symbol a changed file declares, so they have lanes of their own, read once
+the sync's files and framework nodes are written (W7-23). A parked module
+reference goes back when its module path's stem is an import path key of a
+module file the sync added, re-extracted or removed (a file of a language
+with a module surface), or of a barrel forwarding one, found through the
+module-surface rows since an `export … from` makes no import edge; a
+resolved one when its module now resolves into those files. A `references`
+reference naming a module-level constant or variable of its own file
+(`const Docs = lazy(() => import('./pages/Docs'))`, rendered by a route's
+`element` or a JSX tag), in a file holding a dynamic `import(…)`, goes back
+when the files React's lookup reads through the value
+(`FrameworkResolver::lazy_modules`: the module and each barrel on the way,
+read after the change) include a changed file. The route nodes of the
+navigation routers' languages are read before the sync's first mutation and
+compared with those after its framework passes, by file and path: each
+detected router that binds navigation (`FrameworkResolver::navigation`)
+scopes a changed route to the calls of its app, Vue Router and Angular count
+each route of a routes file the sync re-extracted or removed as changed
+(their tables read a route's name or a redirect from the file's text), and
+Angular adds the app of a rewritten file that only lazy-loads routes files;
+the parked calls with the routers' method tails and the `navigates` edges
+their resolvers drew, in that scope and claimed by the router, go back.
+Angular and React Router read a destination through constants another file
+holds, so their calls in the files whose references into a rewritten file
+the sync refreshes go back too. Each goes back at its site, with no ceiling;
+a file the sync re-extracted is left out, and a sync that re-resolves the
+JavaScript family whole (a framework change, a JavaScript control-input
+change, a module-surface bootstrap) runs none of these lanes. A reference
+written through an import binding (`logger.info()` after `import { logger }
+from './logging'`, `setTimeout(api.getUser)` after `import { api } from
+'./api'`) reads the bound module's own text: which of its declarations the
+binding names, the value's initializer or annotation and that file's import
+of the class it names (#1292, upstream #2644), or the binding an object
+literal names (#1932). No edge into the module and no touched name reaches
+it, so a sync that removes a module of a language with a module surface, or
+a Python module, or re-extracts one whose binding facts moved, reads the
+`imports` edges other files of those languages hold into it before its nodes
+go, and sends the references each importer writes through a binding's local
+name (`log.info()` after `import { logger as log }`, of any kind but an
+import) back at their sites with the binding (W7-31). The facts are a
+`binding_facts:` digest row per file (OD-B72): the import mappings
+resolution extracts from the file's text, its module-level values with their
+full lines, and each module-level declaration that shares its name with
+another, in the store's order. A missing row counts as moved, and a
+re-extracted module whose facts did not move still counts when the
+module-surface lane walked in the same sync, since that lane re-resolves no
+re-extracted file and a barrel the module imports through may have moved.
+The references are read from the importer's stored references while the
+stored-references marker holds, and from its extraction otherwise, as the
+dependent refresh reads them; a binding whose site holds no import reference
+sends the importer whole. A module the module-surface lane re-resolves
+whole, because a barrel it imports a class through moved, counts as
+rewritten too. There is no ceiling, and an importer the sync re-extracts or
+re-resolves whole is left out. A sync that fails after its first write
+leaves the class-heads marker away, and its bootstrap re-resolves every file
+of both languages once. Framework nodes (a React Router route) are made
+by passes that run after a file's re-extraction, so comparing a
+changed file's stored nodes with its re-extracted ones touches their names; when
+that comparison is all that touched names in a sync, and once the passes have
+run each compared file's nodes, compared again with its stored ones, touch
+none, the sync retries no reference by name. A name touched any other way (by a
+lane above, by a removed file), a framework node made or changed in a file the
+sync did not compare, a cross-file route table that changed, or compared files
+holding more stored nodes than the check keeps, leave the retry as it was. A
+call through a class name (`User.create()`)
 reads the supertypes each class head names, at most five levels up, which no
 node records: every index and sync keeps a `class_heads:` row per file declaring
 such a type, with what each declaration's own head writes, and a sync seeds the
@@ -592,21 +1098,40 @@ it, however many there are; while it resolves, a sync whose rows were current
 as it started reads the heads of a file it neither rebuilds nor removes from
 that file's row rather than its source; the `class_heads_version` marker is
 withdrawn and restored with the others. Resolution also reads control files, which are no
-source files: the JS/TS path-alias configs along their `extends` chains, the
-workspace manifests and the folders a workspace glob lists, the `package.json`
-and Deno manifests above each JavaScript-family file, the C# project files
-above each C# file, and the `Cargo.toml` files above each Rust file; and the
+source files: the JS/TS path-alias configs along their `extends` chains (the
+root's, and those in each directory above a JavaScript-family file), the
+workspace manifests and the folders a workspace glob lists, the
+`oh-package.json5` manifests the ohpm walk reads, the `package.json`
+and Deno manifests above each JavaScript-family file and the `package.json`
+files framework detection reads, the `angular.json` and `nx.json` in each
+directory above a JavaScript-family file (an Angular app's root is the
+nearest one holding either), the C# project files
+above each C# file, the `Cargo.toml` files above each Rust file, and the
+`go.mod` files at the root and above each Go file; the root files Django,
+Flask and FastAPI are detected by (`requirements.txt`, `setup.py`, `pyproject.toml`,
+`Pipfile`, `manage.py`, `app.py`, `main.py` and `api.py`, indexed or not), and those
+Spring and Play are (`pom.xml`, `build.gradle`, `build.gradle.kts`, `build.sbt`,
+`conf/routes` and `conf/application.conf`, indexed or not), and those Laravel and
+Drupal are (`artisan`, `app/Http/Kernel.php` and `composer.json`, indexed or not), and
+those Rails is (`Gemfile`, `config/application.rb`,
+`app/controllers/application_controller.rb` and `config/routes.rb`, indexed or not), and
+those ASP.NET is (`Program.cs` and `Startup.cs`, indexed or not), and the one
+Vapor is (`Package.swift`, indexed or not); and the
 frameworks it detects. Each reader reports what it read or probed in the same
 traversal, and every index and sync keeps a `control_inputs:` row per kind
-(`js`, `csharp`, `rust`) holding each input's digest by path (the sha256 of
+(`js`, `csharp`, `rust`, `go`, `python`, `jvm`, `php`, `ruby`, `dotnet`, `swift`) holding each input's digest by path (the sha256 of
 its text, or of a listed folder's names; `null` for a missing one; one outside
 the project by the absolute path its reader used), and a `frameworks_detected`
-row. A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
+row (the detected frameworks, sorted, and, when a framework runs only in its
+own apps, a digest of where it runs). A sync re-reads a kind's inputs (a CLI sync always; a watcher's when a
 path it was handed is a recorded input, a control file of the kind, or a folder
 coming into a workspace glob's listing, or when a file of the kind came, went
 or changed language), whole, with no size or time shortcut; a kind whose inputs
-moved re-resolves every file of its languages whole, and a framework that came
-or went re-extracts every file, since framework nodes are made at extraction.
+moved re-resolves every file of its languages whole (the `python`, `jvm`, `php`,
+`ruby`, `dotnet` and `swift` kinds have none: a move, or a row missing from an older index, only has the sync detect
+the frameworks again), and a framework that came
+or went, or an app that moved onto or off a framework that runs only in its
+apps, re-extracts every file, since framework nodes are made at extraction.
 The `control_inputs_version` marker is withdrawn and restored with the others,
 and `frameworks_version` only by a sync re-extracting for a framework change.
 The watcher hands a control file's event to the sync, ignored or not, and an

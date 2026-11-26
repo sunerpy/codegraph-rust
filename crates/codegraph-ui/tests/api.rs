@@ -170,8 +170,18 @@ async fn lists_the_endpoints_it_answers() {
     ] {
         assert!(paths.iter().any(|p| p == path), "{path}");
     }
-    // Steps is not built by this server, so it is not listed.
-    assert!(!paths.iter().any(|p| p == "/api/steps"));
+    // Steps is listed with upstream's parameters (`through` unlisted, as
+    // upstream lists it).
+    let steps = body["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|endpoint| endpoint["path"] == "/api/steps")
+        .unwrap_or_else(|| panic!("/api/steps is listed: {body}"));
+    assert_eq!(
+        steps["params"],
+        serde_json::json!(["anchor", "symbol", "depth", "limit"])
+    );
 }
 
 #[tokio::test]
@@ -180,9 +190,43 @@ async fn _404s_an_unknown_endpoint_as_json_never_as_the_app_shell() {
     let reply = project.viewer().get("/api/nope").await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(reply.json()["code"], "not-found");
-    let steps = project.viewer().get("/api/steps").await;
-    assert_eq!(steps.status, StatusCode::NOT_FOUND);
-    assert!(steps.json()["hint"].as_str().unwrap().contains("Steps"));
+}
+
+/* ------------------------------------------------------------ /api/steps -- */
+
+#[tokio::test]
+async fn steps_refuses_a_missing_anchor_an_unknown_id_or_name_and_a_depth_past_the_cap() {
+    let project = fixture();
+    let viewer = project.viewer();
+    let missing = viewer.get("/api/steps").await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json()["code"], "bad-request");
+    assert!(
+        missing.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Give the picture an anchor"),
+        "{}",
+        missing.text()
+    );
+    let unknown = viewer.get("/api/steps?anchor=function%3Anope").await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+    assert!(
+        unknown.text().contains("No symbol with id"),
+        "{}",
+        unknown.text()
+    );
+    let unnamed = viewer.get("/api/steps?symbol=nothingNamedThis").await;
+    assert_eq!(unnamed.status, StatusCode::NOT_FOUND);
+    assert!(
+        unnamed.text().contains("Nothing in this index is named"),
+        "{}",
+        unnamed.text()
+    );
+    let deep = viewer
+        .get("/api/steps?symbol=nothingNamedThis&depth=15")
+        .await;
+    assert_eq!(deep.status, StatusCode::BAD_REQUEST, "{}", deep.text());
 }
 
 #[tokio::test]
@@ -616,6 +660,118 @@ async fn summarizes_which_tests_reach_the_symbol() {
     assert_eq!(unreached["tests"]["reached"], false);
     assert!(unreached["tests"]["hops"].is_null());
     assert_eq!(unreached["tests"]["files"], serde_json::json!([]));
+}
+
+const SPRING_POM: &str = "<project><dependencies><dependency><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>";
+
+const SPRING_CONTROLLER: &str = "package app.owner;
+import org.springframework.web.bind.annotation.*;
+@Controller
+class OwnerController {
+    @GetMapping(\"/owners/new\")
+    public String initCreationForm() { return \"owners/form\"; }
+    @PostMapping(\"/owners/new\")
+    public String processCreationForm() { return \"redirect:/owners\"; }
+    @GetMapping(\"/owners/{ownerId}/edit\")
+    public String initUpdateOwnerForm(@PathVariable int ownerId) { return \"owners/form\"; }
+    @GetMapping(\"/owners\")
+    public String processFindForm() { return \"owners/list\"; }
+}
+";
+
+/// Upstream `test-request-edges.test.ts` 127 (W7-20): a Spring test reaches
+/// its controller by URL. The test's request reaches the route and the
+/// route's own edge the handler, so the handler is tested, two hops up; an
+/// untested handler still says so.
+#[tokio::test]
+async fn reaches_a_handler_through_a_tests_request() {
+    let project = Project::indexed(&[
+        ("pom.xml", SPRING_POM),
+        (
+            "src/main/java/app/owner/OwnerController.java",
+            SPRING_CONTROLLER,
+        ),
+        (
+            "src/test/java/app/owner/OwnerControllerTests.java",
+            "package app.owner;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+class OwnerControllerTests {
+    void creates() throws Exception { mockMvc.perform(post(\"/owners/new\")); }
+}
+",
+        ),
+    ]);
+    let viewer = project.viewer();
+    let handler = viewer.id_of("processCreationForm", Some("method")).await;
+    let reached = viewer
+        .json(&format!("/api/node/{}", encode(&handler)))
+        .await;
+    assert_eq!(reached["tests"]["reached"], true, "{}", reached["tests"]);
+    assert_eq!(reached["tests"]["hops"], 2);
+    assert_eq!(
+        reached["tests"]["files"],
+        serde_json::json!(["src/test/java/app/owner/OwnerControllerTests.java"])
+    );
+    let untested = viewer.id_of("processFindForm", Some("method")).await;
+    let unreached = viewer
+        .json(&format!("/api/node/{}", encode(&untested)))
+        .await;
+    assert_eq!(unreached["tests"]["reached"], false);
+}
+
+/// Upstream `test-request-edges.test.ts` 286 (W7-20, #2100): forty-five
+/// tests requesting one route make it no hub. The route's rail row counts
+/// its fan-in without the tests' requests; its own `counts` are its callers,
+/// the tests among them, as upstream's are.
+#[tokio::test]
+async fn keeps_a_tests_requests_out_of_a_routes_fan_in() {
+    let tests: Vec<String> = (0..45)
+        .map(|at| format!("    public function testAbout{at}() {{ $this->get('/about'); }}"))
+        .collect();
+    let many = format!(
+        "<?php\nclass ManyTest extends TestCase {{\n{}\n}}\n",
+        tests.join("\n")
+    );
+    let project = Project::indexed(&[
+        ("artisan", "#!/usr/bin/env php\n<?php\n"),
+        (
+            "composer.json",
+            "{\"require\":{\"laravel/framework\":\"^11.0\"}}",
+        ),
+        (
+            "routes/web.php",
+            "<?php\nRoute::get('/about', [PageController::class, 'about']);\n",
+        ),
+        (
+            "app/Http/Controllers/PageController.php",
+            "<?php\nclass PageController { public function about() {} }\n",
+        ),
+        ("tests/Feature/ManyTest.php", &many),
+    ]);
+    let viewer = project.viewer();
+    let test = viewer.id_of("testAbout0", Some("method")).await;
+    let body = viewer.json(&format!("/api/node/{}", encode(&test))).await;
+    let route = body["outgoing"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["node"]["name"] == "GET /about")
+        .unwrap_or_else(|| panic!("no rail row for the route: {}", body["outgoing"]))
+        .clone();
+    assert!(route["fanIn"].as_i64().unwrap() < 5, "{route}");
+    assert_eq!(route["hub"], false, "{route}");
+    let own = viewer
+        .json(&format!(
+            "/api/node/{}",
+            encode(route["node"]["id"].as_str().unwrap())
+        ))
+        .await;
+    assert!(
+        own["counts"]["callers"].as_i64().unwrap() >= 45,
+        "{}",
+        own["counts"]
+    );
+    assert_eq!(own["counts"]["hub"], true, "{}", own["counts"]);
 }
 
 #[tokio::test]

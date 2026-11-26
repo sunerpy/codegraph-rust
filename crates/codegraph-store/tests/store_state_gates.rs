@@ -651,6 +651,26 @@ fn current_read_and_status_reject_tombstone_without_mutating_any_artifact() {
     }
 }
 
+/// The tombstone an `init` that published `Current` could not remove does not
+/// stand between `uninit --force` and the index: uninit completes the discard
+/// that tombstone records.
+#[test]
+fn uninit_discards_a_current_index_beside_its_tombstone() {
+    let project = TempProject::new("current-tombstoned-uninit");
+    let paths = stage_current(&project, Some(&CURRENT_EXTRACTION_VERSION.to_string()));
+    std::fs::write(paths.tombstone(), b"remove failed")
+        .expect("stage Current+tombstone finalizer residue");
+
+    codegraph_store::uninit_index(&paths, deadline(), || false)
+        .expect("uninit --force discards Current+tombstone");
+    assert!(!paths.current_db().exists(), "uninit removed the database");
+    assert!(paths.tombstone().is_file(), "the tombstone stays for init");
+    assert_eq!(
+        Store::extraction_status(&paths),
+        ExtractionStatus::Uninitialized
+    );
+}
+
 #[test]
 fn current_read_stamp_failures_are_typed_and_byte_nonmutating() {
     for (stamp, expected) in [

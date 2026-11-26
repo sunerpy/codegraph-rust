@@ -311,6 +311,68 @@ fn checkpoint_wal_if_over_folds_only_past_threshold() {
     );
 }
 
+/// Write rows of 4 KiB until the `-wal` sidecar holds over 1 MiB, with the
+/// bulk pragmas deferring every autocheckpoint.
+fn grow_wal_past_one_mib(store: &Store) {
+    store
+        .connection()
+        .execute_batch("CREATE TABLE IF NOT EXISTS wal_fill(x TEXT);")
+        .unwrap();
+    let big = "x".repeat(4096);
+    while store.wal_size_bytes().unwrap() <= 1 << 20 {
+        store
+            .connection()
+            .execute("INSERT INTO wal_fill(x) VALUES (?)", [&big])
+            .unwrap();
+    }
+}
+
+// Table 9.1 row 26 (upstream 8c1e821, `wal-deferral.test.ts`: "chops a
+// fully-backfilled WAL file to zero"): the valve's fold leaves a `-wal`
+// sidecar of zero bytes, the file itself and not only its backlog, whether
+// the store folds it (the batched resolver and migration) or the active
+// rebuild does (the full index's edge and reference replay). Every caller
+// holds the exclusive lease, so no reader can pin the WAL.
+#[test]
+fn wal_fold_truncates_the_sidecar_to_zero() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: guarded by ENV_LOCK so the opt-out test's env set/remove can't race.
+    unsafe { std::env::remove_var("CODEGRAPH_NO_WAL_DEFER") };
+
+    let dir = TestDir::new();
+    let store = Store::open(&dir.path().join("codegraph.db")).unwrap();
+    store.set_bulk_index_pragmas().unwrap();
+    grow_wal_past_one_mib(&store);
+    assert!(store.checkpoint_wal_if_over(0).unwrap(), "over the valve");
+    assert_eq!(
+        store.wal_size_bytes().unwrap(),
+        0,
+        "the store's fold must truncate the -wal file to zero"
+    );
+    drop(store);
+
+    let project = TestDir::new();
+    let paths = codegraph_core::IndexPaths::resolve(project.path(), None).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let rebuild = codegraph_store::begin_full_rebuild(
+        &paths,
+        codegraph_store::RebuildKind::ExplicitInit,
+        deadline,
+        || false,
+    )
+    .unwrap()
+    .open_store()
+    .unwrap();
+    rebuild.set_bulk_index_pragmas().unwrap();
+    grow_wal_past_one_mib(rebuild.store());
+    assert!(rebuild.checkpoint_wal_if_over(0).unwrap(), "over the valve");
+    assert_eq!(
+        rebuild.store().wal_size_bytes().unwrap(),
+        0,
+        "the rebuild's fold must truncate the -wal file to zero"
+    );
+}
+
 fn run_isolated_child(case: &str) {
     let mut command = Command::new(std::env::current_exe().expect("current test binary"));
     command

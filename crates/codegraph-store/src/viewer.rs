@@ -196,16 +196,19 @@ impl Store {
         self.batched_edges("target", ids, kinds)
     }
 
+    /// Edge counts per id in `column`, the edges `filter` (an `AND …`
+    /// clause, or empty) keeps.
     fn batched_counts(
         &self,
         column: &str,
+        filter: &str,
         ids: &[String],
     ) -> rusqlite::Result<HashMap<String, i64>> {
         let ids = unique(ids);
         let mut out = HashMap::new();
         for chunk in ids.chunks(SQLITE_PARAM_CHUNK_SIZE) {
             let sql = format!(
-                "SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({}) GROUP BY {column}",
+                "SELECT {column}, COUNT(*) FROM edges WHERE {column} IN ({}) {filter} GROUP BY {column}",
                 placeholders(chunk.len())
             );
             let values: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
@@ -221,14 +224,21 @@ impl Store {
         Ok(out)
     }
 
-    /// `countIncomingEdges` (`getFanIn`): incoming edge count per id.
+    /// `countIncomingEdges` (`getFanIn`): incoming edge count per id, a
+    /// test's request onto a route left out (upstream #2100): forty tests
+    /// hitting one endpoint make it no hub. The condition is upstream's; the
+    /// metadata is compact JSON, so the key and value appear as written.
     pub fn count_incoming_edges(&self, ids: &[String]) -> rusqlite::Result<HashMap<String, i64>> {
-        self.batched_counts("target", ids)
+        self.batched_counts(
+            "target",
+            "AND (metadata IS NULL OR metadata NOT LIKE '%\"synthesizedBy\":\"test-request\"%')",
+            ids,
+        )
     }
 
     /// `countOutgoingEdges` (`getFanOut`): outgoing edge count per id.
     pub fn count_outgoing_edges(&self, ids: &[String]) -> rusqlite::Result<HashMap<String, i64>> {
-        self.batched_counts("source", ids)
+        self.batched_counts("source", "", ids)
     }
 
     /// `getTopDependedOn`: the nodes with the most distinct dependents.
@@ -415,7 +425,8 @@ impl Store {
     }
 
     /// `getRoutingManifest`'s SELECT: route → handler rows, routes in file and
-    /// line order, at most `limit`.
+    /// line order, at most `limit`. A screen in a Vue app is served by a
+    /// `component` (upstream #2267).
     pub fn routing_manifest_rows(&self, limit: i64) -> rusqlite::Result<Vec<RoutingRow>> {
         let mut stmt = self.connection().prepare(
             "SELECT r.name, r.id, r.file_path, r.start_line,
@@ -425,7 +436,7 @@ impl Store {
                JOIN nodes h ON e.target = h.id
               WHERE r.kind = 'route'
                 AND e.kind IN ('references', 'calls')
-                AND h.kind IN ('function', 'method', 'class', 'constant', 'variable')
+                AND h.kind IN ('function', 'method', 'class', 'constant', 'variable', 'component')
            ORDER BY r.file_path, r.start_line, r.id, h.id
               LIMIT ?",
         )?;
@@ -761,6 +772,50 @@ impl Store {
         Ok(found)
     }
 
+    /// The names the references that resolved at these sites were written
+    /// with — `prisma.user.create` where the edge only says `create` — by
+    /// `(from_node_id, line, col)`, each site's names in id order. Upstream
+    /// keeps the name on a `calls` edge's metadata (`refName`); this index
+    /// keeps it on the resolved reference. One query per chunk of sources,
+    /// through `idx_resolved_refs_site`.
+    pub fn resolved_reference_names_at(
+        &self,
+        sites: &[(String, i64, i64)],
+    ) -> rusqlite::Result<HashMap<(String, i64, i64), Vec<String>>> {
+        let mut out: HashMap<(String, i64, i64), Vec<String>> = HashMap::new();
+        if sites.is_empty() {
+            return Ok(out);
+        }
+        let wanted: std::collections::HashSet<(&str, i64, i64)> = sites
+            .iter()
+            .map(|(source, line, col)| (source.as_str(), *line, *col))
+            .collect();
+        let sources: Vec<String> = sites.iter().map(|(source, _, _)| source.clone()).collect();
+        for chunk in unique(&sources).chunks(SQLITE_PARAM_CHUNK_SIZE) {
+            let sql = format!(
+                "SELECT from_node_id, line, col, reference_name FROM resolved_refs WHERE from_node_id IN ({}) ORDER BY from_node_id, line, col, id",
+                placeholders(chunk.len())
+            );
+            let values: Vec<&dyn ToSql> = chunk.iter().map(|id| id as &dyn ToSql).collect();
+            let mut stmt = self.connection().prepare(&sql)?;
+            let rows = stmt.query_map(values.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (source, line, col, name) = row?;
+                if wanted.contains(&(source.as_str(), line, col)) {
+                    out.entry((source, line, col)).or_default().push(name);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// `getUnresolvedReferencesFrom`: references from one symbol that never
     /// resolved to an indexed node, in line order.
     pub fn unresolved_refs_from(&self, from_node_id: &str) -> rusqlite::Result<Vec<UnresolvedRef>> {
@@ -797,5 +852,156 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![format!("%{substring}%"), limit], row_to_node)?;
         rows.collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use codegraph_core::types::Language;
+
+    use super::*;
+
+    fn node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            kind: NodeKind::Function,
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: format!("src/{id}.ts"),
+            language: Language::TypeScript,
+            start_line: 1,
+            end_line: 1,
+            start_column: 0,
+            end_column: 1,
+            docstring: None,
+            signature: None,
+            visibility: None,
+            is_exported: true,
+            is_async: false,
+            is_static: false,
+            is_abstract: false,
+            decorators: Vec::new(),
+            type_parameters: Vec::new(),
+            return_type: None,
+            updated_at: 0,
+        }
+    }
+
+    /// The names written at a resolved site come back for that site only,
+    /// in id order, through the site index.
+    #[test]
+    fn resolved_reference_names_come_back_by_site() {
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-store-viewer-ref-names-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store.upsert_nodes(&["caller", "other"].map(node)).unwrap();
+        for (id, source, name, line, col) in [
+            (1, "caller", "prisma.user.create", 3, 4),
+            (2, "caller", "user.create", 3, 4),
+            (3, "caller", "log", 5, 2),
+            (4, "other", "prisma.user.create", 3, 4),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO resolved_refs (id, from_node_id, reference_name, reference_kind, line, col, file_path, language) VALUES (?1, ?2, ?3, 'calls', ?4, ?5, 'src/caller.ts', 'typescript')",
+                    params![id, source, name, line, col],
+                )
+                .unwrap();
+        }
+        let names = store
+            .resolved_reference_names_at(&[
+                ("caller".to_string(), 3, 4),
+                ("caller".to_string(), 9, 9),
+            ])
+            .unwrap();
+        assert_eq!(
+            names.get(&("caller".to_string(), 3, 4)),
+            Some(&vec![
+                "prisma.user.create".to_string(),
+                "user.create".to_string()
+            ])
+        );
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(store.resolved_reference_names_at(&[]).unwrap().is_empty());
+        let plan: Vec<String> = store
+            .connection()
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT from_node_id, line, col, reference_name FROM resolved_refs WHERE from_node_id IN (?, ?) ORDER BY from_node_id, line, col, id",
+            )
+            .unwrap()
+            .query_map(params!["caller", "other"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_resolved_refs_site")),
+            "{plan:?}"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A test's request onto a route is left out of the route's fan-in;
+    /// every other edge counts, another synthesized one, one without
+    /// metadata and one whose metadata is no JSON alike. Fan-out is not
+    /// filtered.
+    #[test]
+    fn fan_in_leaves_out_a_tests_requests() {
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-store-viewer-fan-in-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir.join("index.db")).unwrap();
+        store
+            .upsert_nodes(&["route", "test", "client", "plain", "broken"].map(node))
+            .unwrap();
+        for (source, metadata) in [
+            (
+                "test",
+                Some(r#"{"callee":"$this->get","channel":"http","synthesizedBy":"test-request"}"#),
+            ),
+            (
+                "client",
+                Some(r#"{"channel":"http","synthesizedBy":"http-client"}"#),
+            ),
+            ("plain", None),
+            ("broken", Some("not json")),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO edges (source, target, kind, metadata, line, col) VALUES (?1, 'route', 'calls', ?2, 1, 0)",
+                    params![source, metadata],
+                )
+                .unwrap();
+        }
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        let fan_in = store
+            .count_incoming_edges(&ids(&["route", "test"]))
+            .unwrap();
+        assert_eq!(fan_in.get("route"), Some(&3));
+        assert_eq!(fan_in.get("test"), None);
+        let fan_out = store
+            .count_outgoing_edges(&ids(&["test", "client", "plain", "broken"]))
+            .unwrap();
+        for source in ["test", "client", "plain", "broken"] {
+            assert_eq!(fan_out.get(source), Some(&1), "{source}");
+        }
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

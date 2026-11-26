@@ -6,7 +6,8 @@
 
 - **Positional or `-p/--path`:** `init`, `uninit`, `index`, `sync`, `status`,
   `callers`, `callees`, `impact`, `affected`, `unlock`, `check`, `export`.
-- **`-p/--path` only:** `search`, `files`, `serve`, `audit`, `explore`, `node`.
+- **`-p/--path` only:** `search`, `files`, `serve`, `audit`, `explore`, `node`,
+  `context`.
 - **No project path:** `install`, `uninstall`, `skill`, `version`, `self-update`,
   `completions`, `http`, `mcp`.
 
@@ -41,6 +42,7 @@
 | `export`          | Export the whole code graph as NetworkX node-link JSON                                                                        | `-p/--path`, `-o/--out <file>`, `--no-centrality`                                                                                          |
 | `explore`         | Explore an area with the same deterministic engine/output as `codegraph_explore`                                              | `<query>`, `-p`, `--max-files <1..20>`, `-j/--json`                                                                                        |
 | `node`            | Read a symbol name, exact node ID, or indexed file with the `codegraph_node` engine                                           | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
+| `context`         | Build task context: entry points, related symbols, code blocks and call paths, as Markdown or JSON                            | `<task...>`, `-p`, `-f/--format markdown\|json`, `-n/--max-nodes <N>`, `--no-code`                                                         |
 | `http`            | Inspect or stop detached HTTP MCP servers                                                                                     | `<action>` (`list`, `status`, `stop`)                                                                                                      |
 | `mcp`             | Inspect foreground stdio MCP processes                                                                                        | `list`, optional `--json`                                                                                                                  |
 | `ui`              | Open the browser viewer over the existing index (preview: refused unless `CODEGRAPH_UI=1`; see [the viewer reference](ui.md)) | `[path]`, `--port <N>`, `--no-open`, `--read-only`; alias `web`                                                                            |
@@ -107,11 +109,14 @@ codegraph sync .
 codegraph search "handle_node" -p . --json
 codegraph explore "node lookup flow" -p .
 codegraph node "handle_node" -p .
+codegraph context "node lookup flow" -p . --format json
 ```
 
 Do not append `.` as a second positional argument to `search`, `explore`, or
-`node`. On an argument error, use `codegraph <command> --help`; a CLI-shape
-mismatch is not a reason to abandon the index for grep.
+`node`; `context` takes every positional word as part of its task, so a `.`
+there becomes a word of the query. On an argument error, use
+`codegraph <command> --help`; a CLI-shape mismatch is not a reason to abandon
+the index for grep.
 
 `search --json` includes each result's stable internal `node.id`. That ID can be
 passed directly to `node`, avoiding name ambiguity:
@@ -444,6 +449,88 @@ If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run with
 appropriate privileges. Windows assets are `.zip`; if `self-update` cannot fetch
 them automatically, reinstall via
 `cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs`.
+
+---
+
+## `codegraph context` — task context as Markdown or JSON
+
+`codegraph context <task...>` builds what upstream's `codegraph context` builds
+for a task: its entry points, the symbols around them, their code and the call
+paths among them. The words of the task are joined with spaces. Scripts and
+tools call it the way Memorix does:
+
+```bash
+codegraph context -p . --format json --max-nodes 8 --no-code "where is the token refreshed"
+codegraph context "parseToken expiry handling" -p .
+```
+
+| Flag                         | Default                                                          | Meaning                   |
+| ---------------------------- | ---------------------------------------------------------------- | ------------------------- |
+| `-p/--path <PATH>`           | the current directory, or the nearest indexed directory above it | Project root              |
+| `-f/--format markdown\|json` | `markdown`                                                       | Output format             |
+| `-n/--max-nodes <N>`         | 20                                                               | Symbols at most           |
+| `--no-code`                  | code blocks on                                                   | Leave the code blocks out |
+
+The other limits are upstream's defaults and have no flag: 3 entry points, a
+walk of one hop, and at most 5 code blocks of at most 1500 UTF-16 code units
+each (a longer block is cut and ends with `... (truncated) ...`).
+
+How the answer is built:
+
+- **Entry points:** the first three results of the search `codegraph explore`
+  runs for the same words (the high-value kinds, the identifier-segment
+  seeds), with no score floor. Unlike explore, `context` keeps any path the
+  task names as words of the query.
+- **Subgraph:** explore's walk from the entry points, at context's limits:
+  each class-like entry point's type hierarchy, one hop over every edge kind
+  onto the high-value kinds, the node budget, at most `max(5, ⌈0.2·N⌉)` nodes
+  of one file, at most `max(3, ⌈0.15·N⌉)` nodes of test, example or fixture
+  files unless the task mentions `test` or `spec`, then the `calls`,
+  `extends`, `implements`, `references`, `overrides` and `navigates` edges
+  among the kept nodes.
+- **Code blocks:** the entry points, then the other functions and methods,
+  then the other classes, in the subgraph's order. Source goes through the
+  freshness check `codegraph node` uses: a file changed since the last sync
+  gives no block, never one cut at the indexed lines, and a `warning:` line on
+  stderr names it. A YAML or properties key gives its key alone, never the
+  value on its line.
+- **Call paths:** chains of three to six symbols along the `calls` edges
+  between kept nodes that pass through at least two entry points, three at
+  most. A hop a synthesis pass bridged reads
+  `→[interface → impl @src/pdf-exporter.ts:5]`, in the wording of explore's
+  Flow, and the footnote says so.
+- **Low-confidence note:** when the task has two or more terms and no entry
+  point is named in it as a distinctive identifier or carries two of its terms
+  in its name or directory, the Markdown ends with
+  `### ⚠️ Low-confidence match` and points to `codegraph_explore`,
+  `codegraph_search` and `codegraph_files`.
+
+Markdown has `## Code Context`, `**Query:**`, `### Entry Points` (generated
+files last), `### Related Symbols` (up to ten other symbols outside generated
+files, grouped by file), `### Code`, then `## Call paths` and the note.
+`--format json` prints one object with `query`, `summary`, `entryPoints`,
+`nodes`, `edges`, `codeBlocks`, `relatedFiles` and `stats`. A node has `id`,
+`kind`, `name`, `qualifiedName`, `filePath`, `language`, `startLine`,
+`endLine`, `signature`, `docstring`, `visibility`, `isExported`, `isAsync` and
+`isStatic`; a missing `signature` or `docstring` leaves its key out and a
+missing `visibility` is `null`. An edge has `source`, `target`, `kind`, `line`
+and `column`, the last two left out when unknown. `relatedFiles` sorts by
+UTF-16 code units and `stats.totalCodeSize` counts them. JSON carries neither
+the call paths nor the note.
+
+stdout holds the answer alone. Errors go to stderr with exit status 1:
+`Unknown format "<x>" — use "markdown" or "json".` and
+`--max-nodes expects a positive integer, got "<x>".`, both checked before the
+project, then the shared lifecycle errors, which for a missing index begin
+`CodeGraph not initialized in <path>`. `--max-nodes` reads its leading number
+as JavaScript's `parseInt` does, so `5abc` is 5 and `1.9` is 1. A missing task
+is a usage error (exit status 2). When the engine reports auto-sync recovering
+or disabled, a `warning:` line says the context may be stale; stdout does not
+change.
+
+`context` is CLI-only, as upstream's is; there is no MCP context tool. Where
+it differs from upstream's command, its entry points above all, is listed in
+[KNOWN_DIFFS](upstream-sync/KNOWN_DIFFS.md#codegraph-context-tier-2-content-differences).
 
 ---
 
@@ -992,7 +1079,8 @@ A `Current` index beside the uninit tombstone, which an `init` that published
 `Current` but could not remove the tombstone leaves, is reported the same way,
 with `recoveryCommand` set to `codegraph init <project>`; human output shows
 `current (blocked by the uninit tombstone)` and that recovery. Reads refuse such
-an index until `init` rebuilds it.
+an index until `init` rebuilds it; `uninit --force` discards it instead and keeps
+the tombstone.
 
 When the WAL is larger than both the database and the configured WAL limit,
 `status` warns that live CodeGraph processes must be stopped before running:
@@ -1141,14 +1229,16 @@ daemon mode when several agents or editor windows need the same live index.
 ### Live file watch
 
 The daemon watches the project for file changes and re-indexes automatically.
-Changes are debounced before the re-index triggers. On WSL2, watching files under
-`/mnt/` is automatically disabled because recursive `fs.watch` is too slow on
-those paths; the reason is surfaced in the log. On such a Windows drive WSL also
-keeps its own index: SQLite's locking does not hold across the Windows/WSL
-bridge, so with `CODEGRAPH_DIR` unset an existing `.codegraph-wsl/` is used, then
-an existing `.codegraph/codegraph.db` is kept, and otherwise a fresh index goes
-in `.codegraph-wsl/` (`init` says so). A disk I/O error on a shared
-`.codegraph/` index explains how to give WSL its own.
+Changes are debounced before the re-index triggers: a save of one or two files
+re-indexes after a 300 ms quiet window (the debounce, when that is shorter), a
+larger burst after the whole debounce, and every event restarts the wait. On
+WSL2, watching files under `/mnt/` is automatically disabled because recursive
+`fs.watch` is too slow on those paths; the reason is surfaced in the log. On
+such a Windows drive WSL also keeps its own index: SQLite's locking does not
+hold across the Windows/WSL bridge, so with `CODEGRAPH_DIR` unset an existing
+`.codegraph-wsl/` is used, then an existing `.codegraph/codegraph.db` is kept,
+and otherwise a fresh index goes in `.codegraph-wsl/` (`init` says so). A disk
+I/O error on a shared `.codegraph/` index explains how to give WSL its own.
 
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
@@ -1186,19 +1276,22 @@ target lies outside every indexed directory. Edits to that target are picked
 up by the next full `sync`.
 
 This keeps the total watch count well inside the OS inotify limit on large trees
-and makes daemon startup fast. A newly-created non-ignored directory is picked up
-automatically on its create event — no restart required. One kind of ignored
+and makes daemon startup fast. A directory that arrives whole, created, moved or
+copied in, or filled before its watch exists, is watched as soon as its event
+arrives, and the files already in it go to the next sync under the same ignore
+rules, as if each had sent its own event. One kind of ignored
 directory is still watched, itself and not below it: a `config/` or `layout/`
 directory, which may hold a Shopify theme marker (`config/settings_schema.json`,
 `layout/theme.liquid`). A marker counts though ignored, since it only tells a
 theme's JSON templates apart, and the watcher hands its events to the sync; a
 marker folder removed or moved away takes its marker with it.
 
-A settled burst normally syncs exactly the paths its events named. Three cases
+A settled burst normally syncs exactly the paths its events named. These cases
 make it run one full project reconcile instead, the same pass `codegraph sync`
 runs:
 
 - the burst named more than 500 paths, as a branch switch or a mass rename does;
+- a directory arrived holding more than 500 files the watcher would hand on;
 - the backend said events may have been dropped: inotify's queue overflowed,
   FSEvents asked for a rescan, or an event arrived without naming any path;
 - on Windows, whose backend can lose events without saying so, an idle watcher
@@ -1254,12 +1347,13 @@ Three escape hatches:
 | `CODEGRAPH_DAEMON_RETRY_MS`         | `5000`       | ≥0; `0` disables              | How long a cold-start stdio session waits before starting or re-attaching the shared daemon after its connection was lost; doubles after each miss. Empty, malformed, or negative values use the default                                                                                           |
 | `CODEGRAPH_DAEMON_RETRY_MAX_MS`     | `300000`     | ≥ `CODEGRAPH_DAEMON_RETRY_MS` | Cap for that doubling wait                                                                                                                                                                                                                                                                         |
 | `CODEGRAPH_DAEMON_INSTALL_CHECK_MS` | `30000`      | ≥0; `0` disables              | How often a daemon checks whether its own executable was replaced or removed, and then drains and exits. Empty or malformed values use the default                                                                                                                                                 |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`       | `2000`       | 100–60000                     | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`       | `2000`       | 100–60000                     | File-change debounce window before a re-index triggers; one or two changed files wait at most 300 ms                                                                                                                                                                                               |
 | `CODEGRAPH_WATCH_SENTINEL_MS`       | `60000`      | 0 or 1000–3600000             | Windows only: how often an idle watcher checks the index for changes no event reported; `0` disables. Empty or malformed values use the default                                                                                                                                                    |
 | `CODEGRAPH_NO_WATCH`                | —            | —                             | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
 | `CODEGRAPH_FORCE_WATCH`             | —            | —                             | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
 | `CODEGRAPH_NO_WAL_DEFER`            | —            | `1` enables opt-out           | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |
 | `CODEGRAPH_WAL_VALVE_MB`            | `256`        | >0; invalid→default           | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning                                                                                                                                                                                             |
+| `CODEGRAPH_PHASE_TIMINGS`           | —            | `1` enables                   | Print one stderr line per timed phase of `init`, `index`, and `sync`, in microseconds (see [Index diagnostics](#index-diagnostics))                                                                                                                                                                |
 | `CODEGRAPH_MCP_TOOL_TIMEOUT_SECS`   | `60`         | ≥0; `0` disables              | How long an MCP client waits for one tool call, in seconds; past it the call returns an `isError` result while its work finishes in the background. Empty or malformed values use the default                                                                                                      |
 | `CODEGRAPH_MCP_REGISTRY_DIR`        | —            | —                             | Override the stdio MCP registry directory read by `mcp list`                                                                                                                                                                                                                                       |
 | `CODEGRAPH_UI`                      | —            | `1` enables                   | Enable the browser viewer commands `ui` / `web` (preview); otherwise they are refused and hidden from `--help`                                                                                                                                                                                     |
@@ -1286,12 +1380,12 @@ flags here: passing either is an argument error.
 Place a `codegraph.json` inside the `.codegraph/` directory of any project to
 teach CodeGraph how to treat files with non-standard extensions:
 
-```jsonc
+```json
 {
   "extensions": {
     ".x": "lua",
-    ".blade": "php",
-  },
+    ".blade": "php"
+  }
 }
 ```
 
@@ -1326,12 +1420,12 @@ deprioritize = ["vendor/**", "generated/**"]
 The compatibility JSON form shares `.codegraph/codegraph.json` with extension
 overrides:
 
-```jsonc
+```json
 {
   "extensions": {
-    ".x": "lua",
+    ".x": "lua"
   },
-  "deprioritize": ["vendor/**"],
+  "deprioritize": ["vendor/**"]
 }
 ```
 
@@ -1347,6 +1441,121 @@ may waive only the inferred test penalty, never an explicit rule. Files, nodes,
 edges, exact path pins, and direct node/file reads are unchanged. MCP engines
 reload the addressed project's config for every request, so a long-running
 server observes edits on the next search/explore call.
+
+### Custom Lua module loaders (`[lua]`)
+
+A Lua code base that loads its modules through a function of its own,
+`Require("Script/Activity/ActivityMgrC.lua")` or `Include "ui.button"`, where
+other code calls `require`, names those functions, and the folders its modules
+are looked up in first, in the `[lua]` table of `config.toml`:
+
+```toml
+[app]
+name = "my-game"
+
+[lua]
+loader_functions = ["Require", "Include"]
+module_roots = ["Script"]
+```
+
+The compatibility JSON form is the `lua` object of `.codegraph/codegraph.json`:
+
+```json
+{
+  "lua": {
+    "loaderFunctions": ["Require", "Include"],
+    "moduleRoots": ["Script"]
+  }
+}
+```
+
+These rules are this port's own: upstream issue #1617 asked for loader
+functions and has no implementation upstream.
+
+Sources and precedence:
+
+- The TOML table comes from the same file as every other `config.toml`
+  section: the file `APP_CONFIG` names when it is set, which replaces the
+  project's `config.toml` whole (that file's `[lua]` is then not read),
+  otherwise the selected index root's `config.toml`. The JSON object always
+  comes from the selected index root's `codegraph.json`. Neither is looked for
+  in a parent directory or in another project.
+- A TOML key written as an array, an empty one included, replaces the JSON
+  key of the same meaning whole; the two lists are never joined.
+
+Validation never stops indexing:
+
+- A loader name is a Lua name or a dotted path of names
+  (`[A-Za-z_][A-Za-z0-9_]*`, then any `.` and another), ASCII, matched as
+  written: case counts and nothing is trimmed. A name written twice counts
+  once.
+- A module root is a folder inside the project, relative to its root and
+  written with `/`: one leading `./` and one trailing `/` are dropped, and `.`
+  (or `./`, or an empty string) is the project root itself. A root that is
+  absolute (`/x`, `C:`), holds a `\`, or has an empty, `.` or `..` segment is
+  refused. Roots are compared as text, never looked up on disk, and one
+  written twice counts once.
+- An element that is not a valid name, a key that is not an array, an unknown
+  key, and a `lua` entry that is not a table are each ignored with one warning
+  on stderr naming the file, the key and the element. stdout is unaffected.
+
+What a loader call is:
+
+- The call's function is exactly a configured name: `Require(...)`, or the
+  whole dotted path of `Script.Load(...)`, whatever spaces or comments stand
+  between its names. A method call (`Script:Load(...)`), a bracket index and
+  the result of another call are none.
+- Its first argument is one plain string literal: `Require("m")`,
+  `Require "m"` or `Require [[m]]`, the text between the quotes trimmed and its
+  escapes kept as written, the other arguments unread. A concatenation, a
+  variable, a parenthesized string, a table constructor, an empty string and a
+  Luau backtick string are none, and such a call is what it is without the
+  setting.
+- A loader call is extracted as a `require` is: an `import` node named the
+  literal, an `imports` reference of that name, and no `calls` reference. The
+  literal is resolved as a `require` of the same string is (below).
+- It is one where a `require` is one: anywhere outside the body of a named
+  function (`function f()`, `local function f()`, `function M.f()`), so in a
+  top-level statement or block and in an anonymous callback such as busted's
+  `describe("…", function() … end)`; a function value written in a top-level
+  declaration or assignment keeps it as its call too. In a named function's
+  body a loader call stays a `calls` reference, as a `require` there does.
+
+How a module is found, for a loader call and a `require` alike (the resolver
+cannot tell them apart):
+
+- The candidates are the literal with its dots read as `/` (`ui.button` is
+  `ui/button`) and `.lua`, `.luau`, `/init.lua` or `/init.luau` appended, in
+  that order. In a project with any `[lua]` setting, one valid loader or one
+  valid root, the literal as written comes first, and only a Lua or Luau file
+  answers it: `Require("Script/Activity/ActivityMgrC.lua")` is that file.
+  Without settings, `require("foo.lua")` is the module `foo/lua`, as upstream
+  reads it.
+- Each module root is looked in first, in the order written, each candidate in
+  turn: the indexed file at `<root>/<candidate>` (the candidate itself for the
+  project root) wins, unless it is the requiring file.
+- Then the whole project, as without settings: for each candidate in turn, the
+  indexed files whose path is the candidate or ends with `/<candidate>`, the
+  one sharing the longest path prefix with the requiring file winning; when
+  that is the requiring file itself, the next candidate is tried.
+- A module no candidate finds stays an unresolved `imports` reference.
+
+A call through a `local` alias of a loader call (`local m = Require("m")`) is
+followed into the module only when the loader is a single name ending in
+`require`, `Require`, `import`, `Import` or `_module` after at least one other
+character (`myRequire`, `reload_module`), the names upstream's alias rule reads
+beside `require`; an alias of another loader's call (`Require`, `Include`,
+`Script.Load`) is not followed.
+
+Every full index records the settings it ran under, a project naming no loader
+included. A sync compares them with the current settings before it changes
+anything: when the loader names changed, every Lua and Luau file is extracted
+and resolved again, and a sync that stops partway leaves the next one to do it.
+When only the roots changed, nothing is extracted again: every Lua and Luau
+import is resolved again where it is written, and every Lua file whose `local`
+aliases `require` a module is resolved again whole, since a call through such
+an alias follows the module. A running watcher reloads either file on change
+and runs one full reconcile.
 
 ### Extraction-version upgrades
 
@@ -1407,6 +1616,18 @@ the index, even one an interrupted `init` left `building`, because only `init`
 removes the tombstone; `status` and the read errors name `codegraph init` as the
 recovery then.
 
+### An index a newer CodeGraph wrote
+
+A database recording a schema newer than this binary's is left alone: `search`
+and the other reads, `sync`, `init`, `index --force`, MCP tools and the daemon
+refuse it, change nothing, and name both schema versions. `status` reports it as
+`current` with `initialized: false` and the versions in `extractionStatusDetail`.
+Upgrade CodeGraph to use it again. To discard it instead, run `codegraph uninit
+--force` and then `codegraph init`; the refusal offers that only where `uninit`
+would succeed: a state it accepts and, for a current index, a readable database
+with this binary's extraction stamp. The newer schema is reported before a leftover uninit
+tombstone, whose `init` recovery would refuse such an index.
+
 ### Index diagnostics
 
 `init`, `index`, and `sync` share `--debug` and `--debug-log <FILE>`.
@@ -1415,6 +1636,59 @@ recovery then.
 parse, resolution, or persistence decisions. See
 [`troubleshooting.md`](troubleshooting.md) for the event schema, privacy
 boundary, slow-file watchdog behavior, and the files to attach to a report.
+
+`CODEGRAPH_PHASE_TIMINGS=1` makes the same three commands print one stderr
+line per timed phase as the phase ends, with or without `--debug` and
+`--quiet`. Each line has four fields separated by tabs (`\t` below):
+
+```text
+codegraph-phase\t<command>\t<phase>\t<microseconds>
+```
+
+`<command>` is `init`, `index`, or `sync`, and `<microseconds>` is an integer.
+Each phase name appears once per command:
+
+- `init` and `index` report the ten phases of the JSONL log (`scan`,
+  `parse_write`, `node_write`, `edge_write`, `reference_write`,
+  `framework_extract`, `framework_finalize`, `reference_resolution`,
+  `synthesis`, `publish`) and these parts of them:
+  - `parse_write.store_busy`: the time the single index writer spent storing
+    the parsed files; the rest of `parse_write` it waited for them;
+  - `reference_resolution.<part>`, each summed over the batches: `setup`
+    (the incomplete marker, the cache warm-up, the counts), `read` (reading a
+    batch of references), `snapshot` (each batch's resolution context, the
+    node snapshot included), `resolve` (the first batch's resolution, then the
+    wait for each next batch's, which runs while the batch before it is
+    written), `create_edges`, `insert_edges`,
+    `move_refs` (moving the resolved rows to `resolved_refs`), `wal_fold` (the
+    WAL valve), and the two passes after the batches, `conformance` and
+    `this_members`;
+  - `synthesis.<part>`: `read` (the indexed files' text), one line for each
+    prerequisite step and pass that ran, under its upstream name (for example
+    `synthesis.fieldEdges`; a pass whose language gate is closed does not run
+    and prints nothing), then `merge`, `replace` (the edges and the step
+    records, in one transaction), and `inputs` (encoding the records).
+- `sync` reports `sync`, its six consecutive parts `sync.scan` (the index
+  lease, opening the index, and the scan), `sync.files` (re-extracting and
+  writing the changed files, and the change checks before the framework
+  pass), `sync.frameworks` (the framework extract and cross-file
+  finalization), `sync.resolve` (the dependents' references, re-resolution,
+  the lane rows and markers, and the orphan sweep), `sync.synthesis`, and
+  `sync.finish`, and the stage's `synthesis.<part>` lines when the stage ran.
+  When the sync kept steps' recorded outputs, the stage's lines add
+  `synthesis.decide` (reading the records and the sync's changes) and a
+  `synthesis.<pass>.reused` line for each step kept, with the time its
+  decision took; a step that ran again keeps its `synthesis.<pass>` line,
+  which then includes its decision, and `read` is zero unless a step that
+  ran scans files. When it kept every step, `synthesis.restore` is the
+  writing back of the edges the re-extraction's cascade dropped, and `merge`
+  and `replace` are zero. A sync that rebuilds an outdated index prints only
+  `sync`.
+
+The parts are printed only on stderr, never into the JSONL log, so its
+`phase_end` durations still add up to the command. Stdout and the index are
+the same with the variable as without it; unset, or set to anything but `1`,
+no line is printed.
 
 ### `--prompt-hook` detail
 
@@ -1459,6 +1733,6 @@ golden byte-stable output.
   constraint, guardrail-enforced; LLM combination happens in the orchestration
   layer).
 - No semantic search; search is FTS5 + deterministic scoring only.
-- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Godot, and Tauri;
+- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Nuxt, Godot, and Tauri;
   other framework resolution remains explicitly deferred.
 - No languages beyond the fixed `LANGUAGES` set.

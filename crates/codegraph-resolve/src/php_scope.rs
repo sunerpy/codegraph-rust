@@ -578,13 +578,23 @@ pub(crate) fn is_php_class_name_ref(kind: EdgeKind) -> bool {
 /// upstream's extractor records the written name, this one the last segment
 /// for every other class name ref, so the rules that read the qualification
 /// read it here; `None` when the text there is neither the recorded name nor
-/// ends in it.
+/// ends in it. A Laravel route's reference sits at the route's column 0 and
+/// is named as upstream's extraction names it, so a simple name is its own
+/// written name, and a namespaced one, relative to the controllers root, has
+/// none.
 pub(crate) fn php_written_class_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
     if reference.language != Language::Php || !is_php_class_name_ref(reference.reference_kind) {
         return None;
+    }
+    // `Route::post('me', LoginController::class)` references
+    // `LoginController`, which reads through the routes file's `use` imports
+    // as upstream's does (koel's invokable controllers).
+    if crate::frameworks::laravel::is_route_reference(reference) {
+        let name = reference.reference_name.as_str();
+        return (!name.contains('\\')).then(|| name.to_string());
     }
     let facts = context.source_facts(&reference.file_path)?;
     let index = usize::try_from(reference.line).ok()?.checked_sub(1)?;
@@ -1054,6 +1064,49 @@ mod tests {
             Some("Field\\Typed")
         );
         assert_eq!(written(EdgeKind::Calls, "Base", 2, 16), None);
+    }
+
+    /// A Laravel route's handler class is recorded by name at the route's
+    /// column 0: a simple name is its own written name and reads through the
+    /// routes file's `use` imports; a namespaced one has none.
+    #[test]
+    fn a_laravel_route_s_class_name_is_its_recorded_name() {
+        let context = OneFile(
+            "<?php\nuse App\\Http\\Controllers\\Auth\\LoginController;\nRoute::post('me', LoginController::class);\nRoute::get('x', 'Admin\\Invoked');\n",
+        );
+        let route = |name: &str, line: i64| RefView {
+            from_node_id: format!("route:a.php:{line}:POST:me"),
+            ..php_ref(EdgeKind::References, name, line, 0)
+        };
+        assert_eq!(
+            php_written_class_name(&route("LoginController", 3), &context).as_deref(),
+            Some("LoginController")
+        );
+        assert_eq!(
+            php_written_class_name(
+                &php_ref(EdgeKind::References, "LoginController", 3, 0),
+                &context
+            ),
+            None,
+            "a code reference is read back at its column, which holds `Route`"
+        );
+        assert_eq!(
+            php_written_class_name(&route("Admin\\Invoked", 4), &context),
+            None
+        );
+        assert!(is_php_class_visible(
+            &php_node(
+                NodeKind::Class,
+                "App\\Http\\Controllers\\Auth::LoginController"
+            ),
+            &route("LoginController", 3),
+            &context
+        ));
+        assert!(!is_php_class_visible(
+            &php_node(NodeKind::Class, "App\\Http\\Controllers::LoginController"),
+            &route("LoginController", 3),
+            &context
+        ));
     }
 
     #[test]

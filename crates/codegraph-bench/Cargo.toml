@@ -26,6 +26,9 @@ rusqlite = { workspace = true }
 sha2 = { workspace = true }
 codegraph-core = { path = "../codegraph-core" }
 codegraph-extract = { path = "../codegraph-extract" }
+codegraph-resolve = { path = "../codegraph-resolve" }
+regex = "1.10"
+tree-sitter = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

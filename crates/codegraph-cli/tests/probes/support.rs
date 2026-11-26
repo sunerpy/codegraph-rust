@@ -63,6 +63,16 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    codegraph_env(cwd, args, &[])
+}
+
+/// [`codegraph`] with `env` set on top of the inherited environment.
+#[track_caller]
+pub fn codegraph_env<I, S>(cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let args = args
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
@@ -72,6 +82,7 @@ where
         .current_dir(cwd)
         .env("CODEGRAPH_NO_DAEMON", "1")
         .env("CODEGRAPH_NO_WATCH", "1")
+        .envs(env.iter().copied())
         .output()
         .unwrap_or_else(|err| panic!("spawn {}: {err}", bin().display()));
     assert!(
@@ -178,13 +189,28 @@ impl Project {
     /// Runs `codegraph init` on the tree and reads the published graph.
     #[track_caller]
     pub fn index(self) -> Indexed {
-        codegraph(&self.root, [OsStr::new("init"), self.root.as_os_str()]);
+        self.index_capturing().0
+    }
+
+    /// [`Self::index`], with what `codegraph init` printed: a probe of a
+    /// warning reads its stderr.
+    #[track_caller]
+    pub fn index_capturing(self) -> (Indexed, Output) {
+        self.index_with_env(&[])
+    }
+
+    /// [`Self::index_capturing`] with `env` set for `codegraph init`
+    /// (`APP_CONFIG`, say).
+    #[track_caller]
+    pub fn index_with_env(self, env: &[(&str, &OsStr)]) -> (Indexed, Output) {
+        let output = codegraph_env(&self.root, [OsStr::new("init"), self.root.as_os_str()], env);
         let graph = Graph::load(&db_path(&self.root));
-        Indexed {
+        let indexed = Indexed {
             project: self,
             graph,
             generation: 0,
-        }
+        };
+        (indexed, output)
     }
 }
 
@@ -817,6 +843,22 @@ pub fn project_metadata_with_prefix(db: &Path, prefix: &str) -> Vec<(String, Str
     )
     .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
     .unwrap_or_else(|err| panic!("read project_metadata of {}: {err}", db.display()))
+}
+
+/// The targets of `source`'s synthesized edges in the order their rows were
+/// written, which a sync can leave different from a fresh index's.
+#[allow(dead_code)]
+#[track_caller]
+pub fn synthesized_targets_in_row_order(db: &Path, source: &str) -> Vec<String> {
+    let conn = open_immutable(db);
+    let mut stmt = conn
+        .prepare(
+            "SELECT target FROM edges WHERE source = ?1 AND provenance = 'heuristic' ORDER BY id",
+        )
+        .expect("prepare the synthesized-edge read");
+    stmt.query_map([source], |row| row.get(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>())
+        .unwrap_or_else(|err| panic!("read the synthesized edges of {}: {err}", db.display()))
 }
 
 /// Opens `db` read-only with `immutable=1`: no lock, no `-wal`/`-shm`.

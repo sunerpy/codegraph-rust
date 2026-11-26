@@ -132,7 +132,9 @@
     "visibility": null
   },
   {
-    "decorators": null,
+    "decorators": [
+      "Component"
+    ],
     "docstring": null,
     "end_column": 1,
     "end_line": 14,

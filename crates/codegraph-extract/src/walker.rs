@@ -98,7 +98,8 @@ fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
 
 /// G4 (upstream `STATIC_MEMBER_LANGS`) — the languages whose static-member
 /// and enum-value reads (`Enum.value`, `Type.CONST`, `Foo::BAR`) reference the
-/// type they read through. VB.NET's reads are its own (W8).
+/// type they read through. Upstream's list also names VB.NET, which this port
+/// does not extract.
 fn has_static_member_reads(language: Language) -> bool {
     matches!(
         language,
@@ -230,6 +231,28 @@ fn is_js_identifier(segment: &str) -> bool {
         .next()
         .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+}
+
+/// The compiler-predefined Erlang macros: no `-define` exists to link a use
+/// to (upstream `ERLANG_PREDEFINED_MACROS`).
+const ERLANG_PREDEFINED_MACROS: [&str; 10] = [
+    "MODULE",
+    "MODULE_STRING",
+    "FILE",
+    "LINE",
+    "MACHINE",
+    "FUNCTION_NAME",
+    "FUNCTION_ARITY",
+    "OTP_RELEASE",
+    "FEATURE_AVAILABLE",
+    "FEATURE_ENABLED",
+];
+
+/// Whether an ArkUI attribute binds an event handler (`onClick`,
+/// `onChange`): `on` and an uppercase letter (upstream's `/^on[A-Z]/`).
+fn is_arkui_event_attribute(name: &str) -> bool {
+    name.strip_prefix("on")
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
 }
 
 /// Languages whose member calls go through the TS/JS grammars
@@ -529,6 +552,9 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// Whether this file's named object literals own their function members;
     /// see [`Self::owns_object_literals`].
     owns_objects: Option<bool>,
+    /// Whether the source reads like a Vue store; see
+    /// [`Self::looks_like_vue_store_file`].
+    vue_store_file: Option<bool>,
     /// A C++ file whose tree has errors is walked in the scopes its braces
     /// open (see [`Self::visit_in_cpp_brace_scope`], upstream #2426): the
     /// scan of them, `None` for every other file, and the class-like nodes
@@ -545,7 +571,21 @@ pub struct TreeSitterWalker<'a, 'tree> {
     /// recovery can close a scope at the wrong `}`, and with no brace scopes
     /// to correct it the walked class would land in the wrong one.
     walk_declared_types: bool,
+    /// C++ local function pointers (upstream `cppLocalFnPtrs`, #1172): per
+    /// enclosing symbol, the functions each local was bound to by
+    /// `auto kernel = &f<…>;` or a branch's `kernel = &g<…>;`, in the order
+    /// first bound, so a call or launch through the local names them.
+    cpp_local_fn_ptrs: HashMap<String, HashMap<String, Vec<String>>>,
+    /// The project's custom Lua module loaders (#1617): a call of one with
+    /// a plain string literal is an import, as `require` is. None by
+    /// default.
+    lua_loaders: &'a crate::lua_loaders::LuaLoaders,
 }
+
+/// The signature of a function node minted for an RTK Query generated hook
+/// (upstream `extractRtkHookBindings`); the synthesis stage's RTK pass reads
+/// only nodes that carry it.
+pub const RTK_GENERATED_HOOK_SIGNATURE: &str = "= RTK Query generated hook";
 
 /// The parts of a store initializer that its walk must not treat as the
 /// store's own code.
@@ -553,7 +593,8 @@ struct StoreWalk {
     /// The factory closure whose body returns the action object. It is walked
     /// as the store's body, never bound as a function named after the store.
     factory: Option<usize>,
-    /// The action values that became function nodes of their own.
+    /// The values that became function nodes of their own: a store's
+    /// actions, its collections' members, RTK Query endpoints.
     actions: Vec<usize>,
 }
 
@@ -587,12 +628,23 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             store_walk: None,
             object_path_owners: HashMap::new(),
             owns_objects: None,
+            vue_store_file: None,
             cpp_brace_scopes: None,
             cpp_class_scopes: crate::lang::cpp_brace_scopes::NestedIntervals::default(),
             cpp_class_scope_ids: HashSet::new(),
             walk_declared_types: false,
             raw_source: source,
+            cpp_local_fn_ptrs: HashMap::new(),
+            lua_loaders: crate::lua_loaders::LuaLoaders::unconfigured(),
         }
+    }
+
+    /// Read calls of the project's custom Lua module loaders as imports
+    /// ([`crate::ExtractOptions::lua_loaders`]).
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: &'a crate::lua_loaders::LuaLoaders) -> Self {
+        self.lua_loaders = lua_loaders;
+        self
     }
 
     /// The source as written, when the pre-parse rewrote it in place; a text
@@ -671,6 +723,13 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     fn visit_node(&mut self, node: SyntaxNode<'tree>) {
         let node = unwrap_transparent_walk_wrappers(self.spec.language(), node);
         if self.walk_aborted {
+            return;
+        }
+        if self
+            .store_walk
+            .as_ref()
+            .is_some_and(|walk| walk.actions.contains(&node.id()))
+        {
             return;
         }
         if self.walk_depth >= MAX_WALK_DEPTH {
@@ -784,6 +843,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return;
         }
 
+        if node_type == "export_statement" && self.extract_store_module(node) {
+            return;
+        }
+
         if self.extract_c_function_macro(node) {
             return;
         }
@@ -873,10 +936,18 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 self.visit_node(defined);
             }
             self.maybe_cpp_construction(node);
-            self.extract_variable(node);
-            // A type walked above captured its own function values.
-            let walked = defined_type.map(|defined| defined.id());
-            self.scan_fn_ref_subtree(node, 0, walked.as_slice());
+            // A type walked above captured its own function values, and so
+            // did a Go initializer walked under the spec it declares.
+            let mut walked: Vec<usize> = defined_type
+                .map(|defined| defined.id())
+                .into_iter()
+                .collect();
+            if self.spec.language() == Language::Go {
+                walked.extend(self.extract_go_variable(node));
+            } else {
+                self.extract_variable(node);
+            }
+            self.scan_fn_ref_subtree(node, 0, &walked);
             skip_children = true;
         } else if self.spec.language() == Language::Swift
             && node_type == "protocol_property_declaration"
@@ -1070,7 +1141,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// `record_decl` are consumed WITHOUT descending into their type-position
     /// `call` children, so `-spec f(integer()) -> integer().` mints no bogus
     /// `integer` call ref. Static gen_server and spawn/apply MFA dispatch is
-    /// lifted here; behaviour and resource-tuple bridges remain deferred.
+    /// lifted here, and so are a `-behaviour` (`implements`), a macro use
+    /// (its `-define`, whose replacement is walked from the macro) and an
+    /// application resource file's tuple (W7-24d).
     /// CFML extraction (upstream `CfmlExtractor`, `cfml-extractor.ts`). A
     /// first-token sniff (`is_bare_script_cfml`) selects the dialect.
     /// Bare-script: the cfscript type-set config drives the generic dispatch,
@@ -1647,7 +1720,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             .chars()
                             .take(200)
                             .collect();
-                    self.create_node(
+                    let created = self.create_node(
                         NodeKind::Constant,
                         &name,
                         node,
@@ -1656,11 +1729,65 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             ..NodeExtra::default()
                         },
                     );
+                    // The replacement runs where the macro is used, and its
+                    // references are the macro's, once: each `?M(…)` use
+                    // calls the macro, so `caller → M → callee` holds
+                    // without a copy per use (upstream #1168).
+                    if let Some(created) = created
+                        && let Some(replacement) = child_by_field(node, "replacement")
+                    {
+                        self.node_stack.push(created.id);
+                        self.visit_node(replacement);
+                        self.node_stack.pop();
+                    }
                 }
-                // The replacement's call attribution to the macro node is
-                // DEFERRED (macro_call_expr use-site linking); consume the
-                // subtree so its type-position/expression children don't mint
-                // spurious refs from file scope.
+                true
+            }
+            // `-behaviour(m)` implements m's callbacks, from the module
+            // (upstream #1169); an OTP behaviour stays unresolved.
+            "behaviour_attribute" => {
+                if let Some(name) = child_by_field(node, "name")
+                    .map(|name| crate::lang::erlang_atom_text(name, self.source))
+                    .filter(|name| !name.is_empty())
+                    && let Some(from) = self.node_stack.last().cloned()
+                {
+                    self.push_ref(&from, &name, EdgeKind::Implements, node);
+                }
+                true
+            }
+            // A macro use links its `-define` (upstream #1168): a
+            // function-like use (`?LOG(X)`) calls it, a bare read
+            // (`?TIMEOUT`) references it; a predefined macro has no
+            // definition. Its arguments are walked as code.
+            "macro_call_expr" => {
+                if let Some(name) = child_by_field(node, "name")
+                    .map(|name| node_text(name, self.source))
+                    .filter(|name| !ERLANG_PREDEFINED_MACROS.contains(&name.as_str()))
+                    && let Some(from) = self.node_stack.last().cloned()
+                {
+                    let kind = if child_by_field(node, "args").is_some() {
+                        EdgeKind::Calls
+                    } else {
+                        EdgeKind::References
+                    };
+                    self.push_ref(&from, &name, kind, node);
+                }
+                self.visit_named_children(node);
+                true
+            }
+            // An OTP application resource file's `{application, Name,
+            // Props}.` (upstream #1169).
+            "tuple"
+                if node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "source_file")
+                    && crate::engine::is_erlang_app_file(self.file_path)
+                    && node.named_child(0).is_some_and(|first| {
+                        first.kind() == "atom"
+                            && crate::lang::erlang_atom_text(first, self.source) == "application"
+                    }) =>
+            {
+                self.visit_erlang_app_tuple(node);
                 true
             }
             // -spec / -callback: their type expressions parse as `call` nodes;
@@ -1700,6 +1827,50 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// An application tuple's graph: `{mod, {Mod, _}}` references the
+    /// application-callback module, and `{applications, […]}` and
+    /// `{included_applications, […]}` import the apps it depends on; the
+    /// other properties carry none (upstream `handleAppResourceTuple`).
+    fn visit_erlang_app_tuple(&mut self, node: SyntaxNode<'tree>) {
+        let Some(from) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let Some(props) = node.named_child(2).filter(|props| props.kind() == "list") else {
+            return;
+        };
+        for prop in props.named_children(&mut props.walk()) {
+            if prop.kind() != "tuple" || prop.named_child_count() < 2 {
+                continue;
+            }
+            let (Some(key), Some(value)) = (prop.named_child(0), prop.named_child(1)) else {
+                continue;
+            };
+            if key.kind() != "atom" {
+                continue;
+            }
+            let key = crate::lang::erlang_atom_text(key, self.source);
+            let push = |walker: &mut Self, atom: SyntaxNode<'tree>, kind: EdgeKind| {
+                let name = crate::lang::erlang_atom_text(atom, walker.source);
+                if !name.is_empty() {
+                    walker.push_ref(&from, &name, kind, atom);
+                }
+            };
+            if key == "mod" && value.kind() == "tuple" {
+                if let Some(module) = value.named_child(0).filter(|m| m.kind() == "atom") {
+                    push(self, module, EdgeKind::References);
+                }
+            } else if matches!(key.as_str(), "applications" | "included_applications")
+                && value.kind() == "list"
+            {
+                for app in value.named_children(&mut value.walk()) {
+                    if app.kind() == "atom" {
+                        push(self, app, EdgeKind::Imports);
+                    }
+                }
+            }
         }
     }
 
@@ -1922,56 +2093,81 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return own_module();
         }
 
+        // Upstream's macro table (OD-W724-3): a define of the name as
+        // `?MODULE` anywhere in the file names the module itself, whatever
+        // another branch of an `-ifdef` defines; otherwise the last define
+        // of it as an atom names the server.
+        let mut module_itself = false;
+        let mut atom: Option<String> = None;
         for form in self.root.named_children(&mut self.root.walk()) {
             if form.kind() != "pp_define" {
                 continue;
             }
-            let Some(lhs) = child_by_field(form, "lhs") else {
+            let Some(name) =
+                child_by_field(form, "lhs").and_then(|lhs| child_by_field(lhs, "name"))
+            else {
                 continue;
             };
-            let Some(name) = child_by_field(lhs, "name") else {
+            let Some(replacement) = child_by_field(form, "replacement") else {
                 continue;
             };
             if node_text(name, self.source) != macro_name {
                 continue;
             }
-            let replacement = child_by_field(form, "replacement")?;
-            if replacement.kind() == "atom" {
-                let name = crate::lang::erlang_atom_text(replacement, self.source);
-                return (!name.is_empty()).then_some(name);
-            }
             if replacement.kind() == "macro_call_expr"
                 && child_by_field(replacement, "name")
                     .is_some_and(|name| node_text(name, self.source) == "MODULE")
             {
-                return own_module();
+                module_itself = true;
+            } else if replacement.kind() == "atom" {
+                atom = Some(crate::lang::erlang_atom_text(replacement, self.source));
             }
-            return None;
         }
-        None
+        if module_itself {
+            return own_module();
+        }
+        atom.filter(|name| !name.is_empty())
     }
 
     /// Terraform/HCL extraction (upstream `terraformExtractor.visitNode`,
-    /// `terraform.ts`, #1173 — the extraction slice only). HCL's AST has no
-    /// C-family type-set node kinds — EVERY top-level construct is a `block`
-    /// distinguished only by its first `identifier` child — so `TERRAFORM_SPEC`
-    /// returns `&[]` for every type-set and this custom visitor (like
-    /// `visit_nix_node`) is the SOLE owner of the `block` kind. Every other kind
-    /// returns `false` → generic `visit_named_children` descent (so
-    /// `config_file`/`body` are walked into automatically, reaching each
-    /// `block`). Strictly `Language::Terraform`-guarded.
+    /// `terraform.ts`, #1173, #1174). HCL's AST has no C-family type-set node
+    /// kinds — EVERY top-level construct is a `block` distinguished only by
+    /// its first `identifier` child — so `TERRAFORM_SPEC` returns `&[]` for
+    /// every type-set and this custom visitor (like `visit_nix_node`) is the
+    /// SOLE owner of the `block` kind. Every other kind returns `false` →
+    /// generic `visit_named_children` descent (so `config_file`/`body` are
+    /// walked into automatically, reaching each `block`), but for a `.tfvars`
+    /// file's top-level assignment. Strictly `Language::Terraform`-guarded.
     ///
     /// Block-type dispatch: `resource`/`data` → Class, `module` → Module,
-    /// `variable`/`output` → Variable, `provider` → Namespace, `locals` →
-    /// Constant per attribute; body attribute-expression traversal refs
-    /// (`var.X`/`local.X`/`module.M`/`data.T.N`/`<type>.<name>`) →
-    /// `EdgeKind::References` with built-ins skipped. The `emitModuleWiring`
-    /// `:`-scoped refs and the `.tfvars` var ref are DEFERRED (they feed the
-    /// deferred `TerraformResolver`).
+    /// `variable`/`output` → Variable, `provider` → Namespace (an aliased one
+    /// `provider.P.alias`), `locals` → Constant per attribute; `moved`,
+    /// `import`, `removed` and a check's `assert` declare nothing and
+    /// reference what they name from the file. Body attribute-expression
+    /// traversal refs (`var.X`/`local.X`/`module.M`/`data.T.N`/`<type>.<name>`)
+    /// → `EdgeKind::References` with built-ins skipped, where each variable is
+    /// written; a module block adds its `:`-scoped wiring, and a provider
+    /// selection references the configuration it selects.
     fn visit_terraform_node(&mut self, node: SyntaxNode<'tree>) -> bool {
         if node.kind() != "block" {
-            // .tfvars top-level-assignment `var.X` ref DEFERRED — no special
-            // case; let the generic walker descend.
+            // A `.tfvars` file holds no blocks: each top-level assignment
+            // sets the root module variable of its name, a reference from
+            // the file (upstream #1174).
+            if node.kind() == "attribute"
+                && self.file_path.ends_with(".tfvars")
+                && node.parent().is_some_and(|body| {
+                    body.kind() == "body"
+                        && body
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "config_file")
+                })
+            {
+                if let Some(name) = crate::lang::terraform_attribute_name(node, self.source) {
+                    let file = file_node_id(self.file_path);
+                    self.push_ref(&file, &format!("var.{name}"), EdgeKind::References, node);
+                }
+                return true;
+            }
             return false;
         }
 
@@ -1993,6 +2189,23 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             return true;
         }
 
+        // moved / import / removed: state-migration blocks name resource
+        // addresses, and a check's assert its condition's dependencies; none
+        // declares a symbol, so the file references them. A scoped module
+        // reference is dropped: `module.a.aws_x.b` names a resource inside a
+        // module instance, no output (upstream #1174).
+        if matches!(
+            block_type.as_str(),
+            "moved" | "import" | "removed" | "assert"
+        ) && labels.is_empty()
+        {
+            if let Some(body) = body {
+                let file = file_node_id(self.file_path);
+                self.emit_terraform_references_in_body(body, &file, true, &[]);
+            }
+            return true;
+        }
+
         // resource / data / module / variable / output / provider.
         let Some(decl) = crate::lang::describe_terraform_block(&block_type, &labels) else {
             // Unknown top-level block — generic descent.
@@ -2000,10 +2213,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         };
         let crate::lang::TerraformBlockDecl {
             kind,
-            name,
-            qualified_name,
-            signature,
+            mut name,
+            mut qualified_name,
+            mut signature,
         } = decl;
+        // `provider "aws" { alias = "east" }` is addressed as `aws.east`
+        // (upstream #1174).
+        if block_type == "provider"
+            && let Some(body) = body
+            && let Some(provider) = labels.first()
+            && let Some(alias) = crate::lang::terraform_string_attr(body, "alias", self.source)
+        {
+            name = format!("{provider}.{alias}");
+            qualified_name = format!("provider.{provider}.{alias}");
+            signature = format!("provider \"{provider}\" alias=\"{alias}\"");
+        }
         let is_exported = kind == NodeKind::Variable;
         if let Some(created) = self.create_node(
             kind,
@@ -2016,11 +2240,27 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 ..NodeExtra::default()
             },
         ) {
-            self.node_stack.push(created.id);
+            self.node_stack.push(created.id.clone());
             if let Some(body) = body {
-                self.emit_terraform_references_in_body(body);
+                // A resource's `provider` and a module's `providers` select
+                // a provider configuration, which the expression walk would
+                // read as a resource: they reference the configuration.
+                let mut skipped: Vec<&str> = Vec::new();
+                if matches!(block_type.as_str(), "resource" | "data") {
+                    self.emit_terraform_provider_selection(body, &created.id);
+                    skipped.push("provider");
+                }
+                if block_type == "module" {
+                    self.emit_terraform_module_providers(body, &created.id);
+                    skipped.push("providers");
+                }
+                self.emit_terraform_references_in_body(body, &created.id, false, &skipped);
+                if block_type == "module"
+                    && let Some(module) = labels.first()
+                {
+                    self.emit_terraform_module_wiring(module, node, body, &created.id);
+                }
             }
-            // emitModuleWiring for `module` blocks DEFERRED.
             self.node_stack.pop();
         }
         true
@@ -2037,13 +2277,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if attr.kind() != "attribute" {
                 continue;
             }
-            let Some(id_node) = attr
-                .named_children(&mut attr.walk())
-                .find(|c| c.kind() == "identifier")
-            else {
+            let Some(name) = crate::lang::terraform_attribute_name(attr, self.source) else {
                 continue;
             };
-            let name = node_text(id_node, self.source);
             if let Some(created) = self.create_node(
                 NodeKind::Constant,
                 &name,
@@ -2054,13 +2290,10 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     ..NodeExtra::default()
                 },
             ) {
-                if let Some(expr) = attr
-                    .named_children(&mut attr.walk())
-                    .find(|c| c.kind() == "expression")
-                {
+                if let Some(expr) = crate::lang::terraform_attribute_expression(attr) {
                     let refs = crate::lang::collect_terraform_references(expr, self.source);
-                    for (qname, _line, _col) in refs {
-                        self.push_ref(&created.id, &qname, EdgeKind::References, expr);
+                    for (qname, line, col) in refs {
+                        self.push_ref_at(&created.id, &qname, EdgeKind::References, line, col);
                     }
                 }
             }
@@ -2068,27 +2301,159 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// BFS the block body; when a node's kind is `expression`, run
-    /// `collect_terraform_references` and push each ref from the current owner,
-    /// then DON'T descend into that expression (the collector already walked
-    /// it). Ports `emitReferencesInBody` (terraform.ts:526-550).
-    fn emit_terraform_references_in_body(&mut self, body: SyntaxNode<'tree>) {
-        let Some(from_id) = self.node_stack.last().cloned() else {
-            return;
-        };
+    /// `collect_terraform_references` and push each ref from `from_id`, then
+    /// DON'T descend into that expression (the collector already walked it).
+    /// `suppress_scoped` drops the `:`-scoped module refs, and the body's
+    /// own attributes `skipped` names are left out (meta-arguments read
+    /// elsewhere). Ports `emitReferencesInBody` (terraform.ts:526-550).
+    fn emit_terraform_references_in_body(
+        &mut self,
+        body: SyntaxNode<'tree>,
+        from_id: &str,
+        suppress_scoped: bool,
+        skipped: &[&str],
+    ) {
         let mut queue: std::collections::VecDeque<SyntaxNode<'tree>> =
             std::collections::VecDeque::new();
-        queue.push_back(body);
+        for child in body.named_children(&mut body.walk()) {
+            if child.kind() == "attribute"
+                && crate::lang::terraform_attribute_name(child, self.source)
+                    .is_some_and(|name| skipped.contains(&name.as_str()))
+            {
+                continue;
+            }
+            queue.push_back(child);
+        }
         while let Some(node) = queue.pop_front() {
             if node.kind() == "expression" {
                 let refs = crate::lang::collect_terraform_references(node, self.source);
-                for (qname, _line, _col) in refs {
-                    self.push_ref(&from_id, &qname, EdgeKind::References, node);
+                for (qname, line, col) in refs {
+                    if suppress_scoped && qname.contains(':') {
+                        continue;
+                    }
+                    self.push_ref_at(from_id, &qname, EdgeKind::References, line, col);
                 }
                 continue;
             }
             for child in node.named_children(&mut node.walk()) {
                 queue.push_back(child);
             }
+        }
+    }
+
+    /// A module block's wiring across its boundary, in `:`-scoped
+    /// references only the Terraform resolver reads (upstream
+    /// `emitModuleWiring`, #1174): `module.M:file` (imports) for a local
+    /// `./` or `../` source, the entry of the module's directory, and
+    /// `module.M:var.<in>` for each input attribute, the child's variable it
+    /// sets. Meta-arguments configure the call and set nothing.
+    fn emit_terraform_module_wiring(
+        &mut self,
+        module: &str,
+        block: SyntaxNode<'tree>,
+        body: SyntaxNode<'tree>,
+        from_id: &str,
+    ) {
+        const META_ARGUMENTS: [&str; 6] = [
+            "source",
+            "version",
+            "count",
+            "for_each",
+            "providers",
+            "depends_on",
+        ];
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute" {
+                continue;
+            }
+            let Some(name) = crate::lang::terraform_attribute_name(attr, self.source) else {
+                continue;
+            };
+            if name == "source" {
+                let source = crate::lang::terraform_attribute_expression(attr)
+                    .and_then(crate::lang::find_terraform_string_lit)
+                    .map(|literal| crate::lang::terraform_string_lit_value(literal, self.source))
+                    .unwrap_or_default();
+                if source.starts_with("./") || source.starts_with("../") {
+                    self.push_ref(
+                        from_id,
+                        &format!("module.{module}:file"),
+                        EdgeKind::Imports,
+                        block,
+                    );
+                }
+                continue;
+            }
+            if META_ARGUMENTS.contains(&name.as_str()) {
+                continue;
+            }
+            self.push_ref(
+                from_id,
+                &format!("module.{module}:var.{name}"),
+                EdgeKind::References,
+                attr,
+            );
+        }
+    }
+
+    /// A resource's or data source's `provider = aws.east` (or a bare
+    /// `provider = google-beta`) selects a provider configuration: a
+    /// reference to `provider.aws.east` (upstream
+    /// `emitProviderSelectionRef`).
+    fn emit_terraform_provider_selection(&mut self, body: SyntaxNode<'tree>, from_id: &str) {
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute"
+                || crate::lang::terraform_attribute_name(attr, self.source).as_deref()
+                    != Some("provider")
+            {
+                continue;
+            }
+            if let Some(selection) = crate::lang::terraform_attribute_expression(attr)
+                .and_then(|expr| crate::lang::terraform_provider_selection(expr, self.source))
+            {
+                self.push_ref(
+                    from_id,
+                    &format!("provider.{selection}"),
+                    EdgeKind::References,
+                    attr,
+                );
+            }
+            return;
+        }
+    }
+
+    /// A module's `providers = { aws = aws.east }` maps the child's provider
+    /// slots (the keys) to this scope's configurations (the values): a
+    /// reference to each value (upstream `emitModuleProvidersRefs`).
+    fn emit_terraform_module_providers(&mut self, body: SyntaxNode<'tree>, from_id: &str) {
+        for attr in body.named_children(&mut body.walk()) {
+            if attr.kind() != "attribute"
+                || crate::lang::terraform_attribute_name(attr, self.source).as_deref()
+                    != Some("providers")
+            {
+                continue;
+            }
+            let mut queue: std::collections::VecDeque<SyntaxNode<'tree>> =
+                std::collections::VecDeque::from([attr]);
+            while let Some(node) = queue.pop_front() {
+                if node.kind() == "object_elem" {
+                    if let Some(selection) = child_by_field(node, "val").and_then(|value| {
+                        crate::lang::terraform_provider_selection(value, self.source)
+                    }) {
+                        self.push_ref(
+                            from_id,
+                            &format!("provider.{selection}"),
+                            EdgeKind::References,
+                            node,
+                        );
+                    }
+                    continue;
+                }
+                for child in node.named_children(&mut node.walk()) {
+                    queue.push_back(child);
+                }
+            }
+            return;
         }
     }
 
@@ -3047,7 +3412,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     fn emit_lua_require(&mut self, call_node: SyntaxNode<'tree>) -> bool {
-        let Some(module_name) = lua_require_module(call_node, self.source) else {
+        let Some(module_name) = lua_require_module(call_node, self.source, self.lua_loaders) else {
             return false;
         };
         self.create_node(
@@ -3210,8 +3575,8 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             new_node.end_column = end_column;
         }
         // Upstream tree-sitter.ts:626-634: extractModifiers output (Kotlin
-        // expect/actual) merges into decorators.
-        let mods = self.spec.extract_modifiers(node);
+        // expect/actual, ArkTS decorators) merges into decorators.
+        let mods = self.spec.extract_modifiers(node, self.source);
         if !mods.is_empty() {
             new_node.decorators.extend(mods);
         }
@@ -4198,10 +4563,6 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.extract_python_assignment(node);
             return;
         }
-        if self.spec.language() == Language::Go {
-            self.extract_go_variable(node);
-            return;
-        }
         if self.spec.language() == Language::Solidity {
             // #1170 — file-scope `constant_variable_declaration` (`uint256 constant
             // MAX = 100;`) carries a direct `name` field. Emit a Constant (const)
@@ -4248,9 +4609,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
             _ => {}
         }
+        // ArkTS declares variables as TypeScript does (upstream `b635dd46`
+        // tree-sitter.ts:3309-3312, #1186).
         if !matches!(
             self.spec.language(),
-            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::ArkTs
         ) {
             return;
         }
@@ -4273,6 +4640,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 continue;
             };
             if name_node.kind() == "object_pattern" || name_node.kind() == "array_pattern" {
+                // `export const { useGetPostsQuery } = api` destructures the
+                // hooks RTK Query generates off a `createApi` result: each
+                // binding that reads as one is a function of its own.
+                if name_node.kind() == "object_pattern"
+                    && child_by_field(child, "value")
+                        .is_some_and(|value| value.kind() == "identifier")
+                {
+                    self.extract_rtk_hook_bindings(name_node, is_exported);
+                }
                 // A pattern declares no symbol of its own, but its initializer
                 // (and any default value in the pattern) still runs: walk the
                 // declarator the way a function body walks it, with the
@@ -4300,6 +4676,30 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     .collect::<String>();
                 format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
             });
+            // A React component declared through a wrapper whose result is a
+            // component (`forwardRef`/`memo`/`styled`, upstream #841 and
+            // #2429). The initializer is a call or a tagged template, not a
+            // bare arrow, so the const would otherwise be a constant, which
+            // component resolution skips: `<Button/>` would bind another
+            // file's namesake or nothing. PascalCase-gated, so a memoized
+            // helper (`const cache = memo(fn)`) stays a constant.
+            if let Some(value) = value_node
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+                && let Some(render) = self.react_component_hoc(value)
+            {
+                self.extract_react_component(
+                    &name,
+                    child,
+                    render,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature,
+                        is_exported,
+                        ..NodeExtra::default()
+                    },
+                );
+                continue;
+            }
             let declared_id = self
                 .create_node(
                     kind,
@@ -4339,46 +4739,109 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     // shape: no walk of the whole literal, whose functions
                     // would count their calls for the constant as well.
                     self.extract_js_object_literal_members(value, owner_id);
-                } else if let (Some(owner_id), Some(actions)) = (
-                    declared_id.as_deref(),
-                    (value.kind() == "call_expression")
-                        .then(|| initializer_returned_object(value, 0))
-                        .flatten()
-                        .filter(|actions| object_has_inline_functions(*actions))
-                        .filter(|_| is_exported || self.is_exported_later(&name)),
-                ) {
-                    // An exported store — `create((set, get) => ({ reset: () =>
-                    // set({}) }))`, middleware wrappers included — owns the
-                    // inline actions of the object its initializer returns
-                    // (upstream #647/#1862).
-                    let actions_ids = self.extract_js_object_literal_members(actions, owner_id);
-                    // The rest of the initializer runs when the store is built:
-                    // the `create`/`persist` wrappers, their options, a block
-                    // factory's setup. Those calls stay the store's (#693), as
-                    // they were before the actions became nodes; upstream skips
-                    // the whole initializer here and drops them. Only the
-                    // extracted actions are skipped, so no action's calls are
-                    // counted for the store as well.
-                    let previous = self.store_walk.replace(StoreWalk {
-                        factory: nearest_function_ancestor(actions).map(|factory| factory.id()),
-                        actions: actions_ids,
-                    });
-                    self.node_stack.push(owner_id.to_string());
-                    self.visit_function_body(value);
-                    self.node_stack.pop();
-                    self.store_walk = previous;
+                } else if let Some(owner_id) = declared_id.as_deref() {
+                    self.walk_declared_initializer(value, owner_id, &name, is_exported);
                 } else {
-                    match declared_id {
-                        Some(id) => {
-                            self.node_stack.push(id);
-                            self.visit_function_body(value);
-                            self.node_stack.pop();
-                        }
-                        None => self.visit_function_body(value),
-                    }
+                    self.visit_function_body(value);
                 }
             }
         }
+    }
+
+    /// Whether `value` declares a React component through a wrapper whose
+    /// result is one (upstream `reactComponentHoc`, #841): `forwardRef(…)`,
+    /// `memo(…)`, `React.forwardRef(…)`, `React.memo(…)`, and styled-components
+    /// or emotion's `styled.tag\`…\`` and `styled(Base)\`…\``, typed
+    /// (`styled.tag<Props>\`…\``, #2429) or not. `Some` holds the inline render
+    /// function, the first arrow or function expression among the wrapper's
+    /// arguments, when there is one (`memo(Imported)` and a styled template
+    /// have none); `None` for any other initializer.
+    fn react_component_hoc(&self, value: SyntaxNode<'tree>) -> Option<Option<SyntaxNode<'tree>>> {
+        if self.is_typed_styled_template(value) {
+            return Some(None);
+        }
+        if value.kind() != "call_expression" {
+            return None;
+        }
+        let callee = node_text(child_by_field(value, "function")?, self.source);
+        // tree-sitter reads a tagged template as a call whose callee is its
+        // tag: `styled.button` or `styled(Base)`, never `styledFoo`.
+        if starts_with_word(&callee, "styled") {
+            return Some(None);
+        }
+        if !matches!(
+            callee.as_str(),
+            "forwardRef" | "memo" | "React.forwardRef" | "React.memo"
+        ) {
+            return None;
+        }
+        let render = child_by_field(value, "arguments").and_then(|arguments| {
+            (0..arguments.named_child_count())
+                .filter_map(|i| arguments.named_child(i as u32))
+                .find(|argument| {
+                    matches!(argument.kind(), "arrow_function" | "function_expression")
+                })
+        });
+        Some(render)
+    }
+
+    /// A styled tag with type arguments, `styled.div<Props>\`…\`` or
+    /// `styled(Base)<Props>\`…\`` (upstream `isTypedStyledTemplate`, #2429).
+    /// tree-sitter's tagged-template call takes no type arguments, so one that
+    /// also reads as an expression turns the initializer into comparisons,
+    /// `(styled.div < Props) > \`…\``: the tag is the leftmost operand, against
+    /// a `<`, and the template the rightmost, against a `>` (`>>` when the type
+    /// argument ends in its own `<…>`). The operators in between are the type
+    /// argument's: `<A & B>` is `(styled.div < A) & (B > \`…\`)`.
+    fn is_typed_styled_template(&self, value: SyntaxNode<'tree>) -> bool {
+        if value.kind() != "binary_expression" {
+            return false;
+        }
+        let mut tag_parent = value;
+        let mut tag = child_by_field(value, "left");
+        while let Some(inner) = tag.filter(|node| node.kind() == "binary_expression") {
+            tag_parent = inner;
+            tag = child_by_field(inner, "left");
+        }
+        let mut template_parent = value;
+        let mut template = child_by_field(value, "right");
+        while let Some(inner) = template.filter(|node| node.kind() == "binary_expression") {
+            template_parent = inner;
+            template = child_by_field(inner, "right");
+        }
+        let (Some(tag), Some(template)) = (tag, template) else {
+            return false;
+        };
+        template.kind() == "template_string"
+            && child_by_field(tag_parent, "operator").is_some_and(|op| op.kind() == "<")
+            && child_by_field(template_parent, "operator")
+                .is_some_and(|op| !op.kind().is_empty() && op.kind().bytes().all(|b| b == b'>'))
+            && starts_with_word(&node_text(tag, self.source), "styled")
+    }
+
+    /// The `component` node of a wrapper-declared React component (see
+    /// [`Self::react_component_hoc`]), named by the declarator and spanning
+    /// it. An inline render function's body is walked with the component on
+    /// the stack, so its calls (hooks, helpers) are the component's, as a
+    /// plain `const Foo = () => …` component's are.
+    fn extract_react_component(
+        &mut self,
+        name: &str,
+        declarator: SyntaxNode<'tree>,
+        render: Option<SyntaxNode<'tree>>,
+        extra: NodeExtra,
+    ) {
+        let Some(component) = self.create_node(NodeKind::Component, name, declarator, extra) else {
+            return;
+        };
+        let Some(render) = render else {
+            return;
+        };
+        self.node_stack.push(component.id);
+        if let Some(body) = self.resolve_body(render) {
+            self.visit_function_body(body);
+        }
+        self.node_stack.pop();
     }
 
     /// A top-level binding exported by a LATER statement rather than at its
@@ -4465,6 +4928,233 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         self.node_stack.pop();
         extracted
+    }
+
+    /// A declared constant's or variable's initializer: the store shapes whose
+    /// members become function nodes of their own, then one walk of the rest
+    /// under the declaration.
+    ///
+    /// The shapes, each extracted wherever it applies (upstream
+    /// `extractVariable`): an exported store's inline actions, the object its
+    /// initializer returns (`create((set, get) => ({ reset: () => set({}) }))`,
+    /// middleware wrappers included, #647/#1862); RTK Query's endpoints
+    /// (`createApi({ endpoints: (build) => ({ getPosts: build.query(…) }) })`);
+    /// a Vue store's `actions`, `mutations` and `getters` written in its call
+    /// (`defineStore({ actions: {…} })`, `createStore`, `new Vuex.Store`); and
+    /// in a store file a declaration named `actions`, `mutations` or `getters`
+    /// whose object none of the shapes before took. The members are qualified
+    /// under the declaration (`useAuthStore::login`).
+    ///
+    /// The rest of the initializer runs when the store is built: the `create`
+    /// or `defineStore` call, its wrappers, a store's `state` and options.
+    /// Those calls stay the declaration's (#693), as they were before the
+    /// members became nodes; upstream walks none of the initializer for these
+    /// shapes and drops them. What became a node is skipped, so no member's
+    /// calls are counted for the declaration as well.
+    fn walk_declared_initializer(
+        &mut self,
+        value: SyntaxNode<'tree>,
+        owner_id: &str,
+        name: &str,
+        is_exported: bool,
+    ) {
+        let mut extracted = Vec::new();
+        let mut factory = None;
+        let mut store_actions = false;
+        if value.kind() == "call_expression" {
+            if let Some(actions) = initializer_returned_object(value, 0)
+                .filter(|actions| object_has_inline_functions(*actions))
+                .filter(|_| is_exported || self.is_exported_later(name))
+            {
+                factory = nearest_function_ancestor(actions).map(|factory| factory.id());
+                extracted.extend(self.extract_js_object_literal_members(actions, owner_id));
+                store_actions = true;
+            }
+            if let Some(endpoints) = rtk_endpoints_object(value, self.source) {
+                extracted.extend(self.extract_rtk_endpoints(endpoints, owner_id));
+            }
+        }
+        if matches!(value.kind(), "call_expression" | "new_expression") {
+            for collection in vue_store_collection_objects(value, self.source) {
+                extracted.extend(self.extract_js_object_literal_members(collection, owner_id));
+            }
+        }
+        if !store_actions && is_vue_store_collection_name(name) && self.looks_like_vue_store_file()
+        {
+            let object = match value.kind() {
+                "object" | "object_expression" => Some(value),
+                "call_expression" => initializer_returned_object(value, 0),
+                _ => None,
+            };
+            if let Some(object) = object {
+                extracted.extend(self.extract_js_object_literal_members(object, owner_id));
+            }
+        }
+        let previous = (factory.is_some() || !extracted.is_empty()).then(|| {
+            self.store_walk.replace(StoreWalk {
+                factory,
+                actions: extracted,
+            })
+        });
+        self.node_stack.push(owner_id.to_string());
+        self.visit_function_body(value);
+        self.node_stack.pop();
+        if let Some(previous) = previous {
+            self.store_walk = previous;
+        }
+    }
+
+    /// RTK Query's endpoints (upstream `extractRtkEndpoints`): each
+    /// `getPosts: build.query({…})`, `build.mutation` or `build.infiniteQuery`
+    /// of the object `endpoints` returns is a function node named by its key,
+    /// under the api's declaration. One with a handler (`queryFn`, else
+    /// `query`, else its first function member) spans the handler; one with
+    /// none (`queryFn: makeQueryFn(url)`) spans the builder call, which is
+    /// walked under it, with the call's first 80 UTF-16 code units for its
+    /// signature. A key that names no static member (a computed `[key]`) makes
+    /// none. Returns the tree node ids that became the endpoints.
+    fn extract_rtk_endpoints(
+        &mut self,
+        endpoints: SyntaxNode<'tree>,
+        owner_id: &str,
+    ) -> Vec<usize> {
+        let mut extracted = Vec::new();
+        self.node_stack.push(owner_id.to_string());
+        for member in endpoints.named_children(&mut endpoints.walk()) {
+            if member.kind() != "pair" {
+                continue;
+            }
+            let (Some(key), Some(call)) = (
+                child_by_field(member, "key"),
+                child_by_field(member, "value"),
+            ) else {
+                continue;
+            };
+            if call.kind() != "call_expression" {
+                continue;
+            }
+            let Some(callee) = child_by_field(call, "function")
+                .filter(|callee| callee.kind() == "member_expression")
+            else {
+                continue;
+            };
+            let method = child_by_field(callee, "property").unwrap_or(callee);
+            if !matches!(
+                node_text(method, self.source).as_str(),
+                "query" | "mutation" | "infiniteQuery"
+            ) {
+                continue;
+            }
+            let Some(name) = js_object_member_name(key, self.source) else {
+                continue;
+            };
+            if let Some(handler) = rtk_endpoint_handler(call, self.source) {
+                self.extract_function(handler, Some(name));
+                extracted.push(handler.id());
+            } else if let Some(endpoint) = self.create_node(
+                NodeKind::Function,
+                &name,
+                call,
+                NodeExtra {
+                    signature: Some(utf16_prefix(&node_text(call, self.source), 80)),
+                    ..NodeExtra::default()
+                },
+            ) {
+                self.node_stack.push(endpoint.id);
+                self.visit_function_body(call);
+                self.node_stack.pop();
+                extracted.push(call.id());
+            }
+        }
+        self.node_stack.pop();
+        extracted
+    }
+
+    /// RTK Query's generated hooks (upstream `extractRtkHookBindings`): each
+    /// shorthand binding of `export const { useGetPostsQuery, … } = api` whose
+    /// name reads as one (`use`, a capital, and `Query` or `Mutation` at the
+    /// end) is a function node over the binding, exported with its
+    /// declaration, carrying [`RTK_GENERATED_HOOK_SIGNATURE`]. A renamed
+    /// (`usePrefetch: prefetch`) or defaulted binding is none.
+    fn extract_rtk_hook_bindings(&mut self, pattern: SyntaxNode<'tree>, is_exported: bool) {
+        for binding in pattern.named_children(&mut pattern.walk()) {
+            if binding.kind() != "shorthand_property_identifier_pattern" {
+                continue;
+            }
+            let name = node_text(binding, self.source);
+            if !is_rtk_hook_name(&name) {
+                continue;
+            }
+            self.create_node(
+                NodeKind::Function,
+                &name,
+                binding,
+                NodeExtra {
+                    signature: Some(RTK_GENERATED_HOOK_SIGNATURE.to_string()),
+                    is_exported,
+                    ..NodeExtra::default()
+                },
+            );
+        }
+    }
+
+    /// A Vuex module's default export in a store file (upstream
+    /// `extractStoreCollectionMethods`): `export default { namespaced: true,
+    /// mutations: {…}, actions: {…} }`. The members of its `actions`,
+    /// `mutations` and `getters` objects are function nodes of the file; the
+    /// rest of the statement is walked as before, skipping them (upstream
+    /// walks none of it). `false`, leaving the statement to the walk, when it
+    /// exports no object, the file does not read like a store, or the object
+    /// holds no such member.
+    fn extract_store_module(&mut self, statement: SyntaxNode<'tree>) -> bool {
+        if !matches!(
+            self.spec.language(),
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+        ) {
+            return false;
+        }
+        let Some(object) = child_by_field(statement, "value")
+            .filter(|value| matches!(value.kind(), "object" | "object_expression"))
+        else {
+            return false;
+        };
+        if !self.looks_like_vue_store_file() {
+            return false;
+        }
+        let Some(owner_id) = self.node_stack.last().cloned() else {
+            return false;
+        };
+        let mut collections = Vec::new();
+        push_vue_store_collections(object, self.source, &mut collections);
+        let mut extracted = Vec::new();
+        for collection in collections {
+            extracted.extend(self.extract_js_object_literal_members(collection, &owner_id));
+        }
+        if extracted.is_empty() {
+            return false;
+        }
+        let previous = self.store_walk.replace(StoreWalk {
+            factory: None,
+            actions: extracted,
+        });
+        self.visit_named_children(statement);
+        self.store_walk = previous;
+        true
+    }
+
+    /// Whether the source reads like a Vue store (upstream
+    /// `looksLikeVueStoreFile`): at least two different words of
+    /// `defineStore`, `createStore`, `Vuex`, `mutations`, `actions`, `getters`
+    /// and `namespaced` occur in it as whole ASCII words, comments and strings
+    /// included. Computed once per walk; a component's script block is a walk
+    /// of its own.
+    fn looks_like_vue_store_file(&mut self) -> bool {
+        if let Some(store) = self.vue_store_file {
+            return store;
+        }
+        let store = reads_like_vue_store(self.source);
+        self.vue_store_file = Some(store);
+        store
     }
 
     /// Whether a named object literal in this file owns its function members
@@ -5095,36 +5785,95 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         );
     }
 
-    fn extract_go_variable(&mut self, node: SyntaxNode<'tree>) {
+    /// A Go `var` or `const` declaration (upstream `extractVariable`'s Go
+    /// branch). Each spec, a `var ( … )` group's inside its `var_spec_list`
+    /// (#2682), is a node named by its first identifier and spanning the
+    /// spec, with its own doc comment or else the declaration's (#2680), and
+    /// the text of its last child, cut in UTF-16 units as upstream cuts it
+    /// ([`utf16_value_signature`]), as the signature. Its initializer is walked
+    /// under it, so what a package-level `var c = pkg.New()` or `var Cmd =
+    /// &Command{RunE: func(…) {…}}` calls, builds and passes is that
+    /// variable's (#693). A `:=` reaches here only through error recovery
+    /// and declares a variable per name, unwalked. Returns the initializers
+    /// walked under a node: they captured their own function values, so the
+    /// declaration's scan skips them, as the file would otherwise keep a
+    /// second reference to each function from the same spot (#2743).
+    fn extract_go_variable(&mut self, node: SyntaxNode<'tree>) -> Vec<usize> {
         let kind = if node.kind() == "const_declaration" {
             NodeKind::Constant
         } else {
             NodeKind::Variable
         };
-        for ident in descendants_of_kind(node, "identifier") {
-            let Some(parent) = ident.parent() else {
-                continue;
-            };
-            if !matches!(
-                parent.kind(),
-                "var_spec" | "const_spec" | "short_var_declaration"
-            ) {
-                continue;
+        let docstring = self.docstring_for(node);
+        let mut specs = Vec::new();
+        for child in node.named_children(&mut node.walk()) {
+            if child.kind() == "var_spec_list" {
+                specs.extend(child.named_children(&mut child.walk()));
+            } else {
+                specs.push(child);
             }
-            let created = self.create_node(
-                kind,
-                &node_text(ident, self.source),
-                ident,
-                NodeExtra::default(),
-            );
-            // The value reads what its whole spec (its initializer) names.
-            if let Some(created) = created
-                && crate::value_refs::has_value_refs(self.spec.language())
-            {
-                self.value_refs.scan_reader_from(&created.id, parent);
-            }
-            break;
         }
+        let mut walked = Vec::new();
+        for spec in specs {
+            if !matches!(spec.kind(), "var_spec" | "const_spec") {
+                continue;
+            }
+            let mut created = None;
+            if let Some(name) = spec
+                .named_child(0)
+                .filter(|name| name.kind() == "identifier")
+            {
+                let count = spec.named_child_count();
+                let last = (count > 1)
+                    .then(|| spec.named_child(count as u32 - 1))
+                    .flatten();
+                created = self.create_node(
+                    kind,
+                    &node_text(name, self.source),
+                    spec,
+                    NodeExtra {
+                        docstring: self.docstring_for(spec).or_else(|| docstring.clone()),
+                        signature: utf16_value_signature(last, self.source),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+            if let Some(value) = child_by_field(spec, "value") {
+                if let Some(created) = &created {
+                    self.node_stack.push(created.id.clone());
+                }
+                self.visit_function_body(value);
+                if created.is_some() {
+                    self.node_stack.pop();
+                    walked.push(value.id());
+                }
+            }
+        }
+        if node.kind() == "short_var_declaration"
+            && let Some(left) = child_by_field(node, "left")
+        {
+            let names: Vec<SyntaxNode<'tree>> = if left.kind() == "expression_list" {
+                left.named_children(&mut left.walk())
+                    .filter(|name| name.kind() == "identifier")
+                    .collect()
+            } else {
+                vec![left]
+            };
+            let signature = utf16_value_signature(child_by_field(node, "right"), self.source);
+            for name in names {
+                self.create_node(
+                    NodeKind::Variable,
+                    &node_text(name, self.source),
+                    node,
+                    NodeExtra {
+                        docstring: docstring.clone(),
+                        signature: signature.clone(),
+                        ..NodeExtra::default()
+                    },
+                );
+            }
+        }
+        walked
     }
 
     fn extract_lua_variable(&mut self, node: SyntaxNode<'tree>) {
@@ -5321,8 +6070,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// walker (upstream `propertyBodies`, #2345 and #2348): each C#
     /// accessor's body (`get { … }`, `set => …`) and the property's `value`,
     /// an expression body's `=> …` or an `= initializer`. Its attributes are
-    /// not walked. Other languages have none here (VB.NET's whole
-    /// declaration joins with VB.NET support).
+    /// not walked. Other languages have none here (upstream also walks a
+    /// VB.NET property's whole declaration; this port does not extract
+    /// VB.NET).
     fn property_bodies(&self, node: SyntaxNode<'tree>) -> Vec<SyntaxNode<'tree>> {
         if self.spec.language() != Language::CSharp {
             return Vec::new();
@@ -5585,9 +6335,15 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         if !info.handled_refs {
             self.push_ref(&parent_id, &info.module_name, EdgeKind::Imports, node);
         }
+        // ArkTS binds imports as TypeScript does (upstream `b635dd46`
+        // tree-sitter.ts:4115-4118, #1186).
         if matches!(
             self.spec.language(),
-            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::ArkTs
         ) {
             self.emit_import_binding_refs(node, &parent_id);
         }
@@ -5784,10 +6540,151 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         self.push_ref(&caller_id, &reference, EdgeKind::Calls, node);
     }
 
+    /// ArkUI's build() DSL (upstream `tree-sitter.ts` extractCall's arkts
+    /// branch, #1186), the three shapes a chained attribute takes, each
+    /// named with a leading dot (`.width`) so that only an attribute helper
+    /// a decorator marks can resolve it; a framework attribute on nearly
+    /// every UI line otherwise binds any same-named symbol. Returns whether
+    /// `node` was one of them; children are walked by the caller either way.
+    ///
+    /// 1. An `arkui_component_expression` (`Column() { … }.height(…)`): the
+    ///    component is a call by its plain name, and each chained attribute
+    ///    a repeated `property`/`arguments` pair on the node itself.
+    /// 2. A `call_expression` chained on a call's result (`Text(t)
+    ///    .fontSize(16)`), never on a named receiver; or the innermost call
+    ///    of a chain a `leading_dot_expression` heads, whose callee is a bare
+    ///    identifier (an `@Extend` body's `.fontSize(16).fontColor(…)`).
+    /// 3. A `leading_dot_expression` holding a bare identifier, its
+    ///    arguments in the next statement (upstream's 0.2.0 tree; 0.3.0 keeps
+    ///    the shape, which it does not produce).
+    ///
+    /// An `.onXxx(this.handler)` binding also calls the handler.
+    fn extract_arkui_call(&mut self, node: SyntaxNode<'tree>, caller_id: &str) -> bool {
+        match node.kind() {
+            "arkui_component_expression" => {
+                if let Some(component) =
+                    child_by_field(node, "function").filter(|f| f.kind() == "identifier")
+                {
+                    let name = node_text(component, self.source);
+                    self.push_ref(caller_id, &name, EdgeKind::Calls, node);
+                }
+                let children: Vec<SyntaxNode<'tree>> = (0..node.child_count())
+                    .filter_map(|i| node.child(i))
+                    .collect();
+                for (index, child) in children.iter().enumerate() {
+                    if child.kind() != "property_identifier" {
+                        continue;
+                    }
+                    self.push_arkui_attribute(caller_id, *child);
+                    if is_arkui_event_attribute(&node_text(*child, self.source)) {
+                        // The attribute's arguments: the next `arguments`
+                        // before the following attribute's name.
+                        let arguments = children[index + 1..]
+                            .iter()
+                            .take_while(|next| next.kind() != "property_identifier")
+                            .find(|next| next.kind() == "arguments");
+                        self.push_arkui_this_handlers(caller_id, arguments.copied());
+                    }
+                }
+                true
+            }
+            "call_expression" => {
+                let function = child_by_field(node, "function");
+                if let Some(function) = function.filter(|f| f.kind() == "member_expression")
+                    && let Some(property) = child_by_field(function, "property")
+                    && child_by_field(function, "object").is_some_and(|object| {
+                        matches!(
+                            object.kind(),
+                            "call_expression" | "arkui_component_expression"
+                        )
+                    })
+                {
+                    self.push_arkui_attribute(caller_id, property);
+                    if is_arkui_event_attribute(&node_text(property, self.source)) {
+                        self.push_arkui_this_handlers(caller_id, child_by_field(node, "arguments"));
+                    }
+                    return true;
+                }
+                if let Some(function) = function.filter(|f| f.kind() == "identifier") {
+                    let mut parent = node.parent();
+                    while let Some(up) = parent
+                        .filter(|up| matches!(up.kind(), "member_expression" | "call_expression"))
+                    {
+                        parent = up.parent();
+                    }
+                    if parent.is_some_and(|up| up.kind() == "leading_dot_expression") {
+                        self.push_arkui_attribute(caller_id, function);
+                        if is_arkui_event_attribute(&node_text(function, self.source)) {
+                            self.push_arkui_this_handlers(
+                                caller_id,
+                                child_by_field(node, "arguments"),
+                            );
+                        }
+                        return true;
+                    }
+                }
+                false
+            }
+            "leading_dot_expression" => {
+                let only = (node.named_child_count() == 1)
+                    .then(|| node.named_child(0))
+                    .flatten();
+                if let Some(only) = only.filter(|only| only.kind() == "identifier") {
+                    self.push_arkui_attribute(caller_id, only);
+                    if is_arkui_event_attribute(&node_text(only, self.source)) {
+                        let arguments = node
+                            .parent()
+                            .and_then(|statement| statement.next_named_sibling())
+                            .and_then(|next| next.named_child(0))
+                            .filter(|paren| paren.kind() == "parenthesized_expression");
+                        self.push_arkui_this_handlers(caller_id, arguments);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A chained ArkUI attribute: a call named `.` and the attribute's name,
+    /// where the name is written.
+    fn push_arkui_attribute(&mut self, caller_id: &str, name: SyntaxNode<'tree>) {
+        let attribute = node_text(name, self.source);
+        if attribute.is_empty() {
+            return;
+        }
+        self.push_ref(caller_id, &format!(".{attribute}"), EdgeKind::Calls, name);
+    }
+
+    /// A call of each bare `this.handler` among an event attribute's
+    /// arguments, where it is written (upstream `emitThisHandlers`).
+    fn push_arkui_this_handlers(&mut self, caller_id: &str, arguments: Option<SyntaxNode<'tree>>) {
+        let Some(arguments) = arguments else {
+            return;
+        };
+        for i in 0..arguments.named_child_count() {
+            let Some(argument) = arguments.named_child(i as u32) else {
+                continue;
+            };
+            if argument.kind() != "member_expression" {
+                continue;
+            }
+            if child_by_field(argument, "object").is_some_and(|object| object.kind() == "this")
+                && let Some(property) = child_by_field(argument, "property")
+            {
+                let handler = node_text(property, self.source);
+                self.push_ref(caller_id, &handler, EdgeKind::Calls, argument);
+            }
+        }
+    }
+
     fn extract_call(&mut self, node: SyntaxNode<'tree>) {
         let Some(caller_id) = self.node_stack.last().cloned() else {
             return;
         };
+        if self.spec.language() == Language::ArkTs && self.extract_arkui_call(node, &caller_id) {
+            return;
+        }
         // Java/Kotlin `method_invocation` and PHP `member_call_expression` /
         // `scoped_call_expression` carry `object`/`scope` + `name` fields instead
         // of a `function` member-expression (tree-sitter.ts:2573-2663).
@@ -6109,8 +7006,99 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             callee_name = converted;
         }
         callee_name = self.maybe_strip_cpp_template_call(callee_name);
+        // #1172: a C++ call or launch through a local the enclosing symbol
+        // bound from `&fn` calls every function it was bound to, not the
+        // local.
+        if self.spec.language() == Language::Cpp
+            && is_plain_identifier(&callee_name)
+            && let Some(targets) = self
+                .cpp_local_fn_ptrs
+                .get(&caller_id)
+                .and_then(|locals| locals.get(&callee_name))
+                .filter(|targets| !targets.is_empty())
+                .cloned()
+        {
+            for target in targets {
+                self.push_ref(&caller_id, &target, EdgeKind::Calls, position);
+            }
+            return;
+        }
         if !callee_name.is_empty() {
             self.push_ref(&caller_id, &callee_name, EdgeKind::Calls, position);
+        }
+    }
+
+    /// The C++ local function-pointer bindings `node` makes (#1172): each
+    /// `init_declarator` of a `declaration` that declares an identifier,
+    /// and an `assignment_expression` to an identifier. A body is walked in
+    /// source order and C++ declares a local before its use, so a binding
+    /// is recorded before the call through it.
+    fn record_cpp_fn_ptr_bindings(&mut self, node: SyntaxNode<'tree>) {
+        match node.kind() {
+            "declaration" => {
+                for i in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(i as u32) else {
+                        continue;
+                    };
+                    if child.kind() != "init_declarator" {
+                        continue;
+                    }
+                    let Some(declarator) = child_by_field(child, "declarator") else {
+                        continue;
+                    };
+                    if declarator.kind() == "identifier" {
+                        let local = node_text(declarator, self.source);
+                        self.record_cpp_fn_ptr_binding(&local, child_by_field(child, "value"));
+                    }
+                }
+            }
+            "assignment_expression" => {
+                if let Some(left) = child_by_field(node, "left")
+                    && left.kind() == "identifier"
+                {
+                    let local = node_text(left, self.source);
+                    self.record_cpp_fn_ptr_binding(&local, child_by_field(node, "right"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `local = &fn`, `&fn<…>` or `&ns::fn<…>` for the enclosing symbol
+    /// (upstream `recordCppFnPtrBinding`): only the address-of shape, since
+    /// `auto x = y;` copies any value; the template arguments are stripped.
+    fn record_cpp_fn_ptr_binding(&mut self, local: &str, value: Option<SyntaxNode<'tree>>) {
+        let Some(value) = value else {
+            return;
+        };
+        if value.kind() != "pointer_expression" || value.child(0).map(|op| op.kind()) != Some("&") {
+            return;
+        }
+        let Some(argument) = child_by_field(value, "argument").or_else(|| value.named_child(0))
+        else {
+            return;
+        };
+        if !matches!(
+            argument.kind(),
+            "identifier" | "template_function" | "qualified_identifier"
+        ) {
+            return;
+        }
+        let Some(caller_id) = self.node_stack.last().cloned() else {
+            return;
+        };
+        let target = strip_cpp_template_args(&node_text(argument, self.source));
+        if target.is_empty() || target == local {
+            return;
+        }
+        let targets = self
+            .cpp_local_fn_ptrs
+            .entry(caller_id)
+            .or_default()
+            .entry(local.to_string())
+            .or_default();
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
 
@@ -6623,6 +7611,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             }
         }
 
+        // #1172: a C++ body's `auto kernel = &fn<…>;` and `kernel = &g;`.
+        if self.spec.language() == Language::Cpp && !self.node_stack.is_empty() {
+            self.record_cpp_fn_ptr_bindings(node);
+        }
+
         // G4 — a static-member or enum-value read: `Enum.value`,
         // `Type.CONST`, `Foo::BAR`.
         self.extract_static_member_ref(node);
@@ -6920,6 +7913,17 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             self.push_ref(class_id, &name, EdgeKind::Extends, target);
                         }
                     }
+                } else if let Some(types) = type_list(child) {
+                    // Java's `interface I extends A, B` wraps them in a
+                    // `type_list` (upstream `tree-sitter.ts`): one each.
+                    for target in types.named_children(&mut types.walk()) {
+                        self.push_ref(
+                            class_id,
+                            &node_text(target, self.source),
+                            EdgeKind::Extends,
+                            target,
+                        );
+                    }
                 } else if let Some(target) = child.named_child(0) {
                     self.push_ref(
                         class_id,
@@ -6930,7 +7934,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
             if matches!(child.kind(), "implements_clause" | "super_interfaces") {
-                for iface in child.named_children(&mut child.walk()) {
+                // Java's `implements A, B` is a `type_list`, read type by type.
+                let list = type_list(child).unwrap_or(child);
+                for iface in list.named_children(&mut list.walk()) {
                     self.push_ref(
                         class_id,
                         &node_text(iface, self.source),
@@ -7939,6 +8945,31 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         });
     }
 
+    /// [`Self::push_ref`] at a position read elsewhere: `line` 1-based,
+    /// `col` the tree's byte column.
+    fn push_ref_at(
+        &mut self,
+        from_node_id: &str,
+        reference_name: &str,
+        kind: EdgeKind,
+        line: u32,
+        col: u32,
+    ) {
+        self.unresolved_references.push(UnresolvedRef {
+            id: None,
+            from_node_id: from_node_id.to_string(),
+            reference_name: reference_name.to_string(),
+            reference_kind: kind,
+            line: i64::from(line),
+            col: i64::from(col),
+            candidates: None,
+            file_path: self.file_path.to_string(),
+            language: self.spec.language(),
+            is_function_ref: false,
+            reference_subkind: None,
+        });
+    }
+
     /// The node's prose from both places it can live — a preceding comment and
     /// a docstring inside the body — joined when both are present: they are
     /// two things the author wrote about the same symbol (upstream
@@ -8079,8 +9110,25 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
     }
 
+    /// Whether this file's capitalized JSX tags are component references:
+    /// a tsx or jsx file's, and a JavaScript file's own (W7-28, OD-B46;
+    /// colby's jsx-render pass reads the tags of every language that can
+    /// write JSX). A Vue or Svelte `<script>` block is extracted as
+    /// JavaScript under its component's path, and colby folds the block
+    /// into the component's language, whose tags it does not read: a file
+    /// an embedded extractor reads records none.
+    fn reads_jsx_tags(&self) -> bool {
+        match self.spec.language() {
+            Language::Tsx | Language::Jsx => true,
+            Language::JavaScript => {
+                crate::embedded::detect_embedded_language(self.file_path).is_none()
+            }
+            _ => false,
+        }
+    }
+
     fn extract_jsx_component_ref(&mut self, node: SyntaxNode<'tree>) {
-        if !matches!(self.spec.language(), Language::Tsx | Language::Jsx) {
+        if !self.reads_jsx_tags() {
             return;
         }
         let Some(from_id) = self.node_stack.last().cloned() else {
@@ -8103,6 +9151,14 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             self.push_ref(&from_id, component, EdgeKind::References, tag);
         }
     }
+}
+
+/// The `type_list` a heritage clause wraps its types in (tree-sitter-java's
+/// `super_interfaces` and `extends_interfaces`), when it has one.
+fn type_list(clause: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    clause
+        .named_children(&mut clause.walk())
+        .find(|child| child.kind() == "type_list")
 }
 
 fn strip_erlang_arity(name: &str) -> &str {
@@ -8398,6 +9454,17 @@ fn function_returned_object(function: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> 
         })
 }
 
+/// Whether `text` starts with the word `word`: what follows is no ASCII word
+/// character (a JavaScript `^word\b`).
+fn starts_with_word(text: &str, word: &str) -> bool {
+    text.strip_prefix(word).is_some_and(|rest| {
+        !rest
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
 /// Whether an object literal declares an inline function member — an action
 /// map, unlike a setup store's all-shorthand `return { foo, bar }`.
 fn object_has_inline_functions(object: SyntaxNode<'_>) -> bool {
@@ -8410,6 +9477,228 @@ fn object_has_inline_functions(object: SyntaxNode<'_>) -> bool {
             }),
             _ => false,
         })
+}
+
+/// A call's or construction's callee name: an identifier's text, else a
+/// member expression's property (`Vuex.Store` gives `Store`); empty for
+/// any other callee.
+fn callee_property_name(callee: SyntaxNode<'_>, source: &str) -> String {
+    match callee.kind() {
+        "identifier" => node_text(callee, source),
+        "member_expression" => {
+            node_text(child_by_field(callee, "property").unwrap_or(callee), source)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The object of endpoint definitions of a `createApi({ endpoints: (build)
+/// => ({…}) })` or `api.injectEndpoints({ endpoints(build) { return {…} } })`
+/// call (upstream `findRtkEndpointsObject`): the first `endpoints` member of
+/// an object argument, a function or method whose returned object it is.
+/// `None` for any other call, and when that first `endpoints` returns none.
+fn rtk_endpoints_object<'t>(call: SyntaxNode<'t>, source: &str) -> Option<SyntaxNode<'t>> {
+    let callee = child_by_field(call, "function")?;
+    if !matches!(
+        callee_property_name(callee, source).as_str(),
+        "createApi" | "injectEndpoints"
+    ) {
+        return None;
+    }
+    let arguments = child_by_field(call, "arguments")?;
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if !matches!(argument.kind(), "object" | "object_expression") {
+            continue;
+        }
+        for member in argument.named_children(&mut argument.walk()) {
+            match member.kind() {
+                "pair" => {
+                    if !child_by_field(member, "key")
+                        .is_some_and(|key| node_text(key, source) == "endpoints")
+                    {
+                        continue;
+                    }
+                    if let Some(function) = child_by_field(member, "value").filter(|value| {
+                        matches!(value.kind(), "arrow_function" | "function_expression")
+                    }) {
+                        return function_returned_object(function);
+                    }
+                }
+                "method_definition"
+                    if child_by_field(member, "name")
+                        .is_some_and(|name| node_text(name, source) == "endpoints") =>
+                {
+                    return function_returned_object(member);
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The handler of an RTK Query endpoint's builder call (upstream
+/// `rtkEndpointHandler`): in the first object argument that has a function
+/// member (`key: () => …`, `key: function () {…}` or `key() {…}`), the
+/// `queryFn`, else the `query`, else the first; the later of two members of
+/// one key. `None` when no object argument has a function member.
+fn rtk_endpoint_handler<'t>(call: SyntaxNode<'t>, source: &str) -> Option<SyntaxNode<'t>> {
+    let arguments = child_by_field(call, "arguments")?;
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if !matches!(argument.kind(), "object" | "object_expression") {
+            continue;
+        }
+        let (mut query_fn, mut query, mut first) = (None, None, None);
+        for member in argument.named_children(&mut argument.walk()) {
+            let (function, key) = match member.kind() {
+                "pair" => {
+                    let Some(value) = child_by_field(member, "value").filter(|value| {
+                        matches!(value.kind(), "arrow_function" | "function_expression")
+                    }) else {
+                        continue;
+                    };
+                    (value, child_by_field(member, "key"))
+                }
+                "method_definition" => (member, child_by_field(member, "name")),
+                _ => continue,
+            };
+            match key.map(|key| node_text(key, source)).as_deref() {
+                Some("queryFn") => query_fn = Some(function),
+                Some("query") => query = Some(function),
+                _ => {}
+            }
+            first.get_or_insert(function);
+        }
+        if let Some(handler) = query_fn.or(query).or(first) {
+            return Some(handler);
+        }
+    }
+    None
+}
+
+/// Whether `name` reads as an RTK Query generated hook (upstream
+/// `RTK_HOOK_NAME_RE`, `^use[A-Z][A-Za-z0-9]*(?:Query|Mutation)$`):
+/// `useGetPostsQuery`, `useLazyGetPostsQuery`, `useAddPostMutation`.
+pub fn is_rtk_hook_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("use") else {
+        return false;
+    };
+    rest.starts_with(|c: char| c.is_ascii_uppercase())
+        && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+        && ((rest.len() > "Query".len() && rest.ends_with("Query"))
+            || (rest.len() > "Mutation".len() && rest.ends_with("Mutation")))
+}
+
+/// The names of a Vue store's collections (upstream
+/// `VUE_STORE_COLLECTION_NAMES`).
+fn is_vue_store_collection_name(name: &str) -> bool {
+    matches!(name, "actions" | "mutations" | "getters")
+}
+
+/// The `actions`, `mutations` and `getters` objects written in a Vue store's
+/// call (upstream `findVueStoreCollectionObjects`): `defineStore({…})`,
+/// `defineStore('id', {…})`, `createStore({…})`, `new Vuex.Store({…})`,
+/// `new Store({…})`, from every object argument.
+fn vue_store_collection_objects<'t>(call: SyntaxNode<'t>, source: &str) -> Vec<SyntaxNode<'t>> {
+    let mut collections = Vec::new();
+    let Some(callee) =
+        child_by_field(call, "function").or_else(|| child_by_field(call, "constructor"))
+    else {
+        return collections;
+    };
+    if !matches!(
+        callee_property_name(callee, source).as_str(),
+        "defineStore" | "createStore" | "Store"
+    ) {
+        return collections;
+    }
+    let Some(arguments) = child_by_field(call, "arguments") else {
+        return collections;
+    };
+    for argument in arguments.named_children(&mut arguments.walk()) {
+        if matches!(argument.kind(), "object" | "object_expression") {
+            push_vue_store_collections(argument, source, &mut collections);
+        }
+    }
+    collections
+}
+
+/// The object values of a store config's `actions`, `mutations` and
+/// `getters` keys, written as such (a quoted `'actions'` is no key of them,
+/// as upstream compares the key's text).
+fn push_vue_store_collections<'t>(
+    config: SyntaxNode<'t>,
+    source: &str,
+    collections: &mut Vec<SyntaxNode<'t>>,
+) {
+    for member in config.named_children(&mut config.walk()) {
+        if member.kind() != "pair" {
+            continue;
+        }
+        if !child_by_field(member, "key")
+            .is_some_and(|key| is_vue_store_collection_name(&node_text(key, source)))
+        {
+            continue;
+        }
+        if let Some(value) = child_by_field(member, "value")
+            .filter(|value| matches!(value.kind(), "object" | "object_expression"))
+        {
+            collections.push(value);
+        }
+    }
+}
+
+/// Whether `source` holds at least two different words of upstream's
+/// `VUE_STORE_FILE_SIGNAL` (`defineStore`, `createStore`, `Vuex`,
+/// `mutations`, `actions`, `getters`, `namespaced`), each a whole word as
+/// JavaScript's `\b` bounds it: a run of ASCII letters, digits and `_`.
+/// The Vuex pass reads a store file by the same words (`isStoreFile`).
+pub fn reads_like_vue_store(source: &str) -> bool {
+    const SIGNALS: [&str; 7] = [
+        "defineStore",
+        "createStore",
+        "Vuex",
+        "mutations",
+        "actions",
+        "getters",
+        "namespaced",
+    ];
+    let mut seen = [false; SIGNALS.len()];
+    let mut seen_count = 0;
+    for word in source
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| !word.is_empty())
+    {
+        if let Some(index) = SIGNALS.iter().position(|signal| *signal == word)
+            && !seen[index]
+        {
+            seen[index] = true;
+            seen_count += 1;
+            if seen_count >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The first `limit` UTF-16 code units of `text`, as JavaScript's
+/// `slice(0, limit)` keeps them; a surrogate pair the cut splits leaves a
+/// lone high surrogate, which upstream's SQLite binding stores as U+FFFD.
+fn utf16_prefix(text: &str, limit: usize) -> String {
+    let mut units = 0;
+    let mut prefix = String::new();
+    for c in text.chars() {
+        if units + c.len_utf16() > limit {
+            if units < limit {
+                prefix.push(char::REPLACEMENT_CHARACTER);
+            }
+            break;
+        }
+        units += c.len_utf16();
+        prefix.push(c);
+    }
+    prefix
 }
 
 /// The call's callee name when it is a bare identifier or `pkg::fn` (yields
@@ -8465,6 +9754,37 @@ fn value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String
             .collect::<String>();
         format!("= {}{}", init, if init.len() >= 100 { "..." } else { "" })
     })
+}
+
+/// A Go spec's signature as upstream writes it, `= ${text.slice(0, 100)}`
+/// with `...` when the text's `length` is 100 or more, both in UTF-16 code
+/// units as JavaScript counts a string; none for an empty text. A pair the
+/// cut splits leaves upstream a lone high surrogate, which its SQLite
+/// binding stores as U+FFFD, so this writes U+FFFD. [`value_signature`]'s
+/// callers still count characters and bytes.
+fn utf16_value_signature(value: Option<SyntaxNode<'_>>, source: &str) -> Option<String> {
+    let text = node_text(value?, source);
+    if text.is_empty() {
+        return None;
+    }
+    let mut units = 0;
+    let mut init = String::new();
+    for c in text.chars() {
+        if units + c.len_utf16() > 100 {
+            if units < 100 {
+                init.push(char::REPLACEMENT_CHARACTER);
+            }
+            break;
+        }
+        units += c.len_utf16();
+        init.push(c);
+    }
+    let ellipsis = if text.encode_utf16().nth(99).is_some() {
+        "..."
+    } else {
+        ""
+    };
+    Some(format!("= {init}{ellipsis}"))
 }
 
 /// A Ruby assignment whose left side is a `constant` (`MAX = 3`).
@@ -8771,12 +10091,13 @@ fn property_or_field_signature(node: SyntaxNode<'_>, name: &str, source: &str) -
 }
 
 /// Languages whose declarations' annotated types are `references` from them
-/// (upstream `TYPE_ANNOTATION_LANGUAGES`, G3).
+/// (upstream `TYPE_ANNOTATION_LANGUAGES`, G3; ArkTS since #1186).
 fn has_type_annotation_refs(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
             | Language::Tsx
+            | Language::ArkTs
             | Language::Rust
             | Language::Go
             | Language::Java
@@ -8791,7 +10112,8 @@ fn has_type_annotation_refs(language: Language) -> bool {
 
 /// The name node of the type a Go embedding names (upstream
 /// `goEmbeddedTypeName`): `Base`, `pkg.Base` by `Base`, `Base[T]` by `Base`;
-/// a predeclared type is none.
+/// a predeclared type is none but `error`, an interface with a method that
+/// an embedding brings in like any type's from outside the index (#2759).
 fn go_embedded_type_name<'tree>(
     ty: Option<SyntaxNode<'tree>>,
     source: &str,
@@ -8805,8 +10127,11 @@ fn go_embedded_type_name<'tree>(
     if ty.kind() == "qualified_type" {
         return child_by_field(ty, "name");
     }
-    (ty.kind() == "type_identifier" && !is_go_predeclared_type(&node_text(ty, source)))
-        .then_some(ty)
+    if ty.kind() != "type_identifier" {
+        return None;
+    }
+    let name = node_text(ty, source);
+    (name == "error" || !is_go_predeclared_type(&name)).then_some(ty)
 }
 
 /// Whether code comes before `node` on the line it starts on.
@@ -9040,6 +10365,16 @@ fn is_builtin_type(name: &str) -> bool {
     )
 }
 
+/// Whether `name` is one identifier, `[A-Za-z_][A-Za-z0-9_]*` (upstream's
+/// `/^[A-Za-z_]\w*$/`).
+fn is_plain_identifier(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 pub(crate) fn strip_cpp_template_args(name: &str) -> String {
     let mut depth: i32 = 0;
     let mut out = String::with_capacity(name.len());
@@ -9179,11 +10514,25 @@ fn collect_descendants_of_kind<'tree>(
     }
 }
 
-fn lua_require_module(call_node: SyntaxNode<'_>, source: &str) -> Option<String> {
+/// The module a Lua call loads: `require`'s by upstream's rule, a project
+/// loader's ([`crate::lua_loaders`], #1617) only through one plain string
+/// literal ([`lua_loader_literal`]); `None` for any other call.
+fn lua_require_module(
+    call_node: SyntaxNode<'_>,
+    source: &str,
+    loaders: &crate::lua_loaders::LuaLoaders,
+) -> Option<String> {
     let name =
         child_by_field(call_node, "name").or_else(|| child_by_field(call_node, "function"))?;
     if name.kind() != "identifier" || node_text(name, source) != "require" {
-        return None;
+        if loaders.loader_functions().is_empty() {
+            return None;
+        }
+        let callee = lua_dotted_callee(name, source)?;
+        if !loaders.is_loader(&callee) {
+            return None;
+        }
+        return lua_loader_literal(call_node, source);
     }
     let args = child_by_field(call_node, "arguments").or_else(|| call_node.named_child(1))?;
     if let Some(content) = first_descendant_kind(args, "string_content") {
@@ -9215,6 +10564,49 @@ fn lua_require_module(call_node: SyntaxNode<'_>, source: &str) -> Option<String>
         }
     }
     None
+}
+
+/// A call's function as the dotted path of names it is written as (`Require`,
+/// `Script.Load`), whatever space or comments stand between the names;
+/// `None` for any other shape: a method (`A:B`), a bracket index, a call's
+/// result, a parenthesized expression.
+fn lua_dotted_callee(name: SyntaxNode<'_>, source: &str) -> Option<String> {
+    match name.kind() {
+        "identifier" => Some(node_text(name, source).to_string()),
+        "dot_index_expression" => {
+            let table = lua_dotted_callee(child_by_field(name, "table")?, source)?;
+            let field = child_by_field(name, "field")?;
+            (field.kind() == "identifier").then(|| format!("{table}.{}", node_text(field, source)))
+        }
+        _ => None,
+    }
+}
+
+/// The module a loader call names: its first argument when that is one plain
+/// string literal (`Require("m")`, `Require "m"`, `Require [[m]]`), the text
+/// between the quotes trimmed, escapes as written, the other arguments
+/// unread. A concatenation, a variable, a parenthesized string, a table
+/// (`Require{…}`), an empty string and a Luau backtick string, interpolated
+/// or not, name none.
+fn lua_loader_literal(call_node: SyntaxNode<'_>, source: &str) -> Option<String> {
+    let args = child_by_field(call_node, "arguments")?;
+    let first = args
+        .named_children(&mut args.walk())
+        .find(|child| child.kind() != "comment")?;
+    if first.kind() != "string"
+        || node_text(first, source).starts_with('`')
+        || first
+            .named_children(&mut first.walk())
+            .any(|child| child.kind() == "interpolation")
+    {
+        return None;
+    }
+    let content = first
+        .named_children(&mut first.walk())
+        .find(|child| child.kind() == "string_content")?;
+    let module_name = node_text(content, source);
+    let module_name = module_name.trim();
+    (!module_name.is_empty()).then(|| module_name.to_string())
 }
 
 #[cfg(test)]
@@ -9373,6 +10765,270 @@ class Model {}
         assert!(has_node(&nodes, NodeKind::Import, "../foo"));
         assert!(has_ref(&refs, EdgeKind::Imports, "../foo"));
         assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    /// W7-24a1: each binding an ArkTS import statement makes is an `imports`
+    /// reference, as in TypeScript (upstream `tree-sitter.ts`, `b635dd46`
+    /// 4113-4121, lists arkts).
+    #[test]
+    fn w724a1_arkts_import_bindings_are_references() {
+        let src = "import { Foo, Bar as Baz } from '../foo';\nimport Def from './def';\nimport * as ns from './ns';\n";
+        let (_nodes, refs) = run("src/component.ets", src, Language::ArkTs);
+        for binding in ["Foo", "Baz", "Def", "ns"] {
+            assert!(
+                has_ref(&refs, EdgeKind::Imports, binding),
+                "{binding}: {refs:?}"
+            );
+        }
+        assert!(!has_ref(&refs, EdgeKind::Imports, "Bar"));
+    }
+
+    /// W7-24a1: ArkTS module-level `const`/`let` declarations are constants
+    /// and variables (upstream `tree-sitter.ts`, `b635dd46` 3309-3312).
+    #[test]
+    fn w724a1_arkts_module_declarations_are_constants_and_variables() {
+        let src = "export const ROUTE: string = 'pages/Detail';\nlet counter: number = 0;\n";
+        let (nodes, _refs) = run("src/routes.ets", src, Language::ArkTs);
+        assert!(has_node(&nodes, NodeKind::Constant, "ROUTE"), "{nodes:?}");
+        assert!(has_node(&nodes, NodeKind::Variable, "counter"), "{nodes:?}");
+    }
+
+    /// W7-24a1: an ArkTS declaration's annotated types are references from
+    /// it (upstream `TYPE_ANNOTATION_LANGUAGES`, `b635dd46` 7367-7369).
+    #[test]
+    fn w724a1_arkts_annotated_types_are_references() {
+        let src =
+            "export function report(cart: CartRepository): Summary {\n  return new Summary();\n}\n";
+        let (_nodes, refs) = run("src/report.ets", src, Language::ArkTs);
+        assert!(
+            has_ref(&refs, EdgeKind::References, "CartRepository"),
+            "{refs:?}"
+        );
+        assert!(has_ref(&refs, EdgeKind::References, "Summary"), "{refs:?}");
+    }
+
+    /// The `calls` reference names `from` (a method or function named so)
+    /// makes, in order.
+    fn arkts_calls_from(nodes: &[Node], refs: &[UnresolvedRef], from: &str) -> Vec<String> {
+        let id = &nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Method | NodeKind::Function) && n.name == from)
+            .unwrap_or_else(|| panic!("missing {from}"))
+            .id;
+        refs.iter()
+            .filter(|r| r.reference_kind == EdgeKind::Calls && &r.from_node_id == id)
+            .map(|r| r.reference_name.clone())
+            .collect()
+    }
+
+    /// W7-24a2: ArkUI decorators land on the struct, field, method and
+    /// function they mark, by name (upstream `arkts.ts` `collectDecoratorNames`,
+    /// `extraction.test.ts` 13123-13190, 13314-13330): a decorator's call
+    /// gives its callee (`@StorageLink('theme')`), and an exported struct's
+    /// sit on its `export` statement.
+    #[test]
+    fn w724a2_arkts_decorators_on_struct_field_method_function() {
+        let src = r#"
+@Entry
+@Component
+struct Index {
+  @State message: string = 'Hello';
+  @Prop count: number = 0;
+  @StorageLink('theme') theme: string = 'light';
+  private service: TodoService = new TodoService();
+
+  @Builder
+  headerBar(title: string) {
+    Row() {}
+  }
+
+  build() {
+    Column() {}
+  }
+}
+
+@Component
+export struct Card {
+  build() {
+    Row() {}
+  }
+}
+
+@Builder
+function EmptyHint(message: string) {
+  Column() {}
+}
+
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+"#;
+        let (nodes, _refs) = run("pages/Index.ets", src, Language::ArkTs);
+        let decorators = |kind: NodeKind, name: &str| node(&nodes, kind, name).decorators.clone();
+        assert_eq!(
+            decorators(NodeKind::Struct, "Index"),
+            ["Entry", "Component"]
+        );
+        assert_eq!(decorators(NodeKind::Property, "message"), ["State"]);
+        assert_eq!(decorators(NodeKind::Property, "count"), ["Prop"]);
+        assert_eq!(decorators(NodeKind::Property, "theme"), ["StorageLink"]);
+        assert!(decorators(NodeKind::Property, "service").is_empty());
+        assert_eq!(decorators(NodeKind::Method, "headerBar"), ["Builder"]);
+        assert!(decorators(NodeKind::Method, "build").is_empty());
+        assert_eq!(decorators(NodeKind::Struct, "Card"), ["Component"]);
+        assert!(node(&nodes, NodeKind::Struct, "Card").is_exported);
+        assert_eq!(decorators(NodeKind::Function, "EmptyHint"), ["Builder"]);
+        assert_eq!(decorators(NodeKind::Function, "titleStyle"), ["Extend"]);
+    }
+
+    /// W7-24a2: the build() DSL's call surface (upstream `extraction.test.ts`
+    /// 13200-13253, 13300-13312): a component is a call by its plain name, a
+    /// chained attribute a call named with a leading dot, and
+    /// `.onClick(this.handler)` a call of the handler.
+    #[test]
+    fn w724a2_arkts_build_dsl_call_surface() {
+        let src = r#"
+@Extend(Text) function titleStyle(size: number) {
+  .fontSize(size)
+}
+
+@Component
+struct Page {
+  count: number = 0;
+
+  handleTap(): void {
+    this.count += 1;
+  }
+
+  @Builder
+  headerBar(title: string) {
+    Row() {
+      Text(title).titleStyle(24)
+      Button('Go').onClick(this.handleTap)
+    }
+  }
+
+  build() {
+    Column({ space: 8 }) {
+      this.headerBar('Home')
+      ChildCard({ label: 'hi' })
+    }
+    .height('100%')
+  }
+
+  refresh(svc: Service): void {
+    svc.save(1);
+    this.vm.load();
+  }
+}
+"#;
+        let (nodes, refs) = run("pages/Page.ets", src, Language::ArkTs);
+        // A call on a named receiver is no attribute (upstream's shape 2
+        // takes only a chain on a call's result).
+        let refresh = arkts_calls_from(&nodes, &refs, "refresh");
+        assert!(!refresh.is_empty(), "{refresh:?}");
+        assert!(
+            refresh.iter().all(|name| !name.starts_with('.')),
+            "{refresh:?}"
+        );
+        let build = arkts_calls_from(&nodes, &refs, "build");
+        for name in ["Column", "headerBar", "ChildCard", ".height"] {
+            assert!(build.contains(&name.to_string()), "{name}: {build:?}");
+        }
+        assert!(!build.contains(&"height".to_string()), "{build:?}");
+        let header = arkts_calls_from(&nodes, &refs, "headerBar");
+        for name in [
+            "Row",
+            "Text",
+            ".titleStyle",
+            "Button",
+            ".onClick",
+            "handleTap",
+        ] {
+            assert!(header.contains(&name.to_string()), "{name}: {header:?}");
+        }
+        for bare in ["titleStyle", "onClick"] {
+            assert!(!header.contains(&bare.to_string()), "{bare}: {header:?}");
+        }
+    }
+
+    /// W7-24a2: a chain written on the lines after a nested component's `}`
+    /// is one `arkui_component_expression` in tree-sitter-arkts 0.3.0, its
+    /// attributes the node's own property and argument pairs (upstream's
+    /// 0.2.0 tree detached them, `extraction.test.ts` 13256-13310): every
+    /// attribute is a dotted call where its name is written, never a bare
+    /// one.
+    #[test]
+    fn w724a2_arkts_chain_after_closing_brace_is_one_component() {
+        let panel = r#"@Component
+struct Panel {
+  close(): void {}
+
+  build() {
+    Column() {
+      Row() {
+        Text('x')
+      }
+      .width(10)
+      .onClick(this.close)
+      .id('close_button')
+    }
+  }
+}
+"#;
+        let (nodes, refs) = run("components/Panel.ets", panel, Language::ArkTs);
+        let build = arkts_calls_from(&nodes, &refs, "build");
+        for name in ["close", ".width", ".onClick", ".id"] {
+            assert!(build.contains(&name.to_string()), "{name}: {build:?}");
+        }
+        for bare in ["width", "onClick", "id"] {
+            assert!(!build.contains(&bare.to_string()), "{bare}: {build:?}");
+        }
+        let width = refs
+            .iter()
+            .find(|r| r.reference_name == ".width")
+            .expect("the .width reference");
+        assert_eq!((width.line, width.col), (10, 7));
+        let card = r#"@Component
+struct Card {
+  build() {
+    Column() {
+      List() {
+        Text('x')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      .height('100%')
+    }
+  }
+}
+"#;
+        let (nodes, refs) = run("components/Card.ets", card, Language::ArkTs);
+        let build = arkts_calls_from(&nodes, &refs, "build");
+        for name in [".alignItems", ".layoutWeight", ".height"] {
+            assert!(build.contains(&name.to_string()), "{name}: {build:?}");
+        }
+        for bare in ["alignItems", "layoutWeight", "height"] {
+            assert!(!build.contains(&bare.to_string()), "{bare}: {build:?}");
+        }
+    }
+
+    /// W7-24a2: in an `@Extend`/`@Styles` body the leading dot heads a
+    /// chain whose innermost call has a bare callee: each link is a dotted
+    /// attribute call (upstream extractCall's identifier walk up to the
+    /// `leading_dot_expression`).
+    #[test]
+    fn w724a2_arkts_extend_body_dot_prefixes_the_inner_call() {
+        let src = "@Extend(Text) function f() {\n  .fontSize(16).fontColor(Color.Red)\n}\n@Styles function pressed() {\n  .backgroundColor(Color.Red)\n}\n";
+        let (nodes, refs) = run("common/styles.ets", src, Language::ArkTs);
+        let f = arkts_calls_from(&nodes, &refs, "f");
+        assert_eq!(f.len(), 2, "{f:?}");
+        assert!(f.contains(&".fontSize".to_string()), "{f:?}");
+        assert!(f.contains(&".fontColor".to_string()), "{f:?}");
+        assert_eq!(
+            arkts_calls_from(&nodes, &refs, "pressed"),
+            [".backgroundColor"]
+        );
     }
 
     // ---- Solidity (.sol) extraction tier (#1170) ----
@@ -9595,6 +11251,202 @@ M:assignedFn()
         assert!(has_node(&nodes, NodeKind::Function, "helper"));
         assert!(!has_node(&nodes, NodeKind::Variable, "helper"));
         assert!(has_ref(&refs, EdgeKind::Calls, "helper"));
+    }
+
+    // ---- Lua / Luau custom module loaders (#1617, W9-02) ----
+
+    /// `source` of `file` extracted under the project loaders `loaders`, as
+    /// a project pipeline extracts it ([`crate::engine::extraction_of`]).
+    fn run_with_loaders(
+        file: &str,
+        source: &str,
+        loaders: &[&str],
+    ) -> (Vec<Node>, Vec<UnresolvedRef>) {
+        let options = crate::ExtractOptions {
+            lua_loaders: std::sync::Arc::new(crate::LuaLoaders::merge(
+                Some(&serde_json::json!({ "loader_functions": loaders })),
+                None,
+            )),
+            ..crate::ExtractOptions::default()
+        };
+        let result = crate::engine::extraction_of(
+            file,
+            &codegraph_core::source_file::SourceText::Text(source.to_string()),
+            &options,
+            |_| {},
+        );
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        (result.nodes, result.unresolved_references)
+    }
+
+    fn refs_named<'a>(refs: &'a [UnresolvedRef], name: &str) -> Vec<&'a UnresolvedRef> {
+        refs.iter().filter(|r| r.reference_name == name).collect()
+    }
+
+    /// A configured loader called with a string literal is what `require`
+    /// is: an `Import` node named the literal, its signature the call's
+    /// text, an `Imports` reference of that name from the file at the
+    /// call's position, and no `Calls` reference.
+    #[test]
+    fn lua_configured_loader_call_is_an_import_not_a_call() {
+        let src = "Require(\"Script/Activity/ActivityMgrC.lua\")\nlocal ui = Include \"ui.button\"\nreturn ui\n";
+        let (nodes, refs) = run_with_loaders("client.lua", src, &["Require", "Include"]);
+        let import = node(&nodes, NodeKind::Import, "Script/Activity/ActivityMgrC.lua");
+        assert_eq!(
+            import.signature.as_deref(),
+            Some("Require(\"Script/Activity/ActivityMgrC.lua\")")
+        );
+        assert_eq!((import.start_line, import.start_column), (1, 0));
+        let imports = refs_named(&refs, "Script/Activity/ActivityMgrC.lua");
+        assert_eq!(imports.len(), 1, "{refs:#?}");
+        assert_eq!(imports[0].reference_kind, EdgeKind::Imports);
+        assert_eq!(imports[0].from_node_id, "file:client.lua");
+        assert_eq!((imports[0].line, imports[0].col), (1, 0));
+        assert!(has_node(&nodes, NodeKind::Import, "ui.button"));
+        assert!(has_ref(&refs, EdgeKind::Imports, "ui.button"));
+        assert!(
+            !refs.iter().any(|r| r.reference_kind == EdgeKind::Calls
+                && matches!(r.reference_name.as_str(), "Require" | "Include")),
+            "{refs:#?}"
+        );
+    }
+
+    /// A dotted loader matches the call's whole path of names, however it is
+    /// spaced or commented; a method call, a bracket index, a call's result
+    /// or a shorter or longer path is no loader call.
+    #[test]
+    fn lua_dotted_loader_matches_its_whole_path() {
+        let src = "Script.Load(\"a\")\nScript . Load(\"b\")\nScript--[[x]].Load(\"c\")\nScript:Load(\"d\")\nScript[\"Load\"](\"e\")\nLoad(\"f\")\nGame.Script.Load(\"g\")\nScript.Load.Now(\"h\")\n";
+        let (nodes, refs) = run_with_loaders("boot.lua", src, &["Script.Load"]);
+        for module in ["a", "b", "c"] {
+            assert!(has_node(&nodes, NodeKind::Import, module), "{module}");
+            assert!(has_ref(&refs, EdgeKind::Imports, module), "{module}");
+        }
+        for module in ["d", "e", "f", "g", "h"] {
+            assert!(!has_node(&nodes, NodeKind::Import, module), "{module}");
+            assert!(!has_ref(&refs, EdgeKind::Imports, module), "{module}");
+        }
+        assert!(!has_ref(&refs, EdgeKind::Calls, "Script.Load"), "{refs:#?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "Load"), "{refs:#?}");
+    }
+
+    /// Only one plain string literal names a loader's module: the first
+    /// argument, the others unread. Anything else is the call it was.
+    #[test]
+    fn lua_loader_needs_one_plain_string_literal() {
+        let src = "Require(\"a\" .. \"b\")\nRequire(name)\nRequire((\"paren\"))\nRequire{\"table\"}\nRequire(\"\")\nRequire()\nRequire(\"   \")\nRequire(\"first\", \"second\")\nRequire [[long.form]]\nRequire '\\x41'\nRequire(--[[note]] \"commented\")\n";
+        let (nodes, refs) = run_with_loaders("main.lua", src, &["Require"]);
+        let imported: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(
+            imported,
+            ["first", "long.form", "\\x41", "commented"],
+            "{nodes:#?}"
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "Require")
+                .map(|r| r.line)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7],
+            "{refs:#?}"
+        );
+    }
+
+    /// A Luau backtick string is no literal, interpolated or not.
+    #[test]
+    fn luau_interpolated_or_backtick_string_is_no_loader_literal() {
+        let src = "Require(`m{x}`)\nRequire(`plain`)\nRequire(\"quoted\")\n";
+        let (nodes, refs) = run_with_loaders("main.luau", src, &["Require"]);
+        let imported: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Import)
+            .map(|n| n.name.as_str())
+            .collect();
+        assert_eq!(imported, ["quoted"], "{nodes:#?}");
+        assert_eq!(
+            refs.iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "Require")
+                .count(),
+            2,
+            "{refs:#?}"
+        );
+    }
+
+    /// A loader name is matched as written, case included.
+    #[test]
+    fn lua_loader_names_are_case_sensitive() {
+        let src = "Require(\"a\")\nrequire(\"b\")\nREQUIRE(\"c\")\nrequIre(\"d\")\n";
+        let (nodes, refs) = run_with_loaders("main.lua", src, &["Require"]);
+        assert!(has_node(&nodes, NodeKind::Import, "a"));
+        assert!(
+            has_node(&nodes, NodeKind::Import, "b"),
+            "require stays itself"
+        );
+        assert!(!has_node(&nodes, NodeKind::Import, "c"));
+        assert!(!has_node(&nodes, NodeKind::Import, "d"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "REQUIRE"));
+        assert!(has_ref(&refs, EdgeKind::Calls, "requIre"));
+    }
+
+    /// With no loader configured, and under one the source never calls, a
+    /// file's extraction is what it was.
+    #[test]
+    fn lua_extraction_without_loaders_is_unchanged() {
+        let src = "local http = require(\"net.http\")\nRequire(\"x\")\nlocal function f()\n  Require(\"y\")\n  return require(\"z\")\nend\nreturn f\n";
+        let plain = extract_source("main.lua", src, Some(Language::Lua));
+        for loaders in [&[][..], &["Include"][..], &["require"][..]] {
+            let (nodes, refs) = run_with_loaders("main.lua", src, loaders);
+            assert_eq!(nodes, plain.nodes, "{loaders:?}");
+            assert_eq!(refs, plain.unresolved_references, "{loaders:?}");
+        }
+    }
+
+    /// A loader call is an import exactly where a `require` is (#1617
+    /// asked for imports; upstream's `require` is one only where the main
+    /// walk reaches it): a top-level statement, a declaration's value, a
+    /// call nested in it, a function value's body inside a declaration, a
+    /// top-level block, an anonymous callback. In a named function's body
+    /// it stays a call, as `require` does. `require` rewritten as a loader
+    /// gives the same nodes and references, names aside.
+    #[test]
+    fn lua_loader_matches_require_in_every_position() {
+        let with_require = "require(\"top\")\nlocal a = require(\"value\")\nlocal b = wrap(require(\"nested\"))\nlocal f = function() return require(\"fvalue\") end\nlocal function g()\n  return require(\"body\")\nend\nif ready then\n  require(\"block\")\nend\nlocal M = {}\nfunction M.h()\n  require(\"method\")\nend\ndescribe(\"d\", function()\n  require(\"callback\")\nend)\nreturn M\n";
+        let with_loader = with_require.replace("require", "Require");
+        for (file, language) in [("pos.lua", Language::Lua), ("pos.luau", Language::Luau)] {
+            let plain = extract_source(file, with_require, Some(language));
+            let (nodes, refs) = run_with_loaders(file, &with_loader, &["Require"]);
+            let renamed = |text: String| text.replace("require", "Require");
+            assert_eq!(
+                renamed(format!("{:#?}", plain.nodes)),
+                format!("{nodes:#?}"),
+                "{file}"
+            );
+            assert_eq!(
+                renamed(format!("{:#?}", plain.unresolved_references)),
+                format!("{refs:#?}"),
+                "{file}"
+            );
+            let imported: Vec<&str> = nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Import)
+                .map(|n| n.name.as_str())
+                .collect();
+            assert_eq!(
+                imported,
+                ["top", "value", "nested", "fvalue", "block", "callback"],
+                "{file}"
+            );
+            let calls: Vec<i64> = refs
+                .iter()
+                .filter(|r| r.reference_kind == EdgeKind::Calls && r.reference_name == "Require")
+                .map(|r| r.line)
+                .collect();
+            assert_eq!(calls, [4, 6, 13], "{file}: {refs:#?}");
+        }
     }
 
     // ---- Objective-C class_implementation ----
@@ -10017,6 +11869,48 @@ impl Base for u32 { fn id(&self) -> u32 { 3 } }
         );
         assert_eq!(super::normalize_parenthesized_go_conversion("plain"), None);
         assert_eq!(super::normalize_parenthesized_go_conversion("(123)"), None);
+    }
+
+    /// W7-28 (OD-B46): a JavaScript file records its capitalized JSX tags
+    /// as `References` at the tag's name, as a `.jsx` file does, whatever
+    /// its extension. A Vue or Svelte script block, extracted as JavaScript
+    /// under its component's path, records none: colby folds a block into
+    /// its component's language, whose tags it does not read.
+    #[test]
+    fn a_javascript_file_records_its_jsx_tags_and_a_script_block_does_not() {
+        let source = "import { Card } from './Card';\nexport function App() {\n  return <div><Card title=\"x\" /></div>;\n}\n";
+        for file in ["src/App.js", "src/App.mjs", "src/App.cjs"] {
+            let result = extract_source(file, source, None);
+            assert!(result.errors.is_empty(), "{file}: {:?}", result.errors);
+            let tags: Vec<&UnresolvedRef> = result
+                .unresolved_references
+                .iter()
+                .filter(|r| r.reference_kind == EdgeKind::References && r.reference_name == "Card")
+                .collect();
+            assert_eq!(tags.len(), 1, "{file}: {:?}", result.unresolved_references);
+            assert_eq!(tags[0].language, Language::JavaScript, "{file}");
+            assert_eq!((tags[0].line, tags[0].col), (3, 15), "{file}");
+        }
+        for (file, source) in [
+            (
+                "src/Comp.vue",
+                "<template><div /></template>\n<script lang=\"jsx\">\nimport Card from './Card';\nexport default {\n  render() {\n    return <Card />;\n  },\n};\n</script>\n",
+            ),
+            (
+                "src/Comp.svelte",
+                "<script>\n  import Card from './Card';\n  const view = () => <Card />;\n</script>\n<div />\n",
+            ),
+        ] {
+            let result = extract_source(file, source, None);
+            assert!(
+                !result
+                    .unresolved_references
+                    .iter()
+                    .any(|r| r.reference_kind == EdgeKind::References && r.reference_name == "Card"),
+                "{file}: {:?}",
+                result.unresolved_references
+            );
+        }
     }
 
     #[test]
@@ -10572,6 +12466,31 @@ class Widget extends Base implements Named {
         let (_, refs) = run("W.java", src, Language::Java);
         assert!(has_ref(&refs, EdgeKind::Extends, "Base"));
         assert!(has_ref(&refs, EdgeKind::Implements, "Named"));
+    }
+
+    /// tree-sitter-java wraps a class's interfaces and an interface's
+    /// parents in a `type_list`: each type is its own reference, at its own
+    /// place (upstream `tree-sitter.ts`), never the list as one name.
+    #[test]
+    fn java_heritage_lists_read_each_type() {
+        let src = "interface Repo {}\ninterface Store {}\nclass JpaRepo extends Base implements Repo, Store {}\ninterface Combined extends Repo, Store {}\nclass One implements Repo {}\n";
+        let (_, refs) = run("J.java", src, Language::Java);
+        let heritage: Vec<(EdgeKind, &str, i64, i64)> = refs
+            .iter()
+            .filter(|r| matches!(r.reference_kind, EdgeKind::Extends | EdgeKind::Implements))
+            .map(|r| (r.reference_kind, r.reference_name.as_str(), r.line, r.col))
+            .collect();
+        assert_eq!(
+            heritage,
+            [
+                (EdgeKind::Extends, "Base", 3, 22),
+                (EdgeKind::Implements, "Repo", 3, 38),
+                (EdgeKind::Implements, "Store", 3, 44),
+                (EdgeKind::Extends, "Repo", 4, 27),
+                (EdgeKind::Extends, "Store", 4, 33),
+                (EdgeKind::Implements, "Repo", 5, 21),
+            ]
+        );
     }
 
     #[test]
@@ -12516,8 +14435,11 @@ public:
         assert!(has_ref(&refs, EdgeKind::References, "aws_s3_bucket.b"));
     }
 
+    /// W7-24c: a module block with a local source imports the module's
+    /// entry through the `module.M:file` reference (upstream #1174
+    /// `emitModuleWiring`), and no other scoped reference.
     #[test]
-    fn terraform_module_is_module_no_scoped_ref() {
+    fn terraform_module_is_module_with_its_file_ref() {
         let (nodes, refs) = run(
             "main.tf",
             "module \"vpc\" { source = \"./vpc\" }",
@@ -12525,10 +14447,12 @@ public:
         );
         let n = node(&nodes, NodeKind::Module, "vpc");
         assert_eq!(n.qualified_name, "module.vpc");
-        assert!(
-            !refs.iter().any(|r| r.reference_name.contains(':')),
-            "no :-scoped module wiring ref (emitModuleWiring DEFERRED): {refs:?}"
-        );
+        let scoped: Vec<(&str, EdgeKind)> = refs
+            .iter()
+            .filter(|r| r.reference_name.contains(':'))
+            .map(|r| (r.reference_name.as_str(), r.reference_kind))
+            .collect();
+        assert_eq!(scoped, [("module.vpc:file", EdgeKind::Imports)], "{refs:?}");
     }
 
     #[test]
@@ -12566,18 +14490,17 @@ public:
         assert!(has_ref(&refs, EdgeKind::References, "var.name"));
     }
 
+    /// W7-24c: a module output chain also references the output inside
+    /// the module (upstream #1174's `module.M:output.O`).
     #[test]
-    fn terraform_module_output_ref_is_plain() {
+    fn terraform_module_output_ref_has_its_scoped_half() {
         let (_nodes, refs) = run(
             "main.tf",
             "output \"vpc_id\" { value = module.vpc.id }",
             Language::Terraform,
         );
         assert!(has_ref(&refs, EdgeKind::References, "module.vpc"));
-        assert!(
-            !refs.iter().any(|r| r.reference_name.contains(':')),
-            "the module.vpc:output.id scoped half is DEFERRED: {refs:?}"
-        );
+        assert!(has_ref(&refs, EdgeKind::References, "module.vpc:output.id"));
     }
 
     #[test]
@@ -12593,6 +14516,252 @@ public:
                 .any(|r| r.reference_kind == EdgeKind::References),
             "built-in heads (each/count/path) emit no ref: {refs:?}"
         );
+    }
+
+    /// The reference names of `refs`.
+    fn terraform_ref_names(refs: &[UnresolvedRef]) -> Vec<&str> {
+        refs.iter().map(|r| r.reference_name.as_str()).collect()
+    }
+
+    /// W7-24c: a `.tfvars` file's top-level assignment sets the root
+    /// module's variable of its name (upstream `extraction.test.ts`
+    /// 12833-12851): a reference from the file, and no symbol.
+    #[test]
+    fn w724c_terraform_tfvars_assignments_reference_variables() {
+        let (nodes, refs) = run(
+            "terraform.tfvars",
+            "\nregion      = \"us-east-1\"\nenvironment = \"prod\"\n",
+            Language::Terraform,
+        );
+        assert!(nodes.iter().all(|n| n.kind == NodeKind::File), "{nodes:?}");
+        let file = &nodes[0].id;
+        for name in ["var.region", "var.environment"] {
+            let reference = refs
+                .iter()
+                .find(|r| r.reference_name == name)
+                .unwrap_or_else(|| panic!("{name}: {refs:?}"));
+            assert_eq!(&reference.from_node_id, file);
+            assert_eq!(reference.reference_kind, EdgeKind::References);
+        }
+        // The same assignment in a `.tf` file is no variable setting.
+        let (_nodes, refs) = run("main.tf", "region = \"us-east-1\"\n", Language::Terraform);
+        assert!(
+            !has_ref(&refs, EdgeKind::References, "var.region"),
+            "{refs:?}"
+        );
+    }
+
+    /// W7-24c: module wiring (upstream `extraction.test.ts` 12876-12957): an
+    /// input attribute references the child's variable, a meta-argument does
+    /// not, a local source imports the entry, a registry or git source does
+    /// not, and `module.M.outputs.X` is a remote-state output candidate.
+    #[test]
+    fn w724c_terraform_module_wiring() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "module \"vpc\" {\n  source     = \"./modules/vpc\"\n  version    = \"1.0.0\"\n  count      = 2\n  depends_on = [aws_iam_role.net]\n  cidr       = var.vpc_cidr\n  name       = \"prod\"\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in [
+            "module.vpc:var.cidr",
+            "module.vpc:var.name",
+            "var.vpc_cidr",
+            "aws_iam_role.net",
+        ] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        for meta in ["source", "version", "count", "depends_on", "providers"] {
+            assert!(
+                !names.contains(&format!("module.vpc:var.{meta}").as_str()),
+                "{meta}"
+            );
+        }
+        let file = refs
+            .iter()
+            .find(|r| r.reference_name == "module.vpc:file")
+            .expect("the module.vpc:file ref");
+        assert_eq!(file.reference_kind, EdgeKind::Imports);
+        assert_eq!((file.line, file.col), (1, 0));
+        let cidr = refs
+            .iter()
+            .find(|r| r.reference_name == "module.vpc:var.cidr")
+            .expect("the input ref");
+        assert_eq!((cidr.line, cidr.col), (6, 2));
+
+        let (_nodes, refs) = run(
+            "main.tf",
+            "module \"s3\" {\n  source  = \"terraform-aws-modules/s3-bucket/aws\"\n  version = \"4.0.0\"\n  bucket  = \"x\"\n}\nmodule \"net\" {\n  source = \"git::https://example.com/net.git\"\n  cidr   = \"10.0.0.0/16\"\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        assert!(!names.iter().any(|n| n.ends_with(":file")), "{names:?}");
+        assert!(names.contains(&"module.s3:var.bucket"), "{names:?}");
+
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"aws_eks_cluster\" \"this\" {\n  vpc_id = module.vpc.outputs.vpc_id\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        assert!(names.contains(&"module.vpc"), "{names:?}");
+        assert!(
+            names.contains(&"module.vpc:remote-output.vpc_id"),
+            "{names:?}"
+        );
+        let (_nodes, refs) = run(
+            "o.tf",
+            "output \"x\" {\n  value = module.vpc.vpc_id\n}\n",
+            Language::Terraform,
+        );
+        assert!(
+            !terraform_ref_names(&refs)
+                .iter()
+                .any(|n| n.contains(":remote-output.")),
+            "{refs:?}"
+        );
+        let (_nodes, refs) = run(
+            "o.tf",
+            "output \"m\" {\n  value = module.vpc\n}\n",
+            Language::Terraform,
+        );
+        assert_eq!(terraform_ref_names(&refs), ["module.vpc"]);
+    }
+
+    /// W7-24c: state-migration blocks and a check's assert reference what
+    /// they name from the file, with no scoped half and no symbol; a check's
+    /// own data block is still one (upstream `extraction.test.ts`
+    /// 12958-13010).
+    #[test]
+    fn w724c_terraform_state_and_check_blocks() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "resource \"aws_instance\" \"new\" {}\nmoved {\n  from = aws_instance.old\n  to   = aws_instance.new\n}\nimport {\n  to = aws_s3_bucket.b\n  id = \"bucket-name\"\n}\nremoved {\n  from = module.legacy.aws_iam_role.r\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in [
+            "aws_instance.old",
+            "aws_instance.new",
+            "aws_s3_bucket.b",
+            "module.legacy",
+        ] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        assert!(!names.iter().any(|n| n.contains(':')), "{names:?}");
+        let file = &nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::File)
+            .expect("file")
+            .id;
+        assert!(
+            refs.iter()
+                .filter(|r| r.reference_name == "aws_instance.old")
+                .all(|r| &r.from_node_id == file)
+        );
+        assert_eq!(nodes.iter().filter(|n| n.kind != NodeKind::File).count(), 1);
+
+        let (nodes, refs) = run(
+            "checks.tf",
+            "check \"health\" {\n  data \"http\" \"ping\" {\n    url = var.endpoint\n  }\n  assert {\n    condition     = data.http.ping.status_code == 200 && var.strict\n    error_message = \"unhealthy\"\n  }\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in ["data.http.ping", "var.strict", "var.endpoint"] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        assert!(nodes.iter().any(|n| n.qualified_name == "data.http.ping"));
+    }
+
+    /// W7-24c: an aliased provider block is `provider.aws.east`, and a
+    /// provider selection (a resource's `provider`, a module's `providers`
+    /// values) references the configuration, never a resource (upstream
+    /// `extraction.test.ts` 13012-13056).
+    #[test]
+    fn w724c_terraform_provider_alias_and_selection() {
+        let (nodes, refs) = run(
+            "main.tf",
+            "provider \"aws\" {\n  region = \"us-east-1\"\n}\nprovider \"aws\" {\n  alias  = \"east\"\n  region = \"us-east-2\"\n}\nresource \"aws_s3_bucket\" \"b\" {\n  provider = aws.east\n  bucket   = \"x\"\n}\nresource \"google_service_account\" \"sa\" {\n  provider = google-beta\n}\n",
+            Language::Terraform,
+        );
+        let mut providers: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Namespace)
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        providers.sort_unstable();
+        assert_eq!(providers, ["provider.aws", "provider.aws.east"]);
+        let names = terraform_ref_names(&refs);
+        assert!(names.contains(&"provider.aws.east"), "{names:?}");
+        assert!(names.contains(&"provider.google-beta"), "{names:?}");
+        assert!(!names.contains(&"aws.east"), "{names:?}");
+
+        let (_nodes, refs) = run(
+            "main.tf",
+            "module \"vpc\" {\n  source    = \"./modules/vpc\"\n  providers = {\n    aws = aws.east\n  }\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        assert!(names.contains(&"provider.aws.east"), "{names:?}");
+        assert!(!names.contains(&"provider.aws"), "{names:?}");
+        assert!(!names.contains(&"aws.east"), "{names:?}");
+        assert!(!names.contains(&"module.vpc:var.providers"), "{names:?}");
+    }
+
+    /// W7-24c (OD-B49): an operation's last operand keeps its traversal,
+    /// which tree-sitter-hcl 1.1.0 hangs on the whole operation
+    /// (`var.left + var.right` reads `operation(var.left + var) .right`), as
+    /// upstream's grammar reads it; a chain on a parenthesised operation is
+    /// the parentheses' and names no operand.
+    #[test]
+    fn w724c_terraform_operation_operands_keep_their_traversals() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"x\" \"y\" {\n  a = var.left + var.right\n  b = !var.flag\n  c = -var.num + 1\n  d = var.m + var.n.o[0].p\n  e = (var.p + var.q).x\n  f = var.c ? var.d : local.e\n}\n",
+            Language::Terraform,
+        );
+        let names = terraform_ref_names(&refs);
+        for wanted in [
+            "var.left",
+            "var.right",
+            "var.flag",
+            "var.num",
+            "var.m",
+            "var.n",
+            "var.p",
+            "var.q",
+            "var.c",
+            "var.d",
+            "local.e",
+        ] {
+            assert!(names.contains(&wanted), "{wanted}: {names:?}");
+        }
+        assert!(!names.contains(&"var.x"), "{names:?}");
+        let right = refs
+            .iter()
+            .find(|r| r.reference_name == "var.right")
+            .expect("var.right");
+        assert_eq!((right.line, right.col), (2, 17));
+    }
+
+    /// W7-24c: a reference is where its variable is written, not where the
+    /// expression holding it starts (OD-W724-4, upstream's `variable_expr`
+    /// position).
+    #[test]
+    fn w724c_terraform_reference_position_is_the_variable() {
+        let (_nodes, refs) = run(
+            "main.tf",
+            "resource \"x\" \"y\" {\n  tags = merge(\n    var.a,\n    local.b\n  )\n}\n",
+            Language::Terraform,
+        );
+        let at = |name: &str| {
+            refs.iter()
+                .find(|r| r.reference_name == name)
+                .map(|r| (r.line, r.col))
+                .unwrap_or_else(|| panic!("{name}: {refs:?}"))
+        };
+        assert_eq!(at("var.a"), (3, 4));
+        assert_eq!(at("local.b"), (4, 4));
     }
 
     // ---- Erlang (form-based; visit_erlang_node-driven) ----
@@ -12775,6 +14944,163 @@ go() -> codec:decode(<<1,2,3>>, []).\n";
         let (_nodes, refs) = run("probe.erl", src, Language::Erlang);
         assert!(has_ref(&refs, EdgeKind::Calls, "codec::decode/2"));
         assert!(!has_ref(&refs, EdgeKind::Calls, "codec::decode/4"));
+    }
+
+    /// `kind:name` of the references `from` (a node named so) makes.
+    fn erlang_refs_from(nodes: &[Node], refs: &[UnresolvedRef], from: &str) -> Vec<String> {
+        let id = &nodes
+            .iter()
+            .find(|n| n.name == from && n.kind != NodeKind::File)
+            .unwrap_or_else(|| panic!("missing {from}"))
+            .id;
+        refs.iter()
+            .filter(|r| &r.from_node_id == id)
+            .map(|r| format!("{}:{}", r.reference_kind.as_str(), r.reference_name))
+            .collect()
+    }
+
+    /// W7-24d: an escript's functions and calls (behind its shebang), and an
+    /// app resource file's callback module and dependency apps (upstream
+    /// `extraction.test.ts` 12568-12613).
+    #[test]
+    fn w724d_erlang_escript_and_app_files() {
+        let src = "#!/usr/bin/env escript\n%%! -smp enable\n\nmain([Path]) ->\n    Result = analyze(Path),\n    io:format(\"~p~n\", [Result]).\n\nanalyze(Path) ->\n    {ok, Bin} = file:read_file(Path),\n    byte_size(Bin).\n";
+        let (nodes, refs) = run("bin/tool.escript", src, Language::Erlang);
+        assert!(has_node(&nodes, NodeKind::Function, "main"), "{nodes:?}");
+        assert!(has_node(&nodes, NodeKind::Function, "analyze"), "{nodes:?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "analyze/1"), "{refs:?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "io::format/2"), "{refs:?}");
+
+        let app = "{application, sample, [\n    {description, \"Sample application\"},\n    {vsn, \"1.0.0\"},\n    {registered, [sample_server]},\n    {mod, {sample_app, []}},\n    {applications, [kernel, stdlib, sample_core]},\n    {included_applications, [sample_extra]},\n    {env, [{limit, 100}]},\n    {modules, []}\n]}.\n";
+        let (nodes, refs) = run("src/sample.app.src", app, Language::Erlang);
+        let file = &nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::File)
+            .expect("file")
+            .id;
+        let names: Vec<String> = refs
+            .iter()
+            .filter(|r| &r.from_node_id == file)
+            .map(|r| format!("{}:{}", r.reference_kind.as_str(), r.reference_name))
+            .collect();
+        for wanted in [
+            "references:sample_app",
+            "imports:kernel",
+            "imports:stdlib",
+            "imports:sample_core",
+            "imports:sample_extra",
+        ] {
+            assert!(names.iter().any(|n| n == wanted), "{wanted}: {names:?}");
+        }
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r.reference_name == "sample_server" || r.reference_name == "limit"),
+            "{refs:?}"
+        );
+        // The same tuple in a module is no resource term.
+        let (_nodes, refs) = run("src/m.erl", app, Language::Erlang);
+        assert!(!has_ref(&refs, EdgeKind::Imports, "kernel"), "{refs:?}");
+    }
+
+    /// W7-24d: macro linkage (upstream `extraction.test.ts` 12616-12688): a
+    /// define's body calls from the macro, a function-like use calls the
+    /// macro, a bare read references it, a predefined macro links nothing,
+    /// and a use's arguments are walked.
+    #[test]
+    fn w724d_erlang_macro_linkage() {
+        let src = "-module(m).\n-export([do_thing/1]).\n\n-define(LOG_AUDIT(Event), audit_logger:log(Event, ?MODULE)).\n\ndo_thing(X) ->\n    ?LOG_AUDIT({thing, X}),\n    ok.\n";
+        let (nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(
+            erlang_refs_from(&nodes, &refs, "LOG_AUDIT")
+                .contains(&"calls:audit_logger::log/2".to_string()),
+            "{refs:?}"
+        );
+        assert!(
+            erlang_refs_from(&nodes, &refs, "do_thing").contains(&"calls:LOG_AUDIT".to_string()),
+            "{refs:?}"
+        );
+
+        let src = "-module(m).\n-export([wait/0]).\n\n-define(TIMEOUT, 5000).\n\nwait() ->\n    receive after ?TIMEOUT -> ok end.\n";
+        let (_nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(has_ref(&refs, EdgeKind::References, "TIMEOUT"), "{refs:?}");
+        assert!(!has_ref(&refs, EdgeKind::Calls, "TIMEOUT"), "{refs:?}");
+
+        let src = "-module(m).\n-export([check/0]).\n\ncheck() ->\n    ?assertEqual(ok, prepare()),\n    {?MODULE, ?LINE, ?FUNCTION_NAME}.\n\nprepare() -> ok.\n";
+        let (_nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(has_ref(&refs, EdgeKind::Calls, "prepare/0"), "{refs:?}");
+        assert!(has_ref(&refs, EdgeKind::Calls, "assertEqual"), "{refs:?}");
+        for predefined in ["MODULE", "LINE", "FUNCTION_NAME"] {
+            assert!(
+                !refs.iter().any(|r| r.reference_name == predefined),
+                "{predefined}: {refs:?}"
+            );
+        }
+
+        let src = "-module(m).\n\n-define(TARGET, target_fn()).\n-define(ALIAS, ?TARGET).\n";
+        let (nodes, refs) = run("src/m.erl", src, Language::Erlang);
+        assert!(
+            erlang_refs_from(&nodes, &refs, "TARGET").contains(&"calls:target_fn/0".to_string()),
+            "{refs:?}"
+        );
+        assert!(
+            erlang_refs_from(&nodes, &refs, "ALIAS").contains(&"references:TARGET".to_string()),
+            "{refs:?}"
+        );
+    }
+
+    /// W7-24d: `-behaviour(x)` implements x, from the module; a `-callback`
+    /// declares no function (upstream `extraction.test.ts` 12691-12712).
+    #[test]
+    fn w724d_erlang_behaviour_attribute() {
+        let (nodes, refs) = run(
+            "src/m.erl",
+            "-module(m).\n-behaviour(gen_server).\n\ninit(_) -> {ok, #{}}.\n",
+            Language::Erlang,
+        );
+        let implements: Vec<&UnresolvedRef> = refs
+            .iter()
+            .filter(|r| r.reference_kind == EdgeKind::Implements)
+            .collect();
+        assert_eq!(implements.len(), 1, "{refs:?}");
+        assert_eq!(implements[0].reference_name, "gen_server");
+        assert_eq!(
+            implements[0].from_node_id,
+            node(&nodes, NodeKind::Namespace, "m").id
+        );
+        let (nodes, _refs) = run(
+            "src/b.erl",
+            "-module(b).\n\n-callback handle_thing(term()) -> ok.\n-callback init(list()) -> {ok, term()}.\n",
+            Language::Erlang,
+        );
+        assert!(
+            !nodes.iter().any(|n| n.kind == NodeKind::Function),
+            "{nodes:?}"
+        );
+    }
+
+    /// W7-24d (OD-W724-3): a gen_server target macro defined as `?MODULE`
+    /// in one branch is the module itself, whatever the other branch
+    /// defines (upstream's macro table).
+    #[test]
+    fn w724d_erlang_gen_server_macro_table_prefers_the_module() {
+        let src = "-module(kv).\n-behaviour(gen_server).\n-export([get/1, handle_call/3]).\n\n-ifdef(TEST).\n-define(SERVER, other_srv).\n-else.\n-define(SERVER, ?MODULE).\n-endif.\n\nget(K) -> gen_server:call(?SERVER, {get, K}).\n\nhandle_call(_R, _F, S) -> {reply, ok, S}.\n";
+        let (_nodes, refs) = run("src/kv.erl", src, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "kv::handle_call/3"),
+            "{refs:?}"
+        );
+        assert!(
+            !has_ref(&refs, EdgeKind::Calls, "other_srv::handle_call/3"),
+            "{refs:?}"
+        );
+        // Two atom definitions: the last one names the server.
+        let src = "-module(kv).\n-export([get/1]).\n-ifdef(TEST).\n-define(SERVER, test_srv).\n-else.\n-define(SERVER, prod_srv).\n-endif.\nget(K) -> gen_server:call(?SERVER, {get, K}).\n";
+        let (_nodes, refs) = run("src/kv.erl", src, Language::Erlang);
+        assert!(
+            has_ref(&refs, EdgeKind::Calls, "prod_srv::handle_call/3"),
+            "{refs:?}"
+        );
     }
 
     // ---- CFML (dual-grammar: cfscript for bare-script, cfml for tag) ----

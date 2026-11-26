@@ -78,6 +78,7 @@ src/
   lib/hierarchy-model.ts  the type hierarchy's tree geometry (pure)
   lib/entry-model.ts      the entry-points panel: rows, file groups, flow arming (pure)
   lib/screens-model.ts    the Screens view: layering by distance from the entry, edge labels, pill lanes (pure)
+  lib/steps-fit.ts        where the Steps picture is fitted: beside the open key or on the whole canvas (pure)
   lib/export-svg.ts       the Flow strip and the Map as a standalone SVG (pure)
   lib/export-image.ts     rasterising that SVG to PNG, clipboard and download
   lib/live.svelte.ts      /api/events: two counters every screen refreshes from
@@ -124,9 +125,9 @@ format kept as it is, and they live in `src/lib/wire.ts`, which has no imports
 and no runtime. The app runs every screen on `createHttpAdapter()`, the loopback
 JSON API.
 
-`steps` is optional, and `createHttpAdapter()` leaves it out, because the Rust
-server does not build Steps yet. The Steps view therefore says it cannot draw
-steps.
+`steps` is optional: under an adapter without it the Steps view says it cannot
+draw steps. `createHttpAdapter()` has it and asks `api/steps` for the anchor or
+a name, the depth, the limit and `through=1`.
 
 `events` is optional. Omit it and nothing connects and nothing polls; a host
 that learns about a sync some other way calls `live.signal('index')` instead,
@@ -159,9 +160,9 @@ without a second read.
    context, so one page reads one project. `<CodegraphUi>` installs them during
    initialisation, once — swapping projects means re-mounting the subtree
    (`{#key project}`), not swapping the prop.
-3. **Geometry is not themable.** 44px callee rows, the 288/320px rails, the 20px
-   code line: the Symbol view measures these against each other to put a callee
-   row beside the line that calls it.
+3. **Geometry is not themable.** 44px callee rows (taller by a line per
+   condition), the 288/320px rails, the 20px code line: the Symbol view measures
+   these against each other to put a callee row beside the line that calls it.
 
 ### Navigation
 
@@ -240,9 +241,9 @@ draws, the same identity the search palette rests its keyboard on.
 
 `#/screens` draws `/api/screens` — the app as its user meets it: one box per
 screen, an arrow for every way of getting from one to another, and on each
-arrow the condition under which it happens. This server answers upstream's "no
-screen navigation" result until the navigation resolvers are ported, so here
-the canvas is exercised by its suite rather than by an index.
+arrow the condition under which it happens. An index with no screen route, or
+no navigation into one, answers upstream's "no screen navigation" result, and
+the view says so.
 
 The canvas is the Map's layout engine (`buildMapLayout`) driven by
 `screens-model.ts` with three options the Map never sets, because a screens

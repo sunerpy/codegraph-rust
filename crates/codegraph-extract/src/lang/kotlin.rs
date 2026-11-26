@@ -228,7 +228,7 @@ impl LanguageSpec for KotlinSpec {
             .any(|child| child.kind() == "modifiers" && has_descendant_kind(child, "suspend"))
     }
 
-    fn extract_modifiers(&self, node: Node<'_>) -> Vec<String> {
+    fn extract_modifiers(&self, node: Node<'_>, _source: &str) -> Vec<String> {
         // Upstream kotlin.ts:271-293: Kotlin Multiplatform expect/actual markers
         // under modifiers > platform_modifier, matched by AST node not text.
         let mut mods = Vec::new();

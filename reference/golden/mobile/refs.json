@@ -372,16 +372,6 @@
   {
     "candidates": null,
     "col": 4,
-    "file_path": "bridge/ios/Caller.m",
-    "from_node_id": "method:b9e09b3b72138d018e6e7c4f6f7a7b73",
-    "language": "objc",
-    "line": 6,
-    "reference_kind": "calls",
-    "reference_name": "greeter.greet:"
-  },
-  {
-    "candidates": null,
-    "col": 4,
     "file_path": "bridge/ios/Greeter.swift",
     "from_node_id": "method:5c5cbcd2b0e6fe7235dc3ae8e281c076",
     "language": "swift",
@@ -512,16 +502,6 @@
   {
     "candidates": null,
     "col": 9,
-    "file_path": "expo-modules/src/index.ts",
-    "from_node_id": "function:ed409b0ec63920ada922d872991c7d64",
-    "language": "typescript",
-    "line": 6,
-    "reference_kind": "calls",
-    "reference_name": "HelloModule.hello"
-  },
-  {
-    "candidates": null,
-    "col": 9,
     "file_path": "rn/src/Camera.tsx",
     "from_node_id": "file:rn/src/Camera.tsx",
     "language": "tsx",
@@ -538,15 +518,5 @@
     "line": 14,
     "reference_kind": "calls",
     "reference_name": "emitter.addListener"
-  },
-  {
-    "candidates": null,
-    "col": 9,
-    "file_path": "rn/src/Camera.tsx",
-    "from_node_id": "function:8046a67d37fbd343813de38ad289060d",
-    "language": "tsx",
-    "line": 10,
-    "reference_kind": "calls",
-    "reference_name": "CameraModule.takePicture"
   }
 ]

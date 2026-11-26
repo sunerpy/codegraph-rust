@@ -4,10 +4,13 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use codegraph_bench::ab::{
-    AbConfig, AbCorpus, DEFAULT_RUN_TIMEOUT, run_ab, write_ab_markdown, write_ab_report,
+    AbConfig, AbCorpus, AbOp, DEFAULT_RUN_TIMEOUT, Threads, logical_cpus, run_ab,
+    write_ab_markdown, write_ab_report,
 };
 use codegraph_bench::corpus::{corpora_root, fetch_all_in, list_statuses, list_statuses_in};
+use codegraph_bench::go_std_gen;
 use codegraph_bench::graph_diff::run_graph_diff;
+use codegraph_bench::load_guard::{GuardOverrides, LoadGuard};
 use codegraph_bench::markdown::{render_from_json, write_markdown};
 use codegraph_bench::oracle::golden::write_golden;
 use codegraph_bench::pipeline::{PipelineConfig, run_pipeline, select_corpora};
@@ -56,23 +59,71 @@ struct Args {
 
     #[arg(
         long,
-        help = "A/B-time a cold `init` of --baseline against --candidate on --corpora"
+        help = "A/B-time --op (a cold `init` by default) of --baseline against each --candidate \
+                on --corpora"
     )]
     ab: bool,
 
     #[arg(long, value_name = "BIN", help = "Baseline codegraph binary for --ab")]
     baseline: Option<PathBuf>,
 
-    #[arg(long, value_name = "BIN", help = "Candidate codegraph binary for --ab")]
-    candidate: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "BIN",
+        help = "Candidate codegraph binary for --ab; repeat it to time several candidates in \
+                one rotation, each compared with the baseline"
+    )]
+    candidate: Vec<PathBuf>,
 
     #[arg(
         long,
         value_name = "N",
         value_delimiter = ',',
-        help = "RAYON_NUM_THREADS values for --ab, comma-separated; each is its own cell"
+        help = "RAYON_NUM_THREADS values for --ab, comma-separated; each is its own cell. \
+                `default` is a cell with the variable unset, and the default when omitted"
     )]
-    threads: Vec<usize>,
+    threads: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "OP",
+        default_value = "init",
+        help = "What --ab times: `init`, `sync-edit:<N>` (a sync after a comment line is \
+                appended to the first N indexed files that take one) or `sync-edit:1:<path>`"
+    )]
+    op: String,
+
+    #[arg(
+        long,
+        help = "Time --ab without the load guard (no quiet start, no waits, no void runs)"
+    )]
+    no_load_guard: bool,
+
+    #[arg(
+        long,
+        value_name = "CPUS",
+        conflicts_with = "no_load_guard",
+        help = "The foreign CPUs a run may share its time with when its threads cover every \
+                CPU (the `default` cell included) before the guard voids it (default 0.5)"
+    )]
+    guard_max_foreign_saturating: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "CPUS",
+        conflicts_with = "no_load_guard",
+        help = "The foreign CPUs a run of fewer threads than CPUs may share its time with \
+                before the guard voids it (default 2)"
+    )]
+    guard_max_foreign_partial: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "LOAD",
+        conflicts_with = "no_load_guard",
+        help = "The 1-minute load each quiet-start check must stay below (default 3)"
+    )]
+    guard_start_max_load: Option<f64>,
 
     #[arg(
         long,
@@ -129,6 +180,37 @@ struct Args {
                 exit 0 when identical, 1 when different, 2 when an input cannot be loaded"
     )]
     graph_diff: Option<Vec<PathBuf>>,
+
+    #[arg(
+        long,
+        requires = "go_src",
+        help = "Regenerate the Go standard-library method table from a Go source tree \
+                (codegraph-resolve/src/go_std_methods.rs): print it, or with --check \
+                exit 1 when the committed rows differ, or with --write rewrite them"
+    )]
+    gen_go_std_methods: bool,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Go source tree (with src/io) for --gen-go-std-methods"
+    )]
+    go_src: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "gen_go_std_methods",
+        conflicts_with = "write",
+        help = "Compare the generated rows with the committed ones"
+    )]
+    check: bool,
+
+    #[arg(
+        long,
+        requires = "gen_go_std_methods",
+        help = "Write the generated rows into the table module"
+    )]
+    write: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -141,6 +223,9 @@ fn main() -> ExitCode {
     let args = Args::parse();
     if let Some(paths) = &args.graph_diff {
         return graph_diff_exit(&paths[0], &paths[1]);
+    }
+    if args.gen_go_std_methods {
+        return go_std_methods_exit(&args);
     }
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,6 +246,37 @@ fn graph_diff_exit(left: &Path, right: &Path) -> ExitCode {
         Err(error) => {
             eprintln!("Error: {error:?}");
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `--gen-go-std-methods`: 0 when printed, written or matching; 1 when
+/// `--check` finds a difference or the table cannot be generated (a listed
+/// type missing, a signature that does not read), as upstream's generator
+/// fails; 2 when `--go-src` is not a Go source tree.
+fn go_std_methods_exit(args: &Args) -> ExitCode {
+    let mode = if args.check {
+        go_std_gen::Mode::Check
+    } else if args.write {
+        go_std_gen::Mode::Write
+    } else {
+        go_std_gen::Mode::Print
+    };
+    let go_src = args.go_src.as_deref().expect("clap requires --go-src");
+    if !go_src.join("src").join("io").is_dir() {
+        eprintln!(
+            "Error: {} is not a Go source tree (no src/io)",
+            go_src.display()
+        );
+        return ExitCode::from(2);
+    }
+    let mut stdout = std::io::stdout().lock();
+    match go_std_gen::run(go_src, &go_std_gen::table_path(), mode, &mut stdout) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(1)
         }
     }
 }
@@ -247,16 +363,22 @@ fn run_ab_command(args: &Args) -> Result<()> {
         .baseline
         .clone()
         .context("--ab needs --baseline <BIN>")?;
-    let candidate = args
-        .candidate
-        .clone()
-        .context("--ab needs --candidate <BIN>")?;
+    if args.candidate.is_empty() {
+        bail!("--ab needs --candidate <BIN>");
+    }
     if args.corpora.is_empty() {
         bail!("--ab needs --corpora <NAME[,NAME...]> (or 'all')");
     }
-    if args.threads.is_empty() {
-        bail!("--ab needs --threads <N[,M...]>");
-    }
+    let threads = if args.threads.is_empty() {
+        vec![Threads::Default]
+    } else {
+        args.threads
+            .iter()
+            .map(|text| Threads::parse(text))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let op = AbOp::parse(&args.op)?;
+    let load_guard = load_guard_of(args, Path::new("/proc/stat").is_file(), logical_cpus())?;
     let names: Vec<String> = args
         .corpora
         .iter()
@@ -270,11 +392,13 @@ fn run_ab_command(args: &Args) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let config = AbConfig {
         baseline,
-        candidate,
+        candidates: args.candidate.clone(),
         corpora,
-        threads: args.threads.clone(),
+        threads,
         runs: args.runs,
         run_timeout: DEFAULT_RUN_TIMEOUT,
+        op,
+        load_guard,
         workspace_root: workspace_root().ok(),
         argv: std::env::args_os()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -293,6 +417,21 @@ fn run_ab_command(args: &Args) -> Result<()> {
         eprintln!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// The load guard of an `--ab` run: the standard limits for `cpus` CPUs with
+/// the `--guard-*` overrides, or none with `--no-load-guard` or on a host
+/// without `/proc/stat` (`proc_stat`), where it cannot read the load.
+fn load_guard_of(args: &Args, proc_stat: bool, cpus: usize) -> Result<Option<LoadGuard>> {
+    if args.no_load_guard || !proc_stat {
+        return Ok(None);
+    }
+    let overrides = GuardOverrides {
+        foreign_cpus_saturating: args.guard_max_foreign_saturating,
+        foreign_cpus_partial: args.guard_max_foreign_partial,
+        start_load1_max: args.guard_start_max_load,
+    };
+    LoadGuard::standard(cpus).overridden(&overrides).map(Some)
 }
 
 fn selected_corpora_root(args: &Args) -> Result<PathBuf> {
@@ -346,5 +485,54 @@ fn workspace_root() -> Result<PathBuf> {
         if !dir.pop() {
             bail!("cannot locate workspace root from current directory");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guard(args: &[&str]) -> Result<Option<LoadGuard>> {
+        let args = Args::try_parse_from(std::iter::once("bench").chain(args.iter().copied()))?;
+        load_guard_of(&args, true, 32)
+    }
+
+    /// A `--guard-*` flag replaces its default and leaves the others.
+    #[test]
+    fn a_guard_flag_overrides_its_default() {
+        let standard = LoadGuard::standard(32);
+        assert_eq!(guard(&["--ab"]).unwrap(), Some(standard.clone()));
+        let tuned = guard(&[
+            "--ab",
+            "--guard-max-foreign-partial",
+            "3.5",
+            "--guard-start-max-load",
+            "6",
+        ])
+        .unwrap()
+        .expect("the guard is on");
+        assert_eq!(tuned.foreign_cpus_partial, 3.5);
+        assert_eq!(tuned.start_load1_max, 6.0);
+        assert_eq!(
+            tuned.foreign_cpus_saturating,
+            standard.foreign_cpus_saturating
+        );
+        let saturating = guard(&["--ab", "--guard-max-foreign-saturating", "1.25"])
+            .unwrap()
+            .expect("the guard is on");
+        assert_eq!(saturating.foreign_cpus_saturating, 1.25);
+        assert_eq!(
+            saturating.foreign_cpus_partial,
+            standard.foreign_cpus_partial
+        );
+        assert!(guard(&["--ab", "--guard-max-foreign-partial", "-1"]).is_err());
+        assert!(guard(&["--ab", "--no-load-guard", "--guard-start-max-load", "4"]).is_err());
+        assert_eq!(guard(&["--ab", "--no-load-guard"]).unwrap(), None);
+        let args = Args::try_parse_from(["bench", "--ab"]).unwrap();
+        assert_eq!(
+            load_guard_of(&args, false, 32).unwrap(),
+            None,
+            "no /proc/stat"
+        );
     }
 }

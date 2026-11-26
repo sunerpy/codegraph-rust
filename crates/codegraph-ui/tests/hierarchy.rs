@@ -3,9 +3,9 @@
 //! (`buildHierarchyModel`, the fold, `connectorPath`) run in `ui/tests/`; the
 //! descendant bound runs against a synthetic store in `codegraph-graph`.
 //!
-//! Not ported: upstream's Go cases rest on a SYNTHESIZED `implements` edge for
-//! Go's implicit interface satisfaction, and the Rust port has no edge
-//! synthesis stage — there is no edge for the hierarchy to walk. Nor are
+//! Upstream's Go cases rest on the SYNTHESIZED `implements` edge of Go's
+//! implicit interface satisfaction, which the synthesis stage writes since
+//! W7-15b; they run over a fixture of their own. Not ported:
 //! `countImplementers` and the `overrides: false` switch, which only
 //! `codegraph_explore` uses.
 
@@ -63,6 +63,35 @@ fn plugins_ts() -> String {
 fn fixture() -> Project {
     let plugins = plugins_ts();
     Project::indexed(&[("src/shapes.ts", SHAPES_TS), ("src/plugins.ts", &plugins)])
+}
+
+/// Upstream's Go file: `System` satisfies `Clock` without either naming
+/// the other, so the `implements` edge is synthesized.
+const CLOCK_GO: &str = "package clock
+
+import \"time\"
+
+// Clock is the time seam.
+type Clock interface {
+\tNow() time.Time
+}
+
+// System is the production clock.
+type System struct{}
+
+func (System) Now() time.Time { return time.Now().UTC() }
+
+// Fixed is a frozen clock.
+type Fixed struct{ At time.Time }
+
+func (f Fixed) Now() time.Time { return f.At }
+";
+
+fn go_fixture() -> Project {
+    Project::indexed(&[
+        ("go.mod", "module fixture\n\ngo 1.22\n"),
+        ("src/clock.go", CLOCK_GO),
+    ])
 }
 
 fn store(project: &Project) -> Store {
@@ -236,6 +265,51 @@ fn leaves_a_member_that_declares_something_new_unmarked() {
     }
 }
 
+/* ----------------------------------------------- Go implicit satisfaction */
+
+#[test]
+fn finds_the_implementations_of_an_interface_no_file_names() {
+    let project = go_fixture();
+    let store = store(&project);
+    let hierarchy =
+        build_type_hierarchy(&store, &node_named(&store, "Clock", NodeKind::Interface)).unwrap();
+    let mut names: Vec<&str> = hierarchy
+        .descendants
+        .iter()
+        .map(|entry| entry.node.name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Fixed", "System"]);
+    assert!(
+        hierarchy
+            .descendants
+            .iter()
+            .all(|entry| entry.relation == HierarchyRelation::Implements)
+    );
+}
+
+#[test]
+fn marks_the_synthesized_edge_and_keeps_where_it_was_wired() {
+    let project = go_fixture();
+    let store = store(&project);
+    let hierarchy =
+        build_type_hierarchy(&store, &node_named(&store, "Clock", NodeKind::Interface)).unwrap();
+    let system = hierarchy
+        .descendants
+        .iter()
+        .find(|entry| entry.node.name == "System")
+        .expect("System below Clock");
+    assert!(system.synthesized);
+    let meta = system.edge.metadata.as_ref().expect("the edge's metadata");
+    assert_eq!(meta["synthesizedBy"], "go-implements");
+    assert!(
+        meta["registeredAt"]
+            .as_str()
+            .is_some_and(|at| at.contains("clock.go")),
+        "{meta}"
+    );
+}
+
 /* ------------------------------------------------------- the /api/node block */
 
 #[tokio::test]
@@ -261,6 +335,29 @@ async fn carries_a_total_that_equals_the_list_beneath_it() {
     assert_eq!(descendants["truncated"], false);
     assert_eq!(block["direct"], descendants["total"]);
     assert_eq!(block["polymorphic"], true);
+}
+
+#[tokio::test]
+async fn lifts_the_synthesized_edges_wiring_onto_the_row() {
+    let project = go_fixture();
+    let viewer = project.viewer();
+    let id = viewer.id_of("Clock", Some("interface")).await;
+    let block = viewer.json(&format!("/api/node/{}", encode(&id))).await["hierarchy"].clone();
+    let system = block["descendants"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "System")
+        .expect("System in the block")
+        .clone();
+    assert_eq!(system["synthesized"], true);
+    assert_eq!(system["via"], "go-implements");
+    assert!(
+        system["registeredAt"]
+            .as_str()
+            .is_some_and(|at| at.contains("clock.go")),
+        "{system}"
+    );
 }
 
 #[tokio::test]

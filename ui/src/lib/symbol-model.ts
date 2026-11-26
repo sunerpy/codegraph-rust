@@ -517,18 +517,28 @@ export const CALLEE_ROW_GAP = 8;
  * a rail whose rows jump around relative to the body stops being a reading of
  * the code, and the connector still runs to the line.
  *
+ * A row that carries conditions is taller — a line for each — so each row's
+ * own height counts: `y = max(lineY − h / 2, previous top + previous h + 8)`.
+ * Without heights every row is the recipe's 44.
+ *
  * @param centres the call-site line's vertical centre per row, in rail space
  * @param start where the first row may begin (under the rail header)
+ * @param heights each row's measured height, same order; a missing one is 44
  */
-export function calleeRowTops(centres: ReadonlyArray<number | null>, start: number): number[] {
+export function calleeRowTops(
+  centres: ReadonlyArray<number | null>,
+  start: number,
+  heights: ReadonlyArray<number> = []
+): number[] {
   const tops: number[] = [];
   let y = start;
-  for (const centre of centres) {
-    const wanted = centre !== null ? centre - CALLEE_ROW_HEIGHT / 2 : y;
+  centres.forEach((centre, i) => {
+    const height = heights[i] ?? CALLEE_ROW_HEIGHT;
+    const wanted = centre !== null ? centre - height / 2 : y;
     y = Math.max(wanted, y);
     tops.push(y);
-    y += CALLEE_ROW_HEIGHT + CALLEE_ROW_GAP;
-  }
+    y += height + CALLEE_ROW_GAP;
+  });
   return tops;
 }
 

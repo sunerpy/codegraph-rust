@@ -16,6 +16,11 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const DIAGNOSTIC_SCHEMA_VERSION: u64 = 1;
+/// Set to `1` to print one stderr line per timed phase of `init`, `index` and
+/// `sync`, with or without `--debug` (W9-00a).
+pub(crate) const PHASE_TIMINGS_ENV: &str = "CODEGRAPH_PHASE_TIMINGS";
+/// The first tab-separated field of every phase-timing line.
+pub(crate) const PHASE_TIMING_TAG: &str = "codegraph-phase";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const SLOW_FILE_AFTER: Duration = Duration::from_secs(5);
 const SLOW_FILE_REPEAT: Duration = Duration::from_secs(30);
@@ -178,12 +183,20 @@ impl DiagnosticSink {
     }
 }
 
+/// Whether `CODEGRAPH_PHASE_TIMINGS=1` asks for the phase-timing lines.
+pub(crate) fn phase_timings_enabled() -> bool {
+    std::env::var(PHASE_TIMINGS_ENV).as_deref() == Ok("1")
+}
+
 pub(crate) struct DiagnosticRun {
     sink: Option<DiagnosticSink>,
     command: &'static str,
     auto_temporary: bool,
     final_path: Option<PathBuf>,
     finished: bool,
+    /// Print the phase-timing lines (`CODEGRAPH_PHASE_TIMINGS=1`), read once
+    /// when the run starts.
+    timings: bool,
 }
 
 impl DiagnosticRun {
@@ -194,6 +207,7 @@ impl DiagnosticRun {
             auto_temporary: false,
             final_path: None,
             finished: false,
+            timings: phase_timings_enabled(),
         }
     }
 
@@ -260,6 +274,7 @@ impl DiagnosticRun {
             auto_temporary,
             final_path,
             finished: false,
+            timings: phase_timings_enabled(),
         })
     }
 
@@ -302,6 +317,7 @@ impl DiagnosticRun {
     }
 
     pub(crate) fn phase_end(&self, phase: &str, duration: Duration, fields: Value) {
+        self.print_timing(phase, duration);
         if let Some(sink) = &self.sink {
             let mut object = match fields {
                 Value::Object(map) => map,
@@ -314,6 +330,34 @@ impl DiagnosticRun {
             );
             sink.emit("phase_end", Value::Object(object));
         }
+    }
+
+    /// One part of a phase, named `<phase>.<part>`: a phase-timing line only.
+    /// The JSONL log records phases, not their parts, so summing its
+    /// `phase_end` durations still gives the command's time.
+    pub(crate) fn phase_part(&self, part: &str, duration: Duration) {
+        self.print_timing(part, duration);
+    }
+
+    /// Whether this run prints phase-timing lines, so a caller measures a
+    /// part only when it is printed.
+    pub(crate) fn timings_enabled(&self) -> bool {
+        self.timings
+    }
+
+    /// `codegraph-phase\t<command>\t<phase>\t<microseconds>` on stderr, in one
+    /// write, under `CODEGRAPH_PHASE_TIMINGS=1`. A failed write is ignored: a
+    /// diagnostic never fails the command.
+    fn print_timing(&self, phase: &str, duration: Duration) {
+        if !self.timings {
+            return;
+        }
+        let line = format!(
+            "{PHASE_TIMING_TAG}\t{}\t{phase}\t{}\n",
+            self.command,
+            duration.as_micros()
+        );
+        let _ = std::io::stderr().lock().write_all(line.as_bytes());
     }
 
     pub(crate) fn finish_success(&mut self, fields: Value) {

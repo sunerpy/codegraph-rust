@@ -1,0 +1,134 @@
+//! Dynamic-dispatch edge synthesis (upstream `resolution/callback-synthesizer.ts`
+//! and `db/synthesis-stage.ts`, W7-14).
+//!
+//! Static extraction leaves out the edge from a dispatcher to the callbacks
+//! registered elsewhere through a shared store: `triggerUpdate()` loops over
+//! `this.callbacks` calling each, and nothing there names the
+//! `triggerRender` that `scene.onUpdate(this.triggerRender)` registered.
+//! After base resolution a whole-graph stage reads the base graph, runs each
+//! pass, merges their edges in registry order and replaces every synthesized
+//! edge with the result in one transaction. A synthesized edge has
+//! `provenance: "heuristic"` and `metadata.synthesizedBy` naming its pass,
+//! with `registeredAt` where the channel was wired up; a Go type's
+//! `contains` edge to a method of another file (`go-method-contains`) has
+//! no provenance, as a parsed one has.
+//!
+//! The stage reads only the base graph (every edge without `synthesizedBy`,
+//! the nodes, `resolved_refs`, and for Go the `extends` rows resolution
+//! left in `unresolved_refs`), the indexed files' text, the files the C
+//! function-pointer pass `#include`s that the index does not hold, which it
+//! records under [`INPUTS_KEY`] (W7-17b), and, for the import resolution of
+//! the link passes and the tier pass (W7-20), the JavaScript configuration
+//! resolution reads (`tsconfig.json` and `jsconfig.json` aliases, workspace
+//! packages, `package.json` manifests), JavaScript's control inputs
+//! (W7-18a), so a sync that changes none of them keeps its edges. Its Go
+//! prerequisite steps add edges the passes read as base edges first
+//! (W7-15b). `codegraph-watch` recomputes them whole after any sync that
+//! changes the index or finds a recorded file reading differently, under
+//! [`VERSION_KEY`].
+
+mod angular;
+mod arkui;
+mod c_fnptr;
+mod callback;
+mod context;
+mod dispatch;
+mod erlang;
+mod footprint;
+mod framework;
+mod go;
+mod go_dispatch;
+mod go_func_field;
+mod goframe;
+mod iface;
+mod inputs;
+mod jsx;
+mod links;
+mod nix;
+mod react_native;
+mod registry;
+mod reuse;
+mod stage;
+mod sveltekit;
+mod tier;
+mod vue;
+
+// `path.posix`, for the Laravel resolver's route-file mounts too (W7-19d).
+pub(crate) use c_fnptr::{posix_dirname, posix_normalize};
+/// The text of a step's `:edges` row for an output's JSON, and back (W9-00
+/// row 27): tests read and plant rows with them.
+#[doc(hidden)]
+pub use footprint::{decode_output_row, encode_output_row};
+pub use inputs::{INPUTS_KEY, Inputs, inputs_changed, recorded as recorded_inputs};
+pub use stage::{
+    StageStats, StageTimings, records_alone, run_stage, run_stage_reusing, run_stage_timed,
+    stage_rows, step_names, synthesize,
+};
+
+use anyhow::Result;
+use codegraph_core::types::Edge;
+use codegraph_store::Store;
+
+/// `project_metadata` key of the marker a sync reads: [`VERSION`] while the
+/// synthesized edges are the stage's output over the current base graph.
+/// A sync withdraws it before its first change and writes it back after its
+/// last write, so a sync that stops between the two leaves it absent and the
+/// next one recomputes.
+pub const VERSION_KEY: &str = "synthesis_version";
+
+/// The marker's value; a change to what the passes produce moves it. "24"
+/// since a sync keeps the steps whose inputs it left alone (W9-00 row 27):
+/// a build before it recomputes the stage whole without touching the step
+/// records, and its marker value tells the records apart from its edges.
+pub const VERSION: &str = "24";
+
+/// `project_metadata` key of what the pass records were written by and for
+/// (W9-00 row 27): the engine's [`VERSION`], the [`BUILD_IDENTITY`], the
+/// schema version, the options the stage reads, the indexed languages and
+/// the steps that ran.
+pub const STAGE_KEY: &str = "synthesis_passes";
+
+/// `project_metadata` key prefix of each step's record, `synthesis_pass:` and
+/// its upstream name: what it read, and the length and hash of its raw
+/// output's row, the same key with [`EDGES_KEY_SUFFIX`].
+pub const PASS_KEY_PREFIX: &str = "synthesis_pass:";
+
+/// The suffix of a step's raw-output row, `synthesis_pass:{pass}:edges`: its
+/// edges in the order it emitted them, before the merge.
+pub const EDGES_KEY_SUFFIX: &str = ":edges";
+
+/// The build that writes the records: the package version and a digest of
+/// the sources the stage's output follows from, taken when it is compiled
+/// (`build.rs`), so a binary built from other sources trusts no record this
+/// one wrote, and the CLI and an in-process sync of one build agree (H3).
+pub const BUILD_IDENTITY: &str = env!("CODEGRAPH_SYNTHESIS_BUILD");
+
+/// The edges one channel, class or declaration links at most (upstream
+/// `MAX_CALLBACKS_PER_CHANNEL`).
+const MAX_CALLBACKS_PER_CHANNEL: usize = 40;
+
+/// Record that the synthesized edges are the stage's output.
+pub fn write_marker(store: &Store) -> Result<()> {
+    store.set_project_metadata(VERSION_KEY, VERSION)?;
+    Ok(())
+}
+
+/// Withdraw the marker before a change to the base graph.
+pub fn withdraw_marker(store: &Store) -> Result<()> {
+    store.delete_project_metadata(VERSION_KEY)?;
+    Ok(())
+}
+
+/// Whether the marker holds for this engine's passes.
+pub fn marker_is_current(store: &Store) -> Result<bool> {
+    Ok(store.get_project_metadata(VERSION_KEY)?.as_deref() == Some(VERSION))
+}
+
+/// Whether the synthesis stage owns `edge`: its metadata names a pass, as
+/// the store's `synthesizedBy` predicate reads it (a JSON `null` names none).
+pub fn is_synthesized(edge: &Edge) -> bool {
+    edge.metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("synthesizedBy"))
+        .is_some_and(|by| !by.is_null())
+}

@@ -122,6 +122,25 @@ pub struct TsFieldDeclaration {
     pub type_name: String,
 }
 
+/// The `(written, normalized)` types a value's declaration gives it, in
+/// the receiver-type patterns' order ([`SourceFacts::value_declared_types`]).
+pub type DeclaredTypes = Arc<Vec<(String, String)>>;
+
+/// What scanning one scope of a file for one receiver's declaration has
+/// found so far ([`SourceFacts::receiver_declaration`]): every line of
+/// `start..=hi` that declares the receiver, with what it declares, in line
+/// order.
+#[derive(Debug, Default)]
+struct ReceiverScan {
+    /// The highest line scanned; `None` before the first query.
+    hi: Option<usize>,
+    found: Vec<(usize, (String, String))>,
+}
+
+/// A receiver scan's key: the scope's first line, the reference's language,
+/// and the receiver as the patterns match it.
+type ReceiverScanKey = (usize, codegraph_core::types::Language, String);
+
 /// Lazily derived, memoised facts about one file's source text.
 #[derive(Debug)]
 pub struct SourceFacts {
@@ -136,6 +155,9 @@ pub struct SourceFacts {
     js_local_bindings: Mutex<HashMap<String, bool>>,
     node_decisions: Mutex<HashMap<(&'static str, String), bool>>,
     ts_field_declarations: Mutex<HashMap<(String, String), Option<TsFieldDeclaration>>>,
+    class_field_types: Mutex<HashMap<(String, String), Option<String>>>,
+    value_declared_types: Mutex<HashMap<String, DeclaredTypes>>,
+    receiver_scans: Mutex<HashMap<ReceiverScanKey, Arc<Mutex<ReceiverScan>>>>,
     js_get_state_file: OnceLock<bool>,
     js_selector_names: OnceLock<HashSet<String>>,
     literal_properties: Mutex<HashMap<(String, String), LiteralLookup>>,
@@ -194,6 +216,9 @@ impl SourceFacts {
             js_local_bindings: Mutex::new(HashMap::new()),
             node_decisions: Mutex::new(HashMap::new()),
             ts_field_declarations: Mutex::new(HashMap::new()),
+            class_field_types: Mutex::new(HashMap::new()),
+            value_declared_types: Mutex::new(HashMap::new()),
+            receiver_scans: Mutex::new(HashMap::new()),
             js_get_state_file: OnceLock::new(),
             js_selector_names: OnceLock::new(),
             literal_properties: Mutex::new(HashMap::new()),
@@ -825,6 +850,114 @@ impl SourceFacts {
             .insert(key, declaration.clone());
         declaration
     }
+
+    /// The declaration of `receiver` (written in `language`) nearest above
+    /// line `at`, `at` included, in the scope whose first line is `start`
+    /// (0-based lines): what `scan`, read from `at` up to `start`, returns
+    /// first (table 9.1 row 24, upstream 974e6c8's incremental scan cache).
+    /// `scan` must be a function of the line alone. Each line is scanned at
+    /// most once per (scope, language, receiver), in whatever order the
+    /// parallel resolve asks: a query within the lines already scanned reads
+    /// the last declaration at or above it, and one past them scans only the
+    /// new lines. KEEP-RUST: upstream caches only queries that move down the
+    /// file, a thread interleaving the resolve's would rarely keep that order.
+    pub fn receiver_declaration(
+        &self,
+        start: usize,
+        language: codegraph_core::types::Language,
+        receiver: &str,
+        at: usize,
+        mut scan: impl FnMut(usize) -> Option<(String, String)>,
+    ) -> Option<(String, String)> {
+        if at < start {
+            return None;
+        }
+        let state = {
+            let mut scans = self
+                .receiver_scans
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                scans
+                    .entry((start, language, receiver.to_string()))
+                    .or_default(),
+            )
+        };
+        let mut state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let from = match state.hi {
+            Some(hi) if hi >= at => None,
+            Some(hi) => Some(hi + 1),
+            None => Some(start),
+        };
+        if let Some(from) = from {
+            for line in from..=at {
+                if let Some(found) = scan(line) {
+                    state.found.push((line, found));
+                }
+            }
+            state.hi = Some(at);
+        }
+        let through = state.found.partition_point(|(line, _)| *line <= at);
+        through
+            .checked_sub(1)
+            .map(|last| state.found[last].1.clone())
+    }
+
+    /// Memoised type the receiver-type patterns read off the declaration line
+    /// of `field`, a field of the class `owner_id` defined in this file;
+    /// `compute` runs at most once per `(owner, field)`. The patterns are
+    /// compiled for the field's name, so a call through the field compiled
+    /// them on every call (W7-24 cost, OD-B73).
+    pub fn class_field_type(
+        &self,
+        owner_id: &str,
+        field: &str,
+        compute: impl FnOnce(&Self) -> Option<String>,
+    ) -> Option<String> {
+        let key = (owner_id.to_string(), field.to_string());
+        if let Some(known) = self
+            .class_field_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+        {
+            return known.clone();
+        }
+        let found = compute(self);
+        self.class_field_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, found.clone());
+        found
+    }
+
+    /// Memoised `(written, normalized)` type pairs the receiver-type patterns
+    /// read, in pattern order, off the declaration of `value_id`, a value
+    /// node of this file; `compute` runs at most once per value. A call
+    /// through an imported value re-read and re-split its file and compiled
+    /// the patterns for its name on every call (W7-24 cost, OD-B73).
+    pub fn value_declared_types(
+        &self,
+        value_id: &str,
+        compute: impl FnOnce(&Self) -> Vec<(String, String)>,
+    ) -> DeclaredTypes {
+        if let Some(known) = self
+            .value_declared_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(value_id)
+        {
+            return Arc::clone(known);
+        }
+        let found = Arc::new(compute(self));
+        self.value_declared_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(value_id.to_string(), Arc::clone(&found));
+        found
+    }
 }
 
 /// `map[key]`, computed by `compute` without holding the lock when absent.
@@ -1000,6 +1133,155 @@ mod tests {
             None
         );
         assert_eq!(runs, 1);
+    }
+
+    /// A text of `lines` lines where line `i` declares receiver `a` when
+    /// `i % 7 == 3`, `b` when `i % 11 == 5`, and nothing otherwise.
+    fn receiver_text(lines: usize) -> String {
+        (0..lines)
+            .map(|i| {
+                if i % 7 == 3 {
+                    format!("let a = new A{i}();\n")
+                } else if i % 11 == 5 {
+                    format!("let b = new B{i}();\n")
+                } else {
+                    format!("a.run({i}); b.run({i});\n")
+                }
+            })
+            .collect()
+    }
+
+    /// The declaration of `receiver` in `line`, as the scans below read it.
+    fn declares(line: &str, receiver: &str) -> Option<(String, String)> {
+        let rest = line.strip_prefix(&format!("let {receiver} = new "))?;
+        let ty = rest.strip_suffix("();")?;
+        Some((ty.to_string(), ty.to_string()))
+    }
+
+    /// What the scan from `at` up to `start` finds first, line by line.
+    fn direct(text: &str, start: usize, at: usize, receiver: &str) -> Option<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        if at < start {
+            return None;
+        }
+        (start..=at)
+            .rev()
+            .find_map(|i| declares(lines[i], receiver))
+    }
+
+    /// Table 9.1 row 24 (upstream 974e6c8): whatever order the queries come
+    /// in, the cached answer is the direct scan's, per scope, receiver and
+    /// language, and no line of a scope is read twice for one receiver.
+    #[test]
+    fn receiver_declarations_answer_any_query_order_as_the_scan_does() {
+        let text = receiver_text(120);
+        let lines: Vec<&str> = text.lines().collect();
+        let facts = SourceFacts::new(Arc::from(text.as_str()));
+        let mut order: Vec<usize> = (0..120).collect();
+        // A fixed shuffle (an LCG), so the queries go up and down the file.
+        let mut seed: u64 = 0x9e37_79b9;
+        for i in (1..order.len()).rev() {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            order.swap(i, (seed >> 33) as usize % (i + 1));
+        }
+        let mut reads = HashMap::new();
+        for &at in &order {
+            for (start, receiver, language) in [
+                (0, "a", codegraph_core::types::Language::TypeScript),
+                (0, "b", codegraph_core::types::Language::TypeScript),
+                (40, "a", codegraph_core::types::Language::TypeScript),
+                (0, "a", codegraph_core::types::Language::JavaScript),
+            ] {
+                let cached = facts.receiver_declaration(start, language, receiver, at, |i| {
+                    *reads.entry((start, receiver, language, i)).or_insert(0) += 1;
+                    declares(lines[i], receiver)
+                });
+                assert_eq!(
+                    cached,
+                    direct(&text, start, at, receiver),
+                    "line {at}, scope {start}, receiver {receiver}, {language:?}"
+                );
+            }
+        }
+        assert!(
+            reads.values().all(|&count| count == 1),
+            "a line is read once per scope, receiver and language"
+        );
+        assert_eq!(
+            reads.len(),
+            120 * 3 + 80,
+            "every line of each scope at or below its last query was read"
+        );
+    }
+
+    /// W7-24 cost (OD-B73): a class field's type is remembered per owner
+    /// and per field, never across either.
+    #[test]
+    fn class_field_types_are_computed_once_per_owner_and_field() {
+        let facts = SourceFacts::new(Arc::from("class A { r: X; s: Y }\nclass B { r: Z }\n"));
+        let mut runs = 0;
+        let mut compute = |answer: &str| {
+            runs += 1;
+            Some(answer.to_string())
+        };
+        assert_eq!(
+            facts
+                .class_field_type("class:a", "r", |_| compute("X"))
+                .as_deref(),
+            Some("X")
+        );
+        assert_eq!(
+            facts
+                .class_field_type("class:a", "r", |_| unreachable!("memoised"))
+                .as_deref(),
+            Some("X")
+        );
+        // Another owner's field of the same name is its own entry.
+        assert_eq!(
+            facts
+                .class_field_type("class:b", "r", |_| compute("Z"))
+                .as_deref(),
+            Some("Z")
+        );
+        // And so is another field of the same owner.
+        assert_eq!(
+            facts
+                .class_field_type("class:a", "s", |_| compute("Y"))
+                .as_deref(),
+            Some("Y")
+        );
+        assert_eq!(facts.class_field_type("class:a", "t", |_| None), None);
+        assert_eq!(
+            facts.class_field_type("class:a", "t", |_| unreachable!("memoised")),
+            None
+        );
+        assert_eq!(runs, 3);
+    }
+
+    /// W7-24 cost (OD-B73): a value's declared types are remembered per value
+    /// node, in pattern order.
+    #[test]
+    fn value_declared_types_are_computed_once_per_value() {
+        let facts = SourceFacts::new(Arc::from(
+            "export const a = new A();\nexport const b = new B();\n",
+        ));
+        let mut runs = 0;
+        let mut compute = |written: &str| {
+            runs += 1;
+            vec![(written.to_string(), written.to_string())]
+        };
+        let first = facts.value_declared_types("constant:a", |_| compute("A"));
+        assert_eq!(first.as_slice(), [("A".to_string(), "A".to_string())]);
+        let again = facts.value_declared_types("constant:a", |_| unreachable!("memoised"));
+        assert!(Arc::ptr_eq(&first, &again));
+        let other = facts.value_declared_types("constant:b", |_| compute("B"));
+        assert_eq!(other.as_slice(), [("B".to_string(), "B".to_string())]);
+        assert!(
+            facts
+                .value_declared_types("constant:c", |_| Vec::new())
+                .is_empty()
+        );
+        assert_eq!(runs, 2);
     }
 
     /// A module fact read from a transient blanked copy reads the text

@@ -7,6 +7,7 @@
 
 pub mod boundary;
 pub mod deadcode;
+pub mod effects;
 pub mod entrypoints;
 pub mod file;
 pub mod filecode;
@@ -14,13 +15,16 @@ pub mod flow;
 pub mod map;
 pub mod node;
 pub mod nodes;
+pub mod program;
 pub mod route_roots;
 pub mod routes;
 pub mod screens;
 pub mod search;
 pub mod source;
 pub mod stats;
+pub mod steps;
 pub mod trails;
+pub mod when;
 pub mod wire;
 
 use std::sync::Arc;
@@ -46,9 +50,7 @@ impl Ctx<'_> {
     }
 }
 
-/// What `GET /api` answers: the endpoints this server serves. `/api/steps` is
-/// not among them until its port lands (the frontend's adapter is built without
-/// it, so the Steps view says it cannot draw steps).
+/// What `GET /api` answers: the endpoints this server serves.
 fn api_index() -> Value {
     json!({
         "name": "codegraph ui",
@@ -65,6 +67,7 @@ fn api_index() -> Value {
             { "path": "/api/routes", "description": "URL to handler map, when the project is a routed app.", "params": ["limit"] },
             { "path": "/api/map", "description": "The repository at module granularity: modules, cross-module links, cycles.", "params": ["root", "depth"] },
             { "path": "/api/screens", "description": "The app as screens and the transitions between them, each with the conditions it runs under.", "params": [] },
+            { "path": "/api/steps", "description": "What happens from a screen or a symbol: screens, handlers, native bridge calls and events, store writes and calls that leave the index, as typed steps with the conditions between them.", "params": ["anchor", "symbol", "depth", "limit"] },
             { "path": "/api/flow", "description": "The call path between symbols: one hop per card, opened at the calling line.", "params": ["from", "to", "symbols", "hop", "limit"] },
             { "path": "/api/events", "description": "Live channel (server-sent events): source files that changed on disk, and the index moving." },
             { "path": "/api/deadcode", "description": "Symbols nothing in the index reaches, grouped by file, with every reason a candidate was excluded.", "params": ["limit", "kinds", "exported", "tests", "generated"] },
@@ -149,20 +152,7 @@ pub async fn dispatch(
         "/api/source" => read(state, &method, move |ctx| source::build(ctx, &query)).await,
         "/api/flow" => read(state, &method, move |ctx| flow::build(ctx, &query)).await,
         "/api/events" => crate::events::subscribe(state, &method).await,
-        // Steps needs the effect/program builders and the branch conditions
-        // (UI families F1–F6 and F11), which are not ported yet; the frontend
-        // is built without it, so its view says it cannot draw steps.
-        "/api/steps" => fail(
-            &ApiError::not_found(
-                "No such endpoint: /api/steps",
-                Some(
-                    "This server does not build Steps yet: the step, effect and program builders \
-                     (UI families F1–F6) and their branch conditions (F11) are not ported. \
-                     GET /api lists everything this server answers.",
-                ),
-            ),
-            &method,
-        ),
+        "/api/steps" => read(state, &method, move |ctx| steps::build(ctx, &query)).await,
         _ => dispatch_path_routes(state, &method, &route).await,
     }
 }

@@ -8,5 +8,15 @@
     "line": 1,
     "reference_kind": "imports",
     "reference_name": "../foo"
+  },
+  {
+    "candidates": null,
+    "col": 9,
+    "file_path": "component.ets",
+    "from_node_id": "file:component.ets",
+    "language": "arkts",
+    "line": 1,
+    "reference_kind": "imports",
+    "reference_name": "Foo"
   }
 ]

@@ -8,10 +8,11 @@
 
 use crate::name_matcher::{
     local_receiver_type_patterns, normalize_inferred_type_name, regex_escape,
-    resolve_method_on_type, resolve_object_literal_member,
+    resolve_method_on_type, resolve_object_literal_member, ts_imported_type_file,
 };
 use crate::path_aliases::apply_aliases;
 use crate::pathutil;
+use crate::source_facts::SourceFacts;
 use crate::types::{ImportMapping, ReExport, RefView, ResolutionContext, ResolvedBy, ResolvedRef};
 use crate::workspace_packages::resolve_workspace_import;
 use codegraph_core::types::{Language, Node, NodeKind};
@@ -65,6 +66,19 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
             "/index.js",
         ],
         Language::Jsx => &[".jsx", ".js", "/index.jsx", "/index.js"],
+        // ArkTS imports `.ets` components and plain `.ts` logic modules;
+        // `/Index.ets` is ohpm's module entry (upstream #1186,
+        // `import-resolver.ts`, `b635dd46` line 35).
+        Language::ArkTs => &[
+            ".ets",
+            ".ts",
+            ".d.ts",
+            ".js",
+            "/Index.ets",
+            "/index.ets",
+            "/index.ts",
+            "/index.js",
+        ],
         Language::Svelte => &[
             ".ts",
             ".js",
@@ -95,16 +109,27 @@ fn extension_resolution(language: Language) -> &'static [&'static str] {
         Language::Php => &[".php"],
         Language::Ruby => &[".rb"],
         Language::ObjC => &[".h", ".m", ".mm"],
+        // A Nix path names a file, or a directory by its `default.nix`
+        // (upstream #1190).
+        Language::Nix => &[".nix", "/default.nix"],
         _ => &[],
     }
 }
 
+/// The first of `base_path`'s candidates the index holds (see
+/// [`resolve_import_path`]): a TypeScript or ArkTS `.js`-family specifier's
+/// own sources (ArkTS in TypeScript's order, upstream
+/// `EMITTED_SPECIFIER_LANGUAGES`, `b635dd46` 615-617), then `language`'s
+/// extensions, then the path as written.
 fn resolve_source_candidate(
     base_path: &str,
     language: Language,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
-    let substitution = if matches!(language, Language::TypeScript | Language::Tsx) {
+    let substitution = if matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::ArkTs
+    ) {
         if let Some(stem) = base_path.strip_suffix(".mjs") {
             Some((stem, &[".mts", ".d.mts"][..]))
         } else if let Some(stem) = base_path.strip_suffix(".cjs") {
@@ -129,7 +154,7 @@ fn resolve_source_candidate(
     if let Some((stem, extensions)) = substitution {
         for extension in extensions {
             let candidate = format!("{stem}{extension}");
-            if context.file_exists(&candidate) {
+            if context.is_indexed_file(&candidate) {
                 return Some(candidate);
             }
         }
@@ -137,18 +162,26 @@ fn resolve_source_candidate(
 
     for extension in extension_resolution(language) {
         let candidate = format!("{base_path}{extension}");
-        if context.file_exists(&candidate) {
+        if context.is_indexed_file(&candidate) {
             return Some(candidate);
         }
     }
 
     context
-        .file_exists(base_path)
+        .is_indexed_file(base_path)
         .then(|| base_path.to_string())
 }
 
 /// Resolve an import path to an actual file (`resolveImportPath`,
 /// `import-resolver.ts:42-76`).
+///
+/// Every candidate is a file the files table holds
+/// ([`ResolutionContext::is_indexed_file`]), in the order colby tries them;
+/// a file over the size limit, which the table records without nodes, is
+/// one. colby's `fileExists` also answers from the disk, so a file the
+/// configuration excludes, one in a language the index does not hold, or a
+/// directory can win there; such a path appears or goes without a change to
+/// the index, which no sync would resolve again (KEEP-RUST, W7-27).
 pub fn resolve_import_path(
     import_path: &str,
     from_file: &str,
@@ -168,7 +201,9 @@ pub fn resolve_import_path(
     }
 
     // Aliased/absolute imports (import-resolver.ts:64-66).
-    if let Some(aliased) = resolve_aliased_import(import_path, &project_root, language, context) {
+    if let Some(aliased) =
+        resolve_aliased_import(import_path, from_file, &project_root, language, context)
+    {
         return Some(aliased);
     }
 
@@ -336,8 +371,8 @@ fn c_cpp_stdlib_headers() -> &'static BTreeSet<&'static str> {
 ///
 /// Wider than [`crate::types::ESM_LANGUAGES`] on purpose: that set is about
 /// VISIBILITY (which needs an import-mapping channel), this one is about
-/// SPECIFIER SHAPE, which Astro and ArkTS share even though they have no mapping
-/// channel yet.
+/// SPECIFIER SHAPE, which Astro shares even though it has no mapping channel
+/// yet (ArkTS has had one since W7-24a1).
 fn is_js_specifier_language(language: Language) -> bool {
     matches!(
         language,
@@ -397,8 +432,8 @@ fn is_external_import_with(
     // (#1537/#1536). `extract_import_mappings` already routes Svelte and Vue
     // through `extract_js_imports`, so an npm specifier in an SFC reached here and
     // was answered "not external" — which let an out-of-repo supertype bind an
-    // in-repo class. Astro and ArkTS carry the same specifier grammar; they have
-    // no import-mapping channel yet, so for them only import PATH resolution
+    // in-repo class. Astro and ArkTS carry the same specifier grammar; Astro has
+    // no import-mapping channel yet, so for it only import PATH resolution
     // changes, in the same correct direction.
     if is_js_specifier_language(language) {
         const NODE_BUILTINS: [&str; 12] = [
@@ -500,11 +535,11 @@ fn resolve_relative_import(
         let py_rel = pathutil::relative(project_root, &py_base);
         for ext in extensions {
             let candidate = format!("{py_rel}{ext}");
-            if context.file_exists(&candidate) {
+            if context.is_indexed_file(&candidate) {
                 return Some(candidate);
             }
         }
-        if !py_rel.is_empty() && context.file_exists(&py_rel) {
+        if !py_rel.is_empty() && context.is_indexed_file(&py_rel) {
             return Some(py_rel);
         }
         return None;
@@ -518,7 +553,7 @@ fn resolve_relative_import(
         return extension_resolution(language)
             .iter()
             .filter_map(|extension| extension.strip_prefix('/'))
-            .find(|candidate| context.file_exists(candidate))
+            .find(|candidate| context.is_indexed_file(candidate))
             .map(str::to_string);
     }
     resolve_source_candidate(&relative_path, language, context)
@@ -528,15 +563,22 @@ fn resolve_relative_import(
 /// `import-resolver.ts:265-322`).
 fn resolve_aliased_import(
     import_path: &str,
+    from_file: &str,
     project_root: &str,
     language: Language,
     context: &dyn ResolutionContext,
 ) -> Option<String> {
     let try_with_ext = |base_path: &str| resolve_source_candidate(base_path, language, context);
 
-    // 1. Project tsconfig/jsconfig paths (import-resolver.ts:282-289).
-    if let Some(alias_map) = context.get_project_aliases() {
-        for candidate in apply_aliases(import_path, &alias_map, project_root) {
+    // 1. tsconfig/jsconfig paths: the config nearest the importing file (an
+    //    app of a monorepo keeps its own `@/*`, upstream #2165), then the
+    //    project root's.
+    let root_map = context.get_project_aliases();
+    let nearest = context
+        .get_nearest_aliases(from_file)
+        .filter(|nearest| root_map.as_ref() != Some(nearest));
+    for alias_map in nearest.iter().chain(root_map.iter()) {
+        for candidate in apply_aliases(import_path, alias_map, project_root) {
             if let Some(hit) = try_with_ext(&candidate) {
                 return Some(hit);
             }
@@ -587,12 +629,12 @@ fn resolve_cpp_include_path(
         let normalized_dir = dir.replace('\\', "/");
         for ext in extensions {
             let candidate = format!("{normalized_dir}/{import_path}{ext}");
-            if context.file_exists(&candidate) {
+            if context.is_indexed_file(&candidate) {
                 return Some(candidate);
             }
         }
         let candidate = format!("{normalized_dir}/{import_path}");
-        if context.file_exists(&candidate) {
+        if context.is_indexed_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -643,6 +685,25 @@ pub fn is_js_path_import_ref(reference: &RefView) -> bool {
         && is_js_path_specifier(&reference.reference_name)
 }
 
+/// A Nix import of a static relative path (upstream `isNixPathImportRef`,
+/// #1190): `import ./x.nix`, `import ../lib`, `callPackage ./pkgs/hello`, a
+/// module's `imports = [ ./a.nix ]`. It names a file, never a symbol; a
+/// channel (`<nixpkgs>`), an attribute path, a variable or an interpolated
+/// path is none.
+pub fn is_nix_path_import_ref(reference: &RefView) -> bool {
+    let name = &reference.reference_name;
+    reference.language == Language::Nix
+        && reference.reference_kind == codegraph_core::types::EdgeKind::Imports
+        && (name.starts_with("./") || name.starts_with("../"))
+        && !name.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '{' | '}' | '(' | ')' | '[' | ']' | ';' | '"' | '\'' | '<' | '>' | '$'
+                )
+        })
+}
+
 /// A Lua / Luau `require` (upstream `isLuaRequireRef`, #2392): it names a
 /// module file or a module from outside the project, never a symbol.
 pub fn is_lua_require_ref(reference: &RefView) -> bool {
@@ -680,12 +741,12 @@ fn resolve_php_include_path(
     let from_dir = pathutil::dirname(&pathutil::resolve(&project_root, from_file));
     let base_path = pathutil::resolve(&from_dir, include_path);
     let relative_path = pathutil::relative(&project_root, &base_path);
-    if context.file_exists(&relative_path) {
+    if context.is_indexed_file(&relative_path) {
         return Some(relative_path);
     }
     for ext in extension_resolution(Language::Php) {
         let candidate = format!("{relative_path}{ext}");
-        if context.file_exists(&candidate) {
+        if context.is_indexed_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -725,10 +786,12 @@ fn js_require_regex() -> &'static Regex {
 /// `import-resolver.ts:576-608`).
 pub fn extract_import_mappings(content: &str, language: Language) -> Vec<ImportMapping> {
     match language {
+        // ArkTS imports as TypeScript does (upstream #1186, `b635dd46` 983).
         Language::TypeScript
         | Language::JavaScript
         | Language::Tsx
         | Language::Jsx
+        | Language::ArkTs
         | Language::Svelte
         | Language::Vue => extract_js_imports(content),
         Language::Python => extract_python_imports(content),
@@ -1471,11 +1534,16 @@ fn rust_use_path_is_out_of_repo(
 const JS_IDENTIFIER: &str = r"[\p{ID_Start}_$][\p{ID_Continue}$\x{200C}\x{200D}]*";
 
 /// Extract JS/TS cross-file re-exports and explicit local export aliases
-/// (`extractReExports`, `import-resolver.ts:989-1042`).
+/// (`extractReExports`, `import-resolver.ts:989-1042`), ArkTS's too (upstream
+/// #1186, `b635dd46` 1443).
 pub fn extract_re_exports(content: &str, language: Language) -> Vec<ReExport> {
     if !matches!(
         language,
-        Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
+        Language::TypeScript
+            | Language::JavaScript
+            | Language::Tsx
+            | Language::Jsx
+            | Language::ArkTs
     ) {
         return Vec::new();
     }
@@ -1671,12 +1739,12 @@ pub fn resolve_jvm_import(
     } else {
         pick_closest_jvm_candidate(&candidates, &reference.file_path)
     };
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: best.id,
-        confidence: 0.95,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        best.id,
+        0.95,
+        ResolvedBy::Import,
+    ))
 }
 
 /// `pickClosestJvmCandidate` (`import-resolver.ts:1096-1119`).
@@ -1818,12 +1886,12 @@ pub(crate) fn resolve_php_qualified_class_ref(
             .then_some(None);
     };
     let Some(member) = member else {
-        return Some(Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: owner.id.clone(),
-            confidence: 0.95,
-            resolved_by: ResolvedBy::Import,
-        }));
+        return Some(Some(ResolvedRef::new(
+            reference.clone(),
+            owner.id.clone(),
+            0.95,
+            ResolvedBy::Import,
+        )));
     };
     let methods: Vec<Arc<Node>> = context
         .get_nodes_by_qualified_name_shared(&format!("{}::{member}", owner.qualified_name))
@@ -1839,12 +1907,12 @@ pub(crate) fn resolve_php_qualified_class_ref(
     let [method] = methods.as_slice() else {
         return None;
     };
-    Some(Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: method.id.clone(),
-        confidence: 0.95,
-        resolved_by: ResolvedBy::Import,
-    }))
+    Some(Some(ResolvedRef::new(
+        reference.clone(),
+        method.id.clone(),
+        0.95,
+        ResolvedBy::Import,
+    )))
 }
 
 /// Resolve a PHP scoped call through the exact class namespace named by its
@@ -1927,12 +1995,12 @@ pub(crate) fn resolve_php_imported_static_call(
         return PhpImportedStaticCallResolution::Claimed(None);
     };
 
-    PhpImportedStaticCallResolution::Claimed(Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: method.id.clone(),
-        confidence: 0.95,
-        resolved_by: ResolvedBy::Import,
-    }))
+    PhpImportedStaticCallResolution::Claimed(Some(ResolvedRef::new(
+        reference.clone(),
+        method.id.clone(),
+        0.95,
+        ResolvedBy::Import,
+    )))
 }
 
 /// Resolve a reference using import mappings (`resolveViaImport`,
@@ -1964,12 +2032,12 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == file)
     {
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: file_node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
     // A Dart `import` / `export` URI names a library file, and a `part` URI
     // one of the library's own files: `package:app/x.dart` is app's
@@ -1988,12 +2056,12 @@ pub fn resolve_via_import(
             .get_nodes_in_file_shared(&file)
             .into_iter()
             .find(|n| n.kind == NodeKind::File)?;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: file_node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
     // C/C++ #include → file→file edge (import-resolver.ts:1132-1164).
     if matches!(reference.language, Language::C | Language::Cpp)
@@ -2011,12 +2079,12 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == sibling_path)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: sibling.id.clone(),
-                confidence: 0.92,
-                resolved_by: ResolvedBy::Import,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                sibling.id.clone(),
+                0.92,
+                ResolvedBy::Import,
+            ));
         }
         let resolved_path = resolve_import_path(
             &reference.reference_name,
@@ -2030,12 +2098,12 @@ pub fn resolve_via_import(
             .into_iter()
             .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)
         {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: file_node.id.clone(),
-                confidence: 0.9,
-                resolved_by: ResolvedBy::Import,
-            });
+            return Some(ResolvedRef::new(
+                reference.clone(),
+                file_node.id.clone(),
+                0.9,
+                ResolvedBy::Import,
+            ));
         }
         return None;
     }
@@ -2051,15 +2119,37 @@ pub fn resolve_via_import(
                 .into_iter()
                 .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)
             {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: file_node.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::Import,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    file_node.id.clone(),
+                    0.9,
+                    ResolvedBy::Import,
+                ));
             }
         }
         return None;
+    }
+
+    // A Nix path import names a file, the indexed one its path resolves to,
+    // or nothing: never a symbol by its name (upstream #1190).
+    if is_nix_path_import_ref(reference) {
+        let resolved_path = resolve_import_path(
+            &reference.reference_name,
+            &reference.file_path,
+            reference.language,
+            context,
+        )?;
+        let basename = pathutil::basename(&resolved_path);
+        let file_node = context
+            .get_nodes_by_name_shared(basename)
+            .into_iter()
+            .find(|n| n.kind == NodeKind::File && n.file_path == resolved_path)?;
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
 
     let imports = context.get_import_mappings(&reference.file_path, reference.language);
@@ -2121,7 +2211,8 @@ pub fn resolve_via_import(
         }
     }
 
-    // Whole-module / namespace imports → file→file edge (import-resolver.ts:1260-1269).
+    // Whole-module / namespace imports → file→file edge (import-resolver.ts:1260-1269),
+    // ArkTS's too (upstream #1186, `b635dd46` 1925-1929).
     if matches!(
         reference.language,
         Language::Python
@@ -2129,6 +2220,7 @@ pub fn resolve_via_import(
             | Language::Tsx
             | Language::JavaScript
             | Language::Jsx
+            | Language::ArkTs
     ) {
         if let Some(module_file) = resolve_module_import_to_file(reference, &imports, context) {
             return Some(module_file);
@@ -2292,12 +2384,12 @@ pub fn resolve_via_import(
                     } else {
                         target_node
                     };
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: resolved_target.id,
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Import,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        resolved_target.id,
+                        0.9,
+                        ResolvedBy::Import,
+                    ));
                 }
             }
         }
@@ -2350,12 +2442,12 @@ fn resolve_module_import_to_file(
                     .into_iter()
                     .find(|n| n.kind == NodeKind::File)
                 {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: file_node.id.clone(),
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Import,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        file_node.id.clone(),
+                        0.9,
+                        ResolvedBy::Import,
+                    ));
                 }
             }
         }
@@ -2372,12 +2464,12 @@ fn resolve_module_import_to_file(
                     .into_iter()
                     .find(|n| n.kind == NodeKind::File)
                 {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: file_node.id.clone(),
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Import,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        file_node.id.clone(),
+                        0.9,
+                        ResolvedBy::Import,
+                    ));
                 }
             }
         }
@@ -2420,12 +2512,12 @@ fn resolve_jvm_alias(
                 .into_iter()
                 .next()?,
         };
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target_node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        });
+        return Some(ResolvedRef::new(
+            reference.clone(),
+            target_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        ));
     }
     None
 }
@@ -2467,12 +2559,12 @@ fn resolve_java_imported_reference(
             }
             let fp = node.file_path.replace('\\', "/");
             if fp.ends_with(&fqn_path) || fp.ends_with(&format!("/{fqn_path}")) {
-                return Some(ResolvedRef {
-                    original: reference.clone(),
-                    target_node_id: node.id.clone(),
-                    confidence: 0.9,
-                    resolved_by: ResolvedBy::Import,
-                });
+                return Some(ResolvedRef::new(
+                    reference.clone(),
+                    node.id.clone(),
+                    0.9,
+                    ResolvedBy::Import,
+                ));
             }
         }
 
@@ -2487,12 +2579,12 @@ fn resolve_java_imported_reference(
                         }
                         let fp = node.file_path.replace('\\', "/");
                         if fp.ends_with(&owner_path) || fp.ends_with(&format!("/{owner_path}")) {
-                            return Some(ResolvedRef {
-                                original: reference.clone(),
-                                target_node_id: node.id.clone(),
-                                confidence: 0.9,
-                                resolved_by: ResolvedBy::Import,
-                            });
+                            return Some(ResolvedRef::new(
+                                reference.clone(),
+                                node.id.clone(),
+                                0.9,
+                                ResolvedBy::Import,
+                            ));
                         }
                     }
                 }
@@ -2555,7 +2647,7 @@ pub(crate) fn is_js_family_file(file_path: &str) -> bool {
 }
 
 /// Languages with ES import semantics (upstream `ESM_IMPORT_LANGUAGES`).
-fn is_esm_import_language(language: Language) -> bool {
+pub(crate) fn is_esm_import_language(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
@@ -2969,19 +3061,60 @@ fn resolve_imported_instance_member(
     let remainder = reference.reference_name.strip_prefix(&prefix)?;
     let member = remainder.split('.').next().filter(|s| !s.is_empty())?;
 
-    let source = context.read_file(&value.file_path)?;
-    let lines: Vec<&str> = source
+    // What the patterns read off the value's own declaration lines depends
+    // on the value alone: its file's facts remember it per value node, so a
+    // call through the value neither re-reads its file nor compiles the
+    // patterns for its name again (W7-24 cost, OD-B73).
+    let facts = context.source_facts(&value.file_path)?;
+    let declared = facts.value_declared_types(&value.id, |facts| declared_types_of(value, facts));
+    for (written, type_name) in declared.iter() {
+        // Several classes may share the name. The value's file says which
+        // one: the class it imports under that name, or else the one it
+        // declares (upstream #2644, OD-B57).
+        let declaring = is_esm_import_language(value.language).then(|| {
+            ts_imported_type_file(
+                written,
+                &value.file_path,
+                value.language,
+                reference,
+                context,
+            )
+            .unwrap_or_else(|| value.file_path.clone())
+        });
+        if let Some(resolved) = resolve_method_on_type(
+            type_name,
+            member,
+            reference,
+            context,
+            0.85,
+            ResolvedBy::InstanceMethod,
+            declaring.as_deref(),
+            0,
+        ) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+/// The `(written, normalized)` types the receiver-type patterns read, in
+/// their order, off the declaration lines of `value` in its file (`facts`):
+/// [`resolve_imported_instance_member`]'s candidates, each tried in turn.
+fn declared_types_of(value: &Node, facts: &SourceFacts) -> Vec<(String, String)> {
+    let lines: Vec<&str> = facts
+        .source()
         .split('\n')
         .map(|l| l.trim_end_matches('\r'))
         .collect();
     let start = (value.start_line.max(1) - 1) as usize;
     let end = (value.end_line.max(value.start_line) as usize).min(lines.len());
     if start >= end {
-        return None;
+        return Vec::new();
     }
     let decl_slice = lines[start..end].join("\n");
 
     let escaped = regex_escape(&value.name);
+    let mut declared = Vec::new();
     for (pattern, check) in local_receiver_type_patterns(value.language, &escaped) {
         let Some(captures) = pattern.captures(&decl_slice) else {
             continue;
@@ -2995,20 +3128,9 @@ fn resolve_imported_instance_member(
         let Some(type_name) = normalize_inferred_type_name(captured.as_str()) else {
             continue;
         };
-        if let Some(resolved) = resolve_method_on_type(
-            &type_name,
-            member,
-            reference,
-            context,
-            0.85,
-            ResolvedBy::InstanceMethod,
-            None,
-            0,
-        ) {
-            return Some(resolved);
-        }
+        declared.push((captured.as_str().to_string(), type_name));
     }
-    None
+    declared
 }
 
 fn is_static_member_container(kind: NodeKind) -> bool {
@@ -3122,12 +3244,7 @@ fn find_go_package_member(
                 && node.is_exported
                 && crate::go_packages::package_dir_of(&node.file_path) == pkg_dir
         })
-        .map(|node| ResolvedRef {
-            original: reference.clone(),
-            target_node_id: node.id.clone(),
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Import,
-        })
+        .map(|node| ResolvedRef::new(reference.clone(), node.id.clone(), 0.9, ResolvedBy::Import))
 }
 
 #[derive(Default)]
@@ -3243,12 +3360,12 @@ fn lookup_python_module_member(
 
     PythonModuleMemberLookup {
         claimed: true,
-        resolved: Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: target.id.clone(),
-            confidence: 0.85,
-            resolved_by: ResolvedBy::Import,
-        }),
+        resolved: Some(ResolvedRef::new(
+            reference.clone(),
+            target.id.clone(),
+            0.85,
+            ResolvedBy::Import,
+        )),
     }
 }
 
@@ -3345,12 +3462,12 @@ fn resolve_python_from_import_member(
     if targets.len() != 1 {
         return None;
     }
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: targets[0].id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        targets[0].id.clone(),
+        0.9,
+        ResolvedBy::Import,
+    ))
 }
 
 /// Python absolute dotted module import `import a.b.c` → its file (the Django
@@ -3374,12 +3491,12 @@ fn resolve_python_absolute_module(
                 .find(|n| n.kind == NodeKind::File)
                 .map(|n| n.id.clone())
         })?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: hit_id,
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        hit_id,
+        0.9,
+        ResolvedBy::Import,
+    ))
 }
 
 /// How many modules deep a Python re-export walk goes (upstream #2247).
@@ -3673,16 +3790,16 @@ fn resolve_rust_path_reference(
                         | NodeKind::Interface
                 )
         })?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::Import,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.9,
+        ResolvedBy::Import,
+    ))
 }
 
-/// The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file.
-/// Paths are project-relative POSIX. Ports `rustCrateRootDir`.
+/// The crate-root directory (holds an indexed `lib.rs`/`main.rs`), walking up
+/// from a file. Paths are project-relative POSIX. Ports `rustCrateRootDir`.
 fn rust_crate_root_dir(from_file: &str, context: &dyn ResolutionContext) -> Option<String> {
     let mut dir = pathutil::dirname(from_file);
     for _ in 0..64 {
@@ -3696,7 +3813,7 @@ fn rust_crate_root_dir(from_file: &str, context: &dyn ResolutionContext) -> Opti
         } else {
             format!("{dir}/main.rs")
         };
-        if context.file_exists(&lib) || context.file_exists(&main) {
+        if context.is_indexed_file(&lib) || context.is_indexed_file(&main) {
             return Some(dir);
         }
         if dir.is_empty() {
@@ -3723,7 +3840,8 @@ fn rust_self_module_dir(from_file: &str) -> String {
     }
 }
 
-/// Walk module segments to the leaf module's file. Ports `resolveRustModuleFile`.
+/// Walk module segments to the leaf module's file, each an indexed
+/// `{segment}.rs` or else `{segment}/mod.rs`. Ports `resolveRustModuleFile`.
 fn resolve_rust_module_file(
     segments: &[&str],
     from_file: &str,
@@ -3749,9 +3867,9 @@ fn resolve_rust_module_file(
             } else {
                 format!("{dir}/{seg}/mod.rs")
             };
-            if context.file_exists(&as_file) {
+            if context.is_indexed_file(&as_file) {
                 target_file = Some(as_file);
-            } else if context.file_exists(&as_mod) {
+            } else if context.is_indexed_file(&as_mod) {
                 target_file = Some(as_mod);
             } else {
                 return None;
@@ -3786,7 +3904,18 @@ fn resolve_rust_module_file(
 }
 
 /// Lua / Luau `require("a.b.c")` dotted module path → module file. Ports
-/// `resolveLuaRequire`.
+/// `resolveLuaRequire`: the dots become slashes, and the first of `p.lua`,
+/// `p.luau`, `p/init.lua`, `p/init.luau` an indexed file ends with wins, the
+/// file sharing the longest path prefix with the requiring one, unless that
+/// is the requiring file itself.
+///
+/// A project's custom Lua module settings (#1617, W9-02) add two rules of
+/// this port's own ahead of it, for a loader call and a `require` alike:
+/// with any setting, the literal as written is the first candidate, a Lua
+/// or Luau file only (`Require("Script/Foo.lua")`, OD-B83); and each module
+/// root, in the order written, is looked in for each candidate in turn
+/// before the search over the whole project. A project without settings
+/// resolves exactly as before.
 pub(crate) fn resolve_lua_require(
     reference: &RefView,
     context: &dyn ResolutionContext,
@@ -3800,20 +3929,54 @@ pub(crate) fn resolve_lua_require(
     } else {
         name.clone()
     };
+    let loaders = context.lua_loaders();
     let suffixes = [
         format!("{base}.lua"),
         format!("{base}.luau"),
         format!("{base}/init.lua"),
         format!("{base}/init.luau"),
     ];
+    // Each candidate, and whether it is the literal as written, which only
+    // a Lua or Luau file answers.
+    let literal = loaders.is_configured().then_some((name.as_str(), true));
+    let candidates: Vec<(&str, bool)> = literal
+        .into_iter()
+        .chain(suffixes.iter().map(|suffix| (suffix.as_str(), false)))
+        .collect();
+    let resolved = |file_node: &Node| {
+        ResolvedRef::new(
+            reference.clone(),
+            file_node.id.clone(),
+            0.9,
+            ResolvedBy::Import,
+        )
+    };
+    for root in loaders.module_roots() {
+        for &(candidate, lua_only) in &candidates {
+            let path = if root.is_empty() {
+                candidate.to_string()
+            } else {
+                format!("{root}/{candidate}")
+            };
+            if path == reference.file_path || !context.is_indexed_file(&path) {
+                continue;
+            }
+            if let Some(file_node) = lua_module_file_node(&path, lua_only, context) {
+                return Some(resolved(&file_node));
+            }
+        }
+    }
     let shared = |a: &str, b: &str| -> usize {
         a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
     };
-    for suffix in &suffixes {
+    for &(candidate, lua_only) in &candidates {
         // The files the suffix names, read once per pass (W5-09).
-        let mut matches: Vec<String> = crate::lua_scope::lua_require_matches(suffix, context)
+        let mut matches: Vec<String> = crate::lua_scope::lua_require_matches(candidate, context)
             .as_ref()
             .clone();
+        if lua_only {
+            matches.retain(|path| lua_module_file_node(path, true, context).is_some());
+        }
         if matches.is_empty() {
             continue;
         }
@@ -3822,20 +3985,26 @@ pub(crate) fn resolve_lua_require(
         if best == &reference.file_path {
             continue;
         }
-        if let Some(file_node) = context
-            .get_nodes_in_file_shared(best)
-            .into_iter()
-            .find(|n| n.kind == NodeKind::File)
-        {
-            return Some(ResolvedRef {
-                original: reference.clone(),
-                target_node_id: file_node.id.clone(),
-                confidence: 0.9,
-                resolved_by: ResolvedBy::Import,
-            });
+        if let Some(file_node) = lua_module_file_node(best, false, context) {
+            return Some(resolved(&file_node));
         }
     }
     None
+}
+
+/// The file node of `path`, of a Lua or Luau file when `lua_only`.
+fn lua_module_file_node(
+    path: &str,
+    lua_only: bool,
+    context: &dyn ResolutionContext,
+) -> Option<std::sync::Arc<Node>> {
+    context
+        .get_nodes_in_file_shared(path)
+        .into_iter()
+        .find(|node| {
+            node.kind == NodeKind::File
+                && (!lua_only || matches!(node.language, Language::Lua | Language::Luau))
+        })
 }
 
 #[cfg(test)]
@@ -3859,11 +4028,16 @@ mod tests {
         import_mappings: BTreeMap<String, Vec<ImportMapping>>,
         re_exports: BTreeMap<String, Vec<ReExport>>,
         project_aliases: Option<AliasMap>,
+        /// A directory's nearest aliases, by the directory: a file takes the
+        /// longest one its path is under.
+        nearest_aliases: BTreeMap<String, AliasMap>,
         workspace_packages: Option<WorkspacePackages>,
         go_module: Option<GoModule>,
         cpp_include_dirs: Vec<String>,
         /// Files on disk that the index does not hold (a `node_modules` file).
         disk_only_files: BTreeSet<String>,
+        /// The project's custom Lua module settings (W9-02).
+        lua_loaders: codegraph_extract::LuaLoaders,
     }
 
     impl ResolutionContext for TestContext {
@@ -3926,6 +4100,13 @@ mod tests {
         fn get_project_aliases(&self) -> Option<AliasMap> {
             self.project_aliases.clone()
         }
+        fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+            self.nearest_aliases
+                .iter()
+                .filter(|(dir, _)| from_file.starts_with(&format!("{dir}/")))
+                .max_by_key(|(dir, _)| dir.len())
+                .map(|(_, aliases)| aliases.clone())
+        }
         fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
             self.workspace_packages.clone()
         }
@@ -3937,6 +4118,9 @@ mod tests {
         }
         fn get_cpp_include_dirs(&self) -> Vec<String> {
             self.cpp_include_dirs.clone()
+        }
+        fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+            &self.lua_loaders
         }
     }
 
@@ -5088,9 +5272,15 @@ export default defaultTarget;
 "#;
 
         for language in Language::ALL {
+            // ArkTS reads re-exports as TypeScript does (W7-24a1, upstream
+            // #1186, `b635dd46` 1443).
             if matches!(
                 language,
-                Language::TypeScript | Language::JavaScript | Language::Tsx | Language::Jsx
+                Language::TypeScript
+                    | Language::JavaScript
+                    | Language::Tsx
+                    | Language::Jsx
+                    | Language::ArkTs
             ) {
                 continue;
             }
@@ -5151,7 +5341,10 @@ export default defaultTarget;
         let mut by_name = BTreeMap::new();
         by_name.insert("@scope/ui".to_string(), "packages/ui".to_string());
         let ctx = TestContext {
-            workspace_packages: Some(WorkspacePackages { by_name }),
+            workspace_packages: Some(WorkspacePackages {
+                by_name,
+                entry_by_name: BTreeMap::new(),
+            }),
             ..Default::default()
         };
         assert!(!is_external_import(
@@ -5446,10 +5639,12 @@ export default defaultTarget;
             );
         }
 
+        // ArkTS substitutes as TypeScript does (W7-24a1, upstream
+        // `EMITTED_SPECIFIER_LANGUAGES`, `b635dd46` 615-617).
         for language in Language::ALL {
             if !matches!(
                 language,
-                Language::TypeScript | Language::Tsx | Language::Python
+                Language::TypeScript | Language::Tsx | Language::ArkTs | Language::Python
             ) {
                 assert_eq!(
                     resolve_import_path("./foo.js", "src/a.ts", language, &ctx),
@@ -5457,7 +5652,10 @@ export default defaultTarget;
                     "relative TS substitution leaked into {language:?}"
                 );
             }
-            if !matches!(language, Language::TypeScript | Language::Tsx) {
+            if !matches!(
+                language,
+                Language::TypeScript | Language::Tsx | Language::ArkTs
+            ) {
                 assert_eq!(
                     resolve_import_path("@/foo.js", "src/a.ts", language, &ctx),
                     None,
@@ -5551,6 +5749,47 @@ export default defaultTarget;
         );
     }
 
+    /// W7-09a (upstream #2165): an import tries the aliases of the config
+    /// nearest its file first, so each app of a monorepo resolves its own
+    /// `@/*`; the root's answer the rest, and an alias the nearest config
+    /// does not map.
+    #[test]
+    fn an_import_tries_the_nearest_configs_aliases_first() {
+        let existing: BTreeSet<String> =
+            ["src/thing.ts", "apps/web/src/thing.ts", "src/only-root.ts"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        let map = |base: &str, replacement: &str| AliasMap {
+            base_url: base.to_string(),
+            patterns: vec![alias("@/", true, replacement)],
+        };
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: existing,
+            project_aliases: Some(map("/proj", "src/*")),
+            nearest_aliases: [("apps/web".to_string(), map("/proj/apps/web", "src/*"))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let resolve =
+            |spec: &str, from: &str| resolve_import_path(spec, from, Language::TypeScript, &ctx);
+        assert_eq!(
+            resolve("@/thing", "apps/web/src/pages/a.ts"),
+            Some("apps/web/src/thing.ts".to_string())
+        );
+        assert_eq!(
+            resolve("@/thing", "lib/b.ts"),
+            Some("src/thing.ts".to_string())
+        );
+        // The nearest config maps `@/only-root` to no file: the root's does.
+        assert_eq!(
+            resolve("@/only-root", "apps/web/src/pages/a.ts"),
+            Some("src/only-root.ts".to_string())
+        );
+    }
+
     #[test]
     fn resolve_import_path_workspace_package() {
         let mut existing = BTreeSet::new();
@@ -5560,7 +5799,10 @@ export default defaultTarget;
         let ctx = TestContext {
             project_root: "/proj".to_string(),
             existing_files: existing,
-            workspace_packages: Some(WorkspacePackages { by_name }),
+            workspace_packages: Some(WorkspacePackages {
+                by_name,
+                entry_by_name: BTreeMap::new(),
+            }),
             ..Default::default()
         };
         assert_eq!(
@@ -6498,6 +6740,198 @@ export default defaultTarget;
         assert_eq!(resolved.target_node_id, "file:game/lib/mod.lua");
     }
 
+    /// A context over `files` (each a Lua file unless its extension says
+    /// otherwise) under the Lua settings `roots` and `loaders` (W9-02).
+    fn lua_context(files: &[&str], loaders: &[&str], roots: &[&str]) -> TestContext {
+        TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: files.iter().map(|file| file.to_string()).collect(),
+            nodes: files
+                .iter()
+                .map(|file| {
+                    let language = if file.ends_with(".luau") {
+                        Language::Luau
+                    } else if file.ends_with(".lua") {
+                        Language::Lua
+                    } else if file.ends_with(".xml") {
+                        Language::Xml
+                    } else {
+                        Language::Unknown
+                    };
+                    file_node(file, language)
+                })
+                .collect(),
+            lua_loaders: codegraph_extract::LuaLoaders::merge(
+                Some(&serde_json::json!({"loader_functions": loaders, "module_roots": roots})),
+                None,
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn lua_target(ctx: &TestContext, name: &str, from: &str) -> Option<String> {
+        resolve_lua_require(
+            &reference(name, EdgeKind::Imports, from, Language::Lua),
+            ctx,
+        )
+        .map(|resolved| resolved.target_node_id)
+    }
+
+    /// W9-02: a module root is looked in before the project-wide search,
+    /// which would take the file nearer the requiring one.
+    #[test]
+    fn resolve_lua_require_prefers_a_module_root() {
+        let files = ["game/util.lua", "Script/util.lua", "game/main.lua"];
+        let plain = lua_context(&files, &[], &[]);
+        assert_eq!(
+            lua_target(&plain, "util", "game/main.lua").as_deref(),
+            Some("file:game/util.lua")
+        );
+        let rooted = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&rooted, "util", "game/main.lua").as_deref(),
+            Some("file:Script/util.lua")
+        );
+        // `.` is the project root.
+        let files = ["util.lua", "game/util.lua", "game/main.lua"];
+        let rooted = lua_context(&files, &[], &["."]);
+        assert_eq!(
+            lua_target(&rooted, "util", "game/main.lua").as_deref(),
+            Some("file:util.lua")
+        );
+    }
+
+    /// W9-02: the roots are tried in the order written, each candidate in
+    /// turn within a root.
+    #[test]
+    fn resolve_lua_require_tries_roots_in_their_order() {
+        let files = [
+            "A/ui/button.lua",
+            "B/ui/button.lua",
+            "B/ui/button/init.lua",
+            "main.lua",
+        ];
+        for (roots, expected) in [
+            (["A", "B"], "file:A/ui/button.lua"),
+            (["B", "A"], "file:B/ui/button.lua"),
+        ] {
+            let ctx = lua_context(&files, &[], &roots);
+            assert_eq!(
+                lua_target(&ctx, "ui.button", "main.lua").as_deref(),
+                Some(expected),
+                "{roots:?}"
+            );
+        }
+        // Within a root, `p.lua` comes before `p/init.lua`; a later root's
+        // `p.lua` does not come before an earlier root's `p/init.lua`.
+        let files = ["A/ui/button/init.lua", "B/ui/button.lua", "main.lua"];
+        let ctx = lua_context(&files, &[], &["A", "B"]);
+        assert_eq!(
+            lua_target(&ctx, "ui.button", "main.lua").as_deref(),
+            Some("file:A/ui/button/init.lua")
+        );
+    }
+
+    /// W9-02: when no root holds the module, the project-wide search
+    /// resolves it as before.
+    #[test]
+    fn resolve_lua_require_falls_back_when_no_root_holds_the_module() {
+        let files = ["lib/util.lua", "Script/other.lua", "main.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "util", "main.lua").as_deref(),
+            Some("file:lib/util.lua")
+        );
+        assert_eq!(lua_target(&ctx, "missing", "main.lua"), None);
+    }
+
+    /// W9-02: under a root, the requiring file itself is skipped for the
+    /// next candidate, as the project-wide search skips it.
+    #[test]
+    fn resolve_lua_require_skips_its_own_file_under_a_root() {
+        let files = ["Script/util.lua", "Script/util/init.lua", "lib/util.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "util", "Script/util.lua").as_deref(),
+            Some("file:Script/util/init.lua")
+        );
+        let files = ["Script/util.lua", "lib/util.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "util", "Script/util.lua").as_deref(),
+            None,
+            "the project-wide search skips its own file too, as upstream's does"
+        );
+    }
+
+    /// OD-B83: a literal is read as the file path it is written as only in a
+    /// project with Lua settings, before the dotted candidates; without
+    /// them `foo.lua` stays the module `foo/lua`.
+    #[test]
+    fn resolve_lua_require_reads_a_file_literal_only_with_settings() {
+        let files = [
+            "Script/Activity/ActivityMgrC.lua",
+            "foo.lua",
+            "foo/lua.lua",
+            "main.lua",
+        ];
+        let plain = lua_context(&files, &[], &[]);
+        assert_eq!(
+            lua_target(&plain, "Script/Activity/ActivityMgrC.lua", "main.lua"),
+            None
+        );
+        assert_eq!(
+            lua_target(&plain, "foo.lua", "main.lua").as_deref(),
+            Some("file:foo/lua.lua")
+        );
+        for configured in [
+            lua_context(&files, &["Require"], &[]),
+            lua_context(&files, &[], &["Lib"]),
+        ] {
+            assert_eq!(
+                lua_target(&configured, "Script/Activity/ActivityMgrC.lua", "main.lua").as_deref(),
+                Some("file:Script/Activity/ActivityMgrC.lua")
+            );
+            assert_eq!(
+                lua_target(&configured, "foo.lua", "main.lua").as_deref(),
+                Some("file:foo.lua")
+            );
+        }
+        // Under a root, the literal too, before the dotted candidates.
+        let files = ["Script/Foo.lua", "Script/Foo/lua.lua", "main.lua"];
+        let ctx = lua_context(&files, &[], &["Script"]);
+        assert_eq!(
+            lua_target(&ctx, "Foo.lua", "main.lua").as_deref(),
+            Some("file:Script/Foo.lua")
+        );
+    }
+
+    /// OD-B83: only a Lua or Luau file answers a literal read as written; a
+    /// file of another language is no module.
+    #[test]
+    fn resolve_lua_require_takes_a_file_literal_only_when_it_is_lua() {
+        let files = [
+            "Script/Foo.xml",
+            "Script/Bar.luau",
+            "lib/Script/Foo.xml",
+            "main.lua",
+        ];
+        let ctx = lua_context(&files, &["Require"], &["."]);
+        assert_eq!(lua_target(&ctx, "Script/Foo.xml", "main.lua"), None);
+        assert_eq!(
+            lua_target(&ctx, "Script/Bar.luau", "main.lua").as_deref(),
+            Some("file:Script/Bar.luau")
+        );
+        // A non-Lua match does not hide a Lua one the search finds.
+        let files = ["a/Foo.cfg", "b/Foo.cfg", "main.lua"];
+        let mut ctx = lua_context(&files, &["Require"], &[]);
+        ctx.nodes[1].language = Language::Lua;
+        assert_eq!(
+            lua_target(&ctx, "Foo.cfg", "main.lua").as_deref(),
+            Some("file:b/Foo.cfg")
+        );
+    }
+
     #[test]
     fn resolve_java_imported_reference_qualified_member() {
         let mut import_mappings = BTreeMap::new();
@@ -7085,6 +7519,213 @@ export default defaultTarget;
         assert!(resolve_rust_module_file(&[], "src/app.rs", &ctx).is_none());
     }
 
+    // ---- Import candidates are the indexed files (W7-27) ---------------------
+
+    /// A context whose `indexed` files are the index's and whose `disk` files
+    /// exist only on disk: `file_exists` answers for both, the trait's
+    /// `is_indexed_file` for the first alone.
+    fn indexed_and_on_disk(indexed: &[&str], disk: &[&str]) -> TestContext {
+        TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: indexed.iter().map(|path| path.to_string()).collect(),
+            disk_only_files: disk.iter().map(|path| path.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The `.ts` a TypeScript `.js` specifier stands for is a candidate only
+    /// when the index holds it.
+    #[test]
+    fn a_typescript_source_for_a_js_specifier_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| {
+            resolve_import_path("./foo.js", "src/a.ts", Language::TypeScript, ctx)
+        };
+        let ctx = indexed_and_on_disk(&["src/foo.js"], &["src/foo.ts"]);
+        assert!(ctx.file_exists("src/foo.ts"));
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo.js"));
+        let ctx = indexed_and_on_disk(&["src/foo.js", "src/foo.ts"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo.ts"));
+    }
+
+    /// A specifier's extension candidates are the indexed files: `./foo.ts`
+    /// only on disk gives way to the indexed `./foo/index.ts`.
+    #[test]
+    fn an_extension_candidate_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path("./foo", "src/a.ts", Language::TypeScript, ctx);
+        let ctx = indexed_and_on_disk(&["src/foo/index.ts"], &["src/foo.ts"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo/index.ts"));
+        let ctx = indexed_and_on_disk(&["src/foo/index.ts", "src/foo.ts"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("src/foo.ts"));
+    }
+
+    /// The path as written is a candidate only when the index holds it: a
+    /// JSON file the index does not hold names no file.
+    #[test]
+    fn the_written_path_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| {
+            resolve_import_path("./data.json", "src/a.ts", Language::TypeScript, ctx)
+        };
+        assert_eq!(resolve(&indexed_and_on_disk(&[], &["src/data.json"])), None);
+        assert_eq!(
+            resolve(&indexed_and_on_disk(&["src/data.json"], &[])).as_deref(),
+            Some("src/data.json")
+        );
+    }
+
+    /// A Python relative import's module and package candidates are the
+    /// indexed files: `pkg/util.py` only on disk gives way to the indexed
+    /// package `pkg/util/__init__.py`.
+    #[test]
+    fn a_python_relative_module_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path(".util", "pkg/main.py", Language::Python, ctx);
+        let ctx = indexed_and_on_disk(&["pkg/util/__init__.py"], &["pkg/util.py"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("pkg/util/__init__.py"));
+        let ctx = indexed_and_on_disk(&["pkg/util/__init__.py", "pkg/util.py"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("pkg/util.py"));
+    }
+
+    /// A Python relative import's bare path (a namespace package's
+    /// directory) is a candidate only when the index holds that path.
+    #[test]
+    fn a_python_relative_bare_path_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path(".sub", "pkg/app.py", Language::Python, ctx);
+        assert_eq!(resolve(&indexed_and_on_disk(&[], &["pkg/sub"])), None);
+        assert_eq!(
+            resolve(&indexed_and_on_disk(&["pkg/sub"], &[])).as_deref(),
+            Some("pkg/sub")
+        );
+    }
+
+    /// `require('..')` up to the project root takes the first `index` file
+    /// the index holds there.
+    #[test]
+    fn a_root_index_only_on_disk_is_no_candidate() {
+        let resolve =
+            |ctx: &TestContext| resolve_import_path("..", "lib/a.js", Language::JavaScript, ctx);
+        let ctx = indexed_and_on_disk(&["index.jsx"], &["index.js"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("index.jsx"));
+        let ctx = indexed_and_on_disk(&["index.jsx", "index.js"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("index.js"));
+    }
+
+    /// An include directory's candidate with an inferred extension is one
+    /// only when the index holds it: the next directory's header answers.
+    #[test]
+    fn an_include_directory_header_only_on_disk_is_no_candidate() {
+        let resolve = |indexed: &[&str], disk: &[&str]| {
+            let ctx = TestContext {
+                cpp_include_dirs: vec!["inc1".to_string(), "inc2".to_string()],
+                ..indexed_and_on_disk(indexed, disk)
+            };
+            resolve_import_path("util", "src/a.c", Language::C, &ctx)
+        };
+        assert_eq!(
+            resolve(&["inc2/util.h"], &["inc1/util.h"]).as_deref(),
+            Some("inc2/util.h")
+        );
+        assert_eq!(
+            resolve(&["inc2/util.h", "inc1/util.h"], &[]).as_deref(),
+            Some("inc1/util.h")
+        );
+    }
+
+    /// An include directory's candidate as written is one only when the
+    /// index holds it: the next directory's header answers.
+    #[test]
+    fn an_include_directory_path_only_on_disk_is_no_candidate() {
+        let resolve = |indexed: &[&str], disk: &[&str]| {
+            let ctx = TestContext {
+                cpp_include_dirs: vec!["inc1".to_string(), "inc2".to_string()],
+                ..indexed_and_on_disk(indexed, disk)
+            };
+            resolve_import_path("util.h", "src/a.c", Language::C, &ctx)
+        };
+        assert_eq!(
+            resolve(&["inc2/util.h"], &["inc1/util.h"]).as_deref(),
+            Some("inc2/util.h")
+        );
+        assert_eq!(
+            resolve(&["inc2/util.h", "inc1/util.h"], &[]).as_deref(),
+            Some("inc1/util.h")
+        );
+    }
+
+    /// A PHP include's path as written is a candidate only when the index
+    /// holds it: `inc/db.inc` only on disk gives way to `inc/db.inc.php`.
+    #[test]
+    fn a_php_include_path_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| resolve_php_include_path("inc/db.inc", "index.php", ctx);
+        let ctx = indexed_and_on_disk(&["inc/db.inc.php"], &["inc/db.inc"]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("inc/db.inc.php"));
+        let ctx = indexed_and_on_disk(&["inc/db.inc.php", "inc/db.inc"], &[]);
+        assert_eq!(resolve(&ctx).as_deref(), Some("inc/db.inc"));
+    }
+
+    /// A PHP include's `.php` candidate is one only when the index holds it.
+    #[test]
+    fn a_php_include_with_its_extension_only_on_disk_is_no_candidate() {
+        let resolve = |ctx: &TestContext| resolve_php_include_path("inc/db", "index.php", ctx);
+        assert_eq!(resolve(&indexed_and_on_disk(&[], &["inc/db.php"])), None);
+        assert_eq!(
+            resolve(&indexed_and_on_disk(&["inc/db.php"], &[])).as_deref(),
+            Some("inc/db.php")
+        );
+    }
+
+    /// A crate root is a `lib.rs` the index holds.
+    #[test]
+    fn a_crate_root_lib_only_on_disk_is_no_candidate() {
+        let root = |ctx: &TestContext| rust_crate_root_dir("src/deep/mod.rs", ctx);
+        assert_eq!(root(&indexed_and_on_disk(&[], &["src/lib.rs"])), None);
+        assert_eq!(
+            root(&indexed_and_on_disk(&["src/lib.rs"], &[])).as_deref(),
+            Some("src")
+        );
+    }
+
+    /// A crate root is a `main.rs` the index holds.
+    #[test]
+    fn a_crate_root_main_only_on_disk_is_no_candidate() {
+        let root = |ctx: &TestContext| rust_crate_root_dir("src/deep/mod.rs", ctx);
+        assert_eq!(root(&indexed_and_on_disk(&[], &["src/main.rs"])), None);
+        assert_eq!(
+            root(&indexed_and_on_disk(&["src/main.rs"], &[])).as_deref(),
+            Some("src")
+        );
+    }
+
+    /// A module's `{name}.rs` is a candidate only when the index holds it:
+    /// `src/util.rs` only on disk gives way to the indexed
+    /// `src/util/mod.rs`.
+    #[test]
+    fn a_rust_module_file_only_on_disk_is_no_candidate() {
+        let module =
+            |ctx: &TestContext| resolve_rust_module_file(&["self", "util"], "src/lib.rs", ctx);
+        let ctx = indexed_and_on_disk(&["src/util/mod.rs"], &["src/util.rs"]);
+        assert_eq!(module(&ctx).as_deref(), Some("src/util/mod.rs"));
+        let ctx = indexed_and_on_disk(&["src/util/mod.rs", "src/util.rs"], &[]);
+        assert_eq!(module(&ctx).as_deref(), Some("src/util.rs"));
+    }
+
+    /// A module's `{name}/mod.rs` is a candidate only when the index holds
+    /// it.
+    #[test]
+    fn a_rust_module_directory_file_only_on_disk_is_no_candidate() {
+        let module =
+            |ctx: &TestContext| resolve_rust_module_file(&["self", "util"], "src/lib.rs", ctx);
+        assert_eq!(
+            module(&indexed_and_on_disk(&[], &["src/util/mod.rs"])),
+            None
+        );
+        assert_eq!(
+            module(&indexed_and_on_disk(&["src/util/mod.rs"], &[])).as_deref(),
+            Some("src/util/mod.rs")
+        );
+    }
+
     // ---- Imported-singleton instance-method calls (#1292 / upstream 2ec877b) --
 
     /// The exporting file's source. `reproStore` is the singleton constant on
@@ -7237,5 +7878,170 @@ export default defaultTarget;
             resolved.target_node_id, "constant:reproStore",
             "the line-6 local must not type the line-9 constant"
         );
+    }
+
+    /// W7-24a1: an ArkTS module tries upstream's ArkTS extensions
+    /// (`import-resolver.ts`, `b635dd46` line 35): `.ets` components first,
+    /// then plain `.ts` logic modules, and ohpm's `Index.ets` entry.
+    #[test]
+    fn w724a1_arkts_resolves_with_upstreams_extensions() {
+        assert_eq!(
+            extension_resolution(Language::ArkTs),
+            [
+                ".ets",
+                ".ts",
+                ".d.ts",
+                ".js",
+                "/Index.ets",
+                "/index.ets",
+                "/index.ts",
+                "/index.js",
+            ]
+        );
+        let ctx = TestContext {
+            existing_files: [
+                "pages/Home.ets",
+                "pages/util.ets",
+                "pages/model.ts",
+                "common/Index.ets",
+                "lib/emit.ts",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            ..TestContext::default()
+        };
+        let resolve =
+            |spec: &str| resolve_import_path(spec, "pages/Home.ets", Language::ArkTs, &ctx);
+        assert_eq!(resolve("./util").as_deref(), Some("pages/util.ets"));
+        assert_eq!(resolve("./model").as_deref(), Some("pages/model.ts"));
+        assert_eq!(resolve("../common").as_deref(), Some("common/Index.ets"));
+        // An emitted `.js` specifier names its TypeScript source, as for
+        // TypeScript (`EMITTED_SPECIFIER_LANGUAGES`, `b635dd46` 615-617).
+        assert_eq!(resolve("../lib/emit.js").as_deref(), Some("lib/emit.ts"));
+    }
+
+    /// W7-24a1: ArkTS reads its import statements and its re-exports the way
+    /// TypeScript does (`extractImportMappings` and `extractReExports`,
+    /// `b635dd46` 983 and 1443, both list arkts).
+    #[test]
+    fn w724a1_arkts_import_mappings_and_re_exports_read_like_typescript() {
+        let module =
+            "import { CartRepository } from \"data\";\nimport Def, { a as b } from './x';\n";
+        let mappings = extract_import_mappings(module, Language::ArkTs);
+        assert!(!mappings.is_empty(), "no ArkTS import mappings");
+        assert_eq!(
+            mappings,
+            extract_import_mappings(module, Language::TypeScript)
+        );
+        let barrel = "export { CartRepository } from './src/main/ets/CartRepository';\nexport * from './more';\n";
+        let re_exports = extract_re_exports(barrel, Language::ArkTs);
+        assert!(!re_exports.is_empty(), "no ArkTS re-exports");
+        assert_eq!(re_exports, extract_re_exports(barrel, Language::TypeScript));
+    }
+
+    /// W7-24a1: an ArkTS namespace import links the importing file to the
+    /// module file, as TypeScript's does (upstream #1186, `b635dd46`
+    /// 1925-1929).
+    #[test]
+    fn w724a1_arkts_namespace_import_links_the_module_file() {
+        let mut import_mappings = BTreeMap::new();
+        import_mappings.insert(
+            "src/a.ets".to_string(),
+            vec![ImportMapping {
+                local_name: "ns".to_string(),
+                exported_name: "*".to_string(),
+                source: "./ns".to_string(),
+                is_default: false,
+                is_namespace: true,
+            }],
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from(["src/ns.ets".to_string()]),
+            import_mappings,
+            nodes: vec![file_node("src/ns.ets", Language::ArkTs)],
+            ..Default::default()
+        };
+        let r = reference("ns", EdgeKind::Imports, "src/a.ets", Language::ArkTs);
+        let resolved = resolve_via_import(&r, &ctx).expect("resolves");
+        assert_eq!(resolved.target_node_id, "file:src/ns.ets");
+    }
+
+    /// W7-24b: a Nix path names a file, or a directory by its
+    /// `default.nix` (upstream `EXTENSION_RESOLUTION.nix`, #1190).
+    #[test]
+    fn w724b_nix_resolves_files_and_directories() {
+        assert_eq!(
+            extension_resolution(Language::Nix),
+            [".nix", "/default.nix"]
+        );
+        let ctx = TestContext {
+            project_root: "/proj".to_string(),
+            existing_files: BTreeSet::from([
+                "default.nix".to_string(),
+                "foo.nix".to_string(),
+                "a/foo.nix".to_string(),
+                "lib/util/default.nix".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let resolve = |spec: &str, from: &str| resolve_import_path(spec, from, Language::Nix, &ctx);
+        assert_eq!(
+            resolve("./foo.nix", "a/default.nix").as_deref(),
+            Some("a/foo.nix")
+        );
+        assert_eq!(
+            resolve("../foo.nix", "a/default.nix").as_deref(),
+            Some("foo.nix")
+        );
+        assert_eq!(
+            resolve("./lib/util", "default.nix").as_deref(),
+            Some("lib/util/default.nix")
+        );
+        assert_eq!(resolve("./missing.nix", "default.nix"), None);
+    }
+
+    /// W7-24b: only a static relative path is a Nix path import (upstream
+    /// `isNixPathImportRef`): never a channel, an attribute, a variable, an
+    /// interpolation or another language's import.
+    #[test]
+    fn w724b_nix_path_import_refs_are_static_relative_paths() {
+        let r = |name: &str, kind: EdgeKind, language: Language| {
+            reference(name, kind, "a.nix", language)
+        };
+        assert!(is_nix_path_import_ref(&r(
+            "./x.nix",
+            EdgeKind::Imports,
+            Language::Nix
+        )));
+        assert!(is_nix_path_import_ref(&r(
+            "../lib",
+            EdgeKind::Imports,
+            Language::Nix
+        )));
+        for name in [
+            "<nixpkgs>",
+            "sources.nixpkgs",
+            "selectedPath",
+            "./x${y}.nix",
+            "./a b.nix",
+            "/abs.nix",
+        ] {
+            assert!(
+                !is_nix_path_import_ref(&r(name, EdgeKind::Imports, Language::Nix)),
+                "{name}"
+            );
+        }
+        assert!(!is_nix_path_import_ref(&r(
+            "./x.nix",
+            EdgeKind::Calls,
+            Language::Nix
+        )));
+        assert!(!is_nix_path_import_ref(&r(
+            "./x.nix",
+            EdgeKind::Imports,
+            Language::Python
+        )));
     }
 }

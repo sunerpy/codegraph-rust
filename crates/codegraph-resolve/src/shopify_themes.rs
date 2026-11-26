@@ -53,10 +53,12 @@ pub(crate) fn match_shopify_theme_file(
         .find(|node| node.kind == NodeKind::File && node.file_path == target);
     // The confidence the path matcher gives the same link: an exact path for
     // a theme at the project root, a path tail for one in a folder.
-    Some(found.map(|file| ResolvedRef {
-        original: reference.clone(),
-        target_node_id: file.id.clone(),
-        confidence: if theme.is_empty() { 0.95 } else { 0.85 },
-        resolved_by: ResolvedBy::FilePath,
+    Some(found.map(|file| {
+        ResolvedRef::new(
+            reference.clone(),
+            file.id.clone(),
+            if theme.is_empty() { 0.95 } else { 0.85 },
+            ResolvedBy::FilePath,
+        )
     }))
 }

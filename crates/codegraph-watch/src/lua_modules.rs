@@ -27,6 +27,17 @@
 //! The rows are written last, with the other rows. An index without the
 //! marker at [`VERSION`], or with a row it cannot read, re-resolves every Lua
 //! file once and rebuilds the rows.
+//!
+//! The project's custom Lua module loaders and module roots (#1617,
+//! [`codegraph_extract::lua_loaders`]) are recorded beside them under
+//! [`LOADERS_KEY`], in their canonical form, by every full index, migration
+//! and persisted sync, a project naming none included. A sync compares the
+//! record with the settings it runs under before its first change
+//! ([`loaders_change`]): when the loader names differ, or the record is
+//! missing or unreadable, every Lua and Luau file is extracted again, since
+//! a loader call is an import only under the settings that name it. The
+//! record is withdrawn before anything changes, so a sync stopping partway
+//! leaves the next one to extract them all again.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -34,6 +45,7 @@ use std::path::Path;
 use anyhow::Result;
 use codegraph_core::source_file::{SourceText, read_source_file};
 use codegraph_core::types::{Language, Node};
+use codegraph_extract::LuaLoaders;
 use codegraph_resolve::lua_scope::{
     LocalDecl, LuaModuleRow, MODULE_ROW_KEY_PREFIX, lua_module_may_be, module_row_key,
 };
@@ -43,6 +55,83 @@ use codegraph_store::Store;
 pub const VERSION_KEY: &str = "lua_modules_version";
 /// Value of [`VERSION_KEY`].
 pub const VERSION: &str = "1";
+/// Metadata key of the Lua loader settings the index was extracted and
+/// resolved under, as [`LuaLoaders::canonical_json`] writes them.
+pub const LOADERS_KEY: &str = "lua_loaders";
+
+/// How the Lua loader settings a sync runs under differ from the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadersChange {
+    /// The record holds these settings.
+    Same,
+    /// The record is missing or unreadable: a sync stopped partway, or an
+    /// older build made the index. Every Lua file is extracted again.
+    Bootstrap,
+    /// The loader names differ (the roots may too): every Lua file is
+    /// extracted again.
+    Loaders,
+    /// Only the module roots differ, their order included.
+    Roots,
+}
+
+/// How `current` differs from the settings `store` records, read before a
+/// sync's first change.
+pub(crate) fn loaders_change(store: &Store, current: &LuaLoaders) -> Result<LoadersChange> {
+    let Some(recorded) = store.get_project_metadata(LOADERS_KEY)? else {
+        return Ok(LoadersChange::Bootstrap);
+    };
+    if recorded == current.canonical_json() {
+        return Ok(LoadersChange::Same);
+    }
+    Ok(match LuaLoaders::from_canonical_json(&recorded) {
+        None => LoadersChange::Bootstrap,
+        Some(recorded) if recorded.loader_functions() != current.loader_functions() => {
+            LoadersChange::Loaders
+        }
+        Some(_) => LoadersChange::Roots,
+    })
+}
+
+/// Record `current` as the settings the index is extracted and resolved
+/// under: a full index, a migration, or a sync whose resolution is
+/// persisted.
+pub fn write_loaders(store: &Store, current: &LuaLoaders) -> Result<()> {
+    store.set_project_metadata(LOADERS_KEY, &current.canonical_json())?;
+    Ok(())
+}
+
+/// Withdraw the record before a sync's first change for new settings.
+pub(crate) fn withdraw_loaders(store: &Store) -> Result<()> {
+    store.delete_project_metadata(LOADERS_KEY)?;
+    Ok(())
+}
+
+/// The Lua files whose aliases `require` a module (their row's `reads`),
+/// but `skip`, and any whose row cannot be read: what an alias through them
+/// names follows a module root, so a change of the roots re-resolves them
+/// whole.
+pub(crate) fn alias_readers(store: &Store, skip: &dyn Fn(&str) -> bool) -> Result<Vec<String>> {
+    Ok(store
+        .project_metadata_with_prefix(MODULE_ROW_KEY_PREFIX)?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            let path = key.strip_prefix(MODULE_ROW_KEY_PREFIX)?.to_string();
+            let reads = LuaModuleRow::decode(&value).is_none_or(|row| !row.reads.is_empty());
+            (reads && !skip(&path)).then_some(path)
+        })
+        .collect())
+}
+
+/// The indexed Lua and Luau files, by the language their rows record, but
+/// `skip`: what a change of the loader names extracts again.
+pub(crate) fn every_lua_file(store: &Store, skip: &dyn Fn(&str) -> bool) -> Result<Vec<String>> {
+    Ok(store
+        .all_files()?
+        .into_iter()
+        .filter(|file| is_lua(file.language) && !skip(&file.path))
+        .map(|file| file.path)
+        .collect())
+}
 
 /// How many `require` hops a changed module's dependents are followed: an
 /// alias is followed through three modules' exports, and a module's own
@@ -344,6 +433,118 @@ fn rebuild(
 mod tests {
     use super::*;
 
+    fn temp_store(label: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-lua-loaders-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        (dir, store)
+    }
+
+    fn settings(loaders: &[&str], roots: &[&str]) -> LuaLoaders {
+        LuaLoaders::merge(
+            Some(&serde_json::json!({"loader_functions": loaders, "module_roots": roots})),
+            None,
+        )
+    }
+
+    /// A record that is missing or that this build would not write is a
+    /// bootstrap, for a project naming no loader too.
+    #[test]
+    fn a_missing_loader_record_is_a_bootstrap() {
+        let (dir, store) = temp_store("missing");
+        for current in [settings(&[], &[]), settings(&["Require"], &["Script"])] {
+            assert_eq!(
+                loaders_change(&store, &current).unwrap(),
+                LoadersChange::Bootstrap
+            );
+        }
+        for unreadable in ["", "{", r#"{"loaderFunctions":["B","A"],"moduleRoots":[]}"#] {
+            store.set_project_metadata(LOADERS_KEY, unreadable).unwrap();
+            assert_eq!(
+                loaders_change(&store, &settings(&[], &[])).unwrap(),
+                LoadersChange::Bootstrap,
+                "{unreadable}"
+            );
+        }
+        write_loaders(&store, &settings(&[], &[])).unwrap();
+        assert_eq!(
+            loaders_change(&store, &settings(&[], &[])).unwrap(),
+            LoadersChange::Same
+        );
+        withdraw_loaders(&store).unwrap();
+        assert_eq!(
+            loaders_change(&store, &settings(&[], &[])).unwrap(),
+            LoadersChange::Bootstrap
+        );
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A change of the loader names, with or without one of the roots, is
+    /// a loader change; one of the roots alone, their order included, a
+    /// roots change.
+    #[test]
+    fn loaders_change_tells_loader_names_from_roots() {
+        let (dir, store) = temp_store("kinds");
+        write_loaders(&store, &settings(&["Require"], &["Script", "Lib"])).unwrap();
+        for (current, expected) in [
+            (
+                settings(&["Require"], &["Script", "Lib"]),
+                LoadersChange::Same,
+            ),
+            (
+                settings(&["Require", "Include"], &["Script", "Lib"]),
+                LoadersChange::Loaders,
+            ),
+            (settings(&[], &["Script", "Lib"]), LoadersChange::Loaders),
+            (settings(&["Include"], &["Lib"]), LoadersChange::Loaders),
+            (
+                settings(&["Require"], &["Lib", "Script"]),
+                LoadersChange::Roots,
+            ),
+            (settings(&["Require"], &[]), LoadersChange::Roots),
+            (
+                settings(&["Require"], &["Script", "Lib", "."]),
+                LoadersChange::Roots,
+            ),
+        ] {
+            assert_eq!(
+                loaders_change(&store, &current).unwrap(),
+                expected,
+                "{}",
+                current.canonical_json()
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The loader names are a set: written in another order, or twice, they
+    /// are no change.
+    #[test]
+    fn reordering_loader_names_is_no_change() {
+        let (dir, store) = temp_store("order");
+        write_loaders(&store, &settings(&["Require", "Include"], &["Script"])).unwrap();
+        for current in [
+            settings(&["Include", "Require"], &["Script"]),
+            settings(&["Require", "Include", "Require"], &["./Script/"]),
+        ] {
+            assert_eq!(
+                loaders_change(&store, &current).unwrap(),
+                LoadersChange::Same
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_module_path_is_what_a_require_of_its_dotted_name_loads() {
         assert!(lua_module_may_be("kong.pdk.phases", "kong/pdk/phases.lua"));
@@ -358,5 +559,12 @@ mod tests {
             "kong/pdk/phases_x.lua"
         ));
         assert!(!lua_module_may_be("phases", "kong/pdk/myphases.lua"));
+        // Under a module root, and a literal read as the path it is written
+        // as (W9-02).
+        assert!(lua_module_may_be("util", "Script/util.lua"));
+        assert!(lua_module_may_be("Script/Foo.lua", "Script/Foo.lua"));
+        assert!(lua_module_may_be("Foo.lua", "Script/Foo.lua"));
+        assert!(lua_module_may_be("Script/Foo.lua", "Game/Script/Foo.lua"));
+        assert!(!lua_module_may_be("Foo.lua", "Script/MyFoo.lua"));
     }
 }

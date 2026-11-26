@@ -119,4 +119,10 @@ describe('calleeRowTops', () => {
   it('stacks an unanchored row under the one before it', () => {
     expect(calleeRowTops([null, 400, null], 60)).toEqual([60, 378, 430]);
   });
+
+  it('puts the next row under a taller one', () => {
+    // A row that carries a condition grows a line: 76 high, centred on its
+    // call (200 - 38), and the next row keeps 8 under it (162 + 76 + 8).
+    expect(calleeRowTops([200, 240], 60, [76, 44])).toEqual([162, 246]);
+  });
 });

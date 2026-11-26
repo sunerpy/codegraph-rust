@@ -1,7 +1,7 @@
 //! Where a Swift reference to a type may land (upstream #2107,
 //! `swift-type-visibility.ts` in the shape at `b635dd46`: its non-dispatch
-//! half; the protocol-extension dispatch is W7-18's and the type-path calls
-//! W4-SW-02's).
+//! half; the protocol-extension dispatch is the interface-override pass's,
+//! `synthesis/iface.rs` (W7-14c), and the type-path calls W4-SW-02's).
 //!
 //! Two shapes bound type references to the wrong node:
 //!
@@ -769,12 +769,12 @@ pub(crate) fn resolve_swift_type_path_call(
     let target = fit
         .into_iter()
         .min_by(|a, b| (&a.file_path, a.start_line).cmp(&(&b.file_path, b.start_line)))?;
-    Some(ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
-        confidence: 0.9,
-        resolved_by: ResolvedBy::QualifiedName,
-    })
+    Some(ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
+        0.9,
+        ResolvedBy::QualifiedName,
+    ))
 }
 
 /// Is this case declared in a `@Reducer enum`? (upstream `isReducerEnum`.)

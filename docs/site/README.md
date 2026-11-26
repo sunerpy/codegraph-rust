@@ -114,20 +114,26 @@ block that the components render. The build checks `home:` against firlab's
 
 The screenshots are WebP files in `public/screens/`, named `viewer-<view>-<theme>.webp`, 1440 × 900 at device pixel
 ratio 1. The viewer's interface is English only, so one set serves both languages. They come from the real viewer
-reading this repository's own index:
+reading two indexes. The start page, Symbol, Type hierarchy, File, Flow, Map and Dead code read this repository's own
+index. Screens, both readings of Steps, and the Symbol and Flow views with conditions read the Angular RealWorld
+example app (gothinkster/angular-realworld-example-app at `ea0dd032e0425142f684a870d6e233537baa6bb6`), of which only
+`/src/`, `/package.json`, `/angular.json` and `/tsconfig*.json` are taken:
 
 ```bash
 cargo build --release -p codegraph-rs
 CODEGRAPH_CHROME=/path/to/chrome docs/site/tools/capture-screens.sh target/release/codegraph
 ```
 
-`tools/capture-screens.sh` does four things:
+`tools/capture-screens.sh` does four things, inside a new temporary directory that it removes, indexes included,
+when it exits:
 
-1. it extracts this repository at a fixed commit into `codegraph-rust/` inside a new temporary directory, which it
-   removes, index included, when it exits;
-2. it writes the corpus's `.codegraph/config.toml`, which excludes the viewer bundle as `AGENTS.md` recommends;
-3. it indexes the corpus and serves it with `codegraph ui` on `127.0.0.1:4791`;
-4. it runs `tools/capture-screens.mjs`.
+1. it extracts this repository at a fixed commit into `codegraph-rust/`;
+2. it takes the app's files at its fixed commit, copied from the checkout `CODEGRAPH_SCREENS_APP` names or, without
+   it, fetched from github.com: that commit alone, shallow and sparse;
+3. it writes each corpus's `.codegraph/config.toml` (this repository's excludes the viewer bundle, as `AGENTS.md`
+   recommends) and indexes both;
+4. it serves them with `codegraph ui` on `127.0.0.1:4791` and `127.0.0.1:4792` and runs
+   `tools/capture-screens.mjs`.
 
 That script drives Chrome over its DevTools protocol and installs nothing. It opens each view as a fresh page in the
 light and the dark theme, and waits until the view has finished loading. It stops without saving on:
@@ -136,7 +142,13 @@ light and the dark theme, and waits until the view has finished loading. It stop
 - a view that does not show what it should;
 - a symbol lookup that does not find exactly one match.
 
-`CODEGRAPH_SCREENS_COMMIT` changes the corpus commit and `CODEGRAPH_SCREENS_PORT` the port.
+`CODEGRAPH_SCREENS_COMMIT` changes this repository's commit and `CODEGRAPH_SCREENS_PORT` its port.
+`CODEGRAPH_SCREENS_APP` names a local checkout of the app, `CODEGRAPH_SCREENS_APP_COMMIT` changes its commit and
+`CODEGRAPH_SCREENS_APP_PORT` its port.
+
+The code in the Screens, Steps and condition screenshots is the Angular RealWorld example app's, MIT licensed,
+Copyright (c) 2023 Thinkster and (c) 2026 c4ffein. Its `logo.png`, the Angular logo the licence's trademark notice
+excludes, is neither taken nor shown.
 
 `public/community/wechat-official-account.jpg` is the WeChat Official Account's QR code, the same image the pt-tools
 and Voltip sites show. The sync stops when a page names a `/screens/` or `/community/` file that does not exist.

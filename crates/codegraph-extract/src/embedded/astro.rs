@@ -6,9 +6,10 @@
 //! it has no grammar of its own — frontmatter + scripts delegate to the TS
 //! extractor (offsets remapped), and the template contributes `{fn(...)}` call
 //! refs plus `<Component>` usage refs. The `.astro` file has one file node
-//! holding its `component` node (upstream #2268). Astro's framework resolution (`astro:*` imports, the
-//! `Astro` global, `src/pages` routing) is part of the deferred
-//! `FrameworkResolver` layer (see KNOWN_DIFFS) and is NOT ported here.
+//! holding its `component` node (upstream #2268). Astro's framework
+//! resolution (`astro:*` imports, the `Astro` global, `src/pages` routing,
+//! components named in markup) is the Astro `FrameworkResolver`'s, in
+//! `codegraph-resolve`'s `frameworks/astro.rs`, not this extractor's.
 
 use codegraph_core::types::{EdgeKind, ExtractionResult, Language};
 use regex::Regex;

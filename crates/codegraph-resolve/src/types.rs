@@ -19,14 +19,16 @@ use std::sync::Arc;
 /// sound visibility oracle here and nowhere else: a package- or namespace-scoped
 /// language (Go, Java, Kotlin, C#, Rust, Scala, Dart) makes a sibling-file type
 /// visible with no import at all, so the same predicate would delete real edges
-/// there.
-pub const ESM_LANGUAGES: [Language; 6] = [
+/// there. ArkTS is in it (W7-24a1): its modules import as TypeScript's do, as
+/// upstream's `ESM_FAMILY` has it (`name-matcher.ts`, `b635dd46` 1360).
+pub const ESM_LANGUAGES: [Language; 7] = [
     Language::TypeScript,
     Language::Tsx,
     Language::JavaScript,
     Language::Jsx,
     Language::Svelte,
     Language::Vue,
+    Language::ArkTs,
 ];
 
 /// Is `language` in the [`ESM_LANGUAGES`] family?
@@ -207,7 +209,7 @@ impl ResolvedBy {
 
 /// A resolved reference.
 ///
-/// Ports the upstream `ResolvedRef` interface (`types.ts:34-43`).
+/// Ports the upstream `ResolvedRef` interface (`types.ts:39-71`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedRef {
     /// Original unresolved reference.
@@ -218,6 +220,75 @@ pub struct ResolvedRef {
     pub confidence: f64,
     /// How it was resolved.
     pub resolved_by: ResolvedBy,
+    /// What a framework resolver adds to the edges this resolution draws;
+    /// `None` for a plain edge of the reference's own kind.
+    pub edge: Option<Box<EdgeShape>>,
+}
+
+impl ResolvedRef {
+    /// A resolution drawing one plain edge of the reference's own kind.
+    #[must_use]
+    pub fn new(
+        original: RefView,
+        target_node_id: String,
+        confidence: f64,
+        resolved_by: ResolvedBy,
+    ) -> Self {
+        Self {
+            original,
+            target_node_id,
+            confidence,
+            resolved_by,
+            edge: None,
+        }
+    }
+
+    /// This resolution drawing the edges `edge` describes.
+    #[must_use]
+    pub fn with_edge(mut self, edge: EdgeShape) -> Self {
+        self.edge = Some(Box::new(edge));
+        self
+    }
+
+    /// This resolution as the framework resolver `framework` made it: the
+    /// edge to its target names that resolver in `metadata.framework`
+    /// (upstream #2159), so a bridge or router hop says how it got into the
+    /// graph, as a synthesized edge's `synthesizedBy` does. The edges to
+    /// [`EdgeShape::also_targets`] keep their own metadata, as upstream's do.
+    #[must_use]
+    pub fn named_by(mut self, framework: &str) -> Self {
+        self.edge
+            .get_or_insert_with(Box::default)
+            .metadata
+            .insert("framework".to_string(), serde_json::json!(framework));
+        self
+    }
+}
+
+/// The edges a framework resolution draws when they are not one plain edge
+/// of the reference's own kind (upstream `ResolvedRef.edgeKind`, `metadata`
+/// and `alsoTargets`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EdgeShape {
+    /// The edges' kind when it is not the reference's own: a router turns a
+    /// `calls` reference into a `navigates` edge.
+    pub edge_kind: Option<EdgeKind>,
+    /// Metadata persisted on the edge to the resolution's target (`href`, …).
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// The other targets, when one reference names several: a navigation
+    /// whose destination is a conditional reaches every arm. Each is an edge
+    /// of its own with its own metadata, sharing the kind and confidence; the
+    /// reference still resolves once.
+    pub also_targets: Vec<AlsoTarget>,
+}
+
+/// One more target of a resolution ([`EdgeShape::also_targets`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AlsoTarget {
+    /// ID of the target node.
+    pub target_node_id: String,
+    /// Metadata persisted on this target's edge.
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Aggregate resolution statistics.
@@ -320,6 +391,27 @@ pub struct FrameworkResolverExtractionResult {
     pub references: Vec<RefView>,
 }
 
+/// The part of a method's name [`ResolutionContext::get_methods_named_shared`]
+/// matches (W7-21's cost revision).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodKey {
+    /// The whole name.
+    Name,
+    /// The name up to its first `:`: an Objective-C selector's first
+    /// keyword.
+    FirstKeyword,
+}
+
+impl MethodKey {
+    /// The part of `name` this key reads.
+    pub fn of(self, name: &str) -> &str {
+        match self {
+            Self::Name => name,
+            Self::FirstKeyword => name.split(':').next().unwrap_or_default(),
+        }
+    }
+}
+
 /// Context for resolution — provides read access to the graph.
 ///
 /// Ports the upstream `ResolutionContext` interface (`types.ts:65-142`). Methods
@@ -385,7 +477,8 @@ pub trait ResolutionContext {
     fn file_exists(&self, file_path: &str) -> bool;
     /// Whether `file_path` (project-relative) is one of the files the index
     /// holds. Unlike [`Self::file_exists`], which also answers from the
-    /// filesystem, a directory or a `node_modules` file is never one.
+    /// filesystem, a directory or a `node_modules` file is never one. Import
+    /// resolution asks it of every candidate (W7-27).
     fn is_indexed_file(&self, file_path: &str) -> bool {
         let normalized = file_path.replace('\\', "/");
         let basename = normalized.rsplit('/').next().unwrap_or(&normalized);
@@ -408,6 +501,20 @@ pub trait ResolutionContext {
     fn read_file_shared(&self, file_path: &str) -> Option<Arc<str>> {
         self.read_file(file_path).map(Arc::from)
     }
+    /// The files among `files` whose source text contains one of `needles`,
+    /// in `files`' order: the ones [`Self::read_file_shared`] reads and
+    /// `str::contains` keeps for some needle. A context that reads files
+    /// itself may read the ones it has not cached in parallel.
+    fn files_containing(&self, files: &[String], needles: &[&str]) -> Vec<String> {
+        files
+            .iter()
+            .filter(|file| {
+                self.read_file_shared(file)
+                    .is_some_and(|content| needles.iter().any(|needle| content.contains(needle)))
+            })
+            .cloned()
+            .collect()
+    }
     /// Lazily derived facts about `file_path`'s source text, shared by the
     /// resolver's text-scanning gates. Contexts that live for one resolution
     /// pass cache one [`SourceFacts`] per file so every view — and every
@@ -423,6 +530,12 @@ pub trait ResolutionContext {
         self.get_nodes_in_file_shared(file_path)
             .iter()
             .any(|node| node.is_exported)
+    }
+    /// The dependency names the project's `package.json` files declare
+    /// ([`crate::frameworks::package_deps::declared_dependencies`]). Contexts
+    /// that live for one pass compute it once; the default recomputes.
+    fn declared_dependencies(&self) -> Arc<std::collections::BTreeSet<String>> {
+        Arc::new(crate::frameworks::package_deps::declared_dependencies(self))
     }
     /// Get project root (`getProjectRoot`).
     fn get_project_root(&self) -> &str;
@@ -488,6 +601,15 @@ pub trait ResolutionContext {
         None
     }
 
+    /// The aliases of the tsconfig or jsconfig nearest `from_file` below the
+    /// project root that declares `paths` (upstream #2165
+    /// `getNearestAliases`): a monorepo app's own `@/*`. `None` when no
+    /// directory between the file's and the root has one. The store and
+    /// snapshot contexts keep each directory's answer for the pass.
+    fn get_nearest_aliases(&self, _from_file: &str) -> Option<crate::path_aliases::AliasMap> {
+        None
+    }
+
     /// Monorepo workspace member packages (`getWorkspacePackages?`). `None` for
     /// single-package repos (`types.ts:113-118`).
     fn get_workspace_packages(&self) -> Option<crate::workspace_packages::WorkspacePackages> {
@@ -526,6 +648,22 @@ pub trait ResolutionContext {
         crate::rust_scope::no_rust_crates()
     }
 
+    /// The direct subdirectories of the project-relative directory `dir`
+    /// (`.` the root), sorted by name: what a Cargo workspace's glob member
+    /// walks (upstream #151 `listDirectories`). The store and snapshot
+    /// contexts list the project's directories; the default lists none.
+    fn list_directories(&self, _dir: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The Cargo workspace's crates by name and alias, each its member's
+    /// directory, which the Rust resolver's module rule reads (W7-19h,
+    /// upstream `getCargoWorkspaceCrateMap`). Contexts that live for one
+    /// resolution pass read them once; the default reads them on each call.
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        Arc::new(crate::frameworks::cargo_workspace::crate_map(self))
+    }
+
     /// Re-exports declared by a file (`getReExports?`, `types.ts:119-125`).
     /// Empty when the file has none.
     fn get_re_exports(&self, _file_path: &str, _language: Language) -> Vec<ReExport> {
@@ -562,6 +700,21 @@ pub trait ResolutionContext {
         Arc::new(crate::kotlin_scope::KotlinTables::new())
     }
 
+    /// The project's Spring config keys a binding reads (W7-19c). Contexts
+    /// that live for one resolution pass keep one table; the default makes a
+    /// new one, which reads the constants again, on each call.
+    fn spring_tables(&self) -> Arc<crate::frameworks::spring::SpringTables> {
+        Arc::new(crate::frameworks::spring::SpringTables::new())
+    }
+
+    /// The project's Drupal hook implementations a `hook_X` reference reads
+    /// (W7-19d). Contexts that live for one resolution pass keep one table;
+    /// the default makes a new one, which reads the functions again, on each
+    /// call.
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        Arc::new(crate::frameworks::drupal::DrupalTables::new())
+    }
+
     /// The project-wide Scala facts of one resolution pass (W4-SC-01).
     fn scala_tables(&self) -> Arc<crate::scala_scope::ScalaTables> {
         Arc::new(crate::scala_scope::ScalaTables::new())
@@ -594,6 +747,13 @@ pub trait ResolutionContext {
     /// on each call.
     fn lua_tables(&self) -> Arc<crate::lua_scope::LuaTables> {
         Arc::new(crate::lua_scope::LuaTables::new())
+    }
+
+    /// The project's custom Lua module loaders and module roots (#1617,
+    /// W9-02) a `require` and a loader call are resolved under. The default
+    /// names none: a project without `[lua]` settings.
+    fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+        codegraph_extract::LuaLoaders::unconfigured()
     }
 
     /// The Dart hierarchy memo for the pass (upstream #2145): declaration
@@ -716,6 +876,59 @@ pub trait ResolutionContext {
     fn name_matcher_tables(&self) -> Arc<crate::name_matcher::NameMatcherTables> {
         Arc::new(crate::name_matcher::NameMatcherTables::new())
     }
+
+    /// The routers' route tables of one resolution pass (W7-07). Production
+    /// contexts keep them for the pass; this default builds a table each
+    /// time a router asks.
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::new(crate::frameworks::route_href::RouteTables::default())
+    }
+
+    /// The nodes of `kind` whose language is one of `languages`, in
+    /// [`Self::get_nodes_by_kind_shared`]'s order (W7-21). The store context
+    /// reads only those rows.
+    fn get_nodes_by_kind_in_languages_shared(
+        &self,
+        kind: codegraph_core::types::NodeKind,
+        languages: &[Language],
+    ) -> Vec<Arc<Node>> {
+        self.get_nodes_by_kind_shared(kind)
+            .into_iter()
+            .filter(|node| languages.contains(&node.language))
+            .collect()
+    }
+
+    /// The methods written in `language` whose name's `key` part is one of
+    /// `names`, in [`Self::get_nodes_by_kind_in_languages_shared`]'s order
+    /// (W7-21's cost revision). The store context reads only those rows, in
+    /// no particular order.
+    fn get_methods_named_shared(
+        &self,
+        language: Language,
+        key: MethodKey,
+        names: &[String],
+    ) -> Vec<Arc<Node>> {
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let wanted: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        self.get_nodes_by_kind_in_languages_shared(NodeKind::Method, &[language])
+            .into_iter()
+            .filter(|node| wanted.contains(key.of(&node.name)))
+            .collect()
+    }
+
+    /// The non-empty bridge facts of `files`, in `files`' order: what the
+    /// React Native and Expo bridges read of each file (W7-21). The default
+    /// reads the files' text; a sync's store context reads a file's
+    /// `rn_bridge_surface:` row instead, but for the files the sync changed
+    /// ([`crate::context::StoreResolutionContext::with_recorded_bridge_rows`]).
+    fn bridge_facts_of_files(
+        &self,
+        files: &[String],
+    ) -> Vec<(String, Arc<crate::frameworks::react_native::BridgeFacts>)> {
+        crate::frameworks::react_native::bridge_facts_from_text(self, files)
+    }
 }
 
 /// Go module info parsed from `go.mod`.
@@ -814,6 +1027,21 @@ mod tests {
         }
     }
 
+    /// W7-24a1: ArkTS reads its imports through `extract_js_imports`, so it
+    /// is in the family, as in upstream's `ESM_FAMILY` (`name-matcher.ts`,
+    /// `b635dd46` 1360) that the #1566 receiver gate reads.
+    #[test]
+    fn w724a1_arkts_is_an_esm_language() {
+        assert!(is_esm_language(Language::ArkTs));
+        assert!(
+            !crate::import_resolver::extract_import_mappings(
+                "import { a } from './a';\n",
+                Language::ArkTs
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn esm_language_set_is_the_import_required_family() {
         for language in ESM_LANGUAGES {
@@ -892,12 +1120,12 @@ mod tests {
 
     #[test]
     fn resolved_ref_constructs() {
-        let rr = ResolvedRef {
-            original: sample_ref(),
-            target_node_id: "fn:2".to_string(),
-            confidence: 0.75,
-            resolved_by: ResolvedBy::ExactMatch,
-        };
+        let rr = ResolvedRef::new(
+            sample_ref(),
+            "fn:2".to_string(),
+            0.75,
+            ResolvedBy::ExactMatch,
+        );
         assert_eq!(rr.clone(), rr);
         assert!((rr.confidence - 0.75).abs() < f64::EPSILON);
         assert_eq!(rr.resolved_by, ResolvedBy::ExactMatch);
@@ -1075,6 +1303,96 @@ mod tests {
         assert!(ctx.get_go_module().is_none());
         assert!(ctx.get_re_exports("f.ts", Language::TypeScript).is_empty());
         assert!(ctx.get_cpp_include_dirs().is_empty());
+    }
+
+    /// Files the index holds, by basename, for the default
+    /// [`ResolutionContext::is_indexed_file`]; `file_exists` says yes to every
+    /// path, as a probe of a tree holding everything would.
+    struct BasenameContext {
+        by_basename: std::collections::HashMap<&'static str, Vec<&'static str>>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ResolutionContext for BasenameContext {
+        fn get_nodes_in_file(&self, _file_path: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_name(&self, _name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_qualified_name(&self, _qualified_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_nodes_by_kind(&self, _kind: NodeKind) -> Vec<Node> {
+            Vec::new()
+        }
+        fn file_exists(&self, _file_path: &str) -> bool {
+            true
+        }
+        fn read_file(&self, _file_path: &str) -> Option<String> {
+            None
+        }
+        fn get_project_root(&self) -> &str {
+            "/proj"
+        }
+        fn get_all_files(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
+            self.asked.borrow_mut().push(basename.to_string());
+            Arc::new(
+                self.by_basename
+                    .get(basename)
+                    .map(|files| files.iter().map(|file| file.to_string()).collect())
+                    .unwrap_or_default(),
+            )
+        }
+        fn get_nodes_by_lower_name(&self, _lower_name: &str) -> Vec<Node> {
+            Vec::new()
+        }
+        fn get_node_by_id(&self, _id: &str) -> Option<Node> {
+            None
+        }
+        fn get_import_mappings(&self, _file_path: &str, _language: Language) -> Vec<ImportMapping> {
+            Vec::new()
+        }
+    }
+
+    /// W7-27: the default `is_indexed_file`, which import resolution asks of
+    /// every candidate, looks the path's basename up through
+    /// `get_files_by_basename_shared` and takes only that exact path, `\`
+    /// read as `/` on either side; `file_exists` plays no part, so a path
+    /// only on disk or a directory is not one.
+    #[test]
+    fn default_is_indexed_file_looks_the_basename_up() {
+        let ctx = BasenameContext {
+            by_basename: [
+                ("index.ts", vec!["src/api/index.ts"]),
+                ("win.ts", vec!["lib\\win.ts"]),
+            ]
+            .into_iter()
+            .collect(),
+            asked: std::cell::RefCell::new(Vec::new()),
+        };
+        for (path, expected) in [
+            ("src/api/index.ts", true),
+            ("src\\api\\index.ts", true),
+            ("lib/win.ts", true),
+            ("lib\\win.ts", true),
+            ("index.ts", false),
+            ("src/other/index.ts", false),
+            ("src/api.ts", false),
+            ("src/api", false),
+        ] {
+            assert!(ctx.file_exists(path));
+            assert_eq!(ctx.is_indexed_file(path), expected, "{path}");
+        }
+        assert_eq!(
+            *ctx.asked.borrow(),
+            [
+                "index.ts", "index.ts", "win.ts", "win.ts", "index.ts", "index.ts", "api.ts", "api"
+            ]
+        );
     }
 
     #[test]

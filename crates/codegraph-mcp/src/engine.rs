@@ -17,16 +17,25 @@ use codegraph_core::config::Config;
 use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::file_class::{is_generated_file, is_test_file};
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{EdgeKind, FileRecord, Node, NodeKind};
+use codegraph_core::types::{Edge, EdgeKind, FileRecord, Node, NodeKind};
+use codegraph_graph::branch_guards::{guard_label, guards_at, supports_branch_guards};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, NodeEdge, group_definitions};
+use codegraph_graph::named_symbol_flow::{
+    FlowStep, NamedSymbolFlow, NamedSymbolFlowOptions, resolve_named_symbol_flow,
+};
+use codegraph_graph::query::scoring::normalize_name_token;
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::segment_match::get_segment_matches;
 use codegraph_graph::segments::extract_segment_search_words;
+use codegraph_graph::synthesized_hop::describe_synthesized_hop;
 use codegraph_store::Store;
 use serde_json::Value;
 
+use crate::context::{self, CodeBlock, ContextFormat, ContextOptions, TaskContext};
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
+use crate::explore_gather::{self, HIGH_VALUE_KINDS};
+use crate::explore_rank;
 use crate::protocol::ToolResult;
 use crate::query_paths::{
     QueryLineAnchor, extract_query_paths_with_probes, query_might_contain_paths,
@@ -66,6 +75,33 @@ const MIN_WINDOW_LINES: usize = 12;
 /// span the query anchored. Above a protected focus (11) and a root (10).
 const EXACT_IMPORTANCE: u32 = 12;
 
+/// A protected focus (Rust's own, §3.1): above an entry point, below an
+/// exact target.
+const FOCUS_IMPORTANCE: u32 = 11;
+
+/// A symbol the query named (upstream's importance 9, `tools.ts` b635dd46
+/// 6514): the floor of what a cluster protects.
+const NAMED_IMPORTANCE: u32 = 9;
+
+/// A spine method longer than this renders as its signature head and a window
+/// on its next-hop call (upstream `OVERSIZE_SPINE_LINES`, b635dd46 6640).
+const OVERSIZE_SPINE_LINES: usize = 200;
+
+/// Lines either side of that call (upstream `SPINE_WINDOW`, 5873).
+const SPINE_WINDOW: usize = 28;
+
+/// Implementers of one supertype that make a file one of many
+/// interchangeable siblings (upstream `MIN_SIBLINGS`, b635dd46 5304).
+const MIN_SIBLINGS: usize = 3;
+
+/// Whether off-spine siblings collapse to signatures: on unless
+/// `CODEGRAPH_ADAPTIVE_EXPLORE` is `0` or `false` (upstream
+/// `adaptiveExploreEnabled`, b635dd46 887-889).
+fn adaptive_explore_enabled() -> bool {
+    std::env::var("CODEGRAPH_ADAPTIVE_EXPLORE")
+        .map_or(true, |value| value != "0" && value != "false")
+}
+
 /// Lines either side of a single-line anchor that no callable encloses.
 const ANCHOR_LINE_CONTEXT: usize = 15;
 
@@ -96,34 +132,9 @@ const SECTION_FENCE_CHARS: usize = 11;
 /// whether it is emitted is only known after cluster selection.
 const SECTION_GAP_TAIL_CHARS: usize = 17;
 
-/// Callable node kinds whose signature (parameter/return) types the #1064
-/// change-surface pass follows. Mirrors upstream `CALLABLE_KINDS`
-/// (`tools.ts:2620`); `constructor` has no Rust NodeKind (ctors are `method`).
-const CALLABLE_KINDS: [NodeKind; 4] = [
-    NodeKind::Method,
-    NodeKind::Function,
-    NodeKind::Component,
-    NodeKind::Class,
-];
-
-/// Type node kinds a signature edge may point at — the rescue only surfaces
-/// these. Mirrors upstream `TYPE_KINDS` (`tools.ts:2621`).
-const TYPE_KINDS: [NodeKind; 8] = [
-    NodeKind::Class,
-    NodeKind::Struct,
-    NodeKind::Union,
-    NodeKind::Interface,
-    NodeKind::Trait,
-    NodeKind::Protocol,
-    NodeKind::Enum,
-    NodeKind::TypeAlias,
-];
-
-/// Signature edge kinds: what a callable emits toward its parameter/return
-/// types. Mirrors upstream `SIG_EDGE` (`tools.ts:2622`). This project emits TS
-/// type annotations as `References` today (`TypeOf`/`Returns` are accepted too
-/// for forward-compatibility, but extraction-widening is DEFERRED per the plan).
-const SIG_EDGE_KINDS: [EdgeKind; 3] = [EdgeKind::References, EdgeKind::TypeOf, EdgeKind::Returns];
+/// Upstream's `GLUE_NODE_CAP` (`tools.ts` b635dd46 4363): entry-point
+/// neighbours glued into the subgraph at most.
+const GLUE_NODE_CAP: usize = 60;
 
 /// Holds one request-scoped project store. Its retained shared lease remains
 /// live until the request has produced its final result.
@@ -148,6 +159,11 @@ pub struct CodeGraphEngine {
     /// callees, impact) names as locations. Checked for drift before the answer
     /// is served while auto-sync is not healthy (upstream #1959).
     answer_files: RefCell<BTreeSet<String>>,
+    /// Request-local memo of [`Self::find_all_symbols`], by the exact symbol
+    /// asked for (W7-25 cost, OD-B75): explore's exact targets and its named
+    /// seeds look up the same qualified tokens, and on a large index each
+    /// lookup can scan every node. `execute` clears it before every tool call.
+    symbol_memo: RefCell<HashMap<String, AllSymbols>>,
 }
 
 impl CodeGraphEngine {
@@ -175,6 +191,7 @@ impl CodeGraphEngine {
             source_probes: RefCell::new(HashMap::new()),
             source_citations: RefCell::new(HashSet::new()),
             answer_files: RefCell::new(BTreeSet::new()),
+            symbol_memo: RefCell::new(HashMap::new()),
         })
     }
 
@@ -360,6 +377,7 @@ impl CodeGraphEngine {
         self.source_probes.borrow_mut().clear();
         self.source_citations.borrow_mut().clear();
         self.answer_files.borrow_mut().clear();
+        self.symbol_memo.borrow_mut().clear();
         let health = codegraph_watch::watch_health(&self.project_root);
         let result = match tool_name {
             "codegraph_search" => self.handle_search(args),
@@ -983,11 +1001,17 @@ impl CodeGraphEngine {
         if callees.is_empty() && callers.is_empty() {
             return Ok(String::new());
         }
+        // A synthesized hop carries its tag, so it never reads as a plain
+        // call (upstream `formatTrail`, #2428).
         let fmt = |e: &NodeEdge| -> String {
-            format!(
+            let base = format!(
                 "{} ({}:{})",
                 e.node.name, e.node.file_path, e.node.start_line
-            )
+            );
+            match synth_edge_note(&e.edge) {
+                Some(tag) => format!("{base} [{tag}]"),
+                None => base,
+            }
         };
         let mut lines = vec![
             String::new(),
@@ -1211,9 +1235,11 @@ impl CodeGraphEngine {
     /// DETERMINISTIC structure the upstream renders — header, blast radius,
     /// relationships, dynamic boundaries, then per-file source grouped by file —
     /// under a SIZE-ADAPTIVE OUTPUT BUDGET (`getExploreOutputBudget`) scaled by
-    /// the project's indexed file count. The relevance-ranking heuristics
-    /// (RWR/PageRank, flow detection, off-spine skeletonization) are NOT ported;
-    /// see KNOWN_DIFFS.md.
+    /// the project's indexed file count. The files are ranked as upstream
+    /// ranks them, by graph relevance ([`explore_rank`]); the Flow's spine
+    /// weighs in their clusters and windows, and an off-spine polymorphic
+    /// sibling renders symbol by symbol ([`Self::render_per_symbol`]). The
+    /// differences of mechanism are in KNOWN_DIFFS.md.
     fn handle_explore(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let query = match require_string(args, "query") {
             Ok(q) => q,
@@ -1286,15 +1312,19 @@ impl CodeGraphEngine {
             )));
         }
 
-        let file_count = subgraph.file_order.len();
+        // The Flow section opens the response (upstream prepends it to the
+        // header), so everything below spends against it too.
+        let flow = self.build_flow_section(&match_query);
+        let flow_text: &str = &flow.text;
+        // The summary is written once the final cut is known (#1046): it
+        // counts the files whose source the response shows. This placeholder
+        // holds the raw gather, never shorter than the line that replaces it.
+        let raw_summary = found_line(subgraph.nodes.len(), subgraph.file_order.len());
 
         let mut lines = vec![
             format!("## Exploration: {query}"),
             String::new(),
-            format!(
-                "Found {} symbols across {file_count} files.",
-                subgraph.nodes.len()
-            ),
+            raw_summary.clone(),
         ];
         if !path_extraction.pinned_files.is_empty() {
             lines.push(format!(
@@ -1364,38 +1394,35 @@ impl CodeGraphEngine {
         lines.push("> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.".to_string());
         lines.push(String::new());
 
-        // `excludeLowValueFiles` (`tools.ts:2219-2235`): hard-drop test/spec/
-        // icon/i18n files unless the query mentions tests, and only when >=2
-        // non-low-value files remain (else tests are the only signal here).
-        let mut file_order: Vec<&String> = subgraph.file_order.iter().collect();
-        if budget.exclude_low_value_files && !query_mentions_tests(&match_query) {
-            let non_low: Vec<&String> = file_order
-                .iter()
-                .filter(|f| !is_low_value_file(f) || subgraph.is_pinned(f))
-                .copied()
-                .collect();
-            if non_low.len() >= 2 {
-                file_order = non_low;
-            }
-        }
+        // The ranking already left out the test files a query not about
+        // tests does not need (b635dd46 4846-4868, every tier).
+        let file_order: Vec<&String> = subgraph.file_order.iter().collect();
 
         // Step through ranked files under the total + per-file budget. A file's
         // source is rendered WHOLE when small enough, else clustered; an
         // incidental file that doesn't fit is DROPPED whole (never sliced
         // mid-method) and surfaced in the trailing "Additional relevant files"
         // list (`tools.ts:2483-2905`).
-        let mut total_chars: usize = lines.join("\n").len();
+        let mut total_chars: usize = flow_text.len() + lines.join("\n").len();
         let mut files_included = 0usize;
         let mut budget_dropped = false;
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
         // Every admitted section: `(line index, path, what it elided)`.
         let mut sections: Vec<(usize, &String, Vec<WantedSpan>)> = Vec::new();
-        // Named files whose per-file ceiling clipped them, with what a second
-        // render needs: `(line index, path, focuses, exact focus)`.
-        let mut named_clipped: Vec<(usize, &String, Vec<usize>, Vec<BodyFocus>)> = Vec::new();
+        // Named and spine files whose per-file ceiling clipped them, with what
+        // a second render needs.
+        let mut named_clipped: Vec<ClippedNamedFile<'_>> = Vec::new();
         let precise_tokens = precise_query_tokens(&match_query);
-        let question_ids = subgraph.question_ids(&precise_tokens);
+        // The symbols the question is about: its exact targets, the named ones
+        // and the spine (upstream `questionIds`, `tools.ts` b635dd46 5209).
+        let question_ids: HashSet<String> = subgraph
+            .exact_ids
+            .iter()
+            .chain(&flow.path_node_ids)
+            .chain(&flow.named_node_ids)
+            .cloned()
+            .collect();
         let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
         let effective_budget = budget
             .max_output_chars
@@ -1426,6 +1453,16 @@ impl CodeGraphEngine {
                 file_path,
                 &path_extraction.line_anchors,
                 &question_ids,
+                &flow.spine_call_sites,
+            );
+            let spine_focus = self.body_focus(
+                subgraph
+                    .nodes
+                    .iter()
+                    .filter(|n| n.file_path == **file_path && flow.path_node_ids.contains(&n.id)),
+                &path_extraction.line_anchors,
+                &question_ids,
+                &flow.spine_call_sites,
             );
             let available = effective_budget
                 .saturating_sub(total_chars)
@@ -1444,6 +1481,8 @@ impl CodeGraphEngine {
                 funded_headroom,
                 focuses: &focuses,
                 exact_focus: &exact_focus,
+                flow: &flow,
+                spine_focus: &spine_focus,
                 lift_file_cap: false,
                 drifted: possibly_drifted,
             };
@@ -1465,11 +1504,15 @@ impl CodeGraphEngine {
             if rendered.source_emitted {
                 rendered_sources.push(((*file_path).clone(), lines.len()));
             }
+            // A file holding a spine node renders again too (KEEP-RUST: upstream
+            // funds the spine first through its CG-12 allocation, `tools.ts`
+            // b635dd46 5271-5288, which this port does not have).
             let named = subgraph.is_pinned(file_path)
                 || subgraph.holds_exact(file_path)
-                || !focuses.is_empty();
+                || !focuses.is_empty()
+                || flow.path_files.contains(file_path.as_str());
             if rendered.clipped && named {
-                named_clipped.push((lines.len(), file_path, focuses, exact_focus));
+                named_clipped.push((lines.len(), file_path, focuses, exact_focus, spine_focus));
             }
             sections.push((lines.len(), file_path, rendered.elided));
             lines.push(rendered.section);
@@ -1477,9 +1520,10 @@ impl CodeGraphEngine {
             files_included += 1;
         }
 
-        // A file the query NAMED — by path, or by a symbol it defines — that its
-        // per-file ceiling clipped is rendered again into what the response left
-        // unspent (upstream #2068), in file order. Only that: every other file
+        // A file the query NAMED — by path, or by a symbol it defines — or one
+        // holding a node of the Flow's spine, that its per-file ceiling clipped
+        // is rendered again into what the response left unspent (upstream
+        // #2068), in file order. Only that: every other file
         // keeps exactly the section it was given, and the pointer list below
         // keeps the room it would have had. Where nothing is spare a named file
         // renders exactly as before.
@@ -1505,7 +1549,7 @@ impl CodeGraphEngine {
         let mut spare = effective_budget
             .saturating_sub(total_chars)
             .saturating_sub(pointer_reserve);
-        for (line_index, file_path, focuses, exact_focus) in &named_clipped {
+        for (line_index, file_path, focuses, exact_focus, spine_focus) in &named_clipped {
             if spare == 0 {
                 break;
             }
@@ -1521,6 +1565,8 @@ impl CodeGraphEngine {
                 funded_headroom: given + spare,
                 focuses,
                 exact_focus,
+                flow: &flow,
+                spine_focus,
                 lift_file_cap: true,
                 drifted: source.is_possibly_drifted(),
             };
@@ -1611,7 +1657,7 @@ impl CodeGraphEngine {
         // Final ABSOLUTE inline ceiling — cut at a `#### ` file-section boundary
         // so trailing whole sections drop rather than slicing a method body
         // (`tools.ts:2954-2975`).
-        let output = lines.join("\n");
+        let output = format!("{flow_text}{}", lines.join("\n"));
         let hard_ceiling = ((budget.max_output_chars as f64 * 1.5).round() as usize).min(25000);
         let trimmed_paths: Vec<&str> = trimmed_shown
             .iter()
@@ -1619,8 +1665,328 @@ impl CodeGraphEngine {
             .collect();
         let (output, kept_prefix_len) =
             cut_at_section_boundary(&output, hard_ceiling, &trimmed_paths);
-        self.mark_surviving_explore_citations(&lines, &rendered_sources, kept_prefix_len);
+        let kept_in_lines = kept_prefix_len.saturating_sub(flow_text.len());
+        self.mark_surviving_explore_citations(&lines, &rendered_sources, kept_in_lines);
+        // Upstream's curated summary (`tools.ts` b635dd46 7568-7586): the files
+        // whose section survived the cut, and their listed symbols (no
+        // import or export); the raw gather when none did.
+        let survivors: Vec<&str> = rendered_sources
+            .iter()
+            .filter(|(_, at)| section_survives(&lines, *at, kept_in_lines))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let summary = if survivors.is_empty() {
+            let grouped: HashSet<&str> = subgraph
+                .nodes
+                .iter()
+                .filter(|n| is_listed_symbol(n))
+                .map(|n| n.file_path.as_str())
+                .collect();
+            found_line(subgraph.nodes.len(), grouped.len())
+        } else {
+            let shown = subgraph
+                .nodes
+                .iter()
+                .filter(|n| is_listed_symbol(n) && survivors.contains(&n.file_path.as_str()))
+                .count();
+            found_line(shown, survivors.len())
+        };
+        let at = flow_text.len() + lines[0].len() + 1 + lines[1].len() + 1;
+        let output = if output
+            .get(at..)
+            .is_some_and(|rest| rest.starts_with(&raw_summary))
+        {
+            format!(
+                "{}{summary}{}",
+                &output[..at],
+                &output[at + raw_summary.len()..]
+            )
+        } else {
+            output
+        };
         Ok(ToolResult::text(output))
+    }
+
+    /// The Flow section (upstream `buildFlowFromNamedSymbols`, `e8ddc4e2`):
+    /// explore's query is usually a bag of symbol names that spans the flow
+    /// the agent is investigating, so the longest call chain AMONG those
+    /// symbols opens the response, one numbered line per symbol and one `↓`
+    /// line per hop. The search is `named_symbol_flow`'s, the one the
+    /// viewer's Flow rides. A synthesized hop names its mechanism and wiring
+    /// site; a hop whose call runs under conditions names them, read from
+    /// the caller's current source. The Flow needs two named callables and a
+    /// chain of three or more among them; the dynamic-dispatch links among
+    /// the named symbols ([`Self::synth_links`]) follow it, or stand alone
+    /// when there is none. Empty when the query names fewer than two
+    /// symbols, when neither part has a line to show, or when reading the
+    /// graph fails.
+    ///
+    /// The rest of upstream's builder is not here: the dynamic-boundary and
+    /// polymorphic-dispatch announcements for a flow that does not connect —
+    /// the port keeps its own boundary scan over the explore seeds. The
+    /// spine weighs in the file's clusters and windows ([`FlowSection`]).
+    fn build_flow_section(&self, match_query: &str) -> FlowSection {
+        let flow =
+            resolve_named_symbol_flow(&self.store, match_query, &NamedSymbolFlowOptions::default());
+        if flow.tokens.len() < 2 {
+            return FlowSection::default();
+        }
+        match self.flow_section_of(&flow) {
+            Ok(text) => FlowSection::of(&flow, text),
+            Err(_) => FlowSection::default(),
+        }
+    }
+
+    /// [`Self::build_flow_section`] for a resolved flow.
+    fn flow_section_of(&self, flow: &NamedSymbolFlow) -> anyhow::Result<String> {
+        if flow.named.len() < 2 {
+            // No Flow without two callables, but the named symbols can still
+            // have links: an RTK thunk's run between `constant`s.
+            let links = self.synth_links(flow, None)?;
+            if links.is_empty() {
+                return Ok(String::new());
+            }
+            let mut out = synth_links_block(links);
+            out.push("> Full source for these symbols is below.\n".to_string());
+            return Ok(out.join("\n"));
+        }
+        let best = flow
+            .chains
+            .first()
+            .map(|chain| chain.steps.as_slice())
+            .filter(|steps| steps.len() >= 3);
+        // A two-node chain renders nothing, so its synthesized hop is listed
+        // as a link (upstream #687).
+        let links = self.synth_links(flow, best)?;
+        if best.is_none() && links.is_empty() {
+            return Ok(String::new());
+        }
+        let mut out = Vec::new();
+        if let Some(best) = best {
+            out.push("**Flow (call path among the symbols you queried)**".to_string());
+            out.push(String::new());
+            for (index, step) in best.iter().enumerate() {
+                if let Some(edge) = &step.edge {
+                    let when = match index.checked_sub(1) {
+                        Some(previous) => self.when_label(&best[previous].node, edge),
+                        None => String::new(),
+                    };
+                    let label =
+                        synth_edge_note(edge).unwrap_or_else(|| edge.kind.as_str().to_string());
+                    let when = if when.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (when {when})")
+                    };
+                    out.push(format!("   ↓ {label}{when}"));
+                }
+                out.push(format!(
+                    "{}. {} ({}:{})",
+                    index + 1,
+                    step.node.name,
+                    step.node.file_path,
+                    step.node.start_line
+                ));
+            }
+            out.push(String::new());
+        }
+        if !links.is_empty() {
+            out.extend(synth_links_block(links));
+        }
+        out.push(
+            "> Full source for these symbols is below — the call flow among them, followed by their bodies."
+                .to_string(),
+        );
+        out.push(String::new());
+        Ok(out.join("\n"))
+    }
+
+    /// The dynamic-dispatch links among the named symbols (upstream
+    /// `collectSynthLinks`, `e8ddc4e2`: #2748 and #2751): one line per
+    /// synthesized edge at a named callable or a named non-callable endpoint
+    /// (an RTK thunk), keyed by the edge's two ends whatever its kind, the
+    /// other end named or not. `chain` is the rendered Flow: an edge with
+    /// both ends on it is left out, and a line that reads like one of its
+    /// synthesized hops is not printed again; neither is a line printed
+    /// twice (gin declares `Binding` once per build tag, and both
+    /// declarations link to the same implementation).
+    ///
+    /// At most [`MAX_SYNTH_LINKS`] lines, so the order decides what is left
+    /// out. Links into a low-value file ([`is_low_value_file`]: tests,
+    /// specs, icons, translations) through an end the query did not name go
+    /// last: they are the files explore's hard filter drops. Before that,
+    /// links go by how pointedly the query named their ends: a symbol a
+    /// token picks out (at most three definitions) or a named non-callable
+    /// endpoint weighs 3, a candidate of an ambiguous token 1, anything else
+    /// 0, and a link the sum of its two. Links of one rank take turns by the
+    /// named symbol they hang from, so one symbol's long fan-out cannot fill
+    /// the list before another's first link; the edge order
+    /// ([`Self::edges_at_in_upstream_order`]) breaks the ties.
+    fn synth_links(
+        &self,
+        flow: &NamedSymbolFlow,
+        chain: Option<&[FlowStep]>,
+    ) -> anyhow::Result<Vec<String>> {
+        let chain = chain.unwrap_or_default();
+        let on_chain: HashSet<&str> = chain.iter().map(|step| step.node.id.as_str()).collect();
+        let weight = |id: &str| -> u8 {
+            if flow.unique_named_node_ids.contains(id) || flow.dyn_named.contains_key(id) {
+                3
+            } else if flow.named.contains_key(id) {
+                1
+            } else {
+                0
+            }
+        };
+        let mut links: Vec<SynthLink> = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        // A link's turn: how many links of its rank the same named symbol
+        // already has.
+        let mut turns: HashMap<(String, bool, u8), usize> = HashMap::new();
+        for named in flow.named.values().chain(flow.dyn_named.values()) {
+            // Every edge at the node, as `has_heuristic_edge` reads them: a
+            // static edge over the same pair would hide the synthesized one
+            // from a callers list.
+            for edge in self.edges_at_in_upstream_order(&named.id)? {
+                if edge.provenance.as_deref() != Some("heuristic") {
+                    continue;
+                }
+                let outgoing = edge.source == named.id;
+                let other_id = if outgoing { &edge.target } else { &edge.source };
+                if *other_id == named.id || !seen.insert((edge.source.clone(), edge.target.clone()))
+                {
+                    continue;
+                }
+                if on_chain.contains(edge.source.as_str())
+                    && on_chain.contains(edge.target.as_str())
+                {
+                    continue;
+                }
+                let other = match flow
+                    .named
+                    .get(other_id)
+                    .or_else(|| flow.dyn_named.get(other_id))
+                {
+                    Some(node) => node.clone(),
+                    None => match self.store.node_by_id(other_id)? {
+                        Some(node) => node,
+                        None => continue,
+                    },
+                };
+                let other_weight = weight(other_id);
+                let low_value = other_weight == 0 && is_low_value_file(&other.file_path);
+                let link_weight = weight(&named.id) + other_weight;
+                let counter = turns
+                    .entry((named.id.clone(), low_value, link_weight))
+                    .or_insert(0);
+                let turn = *counter;
+                *counter += 1;
+                let line = if outgoing {
+                    synth_link_line(&edge, named, &other)
+                } else {
+                    synth_link_line(&edge, &other, named)
+                };
+                links.push(SynthLink {
+                    line,
+                    low_value,
+                    weight: link_weight,
+                    turn,
+                });
+            }
+        }
+        // Stable, so the edge order stands within a rank and a turn.
+        links.sort_by(|a, b| {
+            a.low_value
+                .cmp(&b.low_value)
+                .then(b.weight.cmp(&a.weight))
+                .then(a.turn.cmp(&b.turn))
+        });
+        let mut shown: HashSet<String> = HashSet::new();
+        for pair in chain.windows(2) {
+            let (previous, step) = (&pair[0].node, &pair[1]);
+            let Some(edge) = step
+                .edge
+                .as_ref()
+                .filter(|edge| edge.provenance.as_deref() == Some("heuristic"))
+            else {
+                continue;
+            };
+            shown.insert(if edge.source == previous.id {
+                synth_link_line(edge, previous, &step.node)
+            } else {
+                synth_link_line(edge, &step.node, previous)
+            });
+        }
+        let mut lines = Vec::new();
+        for link in links {
+            if lines.len() >= MAX_SYNTH_LINKS {
+                break;
+            }
+            if shown.insert(link.line.clone()) {
+                lines.push(link.line);
+            }
+        }
+        Ok(lines)
+    }
+
+    /// Every edge into `id`, then every edge out of it, as upstream's
+    /// `getIncomingEdges` and `getOutgoingEdges` read them (`ORDER BY kind,
+    /// source, line, col` and `ORDER BY kind, target, line, col`,
+    /// `queries.ts`): kind and the other end byte-wise, a missing line or
+    /// column first, as SQLite sorts NULL. The store's readers keep row
+    /// order, which after a sync can differ from a fresh index's; the edges
+    /// table's identity index makes this order total.
+    fn edges_at_in_upstream_order(&self, id: &str) -> anyhow::Result<Vec<Edge>> {
+        let mut edges = self.store.edges_by_target_kind(id, None)?;
+        edges.sort_by(|a, b| {
+            (a.kind.as_str(), a.source.as_str(), a.line, a.col).cmp(&(
+                b.kind.as_str(),
+                b.source.as_str(),
+                b.line,
+                b.col,
+            ))
+        });
+        let mut outgoing = self.store.edges_by_source_kind(id, None)?;
+        outgoing.sort_by(|a, b| {
+            (a.kind.as_str(), a.target.as_str(), a.line, a.col).cmp(&(
+                b.kind.as_str(),
+                b.target.as_str(),
+                b.line,
+                b.col,
+            ))
+        });
+        edges.extend(outgoing);
+        Ok(edges)
+    }
+
+    /// The conditions a flow hop's call site runs under (upstream
+    /// `whenLabel`), read from the caller's source now; empty when the call
+    /// is unconditional, its line is unknown, the language has no rules, or
+    /// the file changed since it was indexed — a moved line must not be read
+    /// for a condition.
+    fn when_label(&self, caller: &Node, edge: &Edge) -> String {
+        let Some(line) = edge.line.filter(|line| *line > 0) else {
+            return String::new();
+        };
+        if !supports_branch_guards(caller.language) {
+            return String::new();
+        }
+        let source = self.project_source(&caller.file_path);
+        if source.is_possibly_drifted() {
+            return String::new();
+        }
+        let Some(content) = source.content.as_deref() else {
+            return String::new();
+        };
+        let column = edge.col.and_then(|column| usize::try_from(column).ok());
+        let key = self.project_root.join(&caller.file_path);
+        guard_label(&guards_at(
+            &key.to_string_lossy(),
+            content,
+            caller.language,
+            line as usize,
+            column,
+        ))
     }
 
     /// Why an explore came back empty (upstream #1904). Explore matches names
@@ -1746,6 +2112,378 @@ impl CodeGraphEngine {
         diagnostics
     }
 
+    /// Upstream's per-symbol view (`tools.ts` b635dd46 6039-6288), for a file
+    /// that is one of many interchangeable implementations or that the spine
+    /// runs through among off-path named methods: the methods the question is
+    /// about in full, every other symbol as its signature line.
+    ///
+    /// It engages when the switch is on ([`adaptive_explore_enabled`]), the
+    /// Flow has a spine, no line span of the file is anchored, and either the
+    /// file is an on-spine god-file (it holds a spine node, its spine and
+    /// uniquely named bodies overrun the per-file ceiling, and it holds a
+    /// uniquely named callable off the spine), or it holds no spine node, it
+    /// is a polymorphic sibling (a type in it implements or extends one that
+    /// [`MIN_SIBLINGS`] types do) and it is not spared. A file holding a
+    /// uniquely named callable is spared unless it defines such a supertype
+    /// (a base class with its subclasses).
+    ///
+    /// Bodies go by tier within the per-file ceiling, less the signatures'
+    /// reserve: 0 an exact target, 1 a named spine step, 2 an unnamed spine
+    /// step, 3 a uniquely named callable, 4 a named method of the family's
+    /// base file; tiers 0 and 1 are windowed rather than dropped. Upstream's
+    /// `allowance` is this port's per-file ceiling (KEEP-RUST, no CG-12).
+    fn render_per_symbol(
+        &self,
+        subgraph: &ExploreSubgraph,
+        file_path: &str,
+        file_lines: &[&str],
+        lang: &str,
+        ctx: &RenderCtx<'_>,
+    ) -> Option<ExploreFileRender> {
+        let flow = ctx.flow;
+        if !adaptive_explore_enabled()
+            || flow.path_node_ids.is_empty()
+            || !subgraph.anchor_spans_in(file_path).is_empty()
+        {
+            return None;
+        }
+        let budget = ctx.budget;
+        let total_lines = file_lines.len();
+        let mut group: Vec<&Node> = subgraph
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == file_path && is_listed_symbol(n) && n.kind != NodeKind::File)
+            .collect();
+        group.sort_by(|a, b| {
+            (a.start_line, a.start_column, a.id.as_str()).cmp(&(
+                b.start_line,
+                b.start_column,
+                b.id.as_str(),
+            ))
+        });
+        let callable = |n: &Node| {
+            matches!(
+                n.kind,
+                NodeKind::Method | NodeKind::Function | NodeKind::Component
+            )
+        };
+        let on_spine = |n: &Node| flow.path_node_ids.contains(&n.id);
+        let unique = |n: &Node| flow.unique_named_node_ids.contains(&n.id);
+        let defines_super = group.iter().any(|n| {
+            matches!(
+                n.kind,
+                NodeKind::Class
+                    | NodeKind::Interface
+                    | NodeKind::Struct
+                    | NodeKind::Union
+                    | NodeKind::Trait
+                    | NodeKind::Protocol
+                    | NodeKind::TypeAlias
+            ) && self.has_many_implementers(subgraph, &n.id)
+        });
+        let spared = group.iter().any(|n| unique(n)) && !defines_super;
+        let has_spine = group.iter().any(|n| on_spine(n));
+        let allowance = if ctx.lift_file_cap {
+            ctx.funded_headroom
+        } else {
+            (budget.max_chars_per_file as f64 * 1.5).round() as usize
+        };
+        let body_chars = |n: &Node| -> usize {
+            let start = (n.start_line as usize).clamp(1, total_lines.max(1));
+            let end = (n.end_line as usize).clamp(start, total_lines.max(1));
+            file_lines
+                .get(start - 1..end)
+                .map_or(0, |lines| lines.join("\n").len())
+        };
+        let named_body_chars: usize = group
+            .iter()
+            .filter(|n| callable(n) && (on_spine(n) || unique(n)))
+            .map(|n| body_chars(n))
+            .sum();
+        let on_spine_god_file = has_spine
+            && named_body_chars > allowance
+            && group
+                .iter()
+                .any(|n| callable(n) && unique(n) && !on_spine(n));
+        // The group's implements and extends edges, one batched read per kind
+        // (W7-25 cost): the answer is whether any reaches a supertype with
+        // many implementers, whatever the order the edges come in.
+        let sibling = || {
+            let ids: Vec<String> = group.iter().map(|n| n.id.clone()).collect();
+            [EdgeKind::Implements, EdgeKind::Extends]
+                .into_iter()
+                .any(|kind| {
+                    self.store
+                        .edges_by_sources_kind(&ids, kind)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|e| self.has_many_implementers(subgraph, &e.target))
+                })
+        };
+        if !(on_spine_god_file || (!has_spine && !spared && sibling())) {
+            return None;
+        }
+
+        let syms: Vec<&Node> = group
+            .iter()
+            .copied()
+            .filter(|n| n.start_line > 0 && (n.start_line as usize) <= total_lines)
+            .collect();
+        let tier = |n: &Node| -> u8 {
+            if !callable(n) {
+                u8::MAX
+            } else if subgraph.is_exact(&n.id) {
+                0
+            } else if on_spine(n) {
+                if flow.named_node_ids.contains(&n.id) {
+                    1
+                } else {
+                    2
+                }
+            } else if unique(n) {
+                3
+            } else if defines_super && flow.named_node_ids.contains(&n.id) {
+                4
+            } else {
+                u8::MAX
+            }
+        };
+        const WINDOWED_TIER: u8 = 1;
+        let chain_at = |n: &Node| {
+            flow.path_order
+                .iter()
+                .position(|id| id == &n.id)
+                .unwrap_or(usize::MAX)
+        };
+        let span_cost = |start: usize, end: usize| rendered_range_cost(file_lines, start - 1, end);
+        let sig_max = 12.max(budget.max_symbols_in_file_header * 2);
+        let sig_reserve: usize = syms
+            .iter()
+            .take(sig_max)
+            .map(|n| span_cost(n.start_line as usize, n.start_line as usize) + 1)
+            .sum();
+        let body_cap = allowance
+            .min(ctx.funded_headroom)
+            .saturating_sub(sig_reserve);
+        let span_of = |n: &Node| {
+            let start = n.start_line as usize;
+            (start, (n.end_line as usize).clamp(start, total_lines))
+        };
+        let mut ranked: Vec<&Node> = syms
+            .iter()
+            .copied()
+            .filter(|n| tier(n) != u8::MAX && n.end_line >= n.start_line)
+            .collect();
+        ranked.sort_by_key(|n| {
+            (
+                tier(n),
+                chain_at(n),
+                n.start_line,
+                n.start_column,
+                n.id.clone(),
+            )
+        });
+        let mut bodies: HashSet<&str> = HashSet::new();
+        let mut windows_of: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+        let mut spent = 0usize;
+        let mut deferred: Vec<&Node> = Vec::new();
+        for n in ranked.iter().copied().filter(|n| tier(n) <= WINDOWED_TIER) {
+            let (start, end) = span_of(n);
+            let size = span_cost(start, end);
+            if spent + size <= body_cap {
+                bodies.insert(n.id.as_str());
+                spent += size;
+            } else {
+                deferred.push(n);
+            }
+        }
+        for n in deferred {
+            let (start, end) = span_of(n);
+            let room = body_cap.saturating_sub(spent);
+            let floor = span_cost(start, (start + MIN_WINDOW_LINES - 1).min(end));
+            if room < floor && bodies.len() + windows_of.len() > 0 {
+                continue;
+            }
+            let focus: Vec<usize> = ctx
+                .exact_focus
+                .iter()
+                .chain(ctx.spine_focus)
+                .find(|(s, e, _)| (*s, *e) == (start, n.end_line as usize))
+                .map(|(_, _, lines)| lines.clone())
+                .unwrap_or_default();
+            let (windows, _) = window_to_ceiling(file_lines, start - 1, end, room, &focus);
+            if windows.is_empty() {
+                continue;
+            }
+            spent += windows
+                .iter()
+                .map(|&(lo, hi)| rendered_range_cost(file_lines, lo, hi))
+                .sum::<usize>();
+            windows_of.insert(n.id.as_str(), windows);
+        }
+        for n in ranked.iter().copied().filter(|n| tier(n) > WINDOWED_TIER) {
+            let (start, end) = span_of(n);
+            let size = span_cost(start, end);
+            if spent + size > body_cap && bodies.len() + windows_of.len() > 0 {
+                continue;
+            }
+            bodies.insert(n.id.as_str());
+            spent += size;
+        }
+
+        // In line order: a chosen body whole, a windowed one as its windows
+        // with each hole named, every other symbol as its signature line.
+        let mut parts: Vec<(usize, usize, String)> = Vec::new();
+        let mut covered_until = 0usize;
+        let (mut sig_count, mut sig_dropped) = (0usize, 0usize);
+        for n in &syms {
+            let (start, end) = span_of(n);
+            if start <= covered_until {
+                continue;
+            }
+            if bodies.contains(n.id.as_str()) {
+                parts.push((
+                    start,
+                    end,
+                    number_source_lines_at(&file_lines[start - 1..end], start),
+                ));
+                covered_until = end;
+            } else if let Some(windows) = windows_of.get(n.id.as_str()) {
+                for (k, &(lo, hi)) in windows.iter().enumerate() {
+                    let hole_end = windows.get(k + 1).map_or(end + 1, |next| next.0 + 1) - 1;
+                    let mut text = number_source_lines_at(&file_lines[lo..hi], lo + 1);
+                    if hole_end > hi {
+                        text.push_str(&format!(
+                            "\n… lines {}-{hole_end} of `{}` elided — codegraph_explore `{file_path}:{}-{hole_end}` returns them",
+                            hi + 1,
+                            n.name,
+                            hi + 1
+                        ));
+                    }
+                    parts.push((lo + 1, hi, text));
+                }
+                covered_until = end;
+            } else {
+                // The stored line can be a decorator's: the signature is the
+                // first of four lines that names the symbol.
+                let line_no = (0..4)
+                    .map(|k| start + k)
+                    .find(|&line| {
+                        file_lines
+                            .get(line - 1)
+                            .is_some_and(|l| l.contains(n.name.as_str()))
+                    })
+                    .unwrap_or(start);
+                if line_no <= covered_until {
+                    continue;
+                }
+                if sig_count >= sig_max {
+                    sig_dropped += 1;
+                    continue;
+                }
+                let signature = file_lines[line_no - 1].trim();
+                if !signature.is_empty() {
+                    parts.push((line_no, line_no, format!("{line_no}\t{signature}")));
+                    sig_count += 1;
+                }
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for n in &group {
+            if !names.contains(&n.name.as_str()) {
+                names.push(n.name.as_str());
+            }
+        }
+        names.truncate(budget.max_symbols_in_file_header);
+        let tag = if bodies.len() + windows_of.len() > 0 {
+            "focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)"
+        } else {
+            "skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)"
+        };
+        let header = format!("#### {file_path} — {} · {tag}", names.join(", "));
+        let section_of = |parts: &[(usize, usize, String)], trimmed: usize| -> String {
+            let mut body: Vec<&str> = parts.iter().map(|p| p.2.as_str()).collect();
+            let dropped = sig_dropped + trimmed;
+            let tail = format!("… +{dropped} more (signatures elided)");
+            if dropped > 0 {
+                body.push(&tail);
+            }
+            format!("{header}\n\n```{lang}\n{}\n```\n", body.join("\n"))
+        };
+        // Fit the total budget's room (b635dd46 6271-6283): trailing
+        // signatures go first, then trailing bodies; the caller drops the file
+        // whole when not one part fits.
+        let mut trimmed = 0usize;
+        while parts.len() > 1 && section_of(&parts, trimmed).len() + 1 > ctx.funded_headroom {
+            match parts.iter().rposition(|p| p.0 == p.1) {
+                Some(k) => {
+                    parts.remove(k);
+                    trimmed += 1;
+                }
+                None => {
+                    parts.pop();
+                }
+            }
+        }
+        let wanted: Vec<WantedSpan> = syms
+            .iter()
+            .filter(|n| n.kind != NodeKind::File)
+            .map(|n| WantedSpan {
+                name: n.name.clone(),
+                kind: n.kind.as_str(),
+                start: n.start_line as usize,
+                end: n.end_line.max(n.start_line) as usize,
+                importance: if subgraph
+                    .roots
+                    .iter()
+                    .chain(&subgraph.named_seed_ids)
+                    .any(|id| id == &n.id)
+                {
+                    10
+                } else if flow.named_node_ids.contains(&n.id) {
+                    NAMED_IMPORTANCE
+                } else {
+                    1
+                },
+                qualified_name: Some(n.qualified_name.clone()),
+            })
+            .collect();
+        let delivered: Vec<(usize, usize)> = parts.iter().map(|p| (p.0, p.1)).collect();
+        Some(ExploreFileRender {
+            section: section_of(&parts, trimmed),
+            source_emitted: true,
+            // The per-symbol view elides bodies by construction.
+            clipped: true,
+            elided: elided_wanted_spans(&wanted, &delivered),
+        })
+    }
+
+    /// Whether at least [`MIN_SIBLINGS`] types implement or extend `id`, asked
+    /// once per explore. The two kinds are counted through the kind index, not
+    /// by reading every edge into `id` (W7-25 cost).
+    fn has_many_implementers(&self, subgraph: &ExploreSubgraph, id: &str) -> bool {
+        if let Some(&known) = subgraph.implementer_cache.borrow().get(id) {
+            return known;
+        }
+        let many = [EdgeKind::Implements, EdgeKind::Extends]
+            .into_iter()
+            .map(|kind| {
+                self.store
+                    .edges_by_target_kind(id, Some(kind))
+                    .map_or(0, |edges| edges.len())
+            })
+            .sum::<usize>()
+            >= MIN_SIBLINGS;
+        subgraph
+            .implementer_cache
+            .borrow_mut()
+            .insert(id.to_string(), many);
+        many
+    }
+
     /// Render one file's source section under the per-file budget. Small files
     /// come back WHOLE; larger ones are clustered by `gapThreshold` and capped
     /// at `maxCharsPerFile`, dropping whole low-importance clusters (never
@@ -1792,11 +2530,23 @@ impl CodeGraphEngine {
             };
         }
 
+        // Adaptive sizing: an off-spine polymorphic sibling, or an on-spine
+        // god-file, renders symbol by symbol (b635dd46 6039-6288).
+        if let Some(rendered) = self.render_per_symbol(subgraph, file_path, file_lines, lang, ctx) {
+            return rendered;
+        }
+
         // Whole-file rule (`tools.ts:2645-2672`): a relevant file small enough to
         // afford comes back ENTIRELY — clustering exists only to tame god-files.
-        const WHOLE_FILE_MAX_LINES: usize = 220;
+        // A central file, where the query's entry points live, gets the larger
+        // ceiling (`WHOLE_FILE_MAX_LINES`, b635dd46 6319-6328).
+        let whole_file_max_lines = if subgraph.central_files.contains(file_path) {
+            280
+        } else {
+            220
+        };
         let whole_file_max_chars = budget.max_chars_per_file * 3;
-        if total_lines <= WHOLE_FILE_MAX_LINES && content.len() <= whole_file_max_chars {
+        if total_lines <= whole_file_max_lines && content.len() <= whole_file_max_chars {
             let numbered = number_source_lines_at(&body.split('\n').collect::<Vec<_>>(), 1);
             let names =
                 subgraph.file_header_names_capped(file_path, budget.max_symbols_in_file_header);
@@ -1838,16 +2588,51 @@ impl CodeGraphEngine {
         // Cluster nearby symbol ranges; merge ranges within `gapThreshold`
         // lines, rank by importance, and select clusters until the per-file cap
         // is hit (`tools.ts:2674-2848`).
-        let mut ranges: Vec<ClusterRange> = subgraph
+        // The file's gathered nodes plus every definition the query named or
+        // singled out that lives here: the gather can miss a named def in a big
+        // file, and it would form no cluster (b635dd46 6495-6503). Injected in
+        // `(line, column, id)` order, so no set order reaches the output.
+        let in_file = |n: &Node| {
+            n.file_path == file_path
+                && n.kind != NodeKind::Import
+                && n.kind != NodeKind::Export
+                && n.start_line > 0
+                && n.end_line > 0
+        };
+        let mut range_nodes: Vec<Node> = subgraph
             .nodes
             .iter()
-            .filter(|n| {
-                n.file_path == file_path
-                    && n.kind != NodeKind::Import
-                    && n.kind != NodeKind::Export
-                    && n.start_line > 0
-                    && n.end_line > 0
-            })
+            .filter(|n| in_file(n))
+            .cloned()
+            .collect();
+        let mut wanted_ids: Vec<&String> = ctx
+            .flow
+            .named_node_ids
+            .iter()
+            .chain(&subgraph.exact_ids)
+            .filter(|id| subgraph.node(id).is_none())
+            .collect();
+        wanted_ids.sort();
+        wanted_ids.dedup();
+        let mut injected: Vec<Node> = wanted_ids
+            .into_iter()
+            .filter_map(|id| self.store.node_by_id(id).ok().flatten())
+            .filter(|n| in_file(n))
+            .collect();
+        injected.sort_by(|a, b| {
+            (a.start_line, a.start_column, a.id.as_str()).cmp(&(
+                b.start_line,
+                b.start_column,
+                b.id.as_str(),
+            ))
+        });
+        range_nodes.extend(injected);
+        let is_entry = |id: &str| {
+            subgraph.roots.iter().any(|r| r == id)
+                || subgraph.named_seed_ids.iter().any(|r| r == id)
+        };
+        let mut ranges: Vec<ClusterRange> = range_nodes
+            .iter()
             // Drop whole-file envelope containers (>50% of the file) so a class
             // body doesn't merge every method into one whole-file cluster
             // (`tools.ts:2693-2718`).
@@ -1856,17 +2641,26 @@ impl CodeGraphEngine {
                     && (n.end_line - n.start_line + 1) as usize > total_lines / 2)
             })
             .map(|n| {
-                // A protected focus outranks an ordinary root, so a cluster that
-                // owns one sorts ahead of equally-important siblings. It is
-                // matched on the STORED definition line: a focus whose line the
-                // clamp below moves is one the range filters would drop anyway,
-                // and §3.1.1 conditions the guarantee on surviving them.
+                // Upstream's importance (b635dd46 6511-6522): exact, an entry
+                // point 10, a named symbol 9, glue 6, one edge from an entry 3,
+                // the rest 1. A protected focus (Rust's own, §3.1) sits between
+                // the exact target and the entry point, so a cluster that owns
+                // one sorts ahead of equally-important siblings. It is matched
+                // on the STORED definition line: a focus whose line the clamp
+                // below moves is one the range filters would drop anyway, and
+                // §3.1.1 conditions the guarantee on surviving them.
                 let importance = if subgraph.is_exact(&n.id) {
                     EXACT_IMPORTANCE
                 } else if ctx.focuses.contains(&(n.start_line as usize)) {
-                    11
-                } else if subgraph.roots.iter().any(|r| r == &n.id) {
+                    FOCUS_IMPORTANCE
+                } else if is_entry(&n.id) {
                     10
+                } else if ctx.flow.named_node_ids.contains(&n.id) {
+                    NAMED_IMPORTANCE
+                } else if subgraph.glue_ids.contains(&n.id) {
+                    6
+                } else if subgraph.connected_ids.contains(&n.id) {
+                    3
                 } else {
                     1
                 };
@@ -1888,6 +2682,14 @@ impl CodeGraphEngine {
                     },
                     importance,
                     qualified_name: Some(n.qualified_name.clone()),
+                    spine: ctx.flow.path_node_ids.contains(&n.id),
+                    spine_call_line: ctx
+                        .flow
+                        .spine_call_sites
+                        .get(&n.id)
+                        .filter(|&&line| line > 0)
+                        .map(|&line| line as usize),
+                    continuation: false,
                 }
             })
             // Drop ranges whose start is past EOF (a fully-stale node).
@@ -1913,9 +2715,26 @@ impl CodeGraphEngine {
                 },
                 importance: EXACT_IMPORTANCE,
                 qualified_name: None,
+                spine: false,
+                spine_call_line: None,
+                continuation: false,
             });
         }
         ranges.sort_by_key(|r| r.start);
+        // What the section sets out to deliver (#2077), before an oversize
+        // spine method is cut to its windows.
+        let wanted: Vec<WantedSpan> = ranges
+            .iter()
+            .map(|r| WantedSpan {
+                name: r.member.name.clone(),
+                kind: r.member.kind,
+                start: r.start,
+                end: r.end,
+                importance: r.importance,
+                qualified_name: r.qualified_name.clone(),
+            })
+            .collect();
+        let spine_windowed = window_oversize_spine_methods(&mut ranges);
 
         if ranges.is_empty() {
             return ExploreFileRender {
@@ -1930,12 +2749,7 @@ impl CodeGraphEngine {
         let mut current = Cluster::from_range(&ranges[0]);
         for r in &ranges[1..] {
             if r.start <= current.end + budget.gap_threshold {
-                current.end = current.end.max(r.end);
-                current.symbols.push(r.label.clone());
-                current.members.push(r.member.clone());
-                current.spans.push((r.start, r.end, r.importance));
-                current.score += r.importance;
-                current.max_importance = current.max_importance.max(r.importance);
+                current.absorb(r);
             } else {
                 clusters.push(current);
                 current = Cluster::from_range(r);
@@ -1969,114 +2783,43 @@ impl CodeGraphEngine {
         // between neighbours. Summed rather than rendered, so growing a window
         // one line at a time stays linear instead of re-formatting the slice.
         let range_cost = |start_idx: usize, end_idx: usize| -> usize {
-            if end_idx <= start_idx {
-                return 0;
-            }
-            (start_idx..end_idx)
-                .map(|i| decimal_width(i + 1) + 1 + file_lines[i].len())
-                .sum::<usize>()
-                + (end_idx - start_idx - 1)
+            rendered_range_cost(file_lines, start_idx, end_idx)
         };
         let grow_head = |start_idx: usize, end_idx: usize, room: usize| -> (usize, usize) {
-            let floor = (start_idx + MIN_WINDOW_LINES).min(end_idx);
-            let mut end = (start_idx + 1).min(end_idx);
-            while end < end_idx && range_cost(start_idx, end + 1) <= room {
-                end += 1;
-            }
-            (start_idx, end.max(floor))
+            grow_window_head(file_lines, start_idx, end_idx, room)
         };
-        // Grow one line up, then one line down, alternating, so the emitted window
-        // is centred on the focus rather than biased to whichever side was tried
-        // first. Bounded by the span's own line count, so it always terminates.
         let grow_around =
             |focus_idx: usize, start_idx: usize, end_idx: usize, room: usize| -> (usize, usize) {
-                let focus_idx = focus_idx.clamp(start_idx, end_idx - 1);
-                let (mut lo, mut hi) = (focus_idx, focus_idx + 1);
-                let mut up = true;
-                for _ in 0..(end_idx - start_idx) * 2 {
-                    let can_up = lo > start_idx && range_cost(lo - 1, hi) <= room;
-                    let can_down = hi < end_idx && range_cost(lo, hi + 1) <= room;
-                    if !can_up && !can_down {
-                        break;
-                    }
-                    if (up && can_up) || !can_down {
-                        lo -= 1;
-                    } else {
-                        hi += 1;
-                    }
-                    up = !up;
-                }
-                let want = MIN_WINDOW_LINES.min(end_idx - start_idx);
-                if hi - lo < want {
-                    let lo2 = focus_idx
-                        .saturating_sub(want / 2)
-                        .max(start_idx)
-                        .min(end_idx - want);
-                    return (lo2, lo2 + want);
-                }
-                (lo, hi)
+                grow_window_around(file_lines, focus_idx, start_idx, end_idx, room)
             };
         // Only the focuses inside THIS cluster's span may claim its reserve;
         // clamping an out-of-span focus in would spend the reserve re-emitting
         // lines the head window already covers.
+        // The cluster's spine call line comes first (upstream `focusLinesOf`,
+        // b635dd46 6883-6896), so a window of a spine member reaches the call
+        // to the next hop.
         let focuses_in = |c: &Cluster| -> Vec<usize> {
             let (start_idx, end_idx) = span_of(c);
-            ctx.focuses
-                .iter()
-                .copied()
-                .filter(|&line| line > start_idx && line <= end_idx)
-                .collect()
+            let inside = |line: usize| line > start_idx && line <= end_idx;
+            let mut lines: Vec<usize> = c
+                .spine_call_line
+                .filter(|&line| inside(line))
+                .into_iter()
+                .collect();
+            lines.extend(
+                ctx.focuses
+                    .iter()
+                    .copied()
+                    .filter(|&line| inside(line) && Some(line) != c.spine_call_line),
+            );
+            lines
         };
         // CG-30: a cluster too big for its room is emitted as WHOLE-LINE windows
-        // instead of being taken whole (which then costs the entire file) or
-        // skipped whole. Returns the rendered body and whether it was windowed,
-        // so the caller can add the `... (gap) ...` honesty marker.
+        // ([`window_to_ceiling`]).
         let window_cluster =
             |c: &Cluster, room: usize, focuses: &[usize]| -> (Vec<(usize, usize)>, bool) {
                 let (start_idx, end_idx) = span_of(c);
-                if range_cost(start_idx, end_idx) <= room {
-                    return (vec![(start_idx, end_idx)], false);
-                }
-                // Upstream `windowToCeiling` (CG-38): the whole room goes to the
-                // head first, and 40% of it is held back for focus windows only
-                // when that head leaves a focus uncovered — then only the focuses
-                // the smaller head misses take a share of it.
-                let full = grow_head(start_idx, end_idx, room);
-                let covers = |w: (usize, usize), line: usize| line > w.0 && line <= w.1;
-                if focuses.iter().all(|&line| covers(full, line)) {
-                    return (vec![full], full != (start_idx, end_idx));
-                }
-                let head_room = room * 60 / 100;
-                let head = grow_head(start_idx, end_idx, head_room);
-                let pending: Vec<usize> = focuses
-                    .iter()
-                    .copied()
-                    .filter(|&line| !covers(head, line))
-                    .collect();
-                let mut windows: Vec<(usize, usize)> = vec![head];
-                // Even shares with carry-forward, never greedy: upstream measured
-                // that a greedy split let an early focus eat the whole reserve and
-                // re-lose the target. One integer division, so the same input
-                // cannot drift by a char across platforms.
-                let reserve = room - head_room;
-                let base = reserve / pending.len();
-                let mut carry = reserve - base * pending.len();
-                for &line in &pending {
-                    let allot = base + carry;
-                    let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
-                    carry = allot.saturating_sub(range_cost(w.0, w.1));
-                    windows.push(w);
-                }
-                windows.sort_unstable();
-                let mut merged: Vec<(usize, usize)> = Vec::new();
-                for w in windows {
-                    match merged.last_mut() {
-                        Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
-                        _ => merged.push(w),
-                    }
-                }
-                let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
-                (merged, !covers_all)
+                window_to_ceiling(file_lines, start_idx, end_idx, room, focuses)
             };
         // What windows cost with bare gap markers, the price selection uses.
         let bare_len = |windows: &[(usize, usize)]| -> usize {
@@ -2087,16 +2830,18 @@ impl CodeGraphEngine {
                 + GAP_MARKER.len() * windows.len().saturating_sub(1)
         };
 
-        // Rank clusters: entry-point importance first, then density, then span
-        // (`tools.ts:2803-2812`).
+        // Rank clusters: exact targets first, then the spine's, then importance,
+        // density, score and span (b635dd46 6970-6990).
         let mut ranked: Vec<usize> = (0..clusters.len()).collect();
         ranked.sort_by(|&a, &b| {
             let ca = &clusters[a];
             let cb = &clusters[b];
             let span_a = (ca.end - ca.start + 1) as f64;
             let span_b = (cb.end - cb.start + 1) as f64;
-            cb.max_importance
-                .cmp(&ca.max_importance)
+            (cb.max_importance >= EXACT_IMPORTANCE)
+                .cmp(&(ca.max_importance >= EXACT_IMPORTANCE))
+                .then(cb.has_spine.cmp(&ca.has_spine))
+                .then(cb.max_importance.cmp(&ca.max_importance))
                 .then((cb.score as f64 / span_b).total_cmp(&(ca.score as f64 / span_a)))
                 .then(cb.score.cmp(&ca.score))
                 .then((span_a as usize).cmp(&(span_b as usize)))
@@ -2120,10 +2865,12 @@ impl CodeGraphEngine {
             ((budget.max_chars_per_file as f64 * 1.5).round() as usize).min(ctx.funded_headroom)
         };
         let ceiling = file_cap.saturating_sub(section_frame);
-        // A member the query asked for — a root or a protected focus — rather
-        // than incidental context that merely sits within `gap_threshold` of one
-        // (#2062).
-        let is_protected = |importance: u32| importance >= 10;
+        // A member the query asked for — named, an entry point, a protected
+        // focus or an exact target (importance 9 or more), or one on the
+        // Flow's spine — rather than incidental context that merely sits within
+        // `gap_threshold` of one (#2062; upstream `isProtectedMember`, b635dd46
+        // 6731).
+        let is_protected = |s: &(usize, usize, u32, bool)| s.2 >= NAMED_IMPORTANCE || s.3;
         // Member ranges re-merged in source order and padded into windows, so
         // adjacent survivors read as one block.
         let member_windows = |spans: &[(usize, usize)]| -> Vec<(usize, usize)> {
@@ -2158,7 +2905,7 @@ impl CodeGraphEngine {
             let core = c
                 .spans
                 .iter()
-                .filter(|s| is_protected(s.2))
+                .filter(|s| is_protected(s))
                 .map(|s| (s.0, s.1))
                 .collect::<Vec<_>>();
             if core.is_empty() {
@@ -2178,8 +2925,8 @@ impl CodeGraphEngine {
                 }
                 let mut order = c.spans.clone();
                 order.sort_by(|a, b| {
-                    is_protected(b.2)
-                        .cmp(&is_protected(a.2))
+                    is_protected(b)
+                        .cmp(&is_protected(a))
                         .then(b.2.cmp(&a.2))
                         .then((a.1 - a.0).cmp(&(b.1 - b.0)))
                         .then(a.0.cmp(&b.0))
@@ -2189,7 +2936,7 @@ impl CodeGraphEngine {
                     let mut candidate = kept.clone();
                     candidate.push((span.0, span.1));
                     let cost = bare_len(&member_windows(&candidate));
-                    if kept.is_empty() || is_protected(span.2) {
+                    if kept.is_empty() || is_protected(span) {
                         if cost > room {
                             return None;
                         }
@@ -2276,15 +3023,15 @@ impl CodeGraphEngine {
             let core = member_windows(&exact);
             let focuses = exact_focuses_in(c);
             let mut windows = if bare_len(&core) <= room {
-                let mut order: Vec<(usize, usize, u32)> = c
+                let mut order: Vec<(usize, usize, u32, bool)> = c
                     .spans
                     .iter()
                     .filter(|s| s.2 < EXACT_IMPORTANCE)
                     .copied()
                     .collect();
                 order.sort_by(|a, b| {
-                    is_protected(b.2)
-                        .cmp(&is_protected(a.2))
+                    is_protected(b)
+                        .cmp(&is_protected(a))
                         .then(b.2.cmp(&a.2))
                         .then((a.1 - a.0).cmp(&(b.1 - b.0)))
                         .then(a.0.cmp(&b.0))
@@ -2293,7 +3040,7 @@ impl CodeGraphEngine {
                 for span in order {
                     let mut candidate = kept.clone();
                     candidate.push((span.0, span.1));
-                    let limit = if is_protected(span.2) {
+                    let limit = if is_protected(&span) {
                         room
                     } else {
                         cap.min(room)
@@ -2359,7 +3106,7 @@ impl CodeGraphEngine {
                     let cap = room.saturating_sub(owed_below);
                     return exact_render(c, room, cap);
                 }
-                let has_protected = c.spans.iter().any(|s| is_protected(s.2));
+                let has_protected = c.spans.iter().any(is_protected);
                 let cap = match (owed_below > 0, has_protected) {
                     (true, _) => Some(room.saturating_sub(owed_below)),
                     (false, true) => Some(room),
@@ -2455,7 +3202,7 @@ impl CodeGraphEngine {
         let file_index_nodes = self.store.nodes_by_file_path(file_path).unwrap_or_default();
         let mut file_section =
             join_parts_with_named_gaps(file_path, &parts, &file_index_nodes, spare);
-        let clipped = chosen_count < clusters.len() || any_cluster_windowed;
+        let clipped = chosen_count < clusters.len() || any_cluster_windowed || spine_windowed;
         if clipped {
             file_section.push_str("\n\n... (gap) ...");
         }
@@ -2479,18 +3226,8 @@ impl CodeGraphEngine {
             budget.max_symbols_in_file_header,
         );
         // Every member of every cluster, chosen or not: a dropped cluster, a
-        // shrunk one and a windowed body all leave a member short (#2077).
-        let wanted: Vec<WantedSpan> = ranges
-            .iter()
-            .map(|r| WantedSpan {
-                name: r.member.name.clone(),
-                kind: r.member.kind,
-                start: r.start,
-                end: r.end,
-                importance: r.importance,
-                qualified_name: r.qualified_name.clone(),
-            })
-            .collect();
+        // shrunk one and a windowed body all leave a member short (#2077); the
+        // spans are `wanted`, taken before an oversize spine method was cut.
         let delivered: Vec<(usize, usize)> = parts
             .iter()
             .map(|(first, last, _)| (*first, *last))
@@ -2899,8 +3636,21 @@ impl CodeGraphEngine {
     }
 
     /// `findAllSymbols` (`tools.ts:3271-3307`): aggregate matches + the
-    /// multi-match "Aggregated results" note.
+    /// multi-match "Aggregated results" note. Looked up once per symbol and
+    /// request ([`Self::symbol_memo`]); a failed lookup is not remembered.
     fn find_all_symbols(&self, symbol: &str) -> anyhow::Result<AllSymbols> {
+        if let Some(found) = self.symbol_memo.borrow().get(symbol) {
+            return Ok(found.clone());
+        }
+        let found = self.look_up_all_symbols(symbol)?;
+        self.symbol_memo
+            .borrow_mut()
+            .insert(symbol.to_string(), found.clone());
+        Ok(found)
+    }
+
+    /// [`Self::find_all_symbols`] without the memo.
+    fn look_up_all_symbols(&self, symbol: &str) -> anyhow::Result<AllSymbols> {
         let results = self.search_qualified(symbol, 50)?;
         if results.is_empty() {
             return Ok(AllSymbols {
@@ -3082,21 +3832,41 @@ impl CodeGraphEngine {
 
     /// Per exact target in `file_path`, `(start, end, focus lines)`: the lines a
     /// window of its body must reach when it does not fit whole — an anchored
-    /// line inside it, then every line where it uses another symbol the
-    /// question is about (upstream `bodyFocusLines`), capped.
+    /// line inside it, the line where it calls the spine's next hop, then
+    /// every line where it uses another symbol the question is about
+    /// (upstream `bodyFocusLines`, `tools.ts` b635dd46 5217-5233), capped.
     fn exact_body_focus(
         &self,
         subgraph: &ExploreSubgraph,
         file_path: &str,
         anchors: &[QueryLineAnchor],
         question_ids: &HashSet<String>,
+        spine_call_sites: &HashMap<String, i64>,
+    ) -> Vec<BodyFocus> {
+        self.body_focus(
+            subgraph
+                .exact_ids
+                .iter()
+                .filter_map(|id| subgraph.node(id))
+                .filter(|n| n.file_path == file_path),
+            anchors,
+            question_ids,
+            spine_call_sites,
+        )
+    }
+
+    /// [`Self::exact_body_focus`] for any `nodes`: per node, its span and the
+    /// lines a window of its body must reach.
+    fn body_focus<'n>(
+        &self,
+        nodes: impl Iterator<Item = &'n Node>,
+        anchors: &[QueryLineAnchor],
+        question_ids: &HashSet<String>,
+        spine_call_sites: &HashMap<String, i64>,
     ) -> Vec<BodyFocus> {
         let mut out = Vec::new();
-        for id in &subgraph.exact_ids {
-            let Some(n) = subgraph.node(id) else {
-                continue;
-            };
-            if n.file_path != file_path || n.start_line < 1 || n.end_line < n.start_line {
+        for n in nodes {
+            if n.start_line < 1 || n.end_line < n.start_line {
                 continue;
             }
             let (start, end) = (n.start_line as usize, n.end_line as usize);
@@ -3105,6 +3875,11 @@ impl CodeGraphEngine {
                 .filter(|a| a.file == n.file_path && a.start > start && a.start <= end)
                 .map(|a| a.start)
                 .collect();
+            if let Some(&call) = spine_call_sites.get(&n.id)
+                && call > 0
+            {
+                lines.push(call as usize);
+            }
             let mut uses: Vec<usize> = self
                 .store
                 .edges_by_source_kind(&n.id, None)
@@ -3126,16 +3901,50 @@ impl CodeGraphEngine {
         out
     }
 
-    /// Build the explore subgraph. Ports the deterministic spine of
-    /// `findRelevantContext` (`context/index.ts:900-940`): the entry points
-    /// (`roots`) are the FTS search results for the query (`searchLimit: 8`,
-    /// `tools.ts:1597-1602`), in search-rank order. We then pull each root's
-    /// callers/callees + `contains` children into the subgraph so the blast
-    /// radius, relationship map, and source section have content. The RWR
-    /// relevance re-ranking / file gating is NOT ported (see KNOWN_DIFFS.md).
+    /// Build the explore subgraph. The entry points (`roots`) are the Rust
+    /// search's top 8 hits of upstream's high-value kinds, in rank order
+    /// (upstream's multi-channel search is not ported, KNOWN_DIFFS). From
+    /// them the subgraph is walked as `findRelevantContext` walks it
+    /// ([`explore_gather::walk`]); then come the query's pinned files and
+    /// exact targets, upstream's glue and its named-symbol seeds
+    /// (`tools.ts` b635dd46 4352-4626).
     #[cfg(test)]
     fn find_relevant_context(&self, query: &str) -> anyhow::Result<ExploreSubgraph> {
         self.find_relevant_context_with_pins(query, &[], &ExactTargets::default())
+    }
+
+    /// Explore's entry-point search: the Rust search's top eight matches of
+    /// upstream's high-value kinds ([`HIGH_VALUE_KINDS`]), with the
+    /// identifier-segment seeds, in rank order and once per id; nothing for a
+    /// blank query. Upstream's multi-channel search is not ported
+    /// (KNOWN_DIFFS).
+    fn explore_seed_search(&self, query: &str) -> anyhow::Result<Vec<Node>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let seed_names = get_segment_matches(&self.store, &extract_segment_search_words(query), 8)
+            .into_iter()
+            .map(|matched| matched.name)
+            .collect();
+        let results = search_nodes(
+            &self.store,
+            query,
+            &SearchOptions {
+                kinds: HIGH_VALUE_KINDS.to_vec(),
+                limit: Some(8),
+                seed_names,
+                deprioritize: Some(Arc::clone(&self.deprioritize)),
+                ..Default::default()
+            },
+            &self.project_name_tokens(),
+        )?;
+        let mut entries: Vec<Node> = Vec::new();
+        for r in results {
+            if !entries.iter().any(|seen| seen.id == r.node.id) {
+                entries.push(r.node);
+            }
+        }
+        Ok(entries)
     }
 
     fn find_relevant_context_with_pins(
@@ -3145,35 +3954,31 @@ impl CodeGraphEngine {
         exact: &ExactTargets,
     ) -> anyhow::Result<ExploreSubgraph> {
         let mut sub = ExploreSubgraph::default();
-        let traverser = GraphTraverser::new(&self.store);
 
-        let mut seed_ids: Vec<String> = Vec::new();
-        let results = if query.trim().is_empty() {
-            Vec::new()
-        } else {
-            let seed_names =
-                get_segment_matches(&self.store, &extract_segment_search_words(query), 8)
-                    .into_iter()
-                    .map(|matched| matched.name)
-                    .collect();
-            search_nodes(
-                &self.store,
-                query,
-                &SearchOptions {
-                    limit: Some(8),
-                    seed_names,
-                    deprioritize: Some(Arc::clone(&self.deprioritize)),
-                    ..Default::default()
-                },
-                &self.project_name_tokens(),
-            )?
-        };
-        for r in results {
-            if sub.insert(r.node.clone()) {
-                seed_ids.push(r.node.id.clone());
-                sub.roots.push(r.node.id.clone());
-            }
+        let entries = self.explore_seed_search(query)?;
+        // Upstream's walk from the entry points (`findRelevantContext`,
+        // `context/index.ts` 1111-1306): hierarchy, breadth-first walk, trims,
+        // caps and the edges among what was kept. `isTestQuery` is a plain
+        // substring test there (713).
+        let lowered = query.to_lowercase();
+        let test_query = lowered.contains("test") || lowered.contains("spec");
+        let explore_gather::Walk {
+            gathered,
+            roots,
+            mut reads,
+        } = explore_gather::walk(
+            &self.store,
+            &entries,
+            test_query,
+            explore_gather::EXPLORE_WALK,
+        )?;
+        for node in gathered.nodes {
+            sub.insert(node);
         }
+        for edge in gathered.edges {
+            sub.add_edge(edge);
+        }
+        sub.roots = roots;
         for file_path in pinned_files {
             sub.pin_file(file_path);
             let mut file_nodes = self.store.nodes_by_file_path(file_path)?;
@@ -3199,21 +4004,13 @@ impl CodeGraphEngine {
         }
         sub.anchor_spans = exact.spans.clone();
 
-        for root_id in seed_ids.clone() {
-            for c in traverser.get_callers(&root_id, CALL_DEPTH)? {
-                sub.add_edge(c.edge.clone());
-                sub.insert(c.node);
-            }
-            for c in traverser.get_callees(&root_id, CALL_DEPTH)? {
-                sub.add_edge(c.edge.clone());
-                sub.insert(c.node);
-            }
-            for child in traverser.get_children(&root_id)? {
-                sub.insert(child);
-            }
+        // `handleExplore`'s gather after the walk (`tools.ts` b635dd46
+        // 4352-4626), run only when something was found (upstream answers an
+        // empty gather before it): glue, then the named-symbol seeds.
+        if !sub.nodes.is_empty() {
+            self.glue_entry_neighbours(&mut sub, &mut reads)?;
+            self.seed_named_symbols(&mut sub, query)?;
         }
-
-        self.rescue_change_surface(&mut sub, &seed_ids, query, &traverser)?;
 
         // The stored half of the generated signal, in ONE batch query. Sorted and
         // deduped first, so no `HashSet` iteration order can reach output — the
@@ -3234,8 +4031,296 @@ impl CodeGraphEngine {
             .cloned()
             .collect();
 
-        sub.finalize();
+        // Upstream `handleExplore`'s file ranking (`tools.ts` b635dd46
+        // 4625-5134), which also rescues a named callable's buried signature
+        // type (#1064).
+        let multiterm_off = std::env::var("CODEGRAPH_RANK_NO_MULTITERM").is_ok_and(|v| v == "1");
+        let ranked = explore_rank::rank_files(
+            &self.store,
+            &explore_rank::RankInput {
+                nodes: &sub.nodes,
+                edges: &sub.edges,
+                roots: &sub.roots,
+                named_seed_ids: &sub.named_seed_ids,
+                tier_seed_ids: &sub.tier_seed_ids,
+                exact_files: &sub.exact_files,
+                pinned_files: &sub.pinned_files,
+                generated_files: &sub.generated_files,
+                ambient_files: &sub.ambient_files,
+                deprioritized_files: &sub.deprioritized_files,
+                query,
+                multiterm_off,
+            },
+        )?;
+        for node in ranked.rescued {
+            sub.insert(node);
+        }
+        sub.rescued_files.extend(ranked.rescued_files);
+        sub.central_files = ranked.central_files;
+        sub.connected_ids = ranked.connected;
+        // A query-named file leads in the query's order; one with no symbol
+        // to rank still gets its section (the ranking only sees grouped files).
+        let mut order: Vec<String> = sub.pinned_files.clone();
+        order.extend(
+            ranked
+                .file_order
+                .into_iter()
+                .filter(|path| !sub.pinned_files.contains(path)),
+        );
+        sub.file_order = order;
         Ok(sub)
+    }
+
+    /// Upstream's glue (`tools.ts` b635dd46 4352-4381): each entry point's
+    /// callers and callees join the subgraph when they live in a file it
+    /// already holds, at most [`GLUE_NODE_CAP`]; the walk skips some of them
+    /// for their kind (a file node calling at the top level). Nodes only, as
+    /// upstream: the edge recovery ran before. The callers and callees come
+    /// from what the walk read (`reads`), which visited every entry point.
+    fn glue_entry_neighbours(
+        &self,
+        sub: &mut ExploreSubgraph,
+        reads: &mut explore_gather::WalkReads,
+    ) -> anyhow::Result<()> {
+        let gathered_files: HashSet<String> =
+            sub.nodes.iter().map(|n| n.file_path.clone()).collect();
+        for root in sub.roots.clone() {
+            if sub.glue_ids.len() >= GLUE_NODE_CAP {
+                break;
+            }
+            let mut neighbours = reads.callers(&self.store, &root)?;
+            neighbours.extend(reads.callees(&self.store, &root)?);
+            for neighbour in neighbours {
+                if sub.glue_ids.len() >= GLUE_NODE_CAP {
+                    break;
+                }
+                if sub.node(&neighbour.id).is_some()
+                    || !gathered_files.contains(&neighbour.file_path)
+                {
+                    continue;
+                }
+                sub.glue_ids.insert(neighbour.id.clone());
+                sub.insert(neighbour);
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream's named-symbol seeding (`tools.ts` b635dd46 4384-4626): every
+    /// symbol-shaped token of the query resolves to its substantive
+    /// definitions, which join the subgraph as named seeds. A token with at
+    /// most three definitions seeds all of them, and the ones within a quarter
+    /// of the busiest's caller count earn the named tier; one with more seeds
+    /// the definitions in a type or file the query also names (at most four),
+    /// else the most substantive. A bare lowercase word seeds only where
+    /// another query token is defined in the same file. An interface's method
+    /// seeds but never earns the tier. Files declaring a type a precise token
+    /// names are recorded for the declaration-only exemption.
+    ///
+    /// Upstream sorts the definitions by body size over its row order; ties
+    /// here go generated-last, then by file, line, column and id (KEEP-RUST):
+    /// a synced index and a fresh one seed alike, and of two equal
+    /// definitions the hand-written one earns the named tier.
+    fn seed_named_symbols(&self, sub: &mut ExploreSubgraph, query: &str) -> anyhow::Result<()> {
+        let tokens = exact_symbol_tokens(query);
+        let project = self.project_name_tokens();
+        let type_tokens: Vec<String> = tokens
+            .iter()
+            .filter(|t| NAMED_TYPE_TOKEN.is_match(t) && !project.contains(&normalize_name_token(t)))
+            .map(|t| t.to_lowercase())
+            .collect();
+        let lowered: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+        let mut file_names: HashMap<String, HashSet<String>> = HashMap::new();
+        for token in &tokens {
+            let qualified = token.contains(['.', '/']) || token.contains("::");
+            let raw: Vec<Node> = if qualified {
+                self.find_all_symbols(token)?.nodes
+            } else {
+                self.store.nodes_by_name(token)?
+            };
+            if is_precise_query_token(token) {
+                for n in &raw {
+                    if is_declaration_kind(n.kind) && n.name.to_lowercase() == token.to_lowercase()
+                    {
+                        sub.named_type_files.insert(n.file_path.clone());
+                    }
+                }
+            }
+            let mut candidates: Vec<Node> = raw
+                .into_iter()
+                .filter(|n| is_seedable_kind(n.kind) && !is_seeder_test_path(&n.file_path))
+                .collect();
+            let paths: Vec<String> = candidates.iter().map(|n| n.file_path.clone()).collect();
+            let flagged = self.store.generated_paths_among(&paths)?;
+            let generated =
+                |n: &Node| flagged.contains(&n.file_path) || is_generated_file(&n.file_path);
+            candidates.sort_by(|a, b| {
+                (
+                    generated(a),
+                    a.file_path.as_str(),
+                    a.start_line,
+                    a.start_column,
+                    a.id.as_str(),
+                )
+                    .cmp(&(
+                        generated(b),
+                        b.file_path.as_str(),
+                        b.start_line,
+                        b.start_column,
+                        b.id.as_str(),
+                    ))
+            });
+            candidates.sort_by_key(|n| {
+                let lines = body_lines(n);
+                (std::cmp::Reverse(lines > 1), std::cmp::Reverse(lines))
+            });
+            if candidates.is_empty() && !qualified && has_camel_hump(token) {
+                candidates = self.camel_infix_definers(token)?;
+            }
+            if !is_precise_query_token(token) {
+                let mut kept = Vec::new();
+                for n in candidates {
+                    if self.co_named_in_file(token, &n.file_path, &lowered, &mut file_names)? {
+                        kept.push(n);
+                    }
+                }
+                candidates = kept;
+            }
+            let (picks, tier_picks): (Vec<Node>, Vec<Node>) = if candidates.len() <= 3 {
+                let mut counts = Vec::with_capacity(candidates.len());
+                for n in &candidates {
+                    counts.push(explore_gather::callers(&self.store, &n.id)?.len());
+                }
+                let busiest = counts.iter().copied().max().unwrap_or(0).max(1) as f64;
+                let tier = candidates
+                    .iter()
+                    .zip(&counts)
+                    .enumerate()
+                    .filter(|(at, (_, count))| *at == 0 || **count as f64 >= busiest * 0.25)
+                    .map(|(_, (n, _))| n.clone())
+                    .collect();
+                (candidates, tier)
+            } else {
+                let in_context: Vec<Node> = candidates
+                    .iter()
+                    .filter(|n| {
+                        type_tokens.iter().any(|t| {
+                            n.file_path.to_lowercase().contains(t.as_str())
+                                || n.qualified_name.to_lowercase().contains(t.as_str())
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                let picks: Vec<Node> = if in_context.is_empty() {
+                    candidates.into_iter().take(1).collect()
+                } else {
+                    in_context.into_iter().take(4).collect()
+                };
+                (picks.clone(), picks)
+            };
+            for n in picks {
+                if !sub.named_seed_ids.contains(&n.id) {
+                    sub.named_seed_ids.push(n.id.clone());
+                }
+                sub.insert(n);
+            }
+            for n in tier_picks {
+                if !self.is_interface_owned_method(&n)? && !sub.tier_seed_ids.contains(&n.id) {
+                    sub.tier_seed_ids.push(n.id.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upstream's field-name fallback (#1196): a camelCase token naming no
+    /// definition seeds up to three seedable symbols it sits in at a hump or
+    /// as a prefix, shortest first. The candidates come from
+    /// `Store::seedable_nodes_by_name_infix` (shortest first, then name, path
+    /// and line), upstream's `getNodesByNameSubstring` bounded the same way.
+    fn camel_infix_definers(&self, token: &str) -> anyhow::Result<Vec<Node>> {
+        let needle = token.to_lowercase();
+        let mut found: Vec<Node> = self
+            .store
+            .seedable_nodes_by_name_infix(&needle, 60)?
+            .into_iter()
+            .filter(|n| is_seedable_kind(n.kind) && !is_seeder_test_path(&n.file_path))
+            .filter(|n| {
+                let lowered = n.name.to_lowercase();
+                let Some(at) = lowered.find(&needle) else {
+                    return false;
+                };
+                if at == 0 {
+                    return n.name.chars().count() > token.chars().count();
+                }
+                let chars_before = lowered[..at].chars().count();
+                n.name
+                    .chars()
+                    .nth(chars_before)
+                    .is_some_and(|c| c.is_ascii_uppercase())
+            })
+            .collect();
+        found.sort_by_key(|n| n.name.chars().count());
+        found.truncate(3);
+        Ok(found)
+    }
+
+    /// Whether another token of the query names a symbol defined in
+    /// `file_path` (upstream `coNamedInFile`). An interface's members describe
+    /// a shape, not a definition, and do not count.
+    fn co_named_in_file(
+        &self,
+        token: &str,
+        file_path: &str,
+        lowered: &[String],
+        cache: &mut HashMap<String, HashSet<String>>,
+    ) -> anyhow::Result<bool> {
+        if !cache.contains_key(file_path) {
+            // Each node's kind, lines and name, not the whole row (W7-25 cost).
+            let nodes = self.store.node_kinds_and_spans_in_file(file_path)?;
+            let interfaces: Vec<(i64, i64)> = nodes
+                .iter()
+                .filter(|(kind, _)| *kind == NodeKind::Interface)
+                .map(|(_, n)| (n.start_line, n.end_line))
+                .collect();
+            let names = nodes
+                .iter()
+                .filter(|(kind, n)| {
+                    !(matches!(kind, NodeKind::Property | NodeKind::Method)
+                        && interfaces
+                            .iter()
+                            .any(|(start, end)| n.start_line >= *start && n.end_line <= *end))
+                })
+                .map(|(_, n)| n.name.to_lowercase())
+                .collect();
+            cache.insert(file_path.to_string(), names);
+        }
+        let names = &cache[file_path];
+        let own = token.to_lowercase();
+        Ok(lowered
+            .iter()
+            .any(|other| *other != own && names.contains(other)))
+    }
+
+    /// A member an interface declares, a signature without a body (#1638):
+    /// a `method` that an `interface` contains.
+    fn is_interface_owned_method(&self, node: &Node) -> anyhow::Result<bool> {
+        if node.kind != NodeKind::Method {
+            return Ok(false);
+        }
+        for edge in self
+            .store
+            .edges_by_target_kind(&node.id, Some(EdgeKind::Contains))?
+        {
+            if self
+                .store
+                .node_by_id(&edge.source)?
+                .is_some_and(|owner| owner.kind == NodeKind::Interface)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The ambient declaration files among `candidate_paths`, minus any this query
@@ -3250,7 +4335,10 @@ impl CodeGraphEngine {
     /// on this" and damp a type module the repo genuinely imports.
     ///
     /// Conditions 1 and 2 run first as a cheap pre-filter, so the two edge queries
-    /// execute only for the handful of declaration-only files.
+    /// execute only for the handful of declaration-only files. Before that, one
+    /// probe skips a file holding a node of a kind outside
+    /// [`AMBIENT_FILE_NODE_KINDS`] without reading its rows (W7-25 cost): such a
+    /// node is a declaration and not a type, so condition 2 fails on it.
     fn ambient_declaration_files(
         &self,
         candidate_paths: &[String],
@@ -3259,6 +4347,12 @@ impl CodeGraphEngine {
         let precise = precise_query_tokens(query);
         let mut ambient = HashSet::new();
         for path in candidate_paths {
+            if self
+                .store
+                .file_has_node_outside_kinds(path, &AMBIENT_FILE_NODE_KINDS)?
+            {
+                continue;
+            }
             let nodes = self.store.nodes_by_file_path(path)?;
             let interface_owners = nodes
                 .iter()
@@ -3335,127 +4429,6 @@ impl CodeGraphEngine {
             }
         }
         Ok(ambient)
-    }
-
-    /// #1064 change-surface rescue (ports `2b256b9` `tools.ts:2585-2860`, adapted
-    /// to this deterministic explore).
-    ///
-    /// A named callable's signature types — its parameter and return types — are
-    /// part of what you'd edit to "add a parameter to X", yet they can be
-    /// lexically dissimilar to the query ("add a parameter to `newClient`" shares
-    /// no words with `options.ts`, which defines `DialOption`) and sit a hop away
-    /// as a `References` edge. Explore's search + budget then buries that answer
-    /// file under incidental roots that merely share query words, so the agent
-    /// falls back to grep. This pass surfaces the buried signature type.
-    ///
-    /// Two deterministic halves:
-    /// 1. **Tier de-noise**: among same-named callable seeds only the top pick
-    ///    plus any seed with caller-count ≥ 25% of the max seed caller-count is
-    ///    TIERED — a low-centrality namesake (Go's test-fake `NewClient`) can't
-    ///    fill the tier and crowd out the answer.
-    /// 2. **Buried rescue**: from each TIERED callable seed, follow outgoing
-    ///    signature edges to TYPE-kind nodes; a type whose file is BURIED (not
-    ///    already a seed file AND < 2 query-term hits) is inserted + marked
-    ///    `rescued_files` so `finalize` floats it to the top tier. A
-    ///    well-connected type (already a seed / term-matched) is left alone, so
-    ///    ordinary flow queries are unchanged.
-    ///
-    /// Determinism: the tiered-seed list preserves search-rank order; the rescue
-    /// candidates are collected then SORTED by `(file_path, start_line, id)` and
-    /// deduped before insertion — no `HashMap`/`HashSet` iteration reaches output.
-    fn rescue_change_surface(
-        &self,
-        sub: &mut ExploreSubgraph,
-        seed_ids: &[String],
-        query: &str,
-        traverser: &GraphTraverser,
-    ) -> anyhow::Result<()> {
-        // Tier de-noise: rank callable seeds by caller-count, tier the top pick
-        // plus any seed within 25% of the max. Iterated in search-rank order.
-        let mut callable_seeds: Vec<(String, usize)> = Vec::new();
-        for id in seed_ids {
-            let Some(node) = sub.node(id) else { continue };
-            if !CALLABLE_KINDS.contains(&node.kind) {
-                continue;
-            }
-            let caller_count = traverser.get_callers(id, CALL_DEPTH)?.len();
-            callable_seeds.push((id.clone(), caller_count));
-        }
-        if callable_seeds.is_empty() {
-            return Ok(());
-        }
-        let max_callers = callable_seeds.iter().map(|(_, c)| *c).max().unwrap_or(0);
-        let threshold = max_callers / 4;
-        let tiered_seed_ids: Vec<String> = callable_seeds
-            .iter()
-            .enumerate()
-            .filter(|(i, (_, c))| *i == 0 || *c >= threshold)
-            .map(|(_, (id, _))| id.clone())
-            .collect();
-
-        // Seed files are NOT buried: a type already defined in one is on-screen.
-        let seed_files: HashSet<String> = seed_ids
-            .iter()
-            .filter_map(|id| sub.node(id).map(|n| n.file_path.clone()))
-            .collect();
-        let terms = query_terms(query);
-
-        // Collect candidate signature-type nodes from every tiered callable seed.
-        let mut candidates: Vec<Node> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for seed_id in &tiered_seed_ids {
-            for kind in SIG_EDGE_KINDS {
-                for edge in self.store.edges_by_source_kind(seed_id, Some(kind))? {
-                    let Ok(targets) = self.store.nodes_by_ids(std::slice::from_ref(&edge.target))
-                    else {
-                        continue;
-                    };
-                    let Some(target) = targets.get(&edge.target) else {
-                        continue;
-                    };
-                    if !TYPE_KINDS.contains(&target.kind) {
-                        continue;
-                    }
-                    if seed_ids.iter().any(|s| s == &target.id) {
-                        continue;
-                    }
-                    if seen.insert(target.id.clone()) {
-                        candidates.push(target.clone());
-                    }
-                }
-            }
-        }
-
-        // Deterministic order for the rescue set (no HashSet iteration reaches
-        // output): sort by file, then line, then id.
-        candidates.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.id.cmp(&b.id))
-        });
-
-        for target in candidates {
-            let fp = target.file_path.clone();
-            // Buried: not already an on-screen seed file, and the query barely
-            // touches it lexically (< 2 term hits on its file path / node name).
-            if seed_files.contains(&fp) {
-                continue;
-            }
-            let term_hits = terms
-                .iter()
-                .filter(|t| {
-                    fp.to_ascii_lowercase().contains(*t)
-                        || target.name.to_ascii_lowercase().contains(*t)
-                })
-                .count();
-            if term_hits >= 2 {
-                continue;
-            }
-            sub.insert(target);
-            sub.rescued_files.insert(fp);
-        }
-        Ok(())
     }
 
     /// Ports `buildDynamicBoundaries` (`tools.ts:1717-1760`): scan the explored
@@ -3728,6 +4701,145 @@ impl CodeGraphEngine {
         let start_idx = start_idx.min(end_idx);
         Ok(Some(lines[start_idx..end_idx].join("\n")))
     }
+
+    /// `codegraph context <task>` (W9-01): upstream `ContextBuilder.buildContext`
+    /// (`context/index.ts` b635dd46 241-302) over explore's search and walk.
+    ///
+    /// The entry points are the first `search_limit` seeds of
+    /// [`Self::explore_seed_search`] for the task as written (upstream's
+    /// context strips no paths), with no score floor (OD-B81). The subgraph
+    /// is [`explore_gather::walk`] at the options' limits (OD-B79), and the
+    /// low-confidence note is upstream's rule over those entry points
+    /// (OD-B80). Code comes through the drift-safe reader
+    /// ([`Self::get_code`]): a file whose freshness cannot be proven gives no
+    /// block, never one cut at stale lines, and a notice names it; a YAML or
+    /// properties key gives its key alone (#383).
+    pub fn build_context(
+        &self,
+        task: &str,
+        options: &ContextOptions,
+    ) -> anyhow::Result<BuiltContext> {
+        self.source_probes.borrow_mut().clear();
+        self.source_citations.borrow_mut().clear();
+        self.answer_files.borrow_mut().clear();
+        self.symbol_memo.borrow_mut().clear();
+        let health = codegraph_watch::watch_health(&self.project_root);
+
+        let entries: Vec<Node> = self
+            .explore_seed_search(task)?
+            .into_iter()
+            .take(options.search_limit)
+            .collect();
+        let low_confidence = context::is_low_confidence(task, &entries);
+        // `isTestQuery`, as explore reads it (`context/index.ts` 713).
+        let lowered = task.to_lowercase();
+        let test_query = lowered.contains("test") || lowered.contains("spec");
+        let explore_gather::Walk {
+            gathered, roots, ..
+        } = explore_gather::walk(
+            &self.store,
+            &entries,
+            test_query,
+            explore_gather::WalkLimits {
+                max_nodes: options.max_nodes,
+                depth: options.traversal_depth,
+            },
+        )?;
+
+        let mut code_blocks: Vec<CodeBlock> = Vec::new();
+        let mut drifted: BTreeSet<String> = BTreeSet::new();
+        if options.include_code {
+            for node in context::code_block_candidates(&gathered.nodes, &roots) {
+                if code_blocks.len() >= options.max_code_blocks {
+                    break;
+                }
+                let code = if explore_rank::is_config_leaf(node) {
+                    Some(context::config_leaf_code(node).to_string())
+                } else {
+                    let code = self.get_code(node)?;
+                    if code.is_none() && self.project_source(&node.file_path).is_possibly_drifted()
+                    {
+                        drifted.insert(node.file_path.clone());
+                    }
+                    code
+                };
+                // A block with no code takes no slot (`if (code)`).
+                if let Some(code) = code.filter(|code| !code.is_empty()) {
+                    code_blocks.push(CodeBlock {
+                        node: node.clone(),
+                        content: context::truncate_code_block(&code, options.max_code_block_size),
+                    });
+                }
+            }
+        }
+
+        let task_context = TaskContext {
+            query: task.to_string(),
+            nodes: gathered.nodes,
+            edges: gathered.edges,
+            roots,
+            code_blocks,
+            low_confidence,
+        };
+        let output = match options.format {
+            ContextFormat::Markdown => {
+                // Upstream's `generatedPredicateFor` over the answer's paths:
+                // the index's header verdicts and the file-name rule, in one
+                // query over the sorted paths.
+                let mut paths: Vec<String> = task_context
+                    .nodes
+                    .iter()
+                    .map(|node| node.file_path.clone())
+                    .collect();
+                paths.sort_unstable();
+                paths.dedup();
+                let flagged = self.store.generated_paths_among(&paths)?;
+                context::format_markdown(&task_context, &|path| {
+                    flagged.contains(path) || is_generated_file(path)
+                })
+            }
+            ContextFormat::Json => context::format_json(&task_context)?,
+        };
+
+        let mut notices = Vec::new();
+        match &health {
+            Some(codegraph_watch::WatchHealth::Recovering { reason }) => notices.push(format!(
+                "CodeGraph auto-sync is RECOVERING — a full index catch-up has not completed yet, so this context may be stale; read files directly to confirm current content. Reason: {}",
+                one_line(reason)
+            )),
+            Some(codegraph_watch::WatchHealth::Disabled { reason }) => notices.push(format!(
+                "CodeGraph auto-sync is DISABLED — live file watching stopped, so the index is frozen and this context may be stale; read files directly to confirm current content. Reason: {}",
+                one_line(reason)
+            )),
+            Some(codegraph_watch::WatchHealth::Healthy) | None => {}
+        }
+        if !drifted.is_empty() {
+            notices.push(format!(
+                "left out the code of symbols in files that changed since the last index sync: {}; run `codegraph sync` to index them again",
+                drifted.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        Ok(BuiltContext { output, notices })
+    }
+}
+
+/// What `codegraph context` prints (W9-01): the answer for stdout, unchanged
+/// by the index's health, and one-line notices for stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltContext {
+    /// The Markdown or JSON answer, without the newline the CLI ends it with.
+    pub output: String,
+    /// Auto-sync recovering or disabled, and the files whose code was left
+    /// out because they changed since the last index sync.
+    pub notices: Vec<String>,
+}
+
+/// `text` on one line: its line breaks become spaces.
+fn one_line(text: &str) -> String {
+    text.split(['\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3776,6 +4888,7 @@ enum CallDir {
     Callees,
 }
 
+#[derive(Clone)]
 struct AllSymbols {
     nodes: Vec<Node>,
     note: String,
@@ -3835,6 +4948,9 @@ impl GodotHonesty {
 /// ordering for the source section.
 #[derive(Default)]
 struct ExploreSubgraph {
+    /// Type id → whether at least [`MIN_SIBLINGS`] types implement or extend
+    /// it, asked once per explore (upstream's `siblingSuper` and `superMany`).
+    implementer_cache: RefCell<HashMap<String, bool>>,
     nodes: Vec<Node>,
     index: HashMap<String, usize>,
     edges: Vec<codegraph_core::types::Edge>,
@@ -3877,6 +4993,20 @@ struct ExploreSubgraph {
     exact_files: HashSet<String>,
     /// Anchored line spans to render as written, `(file, start, end)`.
     anchor_spans: Vec<(String, usize, usize)>,
+    /// Entry-point neighbours the glue step added (upstream `glueNodeIds`).
+    glue_ids: HashSet<String>,
+    /// Definitions a query token named, in seeding order (`namedSeedIds`).
+    named_seed_ids: Vec<String>,
+    /// The named seeds that earn the named tier (`tierSeedIds`).
+    tier_seed_ids: Vec<String>,
+    /// Files declaring a type a precise token names (`namedTypeFiles`).
+    named_type_files: HashSet<String>,
+    /// The one or two graph-central files that match the query's words
+    /// (upstream `centralFiles`).
+    central_files: HashSet<String>,
+    /// Nodes one edge from an entry point or a named seed
+    /// (`connectedToEntry`).
+    connected_ids: HashSet<String>,
 }
 
 impl ExploreSubgraph {
@@ -3942,17 +5072,6 @@ impl ExploreSubgraph {
             .collect()
     }
 
-    /// The symbols the question is about: its exact targets and the roots a
-    /// shape-precise query token names — the port's analog of upstream's
-    /// `questionIds` (exact ∪ named ∪ spine), since it has no flow spine.
-    fn question_ids(&self, precise: &[String]) -> HashSet<String> {
-        let named = self.roots.iter().filter(|id| {
-            self.node(id)
-                .is_some_and(|n| precise.iter().any(|t| t.eq_ignore_ascii_case(&n.name)))
-        });
-        self.exact_ids.iter().chain(named).cloned().collect()
-    }
-
     fn insert(&mut self, node: Node) -> bool {
         if self.index.contains_key(&node.id) {
             return false;
@@ -3975,111 +5094,6 @@ impl ExploreSubgraph {
 
     fn node(&self, id: &str) -> Option<&Node> {
         self.index.get(id).map(|i| &self.nodes[*i])
-    }
-
-    fn finalize(&mut self) {
-        for n in &self.nodes {
-            if !self.file_order.contains(&n.file_path) {
-                self.file_order.push(n.file_path.clone());
-            }
-        }
-        // Relevance-aware file ranking (lightweight RWR approximation): a file
-        // scores by whether it hosts a query seed/root (definition site), then
-        // its graph proximity to those seeds, then its relevant-symbol count.
-        // This floats the definition + sibling-API files to the top so a single
-        // explore call covers the answer, instead of ranking incidental
-        // high-symbol-count files first. Deterministic: ties break on the file
-        // path, keeping output byte-stable.
-        let root_files: HashSet<&str> = self
-            .roots
-            .iter()
-            .filter_map(|id| self.node(id).map(|n| n.file_path.as_str()))
-            .collect();
-        // Files one graph hop from a seed (edge source or target is a seed).
-        let mut neighbor_files: HashSet<&str> = HashSet::new();
-        for e in &self.edges {
-            if self.roots.iter().any(|r| r == &e.source)
-                && let Some(n) = self.node(&e.target)
-            {
-                neighbor_files.insert(n.file_path.as_str());
-            }
-            if self.roots.iter().any(|r| r == &e.target)
-                && let Some(n) = self.node(&e.source)
-            {
-                neighbor_files.insert(n.file_path.as_str());
-            }
-        }
-        let scores: HashMap<String, (u8, u8, u8, usize)> = self
-            .file_order
-            .iter()
-            .map(|fp| {
-                // A rescued change-surface file (#1064) is the lexically-
-                // dissimilar answer — give it the TOP tier so it outranks
-                // incidental roots that merely share query words and survives
-                // the output file budget. A file holding an exact target
-                // (#2063) is the answer by the same argument, and upstream sorts
-                // the two into one named-file tier.
-                let tier = if self.rescued_files.contains(fp.as_str())
-                    || self.exact_files.contains(fp.as_str())
-                {
-                    3
-                } else if root_files.contains(fp.as_str()) {
-                    2
-                } else if neighbor_files.contains(fp.as_str()) {
-                    1
-                } else {
-                    0
-                };
-                // Generated-path and ambient-declaration demotion sit INSIDE the
-                // tier, so they only ever reorder files of equal query relevance: a
-                // protobuf stub or a shim nothing depends on loses to the
-                // implementation it shadows, never falls behind an unrelated
-                // incidental file, and still ranks first in its tier when it is the
-                // only match. The sort is descending, so real code must carry the
-                // HIGHER value. `find_symbol_matches` and `find_all_symbols` apply
-                // the same generated signal.
-                //
-                // The two signals combine by `min`, upstream's rule, so a file that
-                // is BOTH is damped exactly as much as a generated-only one and no
-                // more. That is why this is one 3-valued integer and not a second
-                // boolean key: appending `not_damped_ambient` to the tuple would
-                // rank generated+ambient strictly BELOW generated-only, which is
-                // the double penalty `min` exists to prevent. For any non-ambient
-                // file the values are order-isomorphic to the old
-                // `not_generated` boolean (10 > 3 exactly where 1 > 0), so no
-                // ranking can move unless the ambient predicate actually fires.
-                let generated = is_generated_file(fp) || self.generated_files.contains(fp);
-                let weight = u8::min(
-                    if generated { 3 } else { 10 },
-                    if self.ambient_files.contains(fp) {
-                        5
-                    } else {
-                        10
-                    },
-                );
-                let sym_count = self
-                    .nodes
-                    .iter()
-                    .filter(|n| &n.file_path == fp && n.kind != NodeKind::File)
-                    .count();
-                let first_party = u8::from(!self.deprioritized_files.contains(fp));
-                (fp.clone(), (tier, first_party, weight, sym_count))
-            })
-            .collect();
-        let pin_order = self
-            .pinned_files
-            .iter()
-            .enumerate()
-            .map(|(index, path)| (path.as_str(), index))
-            .collect::<HashMap<_, _>>();
-        self.file_order.sort_by(|a, b| {
-            match (pin_order.get(a.as_str()), pin_order.get(b.as_str())) {
-                (Some(a_index), Some(b_index)) => a_index.cmp(b_index),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => scores[b].cmp(&scores[a]).then_with(|| a.cmp(b)),
-            }
-        });
     }
 
     fn file_language(&self, file_path: &str) -> String {
@@ -4211,6 +5225,11 @@ struct RenderCtx<'a> {
     /// This file's exact targets as `(start, end, body focus lines)`, from
     /// [`CodeGraphEngine::exact_body_focus`].
     exact_focus: &'a [BodyFocus],
+    /// The Flow's spine and named symbols, which rank this file's clusters.
+    flow: &'a FlowSection,
+    /// This file's spine nodes as `(start, end, body focus lines)`, the
+    /// windows of the per-symbol view.
+    spine_focus: &'a [BodyFocus],
     /// Bound the section by `funded_headroom` alone, not also by the per-file
     /// ceiling: set only when a named file is re-rendered into the budget the
     /// rest of the response left unspent (#2068).
@@ -4252,6 +5271,7 @@ impl ExactTargets {
 }
 
 /// Cluster source range used when sizing a god-file (`tools.ts:2708-2718`).
+#[derive(Clone)]
 struct ClusterRange {
     start: usize,
     end: usize,
@@ -4260,6 +5280,13 @@ struct ClusterRange {
     importance: u32,
     /// The node's qualified name; `None` for an anchored line span.
     qualified_name: Option<String>,
+    /// On the Flow's spine.
+    spine: bool,
+    /// Where this spine node calls the next hop.
+    spine_call_line: Option<usize>,
+    /// The window of an oversize spine method after its head: it renders, but
+    /// names nothing the head does not already name.
+    continuation: bool,
 }
 
 /// A merged run of adjacent ranges (`tools.ts:2744-2771`).
@@ -4270,25 +5297,328 @@ struct Cluster {
     /// Every member's name, kind and definition line, so the header can name
     /// the ones a trim cut (#1711).
     members: Vec<ElidedSymbol>,
-    /// Every member's `(start, end, importance)` source range, 1-based, so a
-    /// cluster can render its protected members without its incidental ones
-    /// (#2062).
-    spans: Vec<(usize, usize, u32)>,
+    /// Every member's `(start, end, importance, on the spine)` source range,
+    /// 1-based, so a cluster can render its protected members without its
+    /// incidental ones (#2062).
+    spans: Vec<(usize, usize, u32, bool)>,
     score: u32,
     max_importance: u32,
+    /// Holds a spine node (upstream `hasSpine`).
+    has_spine: bool,
+    /// The first spine call line among its members (upstream `spineCallLine`).
+    spine_call_line: Option<usize>,
 }
 
 impl Cluster {
     fn from_range(r: &ClusterRange) -> Self {
-        Self {
+        let mut cluster = Self {
             start: r.start,
             end: r.end,
-            symbols: vec![r.label.clone()],
-            members: vec![r.member.clone()],
-            spans: vec![(r.start, r.end, r.importance)],
-            score: r.importance,
-            max_importance: r.importance,
+            symbols: Vec::new(),
+            members: Vec::new(),
+            spans: Vec::new(),
+            score: 0,
+            max_importance: 0,
+            has_spine: false,
+            spine_call_line: None,
+        };
+        cluster.absorb(r);
+        cluster
+    }
+
+    /// Merges `r` in (upstream's cluster loop, `tools.ts` b635dd46 6580-6604).
+    fn absorb(&mut self, r: &ClusterRange) {
+        self.end = self.end.max(r.end);
+        if !r.continuation {
+            self.symbols.push(r.label.clone());
+            self.members.push(r.member.clone());
         }
+        self.spans.push((r.start, r.end, r.importance, r.spine));
+        self.score += r.importance;
+        self.max_importance = self.max_importance.max(r.importance);
+        self.has_spine |= r.spine;
+        self.spine_call_line = self.spine_call_line.or(r.spine_call_line);
+    }
+}
+
+/// What [`number_source_lines_at`] renders for `file_lines[start_idx..end_idx]`
+/// costs: each line's `"{n}\t{line}"` plus one separator between neighbours.
+/// Summed rather than rendered, so growing a window one line at a time stays
+/// linear instead of re-formatting the slice.
+fn rendered_range_cost(file_lines: &[&str], start_idx: usize, end_idx: usize) -> usize {
+    if end_idx <= start_idx {
+        return 0;
+    }
+    (start_idx..end_idx)
+        .map(|i| decimal_width(i + 1) + 1 + file_lines[i].len())
+        .sum::<usize>()
+        + (end_idx - start_idx - 1)
+}
+
+/// The window from `start_idx` grown while it fits `room`, never shorter than
+/// [`MIN_WINDOW_LINES`] (0-based, exclusive end).
+fn grow_window_head(
+    file_lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    room: usize,
+) -> (usize, usize) {
+    let floor = (start_idx + MIN_WINDOW_LINES).min(end_idx);
+    let mut end = (start_idx + 1).min(end_idx);
+    while end < end_idx && rendered_range_cost(file_lines, start_idx, end + 1) <= room {
+        end += 1;
+    }
+    (start_idx, end.max(floor))
+}
+
+/// A window around `focus_idx`: grow one line up, then one line down,
+/// alternating, so the emitted window is centred on the focus rather than
+/// biased to whichever side was tried first. Bounded by the span's own line
+/// count, so it always terminates.
+fn grow_window_around(
+    file_lines: &[&str],
+    focus_idx: usize,
+    start_idx: usize,
+    end_idx: usize,
+    room: usize,
+) -> (usize, usize) {
+    let range_cost = |lo: usize, hi: usize| rendered_range_cost(file_lines, lo, hi);
+    let focus_idx = focus_idx.clamp(start_idx, end_idx - 1);
+    let (mut lo, mut hi) = (focus_idx, focus_idx + 1);
+    let mut up = true;
+    for _ in 0..(end_idx - start_idx) * 2 {
+        let can_up = lo > start_idx && range_cost(lo - 1, hi) <= room;
+        let can_down = hi < end_idx && range_cost(lo, hi + 1) <= room;
+        if !can_up && !can_down {
+            break;
+        }
+        if (up && can_up) || !can_down {
+            lo -= 1;
+        } else {
+            hi += 1;
+        }
+        up = !up;
+    }
+    let want = MIN_WINDOW_LINES.min(end_idx - start_idx);
+    if hi - lo < want {
+        let lo2 = focus_idx
+            .saturating_sub(want / 2)
+            .max(start_idx)
+            .min(end_idx - want);
+        return (lo2, lo2 + want);
+    }
+    (lo, hi)
+}
+
+/// CG-30: `[start_idx, end_idx)` (0-based, exclusive end) too big for `room`
+/// is emitted as WHOLE-LINE windows instead of being taken whole or skipped
+/// whole. Upstream `windowToCeiling` (CG-38): the whole room goes to the head
+/// first, and 40% of it is held back for focus windows only when that head
+/// leaves a 1-based focus line uncovered; then only the focuses the smaller
+/// head misses take a share of it. Returns the windows and whether they leave
+/// lines out, so the caller can add the `... (gap) ...` honesty marker.
+fn window_to_ceiling(
+    file_lines: &[&str],
+    start_idx: usize,
+    end_idx: usize,
+    room: usize,
+    focuses: &[usize],
+) -> (Vec<(usize, usize)>, bool) {
+    let range_cost = |lo: usize, hi: usize| rendered_range_cost(file_lines, lo, hi);
+    if range_cost(start_idx, end_idx) <= room {
+        return (vec![(start_idx, end_idx)], false);
+    }
+    let full = grow_window_head(file_lines, start_idx, end_idx, room);
+    let covers = |w: (usize, usize), line: usize| line > w.0 && line <= w.1;
+    if focuses.iter().all(|&line| covers(full, line)) {
+        return (vec![full], full != (start_idx, end_idx));
+    }
+    let head_room = room * 60 / 100;
+    let head = grow_window_head(file_lines, start_idx, end_idx, head_room);
+    let pending: Vec<usize> = focuses
+        .iter()
+        .copied()
+        .filter(|&line| !covers(head, line))
+        .collect();
+    let mut windows: Vec<(usize, usize)> = vec![head];
+    // Even shares with carry-forward, never greedy: upstream measured that a
+    // greedy split let an early focus eat the whole reserve and re-lose the
+    // target. One integer division, so the same input cannot drift by a char
+    // across platforms.
+    let reserve = room - head_room;
+    let base = reserve / pending.len();
+    let mut carry = reserve - base * pending.len();
+    for &line in &pending {
+        let allot = base + carry;
+        let w = grow_window_around(
+            file_lines,
+            line.saturating_sub(1),
+            start_idx,
+            end_idx,
+            allot,
+        );
+        carry = allot.saturating_sub(range_cost(w.0, w.1));
+        windows.push(w);
+    }
+    windows.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for w in windows {
+        match merged.last_mut() {
+            Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+            _ => merged.push(w),
+        }
+    }
+    let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+    (merged, !covers_all)
+}
+
+/// Cuts each oversize spine method among `ranges` (sorted by start) to its
+/// signature head and a window on its next-hop call (upstream `oversizeSpine`
+/// and `spineWindowOf`, `tools.ts` b635dd46 6622-6663): a method on the Flow
+/// longer than [`OVERSIZE_SPINE_LINES`] whose call lies in its own body, unless
+/// an exact target overlaps it, since that body is what was asked for. The
+/// size test is on the method, never on the cluster it merges into. A range
+/// nested in a cut method goes with the lines it sat on. True when a method
+/// was cut.
+fn window_oversize_spine_methods(ranges: &mut Vec<ClusterRange>) -> bool {
+    let exact: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.importance >= EXACT_IMPORTANCE)
+        .map(|r| (r.start, r.end))
+        .collect();
+    let oversize: Vec<(usize, usize, usize)> = ranges
+        .iter()
+        .filter_map(|r| {
+            let call = r.spine_call_line?;
+            (r.spine
+                && r.end - r.start + 1 > OVERSIZE_SPINE_LINES
+                && call >= r.start
+                && call <= r.end
+                && !exact.iter().any(|&(s, e)| s <= r.end && e >= r.start))
+            .then_some((r.start, r.end, call))
+        })
+        .collect();
+    if oversize.is_empty() {
+        return false;
+    }
+    let mut out: Vec<ClusterRange> = Vec::with_capacity(ranges.len() + oversize.len());
+    for r in ranges.drain(..) {
+        let cut = oversize
+            .iter()
+            .find(|&&(s, e, call)| {
+                r.spine && r.start == s && r.end == e && r.spine_call_line == Some(call)
+            })
+            .copied();
+        if let Some((start, end, call)) = cut {
+            let window_start = start.max(call.saturating_sub(SPINE_WINDOW));
+            let window_end = end.min(call + SPINE_WINDOW);
+            // The signature head, only when it sits clearly above the window.
+            let head_end = (start + 4).min(window_start.saturating_sub(2));
+            if head_end >= start {
+                out.push(ClusterRange {
+                    end: head_end,
+                    ..r.clone()
+                });
+                out.push(ClusterRange {
+                    start: window_start,
+                    end: window_end,
+                    continuation: true,
+                    ..r
+                });
+            } else {
+                out.push(ClusterRange {
+                    start: window_start,
+                    end: window_end,
+                    ..r
+                });
+            }
+            continue;
+        }
+        let nested = oversize
+            .iter()
+            .any(|&(s, e, _)| r.start >= s && r.end <= e && (r.start, r.end) != (s, e));
+        if !nested {
+            out.push(r);
+        }
+    }
+    out.sort_by_key(|r| r.start);
+    *ranges = out;
+    true
+}
+
+/// A file whose per-file ceiling clipped it and that renders again into the
+/// unspent budget (#2068): `(line index, path, focuses, exact focus, spine
+/// focus)`.
+type ClippedNamedFile<'a> = (
+    usize,
+    &'a String,
+    Vec<usize>,
+    Vec<BodyFocus>,
+    Vec<BodyFocus>,
+);
+
+/// What the Flow builder hands the rest of explore (upstream
+/// `buildFlowFromNamedSymbols`' return value, `tools.ts` b635dd46 3471-3684):
+/// the section's text, the rendered chain (the spine), every symbol the query
+/// named, and where each spine node calls the next hop.
+#[derive(Debug, Default)]
+struct FlowSection {
+    text: String,
+    path_node_ids: HashSet<String>,
+    /// The files the spine runs through.
+    path_files: HashSet<String>,
+    named_node_ids: HashSet<String>,
+    /// Named ids whose token picked out at most three definitions.
+    unique_named_node_ids: HashSet<String>,
+    /// The spine in call order.
+    path_order: Vec<String>,
+    spine_call_sites: HashMap<String, i64>,
+}
+
+impl FlowSection {
+    /// The section for `flow`, whose rendered `text` is empty when nothing
+    /// connects and no link was found. The named identity is a separate
+    /// output then (CG-38, upstream `identityOnly`, 3517-3543): only the ids
+    /// of shape-precise tokens, since no prose corroborates the resolution.
+    /// With fewer than two named callables there is no spine (3560).
+    fn of(flow: &NamedSymbolFlow, text: String) -> Self {
+        if text.is_empty() {
+            let named = flow.precise_named_ids.clone();
+            let unique = flow
+                .unique_named_node_ids
+                .iter()
+                .filter(|id| named.contains(*id))
+                .cloned()
+                .collect();
+            return Self {
+                named_node_ids: named,
+                unique_named_node_ids: unique,
+                ..Self::default()
+            };
+        }
+        let mut section = Self {
+            text,
+            named_node_ids: flow
+                .named
+                .keys()
+                .chain(flow.dyn_named.keys())
+                .cloned()
+                .collect(),
+            unique_named_node_ids: flow.unique_named_node_ids.clone(),
+            ..Self::default()
+        };
+        if flow.named.len() >= 2
+            && let Some(chain) = flow.chains.first()
+        {
+            for step in &chain.steps {
+                if section.path_node_ids.insert(step.node.id.clone()) {
+                    section.path_order.push(step.node.id.clone());
+                }
+                section.path_files.insert(step.node.file_path.clone());
+            }
+            section.spine_call_sites = chain.call_sites.clone();
+        }
+        section
     }
 }
 
@@ -4730,6 +6060,38 @@ fn truncate_output(text: &str) -> String {
     format!("{}\n\n... (output truncated)", &truncated[..cut])
 }
 
+/// Explore's summary line, `Found N symbols across M files.`, singular for
+/// one (upstream `tools.ts` b635dd46 7585).
+fn found_line(symbols: usize, files: usize) -> String {
+    format!(
+        "Found {symbols} symbol{} across {files} file{}.",
+        if symbols == 1 { "" } else { "s" },
+        if files == 1 { "" } else { "s" }
+    )
+}
+
+/// Whether `lines[at]` lies wholly inside the first `kept` bytes of
+/// `lines.join("\n")`.
+fn section_survives(lines: &[String], at: usize, kept: usize) -> bool {
+    let Some(section) = lines.get(at) else {
+        return false;
+    };
+    let start = lines[..at].iter().map(String::len).sum::<usize>() + at;
+    start + section.len() <= kept
+}
+
+/// A node explore lists for its file (upstream `isListedSymbol`, without
+/// the COBOL include case): anything but an import or an export, and not a
+/// YAML or properties key, whose line can hold a secret (#383).
+fn is_listed_symbol(node: &Node) -> bool {
+    !matches!(node.kind, NodeKind::Import | NodeKind::Export)
+        && !(node.kind == NodeKind::Constant
+            && matches!(
+                node.language,
+                codegraph_core::types::Language::Yaml | codegraph_core::types::Language::Properties
+            ))
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -5064,6 +6426,52 @@ fn is_seedable_kind(kind: NodeKind) -> bool {
     is_exact_target_kind(kind) || matches!(kind, NodeKind::Variable | NodeKind::Constant)
 }
 
+/// A token naming a type or file the query also names (upstream's
+/// `typeTokens`, `/^[A-Z][A-Za-z0-9]{3,}/`).
+static NAMED_TYPE_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Z][A-Za-z0-9]{3,}").expect("named type token regex is valid")
+});
+
+/// The seeder's test-path test (upstream `isTestPath`, `tools.ts` b635dd46
+/// 4441): a tests, specs, `__tests__`, testdata, mocks or fixtures directory,
+/// or a `.test.`/`.spec.` file name, case-insensitively.
+static SEEDER_TEST_PATH: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new([
+        r"(?i)(^|/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)/",
+        r"(?i)\.(test|spec)\.[a-z]+$",
+    ])
+    .expect("seeder test-path patterns are valid")
+});
+
+fn is_seeder_test_path(path: &str) -> bool {
+    SEEDER_TEST_PATH.is_match(path)
+}
+
+/// Upstream's `DECLARATION_KINDS` (`tools.ts` b635dd46 523).
+fn is_declaration_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Interface
+            | NodeKind::TypeAlias
+            | NodeKind::Enum
+            | NodeKind::EnumMember
+            | NodeKind::Namespace
+    )
+}
+
+/// Upstream's `bodyLines`: the lines after a node's first.
+fn body_lines(node: &Node) -> i64 {
+    (node.end_line - node.start_line).max(0)
+}
+
+/// A lowercase letter followed by an uppercase one (`/[a-z][A-Z]/`).
+fn has_camel_hump(token: &str) -> bool {
+    token
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_lowercase() && w[1].is_ascii_uppercase())
+}
+
 /// File extensions the seeder strips from a token (upstream `FILE_EXT`), so
 /// `compiler.py` reads as `compiler`.
 static SEEDER_FILE_EXT: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -5301,25 +6709,38 @@ fn explore_file_header(
     format!("#### {file_path} — {}", cap_header_names(&ranked, cap))
 }
 
-/// Test/spec/icon/i18n detector for `excludeLowValueFiles` (`tools.ts:2200-2217`).
-fn is_low_value_file(path: &str) -> bool {
-    let lp = path.to_lowercase();
-    is_test_file(&lp) || lp.contains("icon") || lp.contains("i18n")
+/// Test/spec/icon/i18n detector for explore's ranking (the hard filter and
+/// the rank penalty, on every budget tier) and the order of its
+/// dynamic-dispatch links: upstream `isLowValue` as
+/// `b635dd46` wrote it (`tools.ts:4782-4797`), on the lowercased path.
+/// JavaScript's `\b` is an ASCII word boundary, so `lexicon.ts` is no icon
+/// file. Not [`is_test_file`], which the blast radius and the indirect-test
+/// note keep: that one also reads `e2e/` and `_unittest.` as tests. Upstream
+/// later moved explore onto its engine-wide test predicate (#2557); that is
+/// not ported yet.
+pub(crate) fn is_low_value_file(path: &str) -> bool {
+    LOW_VALUE_FILE.is_match(&path.to_lowercase())
 }
 
-/// Lowercased, ≥3-char alphanumeric query terms used by the #1064 buried check.
-/// Deterministic: a stable, deduped, order-preserving token set (short/stop-ish
-/// tokens are dropped so a 1-char "x" never counts as a term hit).
-fn query_terms(query: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for tok in query.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let t = tok.to_ascii_lowercase();
-        if t.len() >= 3 && !out.contains(&t) {
-            out.push(t);
-        }
-    }
-    out
-}
+/// [`is_low_value_file`]'s patterns, in upstream's order.
+static LOW_VALUE_FILE: LazyLock<regex::RegexSet> = LazyLock::new(|| {
+    regex::RegexSet::new([
+        r"(?:^|/)(tests?|__tests?__|specs?)/",
+        r"_test\.go$",
+        r"(?:^|/)test_[^/]+\.py$",
+        r"_test\.py$",
+        r"_spec\.rb$",
+        r"_test\.rb$",
+        r"\.(test|spec)\.[jt]sx?$",
+        r"(test|spec|tests)\.(java|kt|scala)$",
+        r"(tests?|spec)\.cs$",
+        r"tests?\.swift$",
+        r"_test\.dart$",
+        r"(?-u:\b)icons?(?-u:\b)",
+        r"(?-u:\b)i18n(?-u:\b)",
+    ])
+    .expect("low-value file patterns are valid")
+});
 
 /// Whether a query token is SHAPE-PRECISE enough to name a symbol rather than
 /// describe one (upstream `89c53dd`'s `isPreciseToken`): at least 3 chars, and
@@ -5368,7 +6789,7 @@ fn precise_query_tokens(query: &str) -> Vec<String> {
 
 /// Whether the query itself is about tests — keeps the legitimate "explore the
 /// tests" case (`tools.ts:2228`).
-fn query_mentions_tests(query: &str) -> bool {
+pub(crate) fn query_mentions_tests(query: &str) -> bool {
     let q = query.to_lowercase();
     q.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
         matches!(
@@ -5399,6 +6820,23 @@ fn is_type_declaration_kind(kind: NodeKind) -> bool {
             | NodeKind::Namespace
     )
 }
+
+/// Every kind a node of an ambient declaration file can have: the bookkeeping
+/// kinds ([`is_ambient_bookkeeping_kind`]), the type-declaration kinds
+/// ([`is_type_declaration_kind`]) and the two an interface member has.
+const AMBIENT_FILE_NODE_KINDS: [NodeKind; 11] = [
+    NodeKind::File,
+    NodeKind::Import,
+    NodeKind::Export,
+    NodeKind::Parameter,
+    NodeKind::Interface,
+    NodeKind::TypeAlias,
+    NodeKind::Enum,
+    NodeKind::EnumMember,
+    NodeKind::Namespace,
+    NodeKind::Method,
+    NodeKind::Property,
+];
 
 /// Header of the "Not shown above" pointer block (`tools.ts:2910-2927`).
 const POINTER_BLOCK_HEADER: &str = "### Not shown above — explore these names for their source";
@@ -5494,12 +6932,11 @@ const TRIMMED_SYMBOLS_NAMED: usize = 4;
 
 /// The name the completeness note offers for an elided symbol: `Owner.member`
 /// for a method, so an overloaded name resolves to the definition that was cut
-/// (django has 110 `as_sql`s). The bare name otherwise.
-fn follow_up_name(span: &WantedSpan) -> String {
-    let owner = span
-        .qualified_name
-        .as_deref()
-        .filter(|_| span.kind == NodeKind::Method.as_str())
+/// (django has 110 `as_sql`s). The bare name otherwise. The dynamic-dispatch
+/// links name both ends of an `X → X` link the same way.
+fn follow_up_name(name: &str, kind: &str, qualified_name: Option<&str>) -> String {
+    let owner = qualified_name
+        .filter(|_| kind == NodeKind::Method.as_str())
         .and_then(|qualified| {
             let segments: Vec<&str> = qualified.split("::").collect();
             (segments.len() >= 2).then(|| segments[segments.len() - 2])
@@ -5511,8 +6948,8 @@ fn follow_up_name(span: &WantedSpan) -> String {
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         });
     match owner {
-        Some(owner) => format!("{owner}.{}", span.name),
-        None => span.name.clone(),
+        Some(owner) => format!("{owner}.{name}"),
+        None => name.to_string(),
     }
 }
 
@@ -5601,7 +7038,7 @@ fn completeness_notes(
             if span.importance < 10 || container {
                 continue;
             }
-            let name = follow_up_name(span);
+            let name = follow_up_name(&span.name, span.kind, span.qualified_name.as_deref());
             if !names.contains(&name) {
                 names.push(name);
             }
@@ -5782,6 +7219,58 @@ fn cut_at_section_boundary(
     )
 }
 
+/// The tag a synthesized hop carries in explore's Flow and the node trail,
+/// `dynamic: <summary> @<wiring site>`; `None` for an ordinary static edge.
+fn synth_edge_note(edge: &Edge) -> Option<String> {
+    describe_synthesized_hop(edge).map(|hop| hop.tag())
+}
+
+/// Upstream's `MAX_SYNTH_LINKS`: the most lines the dynamic-dispatch links
+/// print.
+const MAX_SYNTH_LINKS: usize = 6;
+
+/// One link the dynamic-dispatch links may print, with what orders it.
+struct SynthLink {
+    line: String,
+    /// Into a low-value file through an end the query did not name.
+    low_value: bool,
+    /// How pointedly the query named the two ends.
+    weight: u8,
+    /// How many links of its rank its named symbol had before it.
+    turn: usize,
+}
+
+/// One line of the dynamic-dispatch links: `- A → B   [tag]`, the edge's
+/// synthesized-hop tag or, without one, its kind. `area → area` says
+/// neither which interface nor which implementation, so a link between two
+/// same-name symbols names each end as the completeness note would
+/// (`Shape.area → Square.area`).
+fn synth_link_line(edge: &Edge, source: &Node, target: &Node) -> String {
+    let same = source.name == target.name;
+    let name = |node: &Node| {
+        if same {
+            follow_up_name(&node.name, node.kind.as_str(), Some(&node.qualified_name))
+        } else {
+            node.name.clone()
+        }
+    };
+    let tag = synth_edge_note(edge).unwrap_or_else(|| edge.kind.as_str().to_string());
+    format!("- {} → {}   [{tag}]", name(source), name(target))
+}
+
+/// The dynamic-dispatch links section around its lines, as upstream prints
+/// it; the closing line is the caller's.
+fn synth_links_block(lines: Vec<String>) -> Vec<String> {
+    let mut out = vec![
+        "**Dynamic-dispatch links among your symbols**".to_string(),
+        "(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)".to_string(),
+        String::new(),
+    ];
+    out.extend(lines);
+    out.push(String::new());
+    out
+}
+
 fn require_string(args: &Value, field: &str) -> Result<String, String> {
     match args.get(field).and_then(Value::as_str) {
         Some(s) if !s.is_empty() => Ok(s.to_string()),
@@ -5797,21 +7286,92 @@ mod tests {
 
     static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_engine() -> CodeGraphEngine {
+    /// An engine over an empty index in its own directory, which is removed
+    /// when the engine is dropped.
+    struct TestEngine {
+        engine: Option<CodeGraphEngine>,
+        root: PathBuf,
+    }
+
+    impl std::ops::Deref for TestEngine {
+        type Target = CodeGraphEngine;
+
+        fn deref(&self) -> &CodeGraphEngine {
+            self.engine.as_ref().expect("the engine lives until drop")
+        }
+    }
+
+    impl std::ops::DerefMut for TestEngine {
+        fn deref_mut(&mut self) -> &mut CodeGraphEngine {
+            self.engine.as_mut().expect("the engine lives until drop")
+        }
+    }
+
+    impl Drop for TestEngine {
+        fn drop(&mut self) {
+            // Close the index first: Windows cannot remove an open database.
+            drop(self.engine.take());
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn test_engine() -> TestEngine {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id()));
+        test_engine_at(
+            std::env::temp_dir().join(format!("cg-mcp-engine-{}-{seq}", std::process::id())),
+        )
+    }
+
+    /// The directory is keyed by pid and sequence number, so a dead process
+    /// whose pid came back may have left one with its own index there: remove
+    /// it first, or the test reads that run's index instead of an empty one.
+    fn test_engine_at(base: PathBuf) -> TestEngine {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove the stale {}: {error}", base.display()),
+        }
         let db = base.join(".codegraph").join("codegraph.db");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = Store::open(&db).unwrap();
-        CodeGraphEngine {
-            store,
-            project_root: base,
-            config: Arc::new(Config::default()),
-            deprioritize: Arc::new(DeprioritizeMatcher::default()),
-            source_probes: RefCell::new(HashMap::new()),
-            source_citations: RefCell::new(HashSet::new()),
-            answer_files: RefCell::new(BTreeSet::new()),
+        TestEngine {
+            engine: Some(CodeGraphEngine {
+                store,
+                project_root: base.clone(),
+                config: Arc::new(Config::default()),
+                deprioritize: Arc::new(DeprioritizeMatcher::default()),
+                source_probes: RefCell::new(HashMap::new()),
+                source_citations: RefCell::new(HashSet::new()),
+                answer_files: RefCell::new(BTreeSet::new()),
+                symbol_memo: RefCell::new(HashMap::new()),
+            }),
+            root: base,
         }
+    }
+
+    #[test]
+    fn a_test_engine_never_reads_what_a_reused_directory_holds() {
+        let base = std::env::temp_dir().join(format!(
+            "cg-mcp-engine-stale-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = base.join(".codegraph").join("codegraph.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"left by a dead process with the same pid").unwrap();
+        std::fs::write(base.join("stale.txt"), b"stale").unwrap();
+
+        let engine = test_engine_at(base.clone());
+        assert!(
+            !base.join("stale.txt").exists(),
+            "the stale directory stays"
+        );
+        assert!(
+            engine.store.all_files().unwrap().is_empty(),
+            "a test engine starts over an empty index"
+        );
+        drop(engine);
+        assert!(!base.exists(), "dropping the engine removes its directory");
     }
 
     fn node(name: &str, file: &str, start: i64, end: i64, kind: NodeKind) -> Node {
@@ -5840,6 +7400,10 @@ mod tests {
         }
     }
 
+    /// No Flow: what `handle_explore` hands the renderer for a query naming
+    /// fewer than two symbols.
+    static NO_FLOW: LazyLock<FlowSection> = LazyLock::new(FlowSection::default);
+
     /// A direct-call render context with nothing already spent, mirroring what
     /// `handle_explore` builds for the FIRST file of a response.
     fn render_ctx<'a>(budget: &'a ExploreOutputBudget, focuses: &'a [usize]) -> RenderCtx<'a> {
@@ -5848,6 +7412,8 @@ mod tests {
             funded_headroom: budget.max_output_chars.saturating_sub(1),
             focuses,
             exact_focus: &[],
+            flow: &NO_FLOW,
+            spine_focus: &[],
             lift_file_cap: false,
             drifted: false,
         }
@@ -6697,6 +8263,8 @@ mod tests {
             funded_headroom: whole.len() - 1,
             focuses: &[],
             exact_focus: &[],
+            flow: &NO_FLOW,
+            spine_focus: &[],
             lift_file_cap: false,
             drifted: false,
         };
@@ -9078,6 +10646,80 @@ mod tests {
         assert!(!is_low_value_file("src/lib.rs"));
     }
 
+    /// Explore's low-value files are upstream `b635dd46`'s `isLowValue`
+    /// (OD-B23): each pattern on the lowercased path, `icon` and `i18n` as
+    /// whole ASCII words.
+    #[test]
+    fn ext_is_low_value_file_is_b635dd46s_is_low_value() {
+        for (path, low) in [
+            // A test directory, at the root or under another segment.
+            ("test/a.ts", true),
+            ("src/tests/a.ts", true),
+            ("__tests__/a.ts", true),
+            ("__test__/a.ts", true),
+            ("specs/a.ts", true),
+            ("spec/a.rb", true),
+            ("contest/a.ts", false),
+            ("src/tests.ts", false),
+            // Go, Python, Ruby and Dart file names.
+            ("pkg/a_test.go", true),
+            ("pkg/atest.go", false),
+            ("test_foo.py", true),
+            ("pkg/test_foo.py", true),
+            ("pkg/mytest_foo.py", false),
+            ("foo_test.py", true),
+            ("foo_testing.py", false),
+            ("user_spec.rb", true),
+            ("user_specs.rb", false),
+            ("user_test.rb", true),
+            ("user_tests.rb", false),
+            ("baz_test.dart", true),
+            ("baz_tests.dart", false),
+            // JavaScript and TypeScript.
+            ("src/a.test.ts", true),
+            ("src/a.spec.jsx", true),
+            ("src/a.test.mjs", false),
+            ("foo.test.go", false),
+            // JVM, .NET and Swift class names.
+            ("FooTest.java", true),
+            ("BarSpec.scala", true),
+            ("BazTests.kt", true),
+            // Upstream's own false positive, kept as it was (#2557 is next).
+            ("Latest.java", true),
+            ("FooTester.java", false),
+            ("FooTests.cs", true),
+            ("FooSpec.cs", true),
+            ("FooSpecs.cs", false),
+            ("BarTests.swift", true),
+            ("BarSpec.swift", false),
+            // Icons and translations, as whole ASCII words.
+            ("icons/x.svg", true),
+            ("assets/icon.svg", true),
+            ("src/icon-button.ts", true),
+            ("éicon.svg", true),
+            ("lexicon.ts", false),
+            ("silicon.ts", false),
+            ("iconic.ts", false),
+            ("i18n/en.json", true),
+            ("src/i18n.ts", true),
+            ("éi18n.json", true),
+            ("i18next.ts", false),
+            ("xi18n.ts", false),
+            // Lowercased first.
+            ("Specs/A.ts", true),
+            ("FOOTEST.JAVA", true),
+            ("SRC/ICONS/X.SVG", true),
+            // The engine's test predicate reads these as tests; upstream's
+            // explore here did not.
+            ("e2e/checkout.ts", false),
+            ("foo_unittest.cc", false),
+            ("a_test.c", false),
+            ("src/lib.rs", false),
+        ] {
+            assert_eq!(is_low_value_file(path), low, "{path}");
+        }
+    }
+
     /// Tier 1 item 1 (upstream #1507) — the MCP-side half of the bidirectional
     /// disagreement: the CLI's `is_test_file` had `/e2e/` and this one did not,
     /// so a Playwright/Cypress `e2e/` tree read as production code on every MCP
@@ -9094,9 +10736,11 @@ mod tests {
             is_test_file("apps/web/e2e/login.ts"),
             "a nested e2e/ tree is a test tree"
         );
-        // And it flows through to `excludeLowValueFiles`, which is what keeps an
-        // e2e tree from crowding out implementations in explore output.
-        assert!(is_low_value_file("e2e/checkout.ts"));
+        // Explore's low-value files are upstream `b635dd46`'s own patterns
+        // (OD-B23), which have no `e2e/`: an e2e tree is a test tree for the
+        // blast radius and the indirect-test note, not a file explore's hard
+        // filter drops.
+        assert!(!is_low_value_file("e2e/checkout.ts"));
         // Negative: `e2e` must be a whole path SEGMENT, never a substring.
         assert!(
             !is_test_file("src/route2e2e.ts"),
@@ -9290,10 +10934,11 @@ mod tests {
         }
     }
 
-    /// Tier 1 item 3, shape detail: upstream anchors mockgen's DEFAULT output as
-    /// `/^mock_[^/]+\.go$/` — a BASENAME rule. A naive `starts_with` on the full
-    /// path would miss every nested occurrence, which is where mocks actually
-    /// live, so the final path segment is what must be tested.
+    /// Tier 1 item 3, shape detail: mockgen's DEFAULT output, `mock_<src>.go`,
+    /// is matched on the final path segment, so a nested occurrence, which is
+    /// where mocks actually live, matches too. Upstream's
+    /// `/^mock_[^/]+\.go$/` tests the whole path and matches a root
+    /// `mock_x.go` alone (KEEP-RUST, `KNOWN_DIFFS.md`).
     #[test]
     fn ext_is_generated_file_mock_prefix_is_basename_anchored() {
         assert!(
@@ -9853,16 +11498,97 @@ mod tests {
         }
     }
 
+    /// Ranks `files` (one entry-point interface each, unless `hub` is set) with
+    /// the CG-28 sets of the combination-rule tests: `c_both` and
+    /// `d_generated` generated, `b_ambient` and `c_both` ambient.
+    fn rank_cg28_files(hub: bool) -> Vec<String> {
+        let mut sg = ExploreSubgraph::default();
+        let mut roots = Vec::new();
+        // Distinct symbol names, because `node`'s synthetic id is derived from
+        // kind+name+line and identical ones would collide into one node.
+        if hub {
+            // One plain entry point whose walk reaches four interfaces in each
+            // other file alike, so the three hold the same graph mass and the
+            // same score before their penalties.
+            let center = node("SharedNameHub", "src/a_plain.ts", 1, 3, NodeKind::Function);
+            roots.push(center.id.clone());
+            sg.insert(center.clone());
+            for (i, stem) in ["b_ambient", "c_both", "d_generated"]
+                .into_iter()
+                .enumerate()
+            {
+                for j in 0..4 {
+                    let path = format!("src/{stem}.ts");
+                    let leaf = node(
+                        &format!("SharedName{i}{j}"),
+                        &path,
+                        1 + 5 * j as i64,
+                        3 + 5 * j as i64,
+                        NodeKind::Interface,
+                    );
+                    sg.edges.push(mk_edge(
+                        &center.id,
+                        &leaf.id,
+                        codegraph_core::types::EdgeKind::References,
+                    ));
+                    sg.insert(leaf);
+                }
+            }
+        } else {
+            for (i, stem) in ["a_plain", "b_ambient", "c_both", "d_generated"]
+                .into_iter()
+                .enumerate()
+            {
+                let path = format!("src/{stem}.ts");
+                let n = node(&format!("SharedName{i}"), &path, 1, 3, NodeKind::Interface);
+                roots.push(n.id.clone());
+                sg.insert(n);
+            }
+        }
+        sg.roots = roots;
+        sg.generated_files.insert("src/c_both.ts".to_string());
+        sg.generated_files.insert("src/d_generated.ts".to_string());
+        sg.ambient_files.insert("src/b_ambient.ts".to_string());
+        sg.ambient_files.insert("src/c_both.ts".to_string());
+        let engine = test_engine();
+        explore_rank::rank_files(
+            &engine.store,
+            &explore_rank::RankInput {
+                nodes: &sg.nodes,
+                edges: &sg.edges,
+                roots: &sg.roots,
+                named_seed_ids: &[],
+                tier_seed_ids: &[],
+                exact_files: &HashSet::new(),
+                pinned_files: &[],
+                generated_files: &sg.generated_files,
+                ambient_files: &sg.ambient_files,
+                deprioritized_files: &HashSet::new(),
+                query: "SharedName",
+                multiterm_off: false,
+            },
+        )
+        .unwrap()
+        .file_order
+    }
+
     /// Tier 5 item 14 (CG-28), the combination rule. Given four files equal in
-    /// `tier` AND in `sym_count`, differing only in the generated and ambient
-    /// signals, When `finalize` ranks them, Then generated-only and
-    /// generated+ambient produce the SAME key, so their order falls through to the
-    /// path tie-break.
+    /// every other ranking input, differing only in the generated and ambient
+    /// signals, When the ranking orders them (W7-25b: upstream's `rankPenalty`,
+    /// the stronger of the two, `tools.ts` b635dd46 4829-4839), Then
+    /// generated-only and generated+ambient carry the SAME penalty, so their
+    /// order falls through to the path tie-break.
     ///
     /// Holding both other components fixed is the whole point: a four-boolean key
     /// would rank generated+ambient strictly below generated-only and still satisfy
     /// any assertion that let `tier` or `sym_count` vary. No weight may be 0
     /// either, or damping would cross a tier.
+    ///
+    /// W7-25b: `finalize` is gone, and the four lone entry points of the old
+    /// fixture no longer hold mass alike (a damped file does not seed the walk;
+    /// that fixture is `ambient_files_do_not_seed_the_walk`). Here one plain
+    /// entry point in `a_plain.ts` reaches the other three files alike, which
+    /// keeps the old assertion.
     #[test]
     fn ambient_and_generated_weight_ties_with_generated_only() {
         // The two generated paths are named so that PATH order puts the
@@ -9871,30 +11597,8 @@ mod tests {
         // order as `min` and the assertion would discriminate nothing. Here the
         // two disagree — `min` ties and the path tie-break wins (`c_both` first),
         // while a fourth boolean ranks `d_generated` strictly higher.
-        let mut sg = ExploreSubgraph::default();
-        let mut roots = Vec::new();
-        // Distinct symbol names, because `node`'s synthetic id is derived from
-        // kind+name+line and four identical ones would collide into a single
-        // inserted node. Each file still contributes exactly one, so `sym_count`
-        // stays equal across all four.
-        for (i, stem) in ["a_plain", "b_ambient", "c_both", "d_generated"]
-            .into_iter()
-            .enumerate()
-        {
-            let path = format!("src/{stem}.ts");
-            let n = node(&format!("SharedName{i}"), &path, 1, 3, NodeKind::Interface);
-            roots.push(n.id.clone());
-            sg.insert(n);
-        }
-        sg.roots = roots;
-        sg.generated_files.insert("src/c_both.ts".to_string());
-        sg.generated_files.insert("src/d_generated.ts".to_string());
-        sg.ambient_files.insert("src/b_ambient.ts".to_string());
-        sg.ambient_files.insert("src/c_both.ts".to_string());
-        sg.finalize();
-
         assert_eq!(
-            sg.file_order,
+            rank_cg28_files(true),
             vec![
                 "src/a_plain.ts",
                 "src/b_ambient.ts",
@@ -9902,6 +11606,26 @@ mod tests {
                 "src/d_generated.ts",
             ],
             "plain > ambient > {{generated, generated+ambient TIED, ordered by path}}"
+        );
+    }
+
+    /// W7-25b, the original fixture of
+    /// `ambient_and_generated_weight_ties_with_generated_only`: four lone entry
+    /// points. Upstream's walk does not start in a damped declaration file
+    /// (`tools.ts` b635dd46 4941-4952, CG-28), so the two ambient files hold no
+    /// graph mass, the comparator's primary key, and rank below the generated
+    /// one; between them the generated backstop puts the plain-ambient file
+    /// first. Before W7-25b the order was plain, ambient, both, generated.
+    #[test]
+    fn ambient_files_do_not_seed_the_walk() {
+        assert_eq!(
+            rank_cg28_files(false),
+            vec![
+                "src/a_plain.ts",
+                "src/d_generated.ts",
+                "src/b_ambient.ts",
+                "src/c_both.ts",
+            ],
         );
     }
 
@@ -11160,6 +12884,33 @@ mod tests {
 
     // --- Round B (#1064): explore change-surface rescue ------------------
 
+    /// Spends `seed`'s share of the explore walk (W7-25a: at most ⌈200 / entry
+    /// points⌉ nodes per entry, structural `calls` before `references`) on
+    /// `count` callees in one file, so a signature type the seed references
+    /// stays outside the subgraph: upstream's #1064 rescue fires only for a
+    /// type the walk did not reach or that has next to no graph mass.
+    fn fill_walk_budget(engine: &mut CodeGraphEngine, seed: &Node, count: i64) {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..count {
+            let callee = node_lang(
+                &format!("budgetStep{i}"),
+                &format!("budgetStep{i}"),
+                "src/budget.ts",
+                1 + 2 * i,
+                2 + 2 * i,
+                NodeKind::Function,
+                Language::TypeScript,
+            );
+            let mut edge = mk_edge(&seed.id, &callee.id, codegraph_core::types::EdgeKind::Calls);
+            edge.line = Some(seed.start_line);
+            edges.push(edge);
+            nodes.push(callee);
+        }
+        put_nodes(engine, &nodes);
+        put_edges(engine, &edges);
+    }
+
     /// Build the proven B repro in a store: `newClient(opt: DialOption)` in
     /// `client.ts` (the seed the query hits) + `interface DialOption` in
     /// `options.ts` (the buried signature type, reachable via a `References`
@@ -11167,6 +12918,11 @@ mod tests {
     /// terms outrank `options.ts` as search seeds and push it past the file
     /// budget — so pre-fix the answer file is dropped (the live #1064 bug),
     /// exactly the buried condition the rescue must undo.
+    ///
+    /// W7-25b: since the walk (W7-25a) gathers `DialOption` one `references`
+    /// edge out, with that edge, its file holds graph mass and is no longer
+    /// buried by upstream's test; [`setup_buried_change_surface_repro`] is the
+    /// shape that still is.
     fn setup_change_surface_repro(engine: &mut CodeGraphEngine) -> (Node, Node) {
         let client = node_lang(
             "newClient",
@@ -11234,13 +12990,25 @@ mod tests {
         (client, dial)
     }
 
+    /// W7-25b: [`setup_change_surface_repro`] with the seed's walk share spent
+    /// on 210 callees first, so `DialOption` stays outside the subgraph with no
+    /// mass, buried as grpc's `dialoptions.go` is (deviations D4).
+    fn setup_buried_change_surface_repro(engine: &mut CodeGraphEngine) -> (Node, Node) {
+        let (client, dial) = setup_change_surface_repro(engine);
+        fill_walk_budget(engine, &client, 210);
+        (client, dial)
+    }
+
     /// #1064 CORE: explore for a plain-language "add a parameter" query surfaces
     /// the seed's buried signature type. Pre-fix `options.ts`/`DialOption` was
     /// absent (0 hits — the proven bug); post-fix it is rescued into the output.
+    ///
+    /// W7-25b: on the buried shape (deviations D4); the original fixture is
+    /// `ext_explore_does_not_rescue_a_gathered_signature_type`.
     #[test]
     fn ext_explore_rescues_buried_signature_type() {
         let mut engine = test_engine();
-        setup_change_surface_repro(&mut engine);
+        setup_buried_change_surface_repro(&mut engine);
         let tr = engine.execute(
             "codegraph_explore",
             &serde_json::json!({"query": "newClient add parameter"}),
@@ -11256,15 +13024,45 @@ mod tests {
         );
     }
 
+    /// W7-25b, the original #1064 fixture: `DialOption` is one `references`
+    /// edge from `newClient`, so the walk gathers it with that edge and its file
+    /// holds graph mass. Upstream rescues a signature type only when its file is
+    /// buried, under 6% of the top file's mass with fewer than two word hits
+    /// (`tools.ts` b635dd46 5001-5014, #1064), so nothing is rescued, and
+    /// `options.ts` (3 points, one edge from an entry) stays under the floor
+    /// that the named seed (50) raises to 10. Before W7-25b the Rust rescue had
+    /// no mass test and rendered `options.ts`.
+    #[test]
+    fn ext_explore_does_not_rescue_a_gathered_signature_type() {
+        let mut engine = test_engine();
+        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.node(&dial.id).is_some(), "the walk gathers the type");
+        assert!(sub.rescued_files.is_empty(), "{:?}", sub.rescued_files);
+        let txt = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "newClient add parameter"}),
+        ));
+        assert!(
+            !txt.contains("#### src/options.ts"),
+            "a gathered type file with mass is not rescued into a section: {txt}"
+        );
+    }
+
     /// #1064 CORE (subgraph-level): `find_relevant_context` inserts the buried
     /// signature type node + its file into the subgraph AND ranks its file
     /// within the top-4 (the tiny-tier `default_max_files`) so it survives the
     /// output budget. Pre-fix the wall of padding roots outrank `options.ts`,
     /// pushing it past position 4 and out of the rendered output.
+    ///
+    /// W7-25b: on the buried shape (deviations D4); the original fixture is
+    /// `ext_find_relevant_context_gathers_a_one_hop_type_without_rescue`.
     #[test]
     fn ext_find_relevant_context_rescues_buried_type_into_subgraph() {
         let mut engine = test_engine();
-        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let (_client, dial) = setup_buried_change_surface_repro(&mut engine);
         let sub = engine
             .find_relevant_context("newClient add parameter")
             .unwrap();
@@ -11280,6 +13078,34 @@ mod tests {
         assert!(
             pos < 4,
             "rescued type file must rank within the top-4 budget, got position {pos} in {:?}",
+            sub.file_order
+        );
+    }
+
+    /// W7-25b, the original #1064 fixture at the subgraph level: the walk
+    /// gathers `DialOption` with its edge, so its file has graph mass, is not
+    /// buried and is not rescued (`tools.ts` b635dd46 5001-5014, #1064); under
+    /// the floor it leaves the file order. Before W7-25b it was rescued into
+    /// the top four.
+    #[test]
+    fn ext_find_relevant_context_gathers_a_one_hop_type_without_rescue() {
+        let mut engine = test_engine();
+        let (_client, dial) = setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.node(&dial.id).is_some(), "the walk gathers the type");
+        assert!(
+            sub.edges
+                .iter()
+                .any(|e| e.target == dial.id
+                    && e.kind == codegraph_core::types::EdgeKind::References),
+            "with its edge, so it holds graph mass"
+        );
+        assert!(!sub.rescued_files.contains("src/options.ts"));
+        assert!(
+            !sub.file_order.iter().any(|f| f == "src/options.ts"),
+            "{:?}",
             sub.file_order
         );
     }
@@ -11352,10 +13178,41 @@ mod tests {
     }
 
     /// #1064 determinism: repeated explore runs produce byte-identical output.
+    ///
+    /// W7-25b: on the original fixture nothing is rescued any more (the type
+    /// is gathered with mass, `tools.ts` b635dd46 5001-5014); the rescue's own
+    /// determinism is `ext_explore_rescue_is_deterministic_when_buried`.
     #[test]
     fn ext_explore_rescue_is_deterministic() {
         let mut engine = test_engine();
         setup_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.rescued_files.is_empty(), "{:?}", sub.rescued_files);
+        let run = || {
+            text_of(&engine.execute(
+                "codegraph_explore",
+                &serde_json::json!({"query": "newClient add parameter"}),
+            ))
+        };
+        let a = run();
+        let b = run();
+        let c = run();
+        assert_eq!(a, b, "explore output must be byte-identical across runs");
+        assert_eq!(b, c, "explore output must be byte-identical across runs");
+    }
+
+    /// W7-25b: the determinism test on the buried shape (deviations D4),
+    /// where the rescue fires.
+    #[test]
+    fn ext_explore_rescue_is_deterministic_when_buried() {
+        let mut engine = test_engine();
+        setup_buried_change_surface_repro(&mut engine);
+        let sub = engine
+            .find_relevant_context("newClient add parameter")
+            .unwrap();
+        assert!(sub.rescued_files.contains("src/options.ts"));
         let run = || {
             text_of(&engine.execute(
                 "codegraph_explore",
@@ -11557,12 +13414,19 @@ mod tests {
     /// sorted by `(file, line, id)` — exercises the sort comparator. Two sig
     /// types in files that sort in reverse of insertion order both rescue, in
     /// stable order.
+    ///
+    /// W7-25b: the seed is `wireUp` and its walk share is spent first
+    /// (deviations D4); the original fixture is
+    /// `ext_explore_a_bare_word_seeds_no_rescue`.
     #[test]
     fn ext_explore_rescue_sorts_multiple_candidates() {
         let mut engine = test_engine();
+        // W7-25b: a camelCase name, because upstream's NL-stopword guard keeps
+        // a bare lowercase word ("wire") from seeding, and the rescue follows
+        // only the named tier's callables.
         let f = node_lang(
-            "wire",
-            "wire",
+            "wireUp",
+            "wireUp",
             "src/wire.ts",
             3,
             3,
@@ -11600,16 +13464,73 @@ mod tests {
                 mk_edge(&f.id, &alpha.id, codegraph_core::types::EdgeKind::Returns),
             ],
         );
-        let sub = engine.find_relevant_context("wire").unwrap();
+        // W7-25b: keep both types outside the walk, or they are not buried.
+        fill_walk_budget(&mut engine, &f, 210);
+        let sub = engine.find_relevant_context("wireUp").unwrap();
         assert!(sub.rescued_files.contains("src/zeta.ts"));
         assert!(sub.rescued_files.contains("src/alpha.ts"));
         // The comparator runs over both candidates; the resulting ranked
         // file_order is deterministic across repeated runs.
-        let again = engine.find_relevant_context("wire").unwrap();
+        let again = engine.find_relevant_context("wireUp").unwrap();
         assert_eq!(
             sub.file_order, again.file_order,
             "multi-candidate rescue ordering must be deterministic"
         );
+    }
+
+    /// W7-25b, the original fixture of `ext_explore_rescue_sorts_multiple_candidates`:
+    /// `wire` is a bare lowercase word that no other query token corroborates,
+    /// so upstream's NL-stopword guard does not seed it (`tools.ts` b635dd46
+    /// 4466-4480) and the rescue, which follows only the named tier's callables
+    /// (4705-4720, #1064), has nothing to follow. Both types are one edge from
+    /// the entry point and gathered with it. Before W7-25b both were rescued.
+    #[test]
+    fn ext_explore_a_bare_word_seeds_no_rescue() {
+        let mut engine = test_engine();
+        let f = node_lang(
+            "wire",
+            "wire",
+            "src/wire.ts",
+            3,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let zeta = node_lang(
+            "Zeta",
+            "Zeta",
+            "src/zeta.ts",
+            1,
+            1,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        let alpha = node_lang(
+            "Alpha",
+            "Alpha",
+            "src/alpha.ts",
+            1,
+            1,
+            NodeKind::Struct,
+            Language::TypeScript,
+        );
+        for rel in ["src/wire.ts", "src/zeta.ts", "src/alpha.ts"] {
+            put_indexed_source(&engine, rel, "// stub\n", Language::TypeScript, 1);
+        }
+        put_nodes(&mut engine, &[f.clone(), zeta.clone(), alpha.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&f.id, &zeta.id, codegraph_core::types::EdgeKind::References),
+                mk_edge(&f.id, &alpha.id, codegraph_core::types::EdgeKind::Returns),
+            ],
+        );
+        let sub = engine.find_relevant_context("wire").unwrap();
+        assert!(sub.roots.contains(&f.id), "the search still finds it");
+        assert!(sub.named_seed_ids.is_empty(), "{:?}", sub.named_seed_ids);
+        assert!(sub.tier_seed_ids.is_empty(), "{:?}", sub.tier_seed_ids);
+        assert!(sub.rescued_files.is_empty(), "{:?}", sub.rescued_files);
+        assert!(sub.node(&zeta.id).is_some() && sub.node(&alpha.id).is_some());
     }
 
     /// #1064 buried check: a signature type whose file the query hits ≥2 times
@@ -11704,5 +13625,2596 @@ mod tests {
             !sub.rescued_files.contains("src/widget.ts"),
             "a type in the seed's own file is on-screen, not rescued"
         );
+    }
+
+    /// Upstream #2428 (`synthesized-hop.ts`): a synthesized hop reads as the
+    /// dynamic dispatch it is, with its wiring site, in explore's Flow and in
+    /// the node trail — never as a bare `calls`. Upstream's fixture: an
+    /// interface method reaches its implementation by an `interface-impl`
+    /// edge.
+    #[test]
+    fn a_synthesized_hop_reads_as_dynamic_dispatch_in_the_flow_and_the_trail() {
+        use codegraph_core::types::EdgeKind;
+        let mut engine = test_engine();
+        let run_export = node_lang(
+            "runExport",
+            "runExport",
+            "src/run.ts",
+            3,
+            5,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        let iface = node_lang(
+            "exportReport",
+            "Exporter::exportReport",
+            "src/exporter.ts",
+            2,
+            2,
+            NodeKind::Method,
+            Language::TypeScript,
+        );
+        let implementation = node_lang(
+            "exportReport",
+            "PdfExporter::exportReport",
+            "src/pdf-exporter.ts",
+            5,
+            7,
+            NodeKind::Method,
+            Language::TypeScript,
+        );
+        let render = node_lang(
+            "renderPdf",
+            "renderPdf",
+            "src/render.ts",
+            1,
+            3,
+            NodeKind::Function,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                run_export.clone(),
+                iface.clone(),
+                implementation.clone(),
+                render.clone(),
+            ],
+        );
+        let mut dispatch = mk_edge(&iface.id, &implementation.id, EdgeKind::Calls);
+        dispatch.provenance = Some("heuristic".to_string());
+        dispatch.metadata = Some(serde_json::json!({
+            "synthesizedBy": "interface-impl",
+            "registeredAt": "src/pdf-exporter.ts:5",
+        }));
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&run_export.id, &iface.id, EdgeKind::Calls),
+                dispatch,
+                mk_edge(&implementation.id, &render.id, EdgeKind::Calls),
+            ],
+        );
+
+        let explored = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({"query": "runExport exportReport renderPdf"}),
+        ));
+        assert!(
+            explored.starts_with(
+                "**Flow (call path among the symbols you queried)**\n\n\
+                 1. runExport (src/run.ts:3)\n   ↓ calls\n\
+                 2. exportReport (src/exporter.ts:2)\n   ↓ dynamic: interface → impl @src/pdf-exporter.ts:5\n\
+                 3. exportReport (src/pdf-exporter.ts:5)\n   ↓ calls\n\
+                 4. renderPdf (src/render.ts:1)\n"
+            ),
+            "{explored}"
+        );
+
+        let trail = text_of(&engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "exportReport", "file": "src/exporter.ts"}),
+        ));
+        assert!(
+            trail.contains(
+                "**Calls →** exportReport (src/pdf-exporter.ts:5) [dynamic: interface → impl @src/pdf-exporter.ts:5]"
+            ),
+            "{trail}"
+        );
+        let caller_trail = text_of(&engine.execute(
+            "codegraph_node",
+            &serde_json::json!({"symbol": "renderPdf"}),
+        ));
+        assert!(
+            caller_trail.contains("**Called by ←** exportReport (src/pdf-exporter.ts:5)\n")
+                || caller_trail.ends_with("**Called by ←** exportReport (src/pdf-exporter.ts:5)"),
+            "a static edge carries no tag: {caller_trail}"
+        );
+    }
+
+    /* ------------------------- the dynamic-dispatch links (W7-26) -- */
+
+    /// A TypeScript method `owner::name` in `file` at `line`.
+    fn link_method(owner: &str, name: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            &format!("{owner}::{name}"),
+            file,
+            line,
+            line + 2,
+            NodeKind::Method,
+            Language::TypeScript,
+        )
+    }
+
+    /// A TypeScript function `name` in `file` at `line`.
+    fn link_function(name: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            name,
+            file,
+            line,
+            line + 2,
+            NodeKind::Function,
+            Language::TypeScript,
+        )
+    }
+
+    /// A synthesized `interface-impl` hop of `kind`, wired at `site`.
+    fn synthesized(source: &Node, target: &Node, kind: EdgeKind, site: &str) -> Edge {
+        let mut edge = mk_edge(&source.id, &target.id, kind);
+        edge.provenance = Some("heuristic".to_string());
+        edge.metadata = Some(serde_json::json!({
+            "synthesizedBy": "interface-impl",
+            "registeredAt": site,
+        }));
+        edge
+    }
+
+    /// What a query naming the callables `named` (`unique` among them picked
+    /// out by their tokens) and the non-callable endpoints `dyn_named`
+    /// resolves to, with `chain` as its best chain.
+    fn named_flow(
+        named: &[&Node],
+        unique: &[&Node],
+        dyn_named: &[&Node],
+        chain: &[FlowStep],
+    ) -> NamedSymbolFlow {
+        let mut flow = NamedSymbolFlow {
+            tokens: vec!["first".to_string(), "second".to_string()],
+            ..NamedSymbolFlow::default()
+        };
+        for node in named {
+            flow.named.set(node.id.clone(), (*node).clone());
+        }
+        for node in unique {
+            flow.unique_named_node_ids.insert(node.id.clone());
+        }
+        for node in dyn_named {
+            flow.dyn_named.set(node.id.clone(), (*node).clone());
+        }
+        if !chain.is_empty() {
+            flow.chains
+                .push(codegraph_graph::named_symbol_flow::FlowChain {
+                    steps: chain.to_vec(),
+                    call_sites: HashMap::new(),
+                });
+        }
+        flow
+    }
+
+    /// A chain step reached by `edge`; none for the first.
+    fn flow_step(node: &Node, edge: Option<&Edge>) -> FlowStep {
+        FlowStep {
+            node: node.clone(),
+            edge: edge.cloned(),
+        }
+    }
+
+    /// An interface method's implementations of one name are one link each,
+    /// and each end of a same-name link is named by its owner (#2748).
+    #[test]
+    fn a_link_is_one_line_per_pair_of_ends() {
+        let mut engine = test_engine();
+        let shape = link_method("Shape", "area", "src/shape.ts", 2);
+        let square = link_method("Square", "area", "src/square.ts", 4);
+        let triangle = link_method("Triangle", "area", "src/triangle.ts", 4);
+        put_nodes(
+            &mut engine,
+            &[shape.clone(), square.clone(), triangle.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&shape, &square, EdgeKind::Calls, "src/square.ts:4"),
+                synthesized(&shape, &triangle, EdgeKind::Calls, "src/triangle.ts:4"),
+            ],
+        );
+        let flow = named_flow(&[&shape], &[&shape], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- Shape.area → Square.area   [dynamic: interface → impl @src/square.ts:4]",
+                "- Shape.area → Triangle.area   [dynamic: interface → impl @src/triangle.ts:4]",
+            ]
+        );
+    }
+
+    /// Two synthesized edges over one pair of ends are one link whatever
+    /// their kinds, the first in the edge order: kind before row.
+    #[test]
+    fn a_pair_of_ends_is_one_link_whatever_kinds_its_edges_have() {
+        let mut engine = test_engine();
+        let dispatch = link_function("dispatchJob", "src/a.ts", 1);
+        let run = link_function("runJob", "src/b.ts", 1);
+        put_nodes(&mut engine, &[dispatch.clone(), run.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&dispatch, &run, EdgeKind::References, "src/b.ts:9"),
+                synthesized(&dispatch, &run, EdgeKind::Calls, "src/b.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&dispatch], &[&dispatch], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            ["- dispatchJob → runJob   [dynamic: interface → impl @src/b.ts:1]"]
+        );
+    }
+
+    #[test]
+    fn a_synthesized_edge_from_a_symbol_to_itself_is_no_link() {
+        let mut engine = test_engine();
+        let retry = link_function("retry", "src/a.ts", 1);
+        put_nodes(&mut engine, std::slice::from_ref(&retry));
+        put_edges(
+            &mut engine,
+            &[synthesized(&retry, &retry, EdgeKind::Calls, "src/a.ts:3")],
+        );
+        let flow = named_flow(&[&retry], &[&retry], &[], &[]);
+        assert!(engine.synth_links(&flow, None).unwrap().is_empty());
+    }
+
+    /// The Flow shows a hop between two of its nodes, so a synthesized edge
+    /// with both ends on it is left out, even one that is not a hop; one end
+    /// on it is not enough.
+    #[test]
+    fn a_link_with_both_ends_on_the_flow_is_left_out() {
+        let mut engine = test_engine();
+        let start = link_function("start", "src/p.ts", 1);
+        let drain = link_method("Queue", "drain", "src/q.ts", 1);
+        let finish = link_function("finish", "src/r.ts", 1);
+        let flush = link_method("Sink", "flush", "src/x.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[start.clone(), drain.clone(), finish.clone(), flush.clone()],
+        );
+        let first = mk_edge(&start.id, &drain.id, EdgeKind::Calls);
+        let second = mk_edge(&drain.id, &finish.id, EdgeKind::Calls);
+        put_edges(
+            &mut engine,
+            &[
+                first.clone(),
+                second.clone(),
+                synthesized(&finish, &start, EdgeKind::Calls, "src/p.ts:2"),
+                synthesized(&drain, &flush, EdgeKind::Calls, "src/x.ts:1"),
+            ],
+        );
+        let chain = [
+            flow_step(&start, None),
+            flow_step(&drain, Some(&first)),
+            flow_step(&finish, Some(&second)),
+        ];
+        let flow = named_flow(
+            &[&start, &drain, &finish],
+            &[&start, &drain, &finish],
+            &[],
+            &chain,
+        );
+        assert_eq!(
+            engine.synth_links(&flow, Some(&chain)).unwrap(),
+            ["- drain → flush   [dynamic: interface → impl @src/x.ts:1]"]
+        );
+    }
+
+    /// gin declares `Binding` once per build tag: the Flow runs through one
+    /// declaration's link, the other declaration's reads the same and is
+    /// not listed, and two links that read the same are listed once.
+    #[test]
+    fn a_line_already_shown_is_not_listed_again() {
+        let mut engine = test_engine();
+        let declared = link_method("Binding", "Bind", "binding.go", 6);
+        let declared_again = link_method("Binding", "Bind", "binding_nomsgpack.go", 6);
+        let form = link_method("formBinding", "Bind", "form.go", 5);
+        let query = link_method("queryBinding", "Bind", "query.go", 5);
+        let map_form = link_function("mapForm", "form.go", 9);
+        put_nodes(
+            &mut engine,
+            &[
+                declared.clone(),
+                declared_again.clone(),
+                form.clone(),
+                query.clone(),
+                map_form.clone(),
+            ],
+        );
+        let hop = synthesized(&declared, &form, EdgeKind::Calls, "form.go:5");
+        let call = mk_edge(&form.id, &map_form.id, EdgeKind::Calls);
+        put_edges(
+            &mut engine,
+            &[
+                hop.clone(),
+                call.clone(),
+                synthesized(&declared_again, &form, EdgeKind::Calls, "form.go:5"),
+                synthesized(&declared, &query, EdgeKind::Calls, "query.go:5"),
+                synthesized(&declared_again, &query, EdgeKind::Calls, "query.go:5"),
+            ],
+        );
+        let chain = [
+            flow_step(&declared, None),
+            flow_step(&form, Some(&hop)),
+            flow_step(&map_form, Some(&call)),
+        ];
+        let named = [&declared, &declared_again, &form, &map_form];
+        let flow = named_flow(&named, &named, &[], &chain);
+        assert_eq!(
+            engine.synth_links(&flow, Some(&chain)).unwrap(),
+            ["- Binding.Bind → queryBinding.Bind   [dynamic: interface → impl @query.go:5]"]
+        );
+    }
+
+    /// A chain step reached against its edge's direction reads as the edge
+    /// runs, so another link that reads the same is still not repeated.
+    #[test]
+    fn a_flow_hop_reads_in_the_direction_of_its_edge() {
+        let mut engine = test_engine();
+        let handle = link_function("handle", "src/a.ts", 1);
+        let emit = link_function("emit", "src/b1.ts", 1);
+        let emit_again = link_function("emit", "src/b2.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[handle.clone(), emit.clone(), emit_again.clone()],
+        );
+        let hop = synthesized(&emit, &handle, EdgeKind::Calls, "src/a.ts:1");
+        put_edges(
+            &mut engine,
+            &[
+                hop.clone(),
+                synthesized(&emit_again, &handle, EdgeKind::Calls, "src/a.ts:1"),
+            ],
+        );
+        let chain = [flow_step(&handle, None), flow_step(&emit, Some(&hop))];
+        let flow = named_flow(&[&handle], &[&handle], &[], &chain);
+        // Without the chain the two links read the same: one line.
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            ["- emit → handle   [dynamic: interface → impl @src/a.ts:1]"]
+        );
+        assert!(engine.synth_links(&flow, Some(&chain)).unwrap().is_empty());
+    }
+
+    /// A link weighs what its two ends do: 3 for a symbol a token picks
+    /// out or a named non-callable endpoint, 1 for an ambiguous token's
+    /// candidate, 0 for an end the query did not name.
+    #[test]
+    fn links_go_by_how_pointedly_the_query_names_their_ends() {
+        let mut engine = test_engine();
+        let alpha = link_function("alpha", "src/a.ts", 1);
+        let beta = link_function("beta", "src/b.ts", 1);
+        let gamma = node_lang(
+            "gamma",
+            "gamma",
+            "src/c.ts",
+            1,
+            1,
+            NodeKind::Constant,
+            Language::TypeScript,
+        );
+        // An ambiguous name's other candidate, after xray in the edge order.
+        let delta = link_function("delta", "src/d.ts", 1);
+        // Before beta in the edge order, so that order alone would list it
+        // first.
+        let xray = link_function("xray", "src/0x.ts", 1);
+        let yankee = link_function("yankee", "src/y.ts", 1);
+        let zulu = link_function("zulu", "src/z.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                alpha.clone(),
+                beta.clone(),
+                gamma.clone(),
+                delta.clone(),
+                xray.clone(),
+                yankee.clone(),
+                zulu.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&alpha, &xray, EdgeKind::Calls, "src/0x.ts:1"),
+                synthesized(&alpha, &beta, EdgeKind::Calls, "src/b.ts:1"),
+                synthesized(&alpha, &delta, EdgeKind::Calls, "src/d.ts:1"),
+                synthesized(&beta, &yankee, EdgeKind::Calls, "src/y.ts:1"),
+                synthesized(&gamma, &zulu, EdgeKind::Calls, "src/z.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&alpha, &beta, &delta], &[&beta], &[&gamma], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- alpha → beta   [dynamic: interface → impl @src/b.ts:1]",
+                "- beta → yankee   [dynamic: interface → impl @src/y.ts:1]",
+                "- gamma → zulu   [dynamic: interface → impl @src/z.ts:1]",
+                "- alpha → delta   [dynamic: interface → impl @src/d.ts:1]",
+                "- alpha → xray   [dynamic: interface → impl @src/0x.ts:1]",
+            ]
+        );
+    }
+
+    /// Links into low-value files go last, but only through an end the
+    /// query did not name: a named symbol in a spec file keeps its place.
+    #[test]
+    fn a_low_value_end_goes_last_only_when_the_query_did_not_name_it() {
+        let mut engine = test_engine();
+        let serve = link_function("serve", "src/a.ts", 1);
+        let named_spec = link_function("serveSpec", "specs/t.ts", 1);
+        let double = link_function("fakeServe", "fakes/d.test.ts", 1);
+        let real = link_function("realServe", "src/p.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                serve.clone(),
+                named_spec.clone(),
+                double.clone(),
+                real.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                synthesized(&serve, &named_spec, EdgeKind::Calls, "specs/t.ts:1"),
+                synthesized(&serve, &double, EdgeKind::Calls, "fakes/d.test.ts:1"),
+                synthesized(&serve, &real, EdgeKind::Calls, "src/p.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&serve, &named_spec], &[&serve], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- serve → serveSpec   [dynamic: interface → impl @specs/t.ts:1]",
+                "- serve → realServe   [dynamic: interface → impl @src/p.ts:1]",
+                "- serve → fakeServe   [dynamic: interface → impl @fakes/d.test.ts:1]",
+            ]
+        );
+    }
+
+    /// Links of one rank take turns by the named symbol they hang from, a
+    /// rank being the low-value flag and the weight; past six lines the
+    /// rest are dropped (#2751).
+    #[test]
+    fn links_of_one_rank_take_turns_by_the_symbol_they_hang_from() {
+        let mut engine = test_engine();
+        let wide = link_method("Wide", "run", "src/wide.ts", 2);
+        let narrow = link_method("Narrow", "run", "src/narrow.ts", 2);
+        let extra = link_method("Extra", "run", "src/extra.ts", 4);
+        let wides: Vec<Node> = ["A", "B", "C", "D"]
+            .iter()
+            .map(|n| link_method(&format!("Wide{n}"), "run", &format!("src/wide-{n}.ts"), 4))
+            .collect();
+        let narrows: Vec<Node> = ["A", "B"]
+            .iter()
+            .map(|n| {
+                link_method(
+                    &format!("Narrow{n}"),
+                    "run",
+                    &format!("src/narrow-{n}.ts"),
+                    4,
+                )
+            })
+            .collect();
+        let mut nodes = vec![wide.clone(), narrow.clone(), extra.clone()];
+        nodes.extend(wides.iter().cloned());
+        nodes.extend(narrows.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        let mut edges = vec![synthesized(
+            &wide,
+            &extra,
+            EdgeKind::Calls,
+            "src/extra.ts:4",
+        )];
+        for target in &wides {
+            edges.push(synthesized(
+                &wide,
+                target,
+                EdgeKind::Calls,
+                &format!("{}:4", target.file_path),
+            ));
+        }
+        for target in &narrows {
+            edges.push(synthesized(
+                &narrow,
+                target,
+                EdgeKind::Calls,
+                &format!("{}:4", target.file_path),
+            ));
+        }
+        put_edges(&mut engine, &edges);
+        let flow = named_flow(
+            &[&wide, &narrow, &extra],
+            &[&wide, &narrow, &extra],
+            &[],
+            &[],
+        );
+        let links = engine.synth_links(&flow, None).unwrap();
+        let ends: Vec<&str> = links
+            .iter()
+            .map(|line| line.split("   [").next().unwrap())
+            .collect();
+        assert_eq!(
+            ends,
+            [
+                "- Wide.run → Extra.run",
+                "- Wide.run → WideA.run",
+                "- Narrow.run → NarrowA.run",
+                "- Wide.run → WideB.run",
+                "- Narrow.run → NarrowB.run",
+                "- Wide.run → WideC.run",
+            ]
+        );
+    }
+
+    /// Ties go by the edge order — kind, the other end, line, column, a
+    /// missing line first — never by the order the rows were written in,
+    /// which a sync can leave different from a fresh index's.
+    #[test]
+    fn links_follow_the_edge_order_whatever_order_the_rows_were_written_in() {
+        let mut engine = test_engine();
+        let route = link_function("route", "src/route.ts", 1);
+        let handlers: Vec<Node> = (1..=7)
+            .map(|i| link_function(&format!("handler{i}"), &format!("src/h{i}.ts"), 1))
+            .collect();
+        let mut nodes = vec![route.clone()];
+        nodes.extend(handlers.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        // Last to first, and handler1's edge with no line after its edge with
+        // one.
+        let mut edges = Vec::new();
+        for handler in handlers[1..].iter().rev() {
+            edges.push(synthesized(
+                &route,
+                handler,
+                EdgeKind::Calls,
+                &format!("{}:1", handler.file_path),
+            ));
+        }
+        let mut with_line = synthesized(&route, &handlers[0], EdgeKind::Calls, "src/h1.ts:9");
+        with_line.line = Some(9);
+        edges.push(with_line);
+        edges.push(synthesized(
+            &route,
+            &handlers[0],
+            EdgeKind::Calls,
+            "src/h1.ts:1",
+        ));
+        put_edges(&mut engine, &edges);
+        let flow = named_flow(&[&route], &[&route], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            (1..=6)
+                .map(|i| format!(
+                    "- route → handler{i}   [dynamic: interface → impl @src/h{i}.ts:1]"
+                ))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The edges into a named symbol come before the edges out of it, each
+    /// in the edge order: kind, the other end, line, then column, a missing
+    /// one first.
+    #[test]
+    fn links_into_a_symbol_come_before_links_out_of_it() {
+        let mut engine = test_engine();
+        let hub = link_function("hub", "src/hub.ts", 1);
+        let senders: Vec<Node> = (1..=3)
+            .map(|i| link_function(&format!("sender{i}"), &format!("src/s{i}.ts"), 1))
+            .collect();
+        // Before every sender in byte order, so an order that mixed the two
+        // directions would put it first.
+        let receiver = link_function("receiver", "src/0r.ts", 1);
+        let mut nodes = vec![hub.clone(), receiver.clone()];
+        nodes.extend(senders.iter().cloned());
+        put_nodes(&mut engine, &nodes);
+        // The edge out first, then the senders' last to first, sender1's
+        // with a column before its edge without one.
+        let mut edges = vec![synthesized(&hub, &receiver, EdgeKind::Calls, "src/0r.ts:1")];
+        for sender in senders[1..].iter().rev() {
+            edges.push(synthesized(
+                sender,
+                &hub,
+                EdgeKind::Calls,
+                &format!("{}:1", sender.file_path),
+            ));
+        }
+        let mut with_column = synthesized(&senders[0], &hub, EdgeKind::Calls, "src/s1.ts:7");
+        with_column.line = Some(1);
+        with_column.col = Some(7);
+        edges.push(with_column);
+        let mut without_column = synthesized(&senders[0], &hub, EdgeKind::Calls, "src/s1.ts:1");
+        without_column.line = Some(1);
+        edges.push(without_column);
+        put_edges(&mut engine, &edges);
+        let flow = named_flow(&[&hub], &[&hub], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            [
+                "- sender1 → hub   [dynamic: interface → impl @src/s1.ts:1]",
+                "- sender2 → hub   [dynamic: interface → impl @src/s2.ts:1]",
+                "- sender3 → hub   [dynamic: interface → impl @src/s3.ts:1]",
+                "- hub → receiver   [dynamic: interface → impl @src/0r.ts:1]",
+            ]
+        );
+    }
+
+    #[test]
+    fn only_synthesized_edges_are_links() {
+        let mut engine = test_engine();
+        let load = link_function("load", "src/a.ts", 1);
+        let parse = link_function("parse", "src/b.ts", 1);
+        let render = link_function("render", "src/c.ts", 1);
+        put_nodes(&mut engine, &[load.clone(), parse.clone(), render.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&load.id, &parse.id, EdgeKind::Calls),
+                synthesized(&load, &render, EdgeKind::Calls, "src/c.ts:1"),
+            ],
+        );
+        let flow = named_flow(&[&load], &[&load], &[], &[]);
+        assert_eq!(
+            engine.synth_links(&flow, None).unwrap(),
+            ["- load → render   [dynamic: interface → impl @src/c.ts:1]"]
+        );
+    }
+
+    /// The section as upstream prints it: alone after fewer than two named
+    /// callables (RTK thunks are `constant`s), alone after a two-node chain
+    /// (#687), and after the Flow, each with its closing line.
+    #[test]
+    fn the_links_section_reads_as_upstream_prints_it() {
+        const HEAD: &str = "**Dynamic-dispatch links among your symbols**\n\
+            (synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)\n\n";
+        const AFTER_FLOW: &str = "> Full source for these symbols is below — the call flow among them, followed by their bodies.\n";
+        let mut engine = test_engine();
+        let outer = node_lang(
+            "outerThunk",
+            "outerThunk",
+            "src/thunks.ts",
+            9,
+            11,
+            NodeKind::Constant,
+            Language::TypeScript,
+        );
+        let inner = node_lang(
+            "innerThunk",
+            "innerThunk",
+            "src/thunks.ts",
+            5,
+            7,
+            NodeKind::Constant,
+            Language::TypeScript,
+        );
+        let complete = link_function("completeCheckout", "src/checkout.ts", 2);
+        let settle = link_function("settleInvoice", "src/billing.ts", 2);
+        let start = link_function("start", "src/p.ts", 1);
+        let drain = link_function("drain", "src/q.ts", 1);
+        let finish = link_function("finish", "src/r.ts", 1);
+        let flush = link_function("flush", "src/x.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                outer.clone(),
+                inner.clone(),
+                complete.clone(),
+                settle.clone(),
+                start.clone(),
+                drain.clone(),
+                finish.clone(),
+                flush.clone(),
+            ],
+        );
+        let mut thunk = mk_edge(&outer.id, &inner.id, EdgeKind::Calls);
+        thunk.provenance = Some("heuristic".to_string());
+        thunk.metadata = Some(serde_json::json!({
+            "synthesizedBy": "redux-thunk",
+            "registeredAt": "src/thunks.ts:10",
+        }));
+        let mut event = mk_edge(&complete.id, &settle.id, EdgeKind::Calls);
+        event.provenance = Some("heuristic".to_string());
+        event.metadata = Some(serde_json::json!({
+            "synthesizedBy": "event-emitter",
+            "event": "invoice.settled",
+            "registeredAt": "src/billing.ts:3",
+        }));
+        let first = mk_edge(&start.id, &drain.id, EdgeKind::Calls);
+        let second = mk_edge(&drain.id, &finish.id, EdgeKind::Calls);
+        put_edges(
+            &mut engine,
+            &[
+                thunk,
+                event.clone(),
+                first.clone(),
+                second.clone(),
+                synthesized(&drain, &flush, EdgeKind::Calls, "src/x.ts:1"),
+            ],
+        );
+
+        let thunks = named_flow(&[], &[], &[&outer, &inner], &[]);
+        assert_eq!(
+            engine.flow_section_of(&thunks).unwrap(),
+            format!(
+                "{HEAD}- outerThunk → innerThunk   [dynamic: redux thunk @src/thunks.ts:10]\n\n\
+                 > Full source for these symbols is below.\n"
+            )
+        );
+
+        let pair = [flow_step(&complete, None), flow_step(&settle, Some(&event))];
+        let emitted = named_flow(&[&complete, &settle], &[&complete, &settle], &[], &pair);
+        assert_eq!(
+            engine.flow_section_of(&emitted).unwrap(),
+            format!(
+                "{HEAD}- completeCheckout → settleInvoice   [dynamic: event `invoice.settled` @src/billing.ts:3]\n\n{AFTER_FLOW}"
+            )
+        );
+
+        let chain = [
+            flow_step(&start, None),
+            flow_step(&drain, Some(&first)),
+            flow_step(&finish, Some(&second)),
+        ];
+        let named = [&start, &drain, &finish];
+        let flowing = named_flow(&named, &named, &[], &chain);
+        assert_eq!(
+            engine.flow_section_of(&flowing).unwrap(),
+            format!(
+                "**Flow (call path among the symbols you queried)**\n\n\
+                 1. start (src/p.ts:1)\n   ↓ calls\n\
+                 2. drain (src/q.ts:1)\n   ↓ calls\n\
+                 3. finish (src/r.ts:1)\n\n\
+                 {HEAD}- drain → flush   [dynamic: interface → impl @src/x.ts:1]\n\n{AFTER_FLOW}"
+            )
+        );
+    }
+
+    // === W7-25a: the subgraph walk (upstream `findRelevantContext`) =========
+
+    /// A function node in `file` for the W7-25 walk fixtures.
+    fn w725_fn(name: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            name,
+            file,
+            line,
+            line + 2,
+            NodeKind::Function,
+            Language::TypeScript,
+        )
+    }
+
+    fn w725_edge_at(source: &Node, target: &Node, kind: EdgeKind, line: i64) -> Edge {
+        let mut edge = mk_edge(&source.id, &target.id, kind);
+        edge.line = Some(line);
+        edge
+    }
+
+    // === W7-25 cost (OD-B75): what explore reads, it reads once =============
+
+    /// The ids `counts` holds more than once, with their counts.
+    fn w725_cost_read_twice(counts: &HashMap<String, usize>) -> Vec<String> {
+        let mut twice: Vec<String> = counts
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(id, n)| format!("{id} ×{n}"))
+            .collect();
+        twice.sort();
+        twice
+    }
+
+    /// W7-25 cost (OD-B75): the walk reads each node's row and each node's
+    /// edges at most once, though two entry points walk to the same helper,
+    /// the file node and a parameter sit next to every visit, and the glue
+    /// asks for the entry points' callers and callees again.
+    #[test]
+    fn w725_cost_the_walk_reads_each_row_and_each_nodes_edges_once() {
+        let mut engine = test_engine();
+        let file = node_lang(
+            "shared.ts",
+            "shared.ts",
+            "src/shared.ts",
+            1,
+            40,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        let alpha = w725_fn("alphaEntry", "src/shared.ts", 1);
+        let beta = w725_fn("betaEntry", "src/shared.ts", 10);
+        let helper = w725_fn("sharedHelper", "src/shared.ts", 20);
+        let deep = w725_fn("deepHelper", "src/deep.ts", 1);
+        let param = node_lang(
+            "input",
+            "alphaEntry::input",
+            "src/shared.ts",
+            1,
+            1,
+            NodeKind::Parameter,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[
+                file.clone(),
+                alpha.clone(),
+                beta.clone(),
+                helper.clone(),
+                deep.clone(),
+                param.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&file.id, &alpha.id, EdgeKind::Contains),
+                mk_edge(&file.id, &beta.id, EdgeKind::Contains),
+                mk_edge(&file.id, &helper.id, EdgeKind::Contains),
+                mk_edge(&alpha.id, &param.id, EdgeKind::Contains),
+                w725_edge_at(&alpha, &helper, EdgeKind::Calls, 2),
+                w725_edge_at(&beta, &helper, EdgeKind::Calls, 11),
+                w725_edge_at(&helper, &deep, EdgeKind::Calls, 21),
+            ],
+        );
+        explore_gather::test_reads::take();
+        let sub = engine
+            .find_relevant_context("alphaEntry betaEntry")
+            .unwrap();
+        let (rows, edges) = explore_gather::test_reads::take();
+        assert!(
+            sub.roots.contains(&alpha.id) && sub.roots.contains(&beta.id),
+            "both are entry points: {:?}",
+            sub.roots
+        );
+        assert!(sub.node(&deep.id).is_some(), "the walk reaches deepHelper");
+        assert!(
+            rows.contains_key(&file.id) && edges.contains_key(&helper.id),
+            "the walk read the file's row and the helper's edges: {rows:?} {edges:?}"
+        );
+        assert_eq!(w725_cost_read_twice(&rows), Vec::<String>::new(), "rows");
+        assert_eq!(w725_cost_read_twice(&edges), Vec::<String>::new(), "edges");
+    }
+
+    /// W7-25 cost (OD-B75): past its node limit a walk skips a new neighbour
+    /// without reading its row, as it skipped it after reading it, and the
+    /// rows it does read come a growing batch at a time: of a helper's 400
+    /// callees the walk reads 32, 64 and 128.
+    #[test]
+    fn w725_cost_a_full_walk_does_not_read_the_rows_it_skips() {
+        let mut engine = test_engine();
+        let entry = w725_fn("hubEntry", "src/hub.ts", 1);
+        let mid = w725_fn("middleStep", "src/mid.ts", 1);
+        let mut nodes = vec![entry.clone(), mid.clone()];
+        let mut edges = vec![w725_edge_at(&entry, &mid, EdgeKind::Calls, 2)];
+        for i in 0..400 {
+            let file = format!("src/leaf{}.ts", i / 20);
+            let leaf = w725_fn(&format!("leafStep{i:03}"), &file, 1 + 4 * (i % 20));
+            edges.push(w725_edge_at(&mid, &leaf, EdgeKind::Calls, 2));
+            nodes.push(leaf);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        explore_gather::test_reads::take();
+        let sub = engine.find_relevant_context("hubEntry").unwrap();
+        let (rows, _) = explore_gather::test_reads::take();
+        let leaf_rows = rows.keys().filter(|id| id.contains(":leafStep")).count();
+        assert!(
+            sub.nodes.iter().any(|n| n.name.starts_with("leafStep")),
+            "the walk keeps leaves"
+        );
+        assert_eq!(leaf_rows, 32 + 64 + 128, "the leaves' rows read");
+    }
+
+    /// W7-25 cost (OD-B75): the walk's reads are keyed by node id, so two
+    /// helpers of one name in two files keep their own rows and edges.
+    #[test]
+    fn w725_cost_the_walk_keeps_same_named_nodes_apart() {
+        let mut engine = test_engine();
+        let entry = w725_fn("startJob", "src/job.ts", 1);
+        let helper_a = w725_fn("helper", "src/a.ts", 1);
+        let helper_b = w725_fn("helper", "src/b.ts", 1);
+        let deep_a = w725_fn("deepAlpha", "src/deep_a.ts", 1);
+        let deep_b = w725_fn("deepBeta", "src/deep_b.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                entry.clone(),
+                helper_a.clone(),
+                helper_b.clone(),
+                deep_a.clone(),
+                deep_b.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&entry, &helper_a, EdgeKind::Calls, 2),
+                w725_edge_at(&entry, &helper_b, EdgeKind::Calls, 3),
+                w725_edge_at(&helper_a, &deep_a, EdgeKind::Calls, 2),
+                w725_edge_at(&helper_b, &deep_b, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("startJob").unwrap();
+        for n in [&helper_a, &helper_b, &deep_a, &deep_b] {
+            assert!(
+                sub.node(&n.id).is_some(),
+                "{} of {} is gathered: {:?}",
+                n.name,
+                n.file_path,
+                sub.nodes
+                    .iter()
+                    .map(|n| (&n.name, &n.file_path))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn w725_cost_files_of(engine: &CodeGraphEngine, symbol: &str) -> Vec<String> {
+        engine
+            .find_all_symbols(symbol)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|n| n.file_path.clone())
+            .collect()
+    }
+
+    fn w725_cost_method(name: &str, owner: &str, file: &str, line: i64) -> Node {
+        node_lang(
+            name,
+            &format!("{owner}::{name}"),
+            file,
+            line,
+            line + 2,
+            NodeKind::Method,
+            Language::TypeScript,
+        )
+    }
+
+    /// W7-25 cost (OD-B75): the request's memo of `find_all_symbols` is keyed
+    /// by the whole symbol: two classes' `run` keep their own definitions.
+    #[test]
+    fn w725_cost_the_symbol_memo_keeps_two_symbols_apart() {
+        let mut engine = test_engine();
+        put_nodes(
+            &mut engine,
+            &[
+                w725_cost_method("run", "Alpha", "src/alpha.ts", 3),
+                w725_cost_method("run", "Beta", "src/beta.ts", 3),
+            ],
+        );
+        assert_eq!(w725_cost_files_of(&engine, "Alpha.run"), ["src/alpha.ts"]);
+        assert_eq!(w725_cost_files_of(&engine, "Beta.run"), ["src/beta.ts"]);
+        assert_eq!(
+            w725_cost_files_of(&engine, "Alpha.run"),
+            ["src/alpha.ts"],
+            "a repeated lookup answers the same"
+        );
+    }
+
+    /// W7-25 cost (OD-B75): the memo lives in one request's engine, so two
+    /// projects asked the same symbol in one process keep their own answers.
+    #[test]
+    fn w725_cost_two_projects_do_not_share_the_symbol_memo() {
+        let mut first = test_engine();
+        let mut second = test_engine();
+        put_nodes(
+            &mut first,
+            &[w725_cost_method("open", "Store", "src/store.ts", 3)],
+        );
+        put_nodes(
+            &mut second,
+            &[w725_cost_method("open", "Store", "lib/db/store.ts", 8)],
+        );
+        assert_eq!(w725_cost_files_of(&first, "Store.open"), ["src/store.ts"]);
+        assert_eq!(
+            w725_cost_files_of(&second, "Store.open"),
+            ["lib/db/store.ts"]
+        );
+    }
+
+    /// W7-25 cost (OD-B75): `execute` starts every tool call with an empty
+    /// memo, so the next request on the same engine sees what a sync added in
+    /// between, as a long-lived server's next call does.
+    #[test]
+    fn w725_cost_each_request_starts_with_an_empty_symbol_memo() {
+        let mut engine = test_engine();
+        let ask = |engine: &CodeGraphEngine| {
+            text_of(&engine.execute(
+                "codegraph_callers",
+                &serde_json::json!({ "symbol": "Store.open" }),
+            ))
+        };
+        let before = ask(&engine);
+        assert!(before.contains("not found"), "{before}");
+        let open = w725_cost_method("open", "Store", "src/store.ts", 3);
+        let boot = w725_fn("bootApp", "src/main.ts", 1);
+        put_nodes(&mut engine, &[open.clone(), boot.clone()]);
+        put_edges(
+            &mut engine,
+            &[w725_edge_at(&boot, &open, EdgeKind::Calls, 2)],
+        );
+        let after = ask(&engine);
+        assert!(
+            after.contains("bootApp"),
+            "the second request sees the new caller: {after}"
+        );
+    }
+
+    /// W7-25 cost (OD-B75): the ranking reads each owner's kind once, by the
+    /// owner: an interface's method and a class's method in one file keep
+    /// their own answer, and an owner outside the subgraph is read from the
+    /// index.
+    #[test]
+    fn w725_cost_interface_ownership_is_read_per_owner() {
+        let mut engine = test_engine();
+        let ts = |name: &str, file: &str, start: i64, end: i64, kind: NodeKind| {
+            node_lang(name, name, file, start, end, kind, Language::TypeScript)
+        };
+        let shape = ts("Shape", "src/shapes.ts", 1, 3, NodeKind::Interface);
+        let shape_area = w725_cost_method("area", "Shape", "src/shapes.ts", 2);
+        let square = ts("Square", "src/shapes.ts", 5, 9, NodeKind::Class);
+        let square_area = w725_cost_method("area", "Square", "src/shapes.ts", 6);
+        let round = ts("Round", "src/round.ts", 1, 3, NodeKind::Interface);
+        let round_area = w725_cost_method("area", "Round", "src/round.ts", 2);
+        put_nodes(
+            &mut engine,
+            &[
+                shape.clone(),
+                shape_area.clone(),
+                square.clone(),
+                square_area.clone(),
+                round.clone(),
+                round_area.clone(),
+            ],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&shape.id, &shape_area.id, EdgeKind::Contains),
+                mk_edge(&square.id, &square_area.id, EdgeKind::Contains),
+                mk_edge(&round.id, &round_area.id, EdgeKind::Contains),
+            ],
+        );
+        // `Round` itself is not in the subgraph.
+        let held = [
+            shape,
+            shape_area.clone(),
+            square,
+            square_area,
+            round_area.clone(),
+        ];
+        let mut owned: Vec<String> =
+            crate::explore_rank::interface_owned_methods(&engine.store, &held)
+                .unwrap()
+                .into_iter()
+                .collect();
+        owned.sort();
+        let mut want = vec![shape_area.id, round_area.id];
+        want.sort();
+        assert_eq!(owned, want);
+    }
+
+    /// W7-25 cost (OD-B75): the glue answers from the walk's edges of every
+    /// kind but keeps only the caller kinds, as reading callers and callees
+    /// did: a parameter the entry point contains in its own (gathered) file is
+    /// not glued, while a top-level call from its file node is.
+    #[test]
+    fn w725_cost_the_glue_follows_only_the_caller_kinds() {
+        let mut engine = test_engine();
+        let demo = w725_fn("runDemo", "src/app.ts", 3);
+        let own_file = node_lang(
+            "app.ts",
+            "app.ts",
+            "src/app.ts",
+            1,
+            9,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        let param = node_lang(
+            "options",
+            "runDemo::options",
+            "src/app.ts",
+            3,
+            3,
+            NodeKind::Parameter,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[demo.clone(), own_file.clone(), param.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                mk_edge(&demo.id, &param.id, EdgeKind::Contains),
+                w725_edge_at(&own_file, &demo, EdgeKind::Calls, 9),
+            ],
+        );
+        let sub = engine.find_relevant_context("runDemo").unwrap();
+        assert!(
+            sub.glue_ids.contains(&own_file.id),
+            "the file's top-level call is glued: {:?}",
+            sub.glue_ids
+        );
+        assert!(
+            !sub.glue_ids.contains(&param.id) && sub.node(&param.id).is_none(),
+            "a contained parameter is not glued: {:?}",
+            sub.glue_ids
+        );
+    }
+
+    /// W7-25a: the walk goes three hops out, so a type the seed's callee
+    /// references is gathered; one hop of callers and callees did not reach it.
+    #[test]
+    fn w725a_explore_walks_to_a_type_two_hops_out() {
+        let mut engine = test_engine();
+        let run = w725_fn("runThing", "src/run.ts", 1);
+        let helper = w725_fn("prepareStep", "src/helper.ts", 1);
+        let payload = node_lang(
+            "Payload",
+            "Payload",
+            "src/types.ts",
+            1,
+            4,
+            NodeKind::Struct,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[run.clone(), helper.clone(), payload.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&run, &helper, EdgeKind::Calls, 2),
+                w725_edge_at(&helper, &payload, EdgeKind::References, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("runThing").unwrap();
+        assert!(sub.node(&helper.id).is_some(), "the callee is gathered");
+        assert!(
+            sub.node(&payload.id).is_some(),
+            "the type two hops out is gathered: {:?}",
+            sub.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// W7-25a: explore's search takes upstream's kinds (`HIGH_VALUE_NODE_KINDS`,
+    /// `context/index.ts` 168-171): a property or an import the query's words
+    /// match is not a seed.
+    #[test]
+    fn w725a_explore_seeds_only_high_value_kinds() {
+        let mut engine = test_engine();
+        let counter = node_lang(
+            "Counter",
+            "Counter",
+            "src/math.ts",
+            5,
+            12,
+            NodeKind::Class,
+            Language::TypeScript,
+        );
+        let value = node_lang(
+            "value",
+            "Counter.value",
+            "src/math.ts",
+            6,
+            6,
+            NodeKind::Property,
+            Language::TypeScript,
+        );
+        let mut import = node_lang(
+            "./math",
+            "./math",
+            "src/app.ts",
+            1,
+            1,
+            NodeKind::Import,
+            Language::TypeScript,
+        );
+        import.signature = Some("import { Counter, value } from './math'".to_string());
+        put_nodes(
+            &mut engine,
+            &[counter.clone(), value.clone(), import.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[mk_edge(&counter.id, &value.id, EdgeKind::Contains)],
+        );
+        let sub = engine.find_relevant_context("Counter value").unwrap();
+        assert!(sub.roots.contains(&counter.id), "the class is a seed");
+        for id in &sub.roots {
+            let kind = sub.node(id).map(|n| n.kind);
+            assert!(
+                !matches!(kind, Some(NodeKind::Property | NodeKind::Import)),
+                "a {kind:?} became a seed: {:?}",
+                sub.roots
+            );
+        }
+        assert!(
+            sub.node(&value.id).is_none(),
+            "a property is not walked into the subgraph"
+        );
+    }
+
+    // === W9-01a: the walk takes its limits ==================================
+
+    /// Three entry points in rank order, `alphaStep` (`src/alpha.ts`),
+    /// `betaStep` (`src/beta.ts`) and `gammaStep` (`src/gamma.ts`), and the
+    /// chain `alphaStep → alphaHelper → alphaLeaf`.
+    fn w901a_project(engine: &mut CodeGraphEngine) -> (Vec<Node>, Node, Node) {
+        let alpha = w725_fn("alphaStep", "src/alpha.ts", 1);
+        let beta = w725_fn("betaStep", "src/beta.ts", 1);
+        let gamma = w725_fn("gammaStep", "src/gamma.ts", 1);
+        let helper = w725_fn("alphaHelper", "src/alpha_helper.ts", 1);
+        let leaf = w725_fn("alphaLeaf", "src/alpha_leaf.ts", 1);
+        put_nodes(
+            engine,
+            &[
+                alpha.clone(),
+                beta.clone(),
+                gamma.clone(),
+                helper.clone(),
+                leaf.clone(),
+            ],
+        );
+        put_edges(
+            engine,
+            &[
+                w725_edge_at(&alpha, &helper, EdgeKind::Calls, 2),
+                w725_edge_at(&helper, &leaf, EdgeKind::Calls, 2),
+            ],
+        );
+        (vec![alpha, beta, gamma], helper, leaf)
+    }
+
+    fn w901a_ids(nodes: &[Node]) -> Vec<&str> {
+        nodes.iter().map(|node| node.id.as_str()).collect()
+    }
+
+    /// W9-01a: a budget of one node keeps the first entry point alone; the
+    /// others stay entry points the subgraph no longer holds, as upstream's
+    /// trim leaves its `roots`.
+    #[test]
+    fn w901a_walk_at_one_node_keeps_the_first_entry_point() {
+        let mut engine = test_engine();
+        let (entries, _, _) = w901a_project(&mut engine);
+        let walk = explore_gather::walk(
+            &engine.store,
+            &entries,
+            false,
+            explore_gather::WalkLimits {
+                max_nodes: 1,
+                depth: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            w901a_ids(&walk.gathered.nodes),
+            vec![entries[0].id.as_str()]
+        );
+        assert_eq!(
+            walk.roots,
+            entries.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(walk.gathered.edges.is_empty(), "{:?}", walk.gathered.edges);
+    }
+
+    /// W9-01a: a walk of depth one stops one hop out; explore's three hops
+    /// reach the leaf.
+    #[test]
+    fn w901a_walk_at_depth_one_stops_one_hop_out() {
+        let mut engine = test_engine();
+        let (entries, helper, leaf) = w901a_project(&mut engine);
+        let one_hop = explore_gather::walk(
+            &engine.store,
+            &entries,
+            false,
+            explore_gather::WalkLimits {
+                max_nodes: 20,
+                depth: 1,
+            },
+        )
+        .unwrap();
+        let ids = w901a_ids(&one_hop.gathered.nodes);
+        assert!(ids.contains(&helper.id.as_str()), "{ids:?}");
+        assert!(!ids.contains(&leaf.id.as_str()), "{ids:?}");
+        let explore =
+            explore_gather::walk(&engine.store, &entries, false, explore_gather::EXPLORE_WALK)
+                .unwrap();
+        assert!(
+            w901a_ids(&explore.gathered.nodes).contains(&leaf.id.as_str()),
+            "{:?}",
+            w901a_ids(&explore.gathered.nodes)
+        );
+    }
+
+    /// W9-01a: explore walks at upstream explore's limits (`maxNodes` 200,
+    /// `traversalDepth` 3) from its own search's seeds: its subgraph opens
+    /// with that walk's nodes, in their order, and keeps its entry points.
+    #[test]
+    fn w901a_explore_walks_its_seeds_at_explore_s_limits() {
+        assert_eq!(
+            explore_gather::EXPLORE_WALK,
+            explore_gather::WalkLimits {
+                max_nodes: 200,
+                depth: 3,
+            }
+        );
+        let mut engine = test_engine();
+        let (_, _, leaf) = w901a_project(&mut engine);
+        let query = "alphaStep betaStep gammaStep";
+        let seeds = engine.explore_seed_search(query).unwrap();
+        assert!(seeds.len() >= 3, "{:?}", w901a_ids(&seeds));
+        let walk = explore_gather::walk(&engine.store, &seeds, false, explore_gather::EXPLORE_WALK)
+            .unwrap();
+        let sub = engine.find_relevant_context(query).unwrap();
+        assert_eq!(sub.roots, walk.roots);
+        let walked = w901a_ids(&walk.gathered.nodes);
+        assert_eq!(&w901a_ids(&sub.nodes)[..walked.len()], walked.as_slice());
+        assert!(walked.contains(&leaf.id.as_str()), "{walked:?}");
+        assert!(engine.explore_seed_search("  ").unwrap().is_empty());
+    }
+
+    // === W9-01b: `codegraph context` =========================================
+
+    /// Four seeds the query names (`southStep` … `northStep`), the first
+    /// calling `deltaHelper`, which calls `epsilonLeaf`; every source file is
+    /// indexed as it is on disk.
+    fn w901_project(engine: &mut CodeGraphEngine) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        for (name, file) in [
+            ("southStep", "src/south.ts"),
+            ("eastStep", "src/east.ts"),
+            ("westStep", "src/west.ts"),
+            ("northStep", "src/north.ts"),
+            ("deltaHelper", "src/delta.ts"),
+            ("epsilonLeaf", "src/epsilon.ts"),
+        ] {
+            let node = w725_fn(name, file, 1);
+            put_indexed_source(
+                engine,
+                file,
+                &format!("export function {name}() {{\n  return 1;\n}}\n"),
+                Language::TypeScript,
+                1,
+            );
+            nodes.push(node);
+        }
+        put_nodes(engine, &nodes);
+        put_edges(
+            engine,
+            &[
+                w725_edge_at(&nodes[0], &nodes[4], EdgeKind::Calls, 2),
+                w725_edge_at(&nodes[4], &nodes[5], EdgeKind::Calls, 2),
+            ],
+        );
+        nodes
+    }
+
+    fn w901_json(
+        engine: &CodeGraphEngine,
+        task: &str,
+        options: ContextOptions,
+    ) -> (serde_json::Value, Vec<String>) {
+        let built = engine
+            .build_context(
+                task,
+                &ContextOptions {
+                    format: ContextFormat::Json,
+                    ..options
+                },
+            )
+            .unwrap();
+        (serde_json::from_str(&built.output).unwrap(), built.notices)
+    }
+
+    fn w901_names(list: &serde_json::Value) -> Vec<&str> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect()
+    }
+
+    /// OD-B81, OD-B79: the entry points are the first three of explore's
+    /// seeds for the task as written, and the walk goes one hop out.
+    #[test]
+    fn w901_context_walks_one_hop_from_explore_s_first_three_seeds() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        let task = "southStep eastStep westStep northStep";
+        let seeds = engine.explore_seed_search(task).unwrap();
+        assert!(seeds.len() >= 4, "{:?}", w901a_ids(&seeds));
+        let (json, notices) = w901_json(&engine, task, ContextOptions::default());
+        assert!(notices.is_empty(), "{notices:?}");
+        let first_three: Vec<&str> = seeds.iter().take(3).map(|n| n.name.as_str()).collect();
+        assert_eq!(w901_names(&json["entryPoints"]), first_three);
+        let names = w901_names(&json["nodes"]);
+        assert!(!names.contains(&seeds[3].name.as_str()), "{names:?}");
+        if first_three.contains(&"southStep") {
+            assert!(names.contains(&"deltaHelper"), "{names:?}");
+        }
+        assert!(!names.contains(&"epsilonLeaf"), "{names:?}");
+        assert_eq!(json["codeBlocks"].as_array().unwrap().len(), names.len());
+        assert_eq!(json["query"], task);
+    }
+
+    /// #383: a Spring properties key's block is its key, and its value is
+    /// never read off the disk.
+    #[test]
+    fn w901_context_gives_a_config_key_s_block_as_the_key_alone() {
+        let mut engine = test_engine();
+        let file = "src/main/resources/application.properties";
+        put_indexed_source(
+            &engine,
+            file,
+            "db.password=s3cr3t-value\n",
+            Language::Properties,
+            1,
+        );
+        let mut key = node_lang(
+            "password",
+            "db.password",
+            file,
+            1,
+            1,
+            NodeKind::Constant,
+            Language::Properties,
+        );
+        key.id = format!("spring-config:{file}:1:db.password");
+        key.signature = Some("db.password".to_string());
+        put_nodes(&mut engine, &[key]);
+        let (json, _) = w901_json(&engine, "password", ContextOptions::default());
+        assert_eq!(json["codeBlocks"][0]["content"], "db.password", "{json}");
+        let markdown = engine
+            .build_context("password", &ContextOptions::default())
+            .unwrap()
+            .output;
+        assert!(
+            markdown.contains("```properties\ndb.password\n```"),
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains("s3cr3t") && !json.to_string().contains("s3cr3t"),
+            "{markdown}"
+        );
+    }
+
+    /// A file changed since its last sync gives no block, is never sliced at
+    /// its stale lines, and a notice names it; its symbols stay listed.
+    #[test]
+    fn w901_context_leaves_a_drifted_file_s_code_out_and_says_so() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        write_src(
+            &engine,
+            "src/south.ts",
+            "// moved down\nexport function southStep() {\n  return 2;\n}\n",
+        );
+        let (json, notices) = w901_json(&engine, "southStep", ContextOptions::default());
+        assert!(w901_names(&json["nodes"]).contains(&"southStep"), "{json}");
+        let blocks = json["codeBlocks"].as_array().unwrap();
+        assert!(
+            blocks.iter().all(|block| block["nodeName"] != "southStep"),
+            "{json}"
+        );
+        assert!(
+            blocks.iter().all(|block| {
+                let content = block["content"].as_str().unwrap();
+                !content.contains("moved down") && !content.contains("return 2")
+            }),
+            "{json}"
+        );
+        assert_eq!(
+            notices,
+            [
+                "left out the code of symbols in files that changed since the last index sync: src/south.ts; run `codegraph sync` to index them again"
+            ]
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["nodeName"] == "deltaHelper"),
+            "{json}"
+        );
+    }
+
+    /// The 取舍 of W9-01's pre-start revision (draft Q7): the answer is the
+    /// same while auto-sync recovers; a notice for stderr says so.
+    #[test]
+    fn w901_context_notices_auto_sync_that_is_not_healthy() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        let healthy = engine
+            .build_context("southStep", &ContextOptions::default())
+            .unwrap();
+        assert!(healthy.notices.is_empty(), "{:?}", healthy.notices);
+        let guard = codegraph_watch::register_watch_health_for_tests(
+            &engine.project_root,
+            codegraph_watch::WatchHealth::Recovering {
+                reason: "lock held\nby another writer".to_string(),
+            },
+        );
+        let recovering = engine
+            .build_context("southStep", &ContextOptions::default())
+            .unwrap();
+        assert_eq!(recovering.output, healthy.output);
+        assert_eq!(recovering.notices.len(), 1, "{:?}", recovering.notices);
+        assert!(
+            recovering.notices[0].starts_with("CodeGraph auto-sync is RECOVERING")
+                && recovering.notices[0].ends_with("Reason: lock held by another writer"),
+            "{:?}",
+            recovering.notices
+        );
+        drop(guard);
+        let _disabled = codegraph_watch::register_watch_health_for_tests(
+            &engine.project_root,
+            codegraph_watch::WatchHealth::Disabled {
+                reason: "inotify limit".to_string(),
+            },
+        );
+        let disabled = engine
+            .build_context("southStep", &ContextOptions::default())
+            .unwrap();
+        assert_eq!(disabled.output, healthy.output);
+        assert!(
+            disabled.notices[0].starts_with("CodeGraph auto-sync is DISABLED"),
+            "{:?}",
+            disabled.notices
+        );
+    }
+
+    /// `--no-code` reads no file; `--max-nodes 1` keeps the first entry
+    /// point alone.
+    #[test]
+    fn w901_context_options_turn_code_off_and_bound_the_nodes() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        let task = "southStep eastStep westStep";
+        let (json, _) = w901_json(
+            &engine,
+            task,
+            ContextOptions {
+                include_code: false,
+                ..ContextOptions::default()
+            },
+        );
+        assert_eq!(json["codeBlocks"], serde_json::json!([]));
+        assert!(!json["nodes"].as_array().unwrap().is_empty());
+        let (one, _) = w901_json(
+            &engine,
+            task,
+            ContextOptions {
+                max_nodes: 1,
+                ..ContextOptions::default()
+            },
+        );
+        let seeds = engine.explore_seed_search(task).unwrap();
+        assert_eq!(w901_names(&one["nodes"]), [seeds[0].name.as_str()]);
+        assert_eq!(w901_names(&one["entryPoints"]), [seeds[0].name.as_str()]);
+        let markdown = engine
+            .build_context(
+                task,
+                &ContextOptions {
+                    include_code: false,
+                    ..ContextOptions::default()
+                },
+            )
+            .unwrap()
+            .output;
+        assert!(!markdown.contains("### Code"), "{markdown}");
+        assert!(
+            markdown.starts_with(
+                "## Code Context\n\n**Query:** southStep eastStep westStep\n\n### Entry Points\n\n"
+            ),
+            "{markdown}"
+        );
+    }
+
+    /// W7-25a: at most ⌈200 × 0.2⌉ = 40 nodes of one file stay in the
+    /// subgraph (`context/index.ts` 1235-1266). The leaves sit two hops out:
+    /// glue re-adds an entry point's own callees from a gathered file, as
+    /// upstream's does.
+    #[test]
+    fn w725a_explore_caps_one_files_share_of_the_subgraph() {
+        let mut engine = test_engine();
+        let hub = w725_fn("hubEntry", "src/hub.ts", 1);
+        let mid = w725_fn("middleStep", "src/mid.ts", 1);
+        let mut nodes = vec![hub.clone(), mid.clone()];
+        let mut edges = vec![w725_edge_at(&hub, &mid, EdgeKind::Calls, 2)];
+        for i in 0..60 {
+            let leaf = w725_fn(&format!("leaf{i}"), "src/big.ts", 1 + 4 * i);
+            edges.push(w725_edge_at(&mid, &leaf, EdgeKind::Calls, 2));
+            nodes.push(leaf);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("hubEntry").unwrap();
+        let in_big = sub
+            .nodes
+            .iter()
+            .filter(|n| n.file_path == "src/big.ts")
+            .count();
+        assert_eq!(in_big, 40, "one file keeps at most 40 nodes");
+    }
+
+    /// W7-25a: test and other non-production files hold at most
+    /// ⌈200 × 0.15⌉ = 30 nodes when the query is not about tests
+    /// (`context/index.ts` 1267-1283).
+    #[test]
+    fn w725a_explore_caps_non_production_nodes() {
+        let mut engine = test_engine();
+        let hub = w725_fn("hubEntry", "src/hub.ts", 1);
+        let mut nodes = vec![hub.clone()];
+        let mut edges = Vec::new();
+        for i in 0..50 {
+            let file = format!("tests/t{}.test.ts", i / 5);
+            let callee = w725_fn(&format!("probe{i}"), &file, 1 + 4 * (i % 5));
+            edges.push(w725_edge_at(&callee, &hub, EdgeKind::Calls, 2));
+            nodes.push(callee);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("hubEntry").unwrap();
+        let in_tests = sub
+            .nodes
+            .iter()
+            .filter(|n| n.file_path.starts_with("tests/"))
+            .count();
+        assert_eq!(in_tests, 30, "non-production nodes are capped at 30");
+        // `hubEntryTest` holds `test`, so the query is about tests: no cap.
+        let mut about = test_engine();
+        let hub_test = w725_fn("hubEntryTest", "src/hub.ts", 1);
+        let mut nodes = vec![hub_test.clone()];
+        let mut edges = Vec::new();
+        for i in 0..50 {
+            let file = format!("tests/t{}.test.ts", i / 5);
+            let callee = w725_fn(&format!("probe{i}"), &file, 1 + 4 * (i % 5));
+            edges.push(w725_edge_at(&callee, &hub_test, EdgeKind::Calls, 2));
+            nodes.push(callee);
+        }
+        put_nodes(&mut about, &nodes);
+        put_edges(&mut about, &edges);
+        let about_tests = about.find_relevant_context("hubEntryTest").unwrap();
+        assert_eq!(
+            about_tests
+                .nodes
+                .iter()
+                .filter(|n| n.file_path.starts_with("tests/"))
+                .count(),
+            50,
+            "a query about tests keeps them"
+        );
+    }
+
+    /// W7-25a: the edges among the gathered nodes are recovered, also the
+    /// ones between two nodes at the walk's last depth, which it never expands
+    /// (`context/index.ts` 1295-1306).
+    #[test]
+    fn w725a_explore_recovers_edges_among_the_last_layer() {
+        let mut engine = test_engine();
+        let root = w725_fn("rootStep", "src/a.ts", 1);
+        let x = w725_fn("secondStep", "src/b.ts", 1);
+        let y = w725_fn("thirdStep", "src/c.ts", 1);
+        let z1 = w725_fn("fourthOne", "src/d.ts", 1);
+        let z2 = w725_fn("fourthTwo", "src/e.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[root.clone(), x.clone(), y.clone(), z1.clone(), z2.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&root, &x, EdgeKind::Calls, 2),
+                w725_edge_at(&x, &y, EdgeKind::Calls, 2),
+                w725_edge_at(&y, &z1, EdgeKind::Calls, 2),
+                w725_edge_at(&y, &z2, EdgeKind::Calls, 3),
+                w725_edge_at(&z1, &z2, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        assert!(
+            sub.edges
+                .iter()
+                .any(|e| e.source == z1.id && e.target == z2.id && e.kind == EdgeKind::Calls),
+            "the edge between the last layer's nodes is recovered: {:?}",
+            sub.edges
+                .iter()
+                .map(|e| (&e.source, &e.target))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// W7-25a: glue (`tools.ts` b635dd46 4352-4381) adds a seed's caller of a
+    /// kind the walk skips only from a file the subgraph already holds.
+    #[test]
+    fn w725a_explore_glue_adds_callers_only_from_gathered_files() {
+        let mut engine = test_engine();
+        let demo = w725_fn("runDemo", "src/app.ts", 3);
+        let own_file = node_lang(
+            "app.ts",
+            "app.ts",
+            "src/app.ts",
+            1,
+            9,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        let other_file = node_lang(
+            "other.ts",
+            "other.ts",
+            "src/other.ts",
+            1,
+            9,
+            NodeKind::File,
+            Language::TypeScript,
+        );
+        put_nodes(
+            &mut engine,
+            &[demo.clone(), own_file.clone(), other_file.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&own_file, &demo, EdgeKind::Calls, 9),
+                w725_edge_at(&other_file, &demo, EdgeKind::Calls, 4),
+            ],
+        );
+        let sub = engine.find_relevant_context("runDemo").unwrap();
+        assert!(
+            sub.node(&own_file.id).is_some(),
+            "the caller in the seed's own file is glued in"
+        );
+        assert!(
+            sub.node(&other_file.id).is_none(),
+            "a caller of a skipped kind in a file the subgraph does not hold stays out"
+        );
+    }
+
+    /// W7-25a: the gathered subgraph does not depend on the order the rows
+    /// were written in (a synced index and a fresh one store them differently).
+    #[test]
+    fn w725a_explore_subgraph_ignores_row_order() {
+        fn build(reverse: bool) -> (Vec<String>, Vec<(String, String, String)>) {
+            let mut engine = test_engine();
+            let root = w725_fn("rootStep", "src/a.ts", 1);
+            let mut nodes = vec![root.clone()];
+            let mut edges = Vec::new();
+            for i in 0..30 {
+                let callee = w725_fn(&format!("callee{i}"), &format!("src/f{}.ts", i % 7), 1 + i);
+                let deeper = w725_fn(&format!("deeper{i}"), &format!("src/g{}.ts", i % 5), 1 + i);
+                edges.push(w725_edge_at(&root, &callee, EdgeKind::Calls, 1 + i));
+                edges.push(w725_edge_at(&callee, &deeper, EdgeKind::References, 1));
+                nodes.push(callee);
+                nodes.push(deeper);
+            }
+            if reverse {
+                nodes.reverse();
+                edges.reverse();
+            }
+            put_nodes(&mut engine, &nodes);
+            put_edges(&mut engine, &edges);
+            let sub = engine.find_relevant_context("rootStep").unwrap();
+            (
+                sub.nodes.iter().map(|n| n.id.clone()).collect(),
+                sub.edges
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.source.clone(),
+                            e.target.clone(),
+                            e.kind.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        let forward = build(false);
+        let backward = build(true);
+        assert_eq!(
+            forward.0.len(),
+            61,
+            "the root, its 30 callees and their 30 types: {:?}",
+            forward.0
+        );
+        assert_eq!(forward, backward, "the gather depends on row order");
+    }
+
+    fn w725_class(name: &str, file: &str) -> Node {
+        node_lang(
+            name,
+            name,
+            file,
+            1,
+            5,
+            NodeKind::Class,
+            Language::TypeScript,
+        )
+    }
+
+    /// W7-25a: a class entry point's ancestors come in through its type
+    /// hierarchy (`context/index.ts` 1111-1137) even past the walk's depth.
+    #[test]
+    fn w725a_explore_takes_a_class_entrys_ancestors_past_the_walk() {
+        let mut engine = test_engine();
+        let chain: Vec<Node> = [
+            "Quokka", "Narwhal", "Pangolin", "Axolotl", "Capybara", "Okapi",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| w725_class(name, &format!("src/l{i}.ts")))
+        .collect();
+        put_nodes(&mut engine, &chain);
+        let edges: Vec<Edge> = chain
+            .windows(2)
+            .map(|pair| mk_edge(&pair[0].id, &pair[1].id, EdgeKind::Extends))
+            .collect();
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("Quokka").unwrap();
+        assert!(
+            sub.node(&chain[5].id).is_some(),
+            "the ancestor five hops up is gathered: {:?}",
+            sub.nodes.iter().map(|n| &n.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// W7-25a: past `maxNodes` (200) the subgraph is trimmed, the entry point
+    /// and its neighbours first (`context/index.ts` 1197-1233).
+    #[test]
+    fn w725a_explore_trims_the_subgraph_to_two_hundred_nodes() {
+        let mut engine = test_engine();
+        let chain: Vec<Node> = (0..250)
+            .map(|i| w725_class(&format!("Tier{i}Kind"), &format!("src/t{i}.ts")))
+            .collect();
+        put_nodes(&mut engine, &chain);
+        let edges: Vec<Edge> = chain
+            .windows(2)
+            .map(|pair| mk_edge(&pair[0].id, &pair[1].id, EdgeKind::Extends))
+            .collect();
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("Tier0Kind").unwrap();
+        assert_eq!(sub.nodes.len(), 200, "the subgraph holds at most 200 nodes");
+        assert!(sub.node(&chain[0].id).is_some(), "the entry point stays");
+        assert!(sub.node(&chain[1].id).is_some(), "its neighbour stays");
+    }
+
+    /// W7-25a: the walk reads a node's edges in upstream's order: out-edges
+    /// by kind then target, in-edges by kind then source, structural kinds
+    /// first (`contains`, then `calls`). The store's own order differs: the
+    /// identity index sorts out-edges by target first, and in-edges of one
+    /// kind come in row order.
+    #[test]
+    fn w725a_explore_walks_edges_in_upstream_order() {
+        let mut engine = test_engine();
+        let root = w725_fn("rootStep", "src/root.ts", 1);
+        let zeta = w725_fn("zetaTarget", "src/y.ts", 1);
+        let alpha = w725_fn("alphaTarget", "src/a.ts", 1);
+        let built = w725_fn("betaTarget", "src/b.ts", 1);
+        let late_caller = w725_fn("zuluCaller", "src/z.ts", 1);
+        let early_caller = w725_fn("echoCaller", "src/e.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[
+                root.clone(),
+                zeta.clone(),
+                alpha.clone(),
+                built.clone(),
+                late_caller.clone(),
+                early_caller.clone(),
+            ],
+        );
+        // Written in the reverse of upstream's order, kind by kind.
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&root, &zeta, EdgeKind::References, 2),
+                w725_edge_at(&root, &alpha, EdgeKind::References, 3),
+                w725_edge_at(&root, &built, EdgeKind::Instantiates, 4),
+                w725_edge_at(&late_caller, &root, EdgeKind::Calls, 2),
+                w725_edge_at(&early_caller, &root, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        let order: Vec<&str> = sub.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "rootStep",
+                "echoCaller",
+                "zuluCaller",
+                "betaTarget",
+                "alphaTarget",
+                "zetaTarget"
+            ],
+            "calls first; in-edges by source; out-edges by kind, then target"
+        );
+    }
+
+    // === W7-25b: the file ranking (upstream `handleExplore`) ================
+
+    fn w725_type(name: &str, kind: NodeKind, file: &str, line: i64) -> Node {
+        node_lang(name, name, file, line, line + 3, kind, Language::TypeScript)
+    }
+
+    /// W7-25b: a named definition's file ranks first; the types its signature
+    /// uses are not rescued, because their file has graph mass (#1064 rescues
+    /// only a buried one). Before, the rescue had no mass test and put the
+    /// shared types file first (`ReferenceResolver resolve_via_import`).
+    #[test]
+    fn w725b_ranks_the_named_definition_before_the_types_it_uses() {
+        let mut engine = test_engine();
+        let seed = w725_fn("resolveViaImport", "src/import_resolver.ts", 10);
+        let types = [
+            w725_type("RefView", NodeKind::Struct, "src/types.ts", 1),
+            w725_type("ResolvedRef", NodeKind::Struct, "src/types.ts", 10),
+            w725_type("EdgeKind", NodeKind::Enum, "src/types.ts", 20),
+        ];
+        let mut nodes = vec![seed.clone()];
+        nodes.extend(types.iter().cloned());
+        let mut edges = Vec::new();
+        for (at, ty) in types.iter().enumerate() {
+            edges.push(w725_edge_at(
+                &seed,
+                ty,
+                EdgeKind::References,
+                11 + at as i64,
+            ));
+        }
+        for i in 0..20 {
+            let user = w725_fn(
+                &format!("consumer{i}"),
+                &format!("src/consumers/c{i}.ts"),
+                1,
+            );
+            for (at, ty) in types.iter().enumerate() {
+                edges.push(w725_edge_at(&user, ty, EdgeKind::References, 2 + at as i64));
+            }
+            nodes.push(user);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        let sub = engine.find_relevant_context("resolveViaImport").unwrap();
+        assert_eq!(
+            sub.file_order.first().map(String::as_str),
+            Some("src/import_resolver.ts"),
+            "{:?}",
+            sub.file_order
+        );
+        assert!(
+            !sub.rescued_files.contains("src/types.ts"),
+            "a types file with graph mass is not rescued"
+        );
+    }
+
+    /// The gate fixture: an entry point with ten neighbours in their own
+    /// files, and a five-node file three hops out behind one of them.
+    fn w725_gate_fixture(engine: &mut CodeGraphEngine, reverse: bool) {
+        let root = w725_fn("rootStep", "src/root.ts", 1);
+        let mut nodes = vec![root.clone()];
+        let mut edges = Vec::new();
+        for i in 0..10 {
+            let x = w725_fn(&format!("neighbour{i}"), &format!("src/n{i}.ts"), 1);
+            edges.push(w725_edge_at(&root, &x, EdgeKind::Calls, 2 + i));
+            nodes.push(x);
+        }
+        let y = w725_fn("bridgeStep", "src/bridge.ts", 1);
+        edges.push(w725_edge_at(&nodes[1], &y, EdgeKind::Calls, 2));
+        for j in 0..5 {
+            let z = w725_fn(&format!("farLeaf{j}"), "src/far.ts", 1 + 5 * j);
+            edges.push(w725_edge_at(&y, &z, EdgeKind::Calls, 3 + j));
+            nodes.push(z);
+        }
+        nodes.push(y);
+        if reverse {
+            nodes.reverse();
+            edges.reverse();
+        }
+        put_nodes(engine, &nodes);
+        put_edges(engine, &edges);
+    }
+
+    /// W7-25b: the relevance gate (`tools.ts` b635dd46 5028-5040) drops a file
+    /// that cleared the floor but holds under 6% of the top file's graph mass,
+    /// is no entry, not central and matches fewer than two query words.
+    #[test]
+    fn w725b_the_gate_drops_a_file_far_from_the_entry_points() {
+        let mut engine = test_engine();
+        w725_gate_fixture(&mut engine, false);
+        // The named seed scores 50, so the floor is 10 and no neighbour
+        // (3 each) clears it; the backfill takes the best two of the rest,
+        // `far.ts` (five peripheral nodes, 5) and `n0.ts`, and the gate then
+        // drops `far.ts`, which holds under 6% of the top file's mass.
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        assert_eq!(sub.file_order, ["src/root.ts", "src/n0.ts"]);
+    }
+
+    /// W7-25b: the ranking does not depend on the order the rows were written.
+    #[test]
+    fn w725b_file_order_ignores_row_order() {
+        let mut forward = test_engine();
+        w725_gate_fixture(&mut forward, false);
+        let mut backward = test_engine();
+        w725_gate_fixture(&mut backward, true);
+        assert_eq!(
+            forward
+                .find_relevant_context("rootStep")
+                .unwrap()
+                .file_order,
+            backward
+                .find_relevant_context("rootStep")
+                .unwrap()
+                .file_order
+        );
+    }
+
+    /// W7-25b: when the relative floor leaves fewer than three files, the
+    /// best of the rest with a score of at least 1 fill up to three
+    /// (`tools.ts` b635dd46 4870-4897).
+    #[test]
+    fn w725b_the_floor_backfills_to_three_files() {
+        let mut engine = test_engine();
+        let root = w725_fn("rootStep", "src/a.ts", 1);
+        let x = w725_fn("middleStep", "src/b.ts", 1);
+        let y1 = w725_fn("leafOne", "src/c.ts", 1);
+        let y2 = w725_fn("leafTwo", "src/d.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[root.clone(), x.clone(), y1.clone(), y2.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&root, &x, EdgeKind::Calls, 2),
+                w725_edge_at(&x, &y1, EdgeKind::Calls, 2),
+                w725_edge_at(&x, &y2, EdgeKind::Calls, 3),
+            ],
+        );
+        let sub = engine.find_relevant_context("rootStep").unwrap();
+        assert_eq!(sub.file_order, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+    }
+
+    /// W7-25b: test files leave the ranking whatever the project's size when
+    /// the query is not about tests and two other files remain (b635dd46
+    /// 4846-4868); the per-tier switch it used to read is gone upstream.
+    #[test]
+    fn w725b_test_files_leave_the_ranking_on_every_tier() {
+        let mut engine = test_engine();
+        let dispatch = w725_fn("dispatchRoute", "lib/dispatch.ts", 1);
+        let parse = w725_fn("parseRoute", "lib/router.ts", 1);
+        let spec = w725_fn("parsesARoute", "test/router.test.ts", 1);
+        put_nodes(
+            &mut engine,
+            &[dispatch.clone(), parse.clone(), spec.clone()],
+        );
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&dispatch, &parse, EdgeKind::Calls, 2),
+                w725_edge_at(&spec, &parse, EdgeKind::Calls, 2),
+            ],
+        );
+        let sub = engine
+            .find_relevant_context("dispatchRoute parseRoute")
+            .unwrap();
+        assert!(
+            !sub.file_order.iter().any(|f| f.starts_with("test/")),
+            "{:?}",
+            sub.file_order
+        );
+        assert_eq!(sub.file_order.len(), 2, "{:?}", sub.file_order);
+    }
+
+    /// W7-25b: a weak-kind match nothing uses scores as a collision
+    /// (`ISOLATED_WEAK_KIND_WEIGHT`, b635dd46 453): an unused `dispatch`
+    /// local scores 0.8 as an entry point, under the floor (2.6 here) and
+    /// the backfill's minimum of 1, so its file leaves the ranking.
+    #[test]
+    fn w725b_an_unused_local_scores_as_a_collision() {
+        let mut engine = test_engine();
+        let dispatch = w725_fn("dispatch", "src/dispatcher.ts", 1);
+        let helper = w725_fn("runHandler", "src/dispatcher.ts", 10);
+        let local = node_lang(
+            "dispatch",
+            "dispatch",
+            "scripts/report.ts",
+            1,
+            1,
+            NodeKind::Variable,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, &[dispatch.clone(), helper.clone(), local]);
+        put_edges(
+            &mut engine,
+            &[w725_edge_at(&dispatch, &helper, EdgeKind::Calls, 2)],
+        );
+        let sub = engine.find_relevant_context("dispatch").unwrap();
+        assert!(
+            sub.roots.iter().any(|id| id.contains("scripts/report.ts")),
+            "the local is an entry point: {:?}",
+            sub.roots
+        );
+        assert_eq!(sub.file_order, ["src/dispatcher.ts"]);
+    }
+
+    /// W7-25b: the generated penalty damps the graph mass, the comparator's
+    /// primary key, and not only the score (`rankPenalty`, b635dd46 4953-4965,
+    /// #1500): a generated twin whose calls stay in its own file holds more raw
+    /// mass than the hand-written file whose callee lives next door, and still
+    /// ranks below both.
+    #[test]
+    fn w725b_the_generated_penalty_damps_graph_mass() {
+        let mut engine = test_engine();
+        let hand = w725_fn("invoice", "src/billing/ledger.ts", 1);
+        let tax = w725_fn("computeTax", "src/billing/tax.ts", 1);
+        let twin = w725_fn("invoice", "src/gen/ledger.generated.ts", 1);
+        let mut nodes = vec![hand.clone(), tax.clone(), twin.clone()];
+        let mut edges = vec![w725_edge_at(&hand, &tax, EdgeKind::Calls, 2)];
+        for i in 0..5 {
+            let step = w725_fn(
+                &format!("buildRow{i}"),
+                "src/gen/ledger.generated.ts",
+                10 + 5 * i,
+            );
+            edges.push(w725_edge_at(&twin, &step, EdgeKind::Calls, 2 + i));
+            nodes.push(step);
+        }
+        put_nodes(&mut engine, &nodes);
+        put_edges(&mut engine, &edges);
+        // The test ids carry the path, which the FTS reads: no path holds the
+        // query word, so the two `invoice` functions are the only entry points.
+        let sub = engine.find_relevant_context("invoice").unwrap();
+        assert_eq!(sub.roots.len(), 2, "{:?}", sub.roots);
+        assert_eq!(
+            sub.file_order,
+            [
+                "src/billing/ledger.ts",
+                "src/billing/tax.ts",
+                "src/gen/ledger.generated.ts"
+            ]
+        );
+    }
+
+    /// W7-25b: upstream's `RELEVANCE_KIND_WEIGHT` (b635dd46 418-431).
+    #[test]
+    fn w725b_kind_weights_rank_callables_over_members_over_locals() {
+        use crate::explore_rank::kind_weight;
+        for kind in [
+            NodeKind::Function,
+            NodeKind::Method,
+            NodeKind::Class,
+            NodeKind::Struct,
+            NodeKind::Interface,
+            NodeKind::Route,
+            NodeKind::Component,
+        ] {
+            assert_eq!(kind_weight(kind), 1.0, "{kind:?}");
+        }
+        for member in [NodeKind::Property, NodeKind::Field, NodeKind::EnumMember] {
+            assert!(kind_weight(member) < kind_weight(NodeKind::Function));
+            assert!(kind_weight(member) > kind_weight(NodeKind::Parameter));
+        }
+        for weak in [NodeKind::Constant, NodeKind::Variable, NodeKind::Parameter] {
+            assert!(kind_weight(weak) < 0.5, "{weak:?}");
+        }
+        assert!(kind_weight(NodeKind::Parameter) < kind_weight(NodeKind::Variable));
+        assert_eq!(kind_weight(NodeKind::Namespace), 0.8);
+        assert_eq!(kind_weight(NodeKind::File), 0.5);
+        assert_eq!(
+            kind_weight(NodeKind::Import),
+            0.5,
+            "an unlisted kind takes the default"
+        );
+    }
+
+    /// W7-25b: upstream's `rankPenalty` (b635dd46 4829-4839): generated and
+    /// ambient take the stronger of the two, never the product (CG-28); a
+    /// low-value file is damped on top.
+    #[test]
+    fn w725b_rank_penalty_takes_the_stronger_structural_penalty() {
+        use crate::explore_rank::rank_penalty;
+        assert_eq!(rank_penalty(false, false, false), 1.0);
+        assert_eq!(rank_penalty(false, true, false), 0.5);
+        assert_eq!(rank_penalty(true, false, false), 0.3);
+        assert_eq!(rank_penalty(true, true, false), 0.3, "not 0.15");
+        assert_eq!(rank_penalty(false, false, true), 0.5);
+        assert_eq!(rank_penalty(true, true, true), 0.15);
+    }
+
+    // === W7-25c: the flow spine in clusters and windows =====================
+
+    /// W7-25c: with no narrative the named identity is still handed over
+    /// (CG-38, upstream `identityOnly`, `tools.ts` b635dd46 3517-3543): two
+    /// shape-precise names that do not connect keep their ids for importance
+    /// 9; bare words keep nothing, since no prose corroborates them.
+    #[test]
+    fn w725c_a_precise_name_without_a_flow_keeps_its_identity() {
+        let mut engine = test_engine();
+        let queue = w725_fn("queueMessage", "src/store.ts", 10);
+        let flush = w725_fn("flushQueuedMessages", "src/store.ts", 20);
+        let drain = w725_fn("drain", "src/pump.ts", 1);
+        let fire = w725_fn("fire", "src/pump.ts", 10);
+        put_nodes(&mut engine, &[queue.clone(), flush.clone(), drain, fire]);
+        let flow = engine.build_flow_section("queueMessage flushQueuedMessages");
+        assert!(flow.text.is_empty(), "{}", flow.text);
+        assert!(flow.path_node_ids.is_empty());
+        let both: HashSet<String> = [queue.id.clone(), flush.id.clone()].into_iter().collect();
+        assert_eq!(flow.named_node_ids, both);
+        let bare = engine.build_flow_section("drain fire");
+        assert!(bare.text.is_empty());
+        assert!(bare.named_node_ids.is_empty(), "{:?}", bare.named_node_ids);
+    }
+
+    /// W7-25c: a rendered chain hands over its spine, the named ids and where
+    /// each spine node calls the next (b635dd46 3565-3571, 3678).
+    #[test]
+    fn w725c_a_flow_hands_over_its_spine_and_call_sites() {
+        let mut engine = test_engine();
+        let a = w725_fn("startJob", "src/a.ts", 1);
+        let b = w725_fn("relayJob", "src/b.ts", 1);
+        let c = w725_fn("finishJob", "src/c.ts", 1);
+        put_nodes(&mut engine, &[a.clone(), b.clone(), c.clone()]);
+        put_edges(
+            &mut engine,
+            &[
+                w725_edge_at(&a, &b, EdgeKind::Calls, 2),
+                w725_edge_at(&b, &c, EdgeKind::Calls, 2),
+            ],
+        );
+        let flow = engine.build_flow_section("startJob finishJob");
+        assert!(
+            flow.text
+                .contains("**Flow (call path among the symbols you queried)**"),
+            "{}",
+            flow.text
+        );
+        let spine: HashSet<String> = [a.id.clone(), b.id.clone(), c.id.clone()]
+            .into_iter()
+            .collect();
+        assert_eq!(flow.path_node_ids, spine);
+        assert!(flow.named_node_ids.contains(&a.id) && flow.named_node_ids.contains(&c.id));
+        assert!(
+            !flow.named_node_ids.contains(&b.id),
+            "the bridge is on the spine, not named"
+        );
+        assert_eq!(flow.spine_call_sites.get(&a.id), Some(&2));
+        assert_eq!(flow.spine_call_sites.get(&b.id), Some(&2));
+        assert!(flow.path_files.contains("src/b.ts"));
+    }
+
+    /// A file of `count` numbered filler lines of about `width` chars.
+    fn w725c_lines(count: usize, width: usize) -> Vec<String> {
+        (1..=count)
+            .map(|i| {
+                format!(
+                    "  const line{i} = '{}';",
+                    "x".repeat(width.saturating_sub(20))
+                )
+            })
+            .collect()
+    }
+
+    /// Whether `section` rendered 1-based `line`.
+    fn w725c_rendered(section: &str, line: usize) -> bool {
+        section.lines().any(|l| {
+            l.split_once('\t')
+                .is_some_and(|(n, _)| n == line.to_string())
+        })
+    }
+
+    /// W7-25c: a definition the query named that the gather missed still forms
+    /// a cluster (b635dd46 6495-6503): it is read from the index and ranked 9.
+    #[test]
+    fn w725c_a_named_definition_outside_the_gather_still_renders() {
+        let mut engine = test_engine();
+        let file = "src/store.ts";
+        let owned = w725c_lines(400, 60);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openStore", file, 1, 10, NodeKind::Function);
+        let named = node("flushStore", file, 380, 390, NodeKind::Function);
+        put_nodes(&mut engine, &[entry.clone(), named.clone()]);
+        let sg = subgraph_with(vec![entry.clone()], vec![entry.id.clone()]);
+        let flow = FlowSection {
+            named_node_ids: [named.id.clone()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let section = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &ctx)
+            .section;
+        assert!(w725c_rendered(&section, 380), "{section}");
+    }
+
+    /// W7-25c: a named cluster (9) ranks above denser incidental ones and is
+    /// protected, so the file's room reaches it (b635dd46 6511-6522, 6731).
+    #[test]
+    fn w725c_a_named_cluster_outranks_incidental_ones() {
+        let engine = test_engine();
+        let file = "src/big.ts";
+        let owned = w725c_lines(600, 60);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openBig", file, 1, 5, NodeKind::Function);
+        let named = node("closeBig", file, 500, 540, NodeKind::Function);
+        let mut nodes = vec![entry.clone(), named.clone()];
+        for i in 0..12 {
+            let start = 50 + 20 * i as i64;
+            nodes.push(node(
+                &format!("helper{i}"),
+                file,
+                start,
+                start + 2,
+                NodeKind::Function,
+            ));
+        }
+        let sg = subgraph_with(nodes, vec![entry.id.clone()]);
+        let flow = FlowSection {
+            named_node_ids: [named.id.clone()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let section = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &ctx)
+            .section;
+        assert!(
+            w725c_rendered(&section, 500) && w725c_rendered(&section, 540),
+            "{section}"
+        );
+    }
+
+    /// W7-25c: a central file comes back whole up to 280 lines, others up to
+    /// 220 (`WHOLE_FILE_MAX_LINES`, b635dd46 6319-6328).
+    #[test]
+    fn w725c_a_central_file_up_to_280_lines_comes_back_whole() {
+        let engine = test_engine();
+        let file = "src/central.ts";
+        let owned = w725c_lines(250, 30);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openCentral", file, 1, 3, NodeKind::Function);
+        let mut sg = subgraph_with(vec![entry.clone()], vec![entry.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let plain = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        assert!(
+            !w725c_rendered(&plain, 250),
+            "a 250-line file clusters: {plain}"
+        );
+        sg.central_files.insert(file.to_string());
+        let central = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        assert!(
+            (1..=250).all(|line| w725c_rendered(&central, line)),
+            "{central}"
+        );
+    }
+
+    /// W7-25c: a spine member too big for its room is windowed on the line
+    /// where it calls the next hop (upstream `focusLinesOf`, b635dd46
+    /// 6883-6896), not only from its head.
+    #[test]
+    fn w725c_a_clipped_spine_member_is_windowed_at_its_call() {
+        let engine = test_engine();
+        let file = "src/relay.ts";
+        let owned = w725c_lines(160, 80);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let relay = node("relayJob", file, 1, 150, NodeKind::Function);
+        let sg = subgraph_with(vec![relay.clone()], Vec::new());
+        let flow = FlowSection {
+            path_node_ids: [relay.id.clone()].into_iter().collect(),
+            path_files: [file.to_string()].into_iter().collect(),
+            spine_call_sites: [(relay.id.clone(), 140)].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let rendered = engine.render_explore_file(&sg, file, &file_lines, "typescript", &ctx);
+        assert!(rendered.clipped, "{}", rendered.section);
+        assert!(w725c_rendered(&rendered.section, 1), "{}", rendered.section);
+        assert!(
+            w725c_rendered(&rendered.section, 140),
+            "{}",
+            rendered.section
+        );
+    }
+
+    /// W7-25c: an exact body's window reaches the line where it calls the
+    /// spine's next hop (upstream `bodyFocusLines`, b635dd46 5217-5233).
+    #[test]
+    fn w725c_an_exact_body_focuses_its_spine_call() {
+        let engine = test_engine();
+        let file = "src/run.ts";
+        let run = node("runAll", file, 10, 400, NodeKind::Method);
+        let mut sg = subgraph_with(vec![run.clone()], vec![run.id.clone()]);
+        sg.exact_ids.push(run.id.clone());
+        let sites: HashMap<String, i64> = [(run.id.clone(), 390)].into_iter().collect();
+        let focus = engine.exact_body_focus(&sg, file, &[], &HashSet::new(), &sites);
+        assert_eq!(focus, vec![(10, 400, vec![390])]);
+    }
+
+    /// W7-25c: a cluster holding a spine node ranks ahead of one holding only
+    /// an entry point (upstream `rankedClusters`, b635dd46 6970-6990), so when
+    /// the file's room holds one of them whole, it is the spine's.
+    #[test]
+    fn w725c_a_spine_cluster_ranks_before_an_entry_cluster() {
+        let engine = test_engine();
+        let file = "src/flow.ts";
+        let owned = w725c_lines(400, 55);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let entry = node("openFlow", file, 1, 60, NodeKind::Function);
+        let bridge = node("relayFlow", file, 300, 360, NodeKind::Function);
+        let sg = subgraph_with(vec![entry.clone(), bridge.clone()], vec![entry.id.clone()]);
+        let flow = FlowSection {
+            path_node_ids: [bridge.id.clone()].into_iter().collect(),
+            path_files: [file.to_string()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let ctx = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let section = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &ctx)
+            .section;
+        assert!(
+            (300..=360).all(|line| w725c_rendered(&section, line)),
+            "{section}"
+        );
+    }
+
+    // === W7-25d: the per-symbol view =========================================
+
+    /// `class {class} implements Interceptor` in `file` with `methods`
+    /// three-line methods, in the store with its `implements` edge; returns
+    /// the file's lines and its nodes, the class first.
+    fn w725d_sibling(
+        engine: &mut CodeGraphEngine,
+        file: &str,
+        class: &str,
+        methods: usize,
+        iface: &Node,
+    ) -> (Vec<String>, Vec<Node>) {
+        let mut lines = vec![format!("export class {class} implements Interceptor {{")];
+        let mut nodes = Vec::new();
+        for i in 0..methods {
+            let start = lines.len() as i64 + 1;
+            lines.push(format!("  step{i}(request: string): string {{"));
+            lines.push(format!("    return request + '{i}';"));
+            lines.push("  }".to_string());
+            nodes.push(node_lang(
+                &format!("step{i}"),
+                &format!("{class}::step{i}"),
+                file,
+                start,
+                start + 2,
+                NodeKind::Method,
+                Language::TypeScript,
+            ));
+        }
+        lines.push("}".to_string());
+        let class_node = node_lang(
+            class,
+            class,
+            file,
+            1,
+            lines.len() as i64,
+            NodeKind::Class,
+            Language::TypeScript,
+        );
+        put_nodes(engine, std::slice::from_ref(&class_node));
+        put_nodes(engine, &nodes);
+        put_edges(
+            engine,
+            &[mk_edge(&class_node.id, &iface.id, EdgeKind::Implements)],
+        );
+        nodes.insert(0, class_node);
+        (lines, nodes)
+    }
+
+    /// W7-25d: a per-symbol section that overruns what the response can still
+    /// pay for drops its trailing signatures first, counted in the tail
+    /// (b635dd46 6271-6283).
+    #[test]
+    fn w725d_a_skeleton_trims_trailing_signatures_to_fit_the_room() {
+        let mut engine = test_engine();
+        let iface = node_lang(
+            "Interceptor",
+            "Interceptor",
+            "src/interceptor.ts",
+            1,
+            3,
+            NodeKind::Interface,
+            Language::TypeScript,
+        );
+        put_nodes(&mut engine, std::slice::from_ref(&iface));
+        for (i, other) in ["CacheInterceptor", "RetryInterceptor"].iter().enumerate() {
+            let n = node_lang(
+                other,
+                other,
+                &format!("src/other{i}.ts"),
+                1,
+                5,
+                NodeKind::Class,
+                Language::TypeScript,
+            );
+            put_nodes(&mut engine, std::slice::from_ref(&n));
+            put_edges(
+                &mut engine,
+                &[mk_edge(&n.id, &iface.id, EdgeKind::Implements)],
+            );
+        }
+        let file = "src/wide.ts";
+        let (owned, nodes) = w725d_sibling(&mut engine, file, "WideInterceptor", 10, &iface);
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let sg = subgraph_with(nodes.clone(), vec![nodes[0].id.clone()]);
+        let flow = FlowSection {
+            path_node_ids: ["elsewhere".to_string()].into_iter().collect(),
+            ..FlowSection::default()
+        };
+        let budget = crate::explore_budget::get_explore_output_budget(3);
+        let roomy = RenderCtx {
+            flow: &flow,
+            ..render_ctx(&budget, &[])
+        };
+        let full = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &roomy)
+            .section;
+        assert!(full.contains("· skeleton (signatures only"), "{full}");
+        assert!(full.contains("step9(request"), "{full}");
+        let room = full.len() - 40;
+        let tight = RenderCtx {
+            flow: &flow,
+            funded_headroom: room,
+            ..render_ctx(&budget, &[])
+        };
+        let trimmed = engine
+            .render_explore_file(&sg, file, &file_lines, "typescript", &tight)
+            .section;
+        assert!(trimmed.len() < room, "{} of {room}", trimmed.len());
+        assert!(
+            trimmed.contains("1\texport class WideInterceptor"),
+            "{trimmed}"
+        );
+        assert!(!trimmed.contains("step9(request"), "{trimmed}");
+        assert!(trimmed.contains("more (signatures elided)"), "{trimmed}");
     }
 }

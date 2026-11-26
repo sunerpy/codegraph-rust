@@ -128,12 +128,12 @@ fn resolved(
     confidence: f64,
     resolved_by: ResolvedBy,
 ) -> ResolvedRef {
-    ResolvedRef {
-        original: reference.clone(),
-        target_node_id: target.id.clone(),
+    ResolvedRef::new(
+        reference.clone(),
+        target.id.clone(),
         confidence,
         resolved_by,
-    }
+    )
 }
 
 /// A class a Dart annotation can call a constructor of: not an extension,

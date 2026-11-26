@@ -13,13 +13,15 @@
 //!   only the edge that already connects each consecutive pair is found.
 //!
 //! Nothing here is cached at the payload level: a card carries source read from
-//! disk, and its drift verdict changes without the index changing. Branch
-//! conditions on links (`when`, family F11) are phase 2.
+//! disk, and its drift verdict changes without the index changing. A link
+//! whose call site runs under a branch condition carries it (`when`, family
+//! F11), read from the caller's current source, and says so in its label.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use codegraph_core::types::{Edge, EdgeKind, Node};
+use codegraph_graph::branch_guards::{guard_label, guards_at, supports_branch_guards};
 use codegraph_graph::flow_boundary::{BoundaryContinuation, continuations_from};
 use codegraph_graph::graph::GraphTraverser;
 use codegraph_graph::named_symbol_flow::{
@@ -164,6 +166,8 @@ fn to_flow_edge(edge: &Edge, upward: bool) -> Value {
 /// One read and one drift probe per file, however many cards land in it.
 struct FileEntry {
     lines: Option<Vec<String>>,
+    /// The text the lines were split from, for the branch-condition walk.
+    text: Option<String>,
     language: codegraph_core::types::Language,
     content_hash: String,
     drift: bool,
@@ -182,6 +186,7 @@ fn load_file<'c>(
                 if has_drifted_on_disk(ctx, &stored, &record, max_file_size(ctx)) {
                     FileEntry {
                         lines: None,
+                        text: None,
                         language: record.language,
                         content_hash: record.content_hash.clone(),
                         drift: true,
@@ -191,6 +196,7 @@ fn load_file<'c>(
                     match read_indexed_file_text(ctx, &stored, MAX_WINDOW_FILE_BYTES) {
                         Some(text) => FileEntry {
                             lines: Some(split_lines(&text)),
+                            text: Some(text),
                             language: record.language,
                             content_hash: record.content_hash.clone(),
                             drift: false,
@@ -198,6 +204,7 @@ fn load_file<'c>(
                         },
                         None => FileEntry {
                             lines: None,
+                            text: None,
                             language: record.language,
                             content_hash: record.content_hash.clone(),
                             drift: false,
@@ -211,6 +218,47 @@ fn load_file<'c>(
         cache.insert(posix.clone(), entry);
     }
     cache.get(&posix).and_then(Option::as_ref)
+}
+
+/// The branch label for `edge`'s call site in `site_node`'s file, or `""`
+/// (upstream `whenAt`): no line, a language without rules, a file that
+/// drifted or could not be read all answer nothing.
+fn when_at(
+    ctx: &Ctx<'_>,
+    cache: &mut HashMap<String, Option<FileEntry>>,
+    site_node: &Node,
+    edge: &Edge,
+) -> String {
+    let Some(line) = edge
+        .line
+        .filter(|line| *line > 0)
+        .and_then(|line| usize::try_from(line).ok())
+    else {
+        return String::new();
+    };
+    if !supports_branch_guards(site_node.language) {
+        return String::new();
+    }
+    let Some(file) = load_file(ctx, cache, &site_node.file_path) else {
+        return String::new();
+    };
+    if file.drift {
+        return String::new();
+    }
+    let Some(text) = file.text.as_deref() else {
+        return String::new();
+    };
+    let key = ctx
+        .project_root()
+        .join(to_request_path(&site_node.file_path));
+    let column = edge.col.and_then(|col| usize::try_from(col).ok());
+    guard_label(&guards_at(
+        &key.to_string_lossy(),
+        text,
+        file.language,
+        line,
+        column,
+    ))
 }
 
 /// The ±[`SOURCE_WINDOW`] lines a card shows, anchored on the line that makes
@@ -316,11 +364,33 @@ fn to_wire_flow(
             reference = call_ref(line, edge, &previous.node, true);
             anchor_line = Some(line);
         }
-        let edge = step
+        let mut edge = step
             .edge
             .as_ref()
             .map(|e| to_flow_edge(e, step.upward))
             .unwrap_or(Value::Null);
+        // The connector's condition: the call site is in the caller's file —
+        // the previous card going down, this card itself when the reader
+        // stepped up (upstream `flow.ts:519-528`).
+        if let Some(raw) = step
+            .edge
+            .as_ref()
+            .filter(|e| e.line.is_some_and(|l| l != 0))
+        {
+            let site_node = if step.upward {
+                Some(&step.node)
+            } else {
+                previous.map(|p| &p.node)
+            };
+            if let Some(site_node) = site_node {
+                let when = when_at(ctx, cache, site_node, raw);
+                if !when.is_empty() {
+                    let label = edge["label"].as_str().unwrap_or_default().to_string();
+                    edge["when"] = json!(when);
+                    edge["label"] = json!(format!("{label} · when {when}"));
+                }
+            }
+        }
         let anchor = step.anchor.or(anchor_line).unwrap_or(step.node.start_line);
         hops.push(json!({
             "node": to_node_ref(&step.node),

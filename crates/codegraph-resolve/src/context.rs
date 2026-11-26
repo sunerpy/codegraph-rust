@@ -8,13 +8,14 @@
 
 use crate::lru_cache::LruCache;
 use crate::package_manifests::{ManifestScope, read_manifest_scope};
-use crate::path_aliases::{AliasMap, load_project_aliases};
+use crate::path_aliases::{AliasMap, load_directory_aliases, load_project_aliases};
 use crate::source_facts::SourceFacts;
 use crate::types::{GoModule, ImportMapping, ReExport, ResolutionContext};
 use crate::workspace_packages::{WorkspacePackages, load_workspace_packages};
 use crate::{import_resolver, pathutil};
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use codegraph_store::Store;
+use rayon::prelude::*;
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -24,6 +25,10 @@ use std::sync::Arc;
 /// `DEFAULT_CACHE_LIMIT` (`index.ts:54`). Override via env in the upstream; the
 /// Rust port keeps the fixed default for one resolution run.
 pub(crate) const DEFAULT_CACHE_LIMIT: usize = 5_000;
+
+/// How many files [`StoreResolutionContext`]'s `files_containing` reads at
+/// once, in parallel: its bound on the text it holds.
+const FILES_CONTAINING_BATCH: usize = 512;
 
 /// A [`ResolutionContext`] over a [`Store`] plus the project root.
 ///
@@ -38,7 +43,19 @@ pub struct StoreResolutionContext<'a> {
     /// The files whose class-head rows are not to be read, when the rows are
     /// trusted at all ([`Self::with_recorded_class_heads`]).
     recorded_heads_stale: Option<Arc<std::collections::HashSet<String>>>,
+    /// The files whose bridge-facts rows are not to be read, when the rows
+    /// are trusted at all ([`Self::with_recorded_bridge_rows`]).
+    recorded_bridge_stale: Option<Arc<std::collections::HashSet<String>>>,
+    /// The store's bridge-facts rows by path, read the first time a bridge
+    /// asks.
+    bridge_rows: std::cell::OnceCell<Arc<BridgeRows>>,
+    /// The project's custom Lua module loaders and roots
+    /// ([`Self::with_lua_loaders`]); none by default.
+    lua_loaders: Arc<codegraph_extract::LuaLoaders>,
 }
+
+/// Each file's bridge facts as its `rn_bridge_surface:` row records them.
+type BridgeRows = HashMap<String, Arc<crate::frameworks::react_native::BridgeFacts>>;
 
 struct Caches {
     node_cache: LruCache<String, Vec<Arc<Node>>>,
@@ -58,17 +75,24 @@ struct Caches {
     /// The name matcher's memos for the pass (W5-08).
     name_matcher_tables: Option<Arc<crate::name_matcher::NameMatcherTables>>,
     project_aliases: Option<Option<AliasMap>>,
+    /// Each directory's nearest aliases below the root (upstream #2165).
+    dir_aliases: HashMap<String, Option<AliasMap>>,
     go_module: Option<Option<GoModule>>,
     go_modules: Option<Vec<GoModule>>,
     rust_crates: Option<Arc<crate::rust_scope::RustCrates>>,
+    /// The Cargo workspace's crates for the pass (W7-19h).
+    cargo_workspace_crates: Option<Arc<crate::frameworks::cargo_workspace::CrateMap>>,
     workspace_packages: Option<Option<WorkspacePackages>>,
     /// Each directory's package.json / Deno import-map scope for the pass.
     manifest_scopes: HashMap<String, Arc<ManifestScope>>,
     all_files: Option<Arc<Vec<String>>>,
+    /// The dependency names the project's manifests declare, for the pass.
+    declared_dependencies: Option<Arc<std::collections::BTreeSet<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
-    /// Existence answers for the pass: import resolution probes every extension
-    /// of a specifier from every importing file, and neither the borrowed store
-    /// nor the tree changes within a pass (upstream `fileExistsMemo`).
+    /// Existence answers for the pass: the same paths are probed again and
+    /// again, and neither the borrowed store nor the tree changes within a
+    /// pass (upstream `fileExistsMemo`, which import resolution reads there;
+    /// here import resolution asks `is_indexed_file`, W7-27).
     file_exists: HashMap<String, bool>,
     /// The Python write index for the pass (upstream #2332).
     python_write_index: Option<Arc<crate::python_globals::PythonWriteIndex>>,
@@ -76,6 +100,10 @@ struct Caches {
     cpp_namespace_tables: Option<Arc<crate::cpp_namespaces::CppNamespaceTables>>,
     /// The Kotlin tables for the pass (upstream #2172).
     kotlin_tables: Option<Arc<crate::kotlin_scope::KotlinTables>>,
+    /// The Spring config keys for the pass (W7-19c).
+    spring_tables: Option<Arc<crate::frameworks::spring::SpringTables>>,
+    /// The Drupal hook implementations for the pass (W7-19d).
+    drupal_tables: Option<Arc<crate::frameworks::drupal::DrupalTables>>,
     scala_tables: Option<Arc<crate::scala_scope::ScalaTables>>,
     csharp_tables: Option<Arc<crate::csharp_types::CsharpTables>>,
     member_tables: Option<Arc<crate::member_types::MemberTables>>,
@@ -94,6 +122,8 @@ struct Caches {
     objc_tables: Option<Arc<crate::objc_scope::ObjcTables>>,
     go_tables: Option<Arc<crate::go_packages::GoTables>>,
     solidity_tables: Option<Arc<crate::solidity_scope::SolidityTables>>,
+    /// The routers' route tables for the pass (W7-07).
+    route_tables: Option<Arc<crate::frameworks::route_href::RouteTables>>,
 }
 
 /// A compiled pattern set by its key.
@@ -133,17 +163,22 @@ impl Caches {
             head_rows: HashMap::new(),
             name_matcher_tables: None,
             project_aliases: None,
+            dir_aliases: HashMap::new(),
             go_module: None,
             go_modules: None,
             rust_crates: None,
+            cargo_workspace_crates: None,
             workspace_packages: None,
             manifest_scopes: HashMap::new(),
             all_files: None,
+            declared_dependencies: None,
             files_by_basename: None,
             file_exists: HashMap::new(),
             python_write_index: None,
             cpp_namespace_tables: None,
             kotlin_tables: None,
+            spring_tables: None,
+            drupal_tables: None,
             scala_tables: None,
             csharp_tables: None,
             member_tables: None,
@@ -159,6 +194,7 @@ impl Caches {
             objc_tables: None,
             go_tables: None,
             solidity_tables: None,
+            route_tables: None,
         }
     }
 }
@@ -172,7 +208,19 @@ impl<'a> StoreResolutionContext<'a> {
             max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             caches: RefCell::new(Caches::new()),
             recorded_heads_stale: None,
+            recorded_bridge_stale: None,
+            bridge_rows: std::cell::OnceCell::new(),
+            lua_loaders: codegraph_extract::LuaLoaders::empty(),
         }
+    }
+
+    /// Resolve Lua `require`s and loader calls under the addressed
+    /// project's custom Lua module settings (#1617): its module roots are
+    /// looked in first, and a literal is read as a file path as written too.
+    #[must_use]
+    pub fn with_lua_loaders(mut self, lua_loaders: Arc<codegraph_extract::LuaLoaders>) -> Self {
+        self.lua_loaders = lua_loaders;
+        self
     }
 
     /// Read files up to the addressed project's extraction limit
@@ -196,6 +244,37 @@ impl<'a> StoreResolutionContext<'a> {
         self
     }
 
+    /// Trust the store's bridge-facts rows (`rn_bridge_surface:<path>`) for
+    /// every indexed file but `stale`, the files a sync changed since they
+    /// were written (W7-21): the React Native and Expo bridges then read a
+    /// file's facts from its row, and an indexed file without one holds
+    /// none, instead of reading every file's text.
+    #[must_use]
+    pub fn with_recorded_bridge_rows(
+        mut self,
+        stale: Option<Arc<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.recorded_bridge_stale = stale;
+        self
+    }
+
+    fn recorded_bridge_rows(&self) -> Arc<BridgeRows> {
+        use crate::frameworks::react_native::{BridgeFacts, ROW_KEY_PREFIX};
+        Arc::clone(self.bridge_rows.get_or_init(|| {
+            Arc::new(
+                self.store
+                    .project_metadata_with_prefix(ROW_KEY_PREFIX)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(key, value)| {
+                        let path = key.strip_prefix(ROW_KEY_PREFIX)?.to_string();
+                        Some((path, Arc::new(BridgeFacts::decode(&value)?)))
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
     /// Drop all caches (`clearCaches`, `index.ts:313-324`). Called between
     /// resolution passes so the conformance pass sees freshly persisted edges.
     pub fn clear_caches(&self) {
@@ -214,6 +293,8 @@ impl<'a> StoreResolutionContext<'a> {
         c.python_write_index = None;
         c.cpp_namespace_tables = None;
         c.kotlin_tables = None;
+        c.spring_tables = None;
+        c.drupal_tables = None;
         c.scala_tables = None;
         c.csharp_tables = None;
         c.member_tables = None;
@@ -354,6 +435,72 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             .collect()
     }
 
+    fn get_nodes_by_kind_in_languages_shared(
+        &self,
+        kind: NodeKind,
+        languages: &[Language],
+    ) -> Vec<Arc<Node>> {
+        self.store
+            .nodes_of_kinds_in_languages(&[kind], languages)
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
+
+    fn get_methods_named_shared(
+        &self,
+        language: Language,
+        key: crate::types::MethodKey,
+        names: &[String],
+    ) -> Vec<Arc<Node>> {
+        let found = match key {
+            crate::types::MethodKey::Name => self.store.methods_named(language, names),
+            crate::types::MethodKey::FirstKeyword => {
+                self.store.methods_by_first_keyword(language, names)
+            }
+        };
+        found
+            .unwrap_or_default()
+            .into_iter()
+            .map(Arc::new)
+            .collect()
+    }
+
+    fn bridge_facts_of_files(
+        &self,
+        files: &[String],
+    ) -> Vec<(String, Arc<crate::frameworks::react_native::BridgeFacts>)> {
+        let Some(stale) = self.recorded_bridge_stale.as_ref() else {
+            return crate::frameworks::react_native::bridge_facts_from_text(self, files);
+        };
+        let rows = self.recorded_bridge_rows();
+        let indexed = self.get_all_files_shared();
+        // A row stands for an indexed file the sync did not change; the
+        // others are read.
+        let trusted = |file: &String| !stale.contains(file) && indexed.binary_search(file).is_ok();
+        let unread: Vec<String> = files
+            .iter()
+            .filter(|file| !trusted(file))
+            .cloned()
+            .collect();
+        let mut read: HashMap<String, Arc<crate::frameworks::react_native::BridgeFacts>> =
+            crate::frameworks::react_native::bridge_facts_from_text(self, &unread)
+                .into_iter()
+                .collect();
+        files
+            .iter()
+            .filter_map(|file| {
+                let facts = if trusted(file) {
+                    rows.get(file).map(Arc::clone)
+                } else {
+                    read.remove(file)
+                };
+                facts.map(|facts| (file.clone(), facts))
+            })
+            .collect()
+    }
+
     fn known_node_names(&self) -> Vec<String> {
         self.store.all_node_names().unwrap_or_default()
     }
@@ -363,7 +510,9 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             return exists;
         }
         // Known-file fast path then filesystem fallback (index.ts:358-374).
-        // The store is the index of known files.
+        // The store is the index of known files. Import resolution asks
+        // `is_indexed_file` of its candidates instead (W7-27), so only the
+        // callers that are not import resolution read the fallback.
         let normalized = file_path.replace('\\', "/");
         let exists = self.store.file_by_path(file_path).ok().flatten().is_some()
             || (normalized != file_path
@@ -409,6 +558,57 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         content
     }
 
+    /// The files the content cache lacks are read in parallel, a batch at a
+    /// time (W7-19a): a pass that searches every indexed file, as Express's
+    /// mount pass does on each sync, then waits for the slowest worker's
+    /// share of the reads rather than for all of them. A cached file answers
+    /// from the cache, as [`Self::read_file_shared`] does; a match is cached
+    /// as it caches it, in `files`' order, and a file that does not match is
+    /// not kept, so a batch is all the text held at once.
+    fn files_containing(&self, files: &[String], needles: &[&str]) -> Vec<String> {
+        let root = Path::new(&self.project_root);
+        let max_file_size = self.max_file_size;
+        let mut matches = Vec::new();
+        for batch in files.chunks(FILES_CONTAINING_BATCH) {
+            let cached: Vec<Option<Option<Arc<str>>>> = {
+                let mut c = self.caches.borrow_mut();
+                batch
+                    .iter()
+                    .map(|file| {
+                        c.file_cache
+                            .has(file.as_str())
+                            .then(|| c.file_cache.get(file.as_str()).flatten())
+                    })
+                    .collect()
+            };
+            let contents: Vec<(Option<Arc<str>>, bool)> = batch
+                .par_iter()
+                .zip(cached.into_par_iter())
+                .map(|(file, cached)| match cached {
+                    Some(content) => (content, true),
+                    None => (
+                        read_source_file(&root.join(file), file, max_file_size).map(Arc::from),
+                        false,
+                    ),
+                })
+                .collect();
+            let mut c = self.caches.borrow_mut();
+            for (file, (content, was_cached)) in batch.iter().zip(contents) {
+                if !content
+                    .as_deref()
+                    .is_some_and(|content| needles.iter().any(|needle| content.contains(needle)))
+                {
+                    continue;
+                }
+                if !was_cached {
+                    c.file_cache.set(file.clone(), content);
+                }
+                matches.push(file.clone());
+            }
+        }
+        matches
+    }
+
     fn source_facts(&self, file_path: &str) -> Option<Arc<SourceFacts>> {
         {
             let mut c = self.caches.borrow_mut();
@@ -436,6 +636,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 
     fn get_all_files_shared(&self) -> Arc<Vec<String>> {
         self.cached_all_files()
+    }
+
+    fn declared_dependencies(&self) -> Arc<std::collections::BTreeSet<String>> {
+        if let Some(names) = self.caches.borrow().declared_dependencies.clone() {
+            return names;
+        }
+        let names = Arc::new(crate::frameworks::package_deps::declared_dependencies(self));
+        self.caches.borrow_mut().declared_dependencies = Some(names.clone());
+        names
     }
 
     fn get_files_by_basename_shared(&self, basename: &str) -> Arc<Vec<String>> {
@@ -570,6 +779,30 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         c.project_aliases.clone().flatten()
     }
 
+    fn get_nearest_aliases(&self, from_file: &str) -> Option<AliasMap> {
+        let walk = crate::path_aliases::nearest_alias_walk(from_file);
+        let mut walked = Vec::new();
+        let mut found = None;
+        for dir in walk {
+            if let Some(hit) = self.caches.borrow().dir_aliases.get(dir) {
+                found = hit.clone();
+                break;
+            }
+            walked.push(dir);
+            if let Some(aliases) =
+                load_directory_aliases(&std::path::Path::new(&self.project_root).join(dir))
+            {
+                found = Some(aliases);
+                break;
+            }
+        }
+        let mut c = self.caches.borrow_mut();
+        for dir in walked {
+            c.dir_aliases.insert(dir.to_string(), found.clone());
+        }
+        found
+    }
+
     fn get_workspace_packages(&self) -> Option<WorkspacePackages> {
         let mut c = self.caches.borrow_mut();
         if c.workspace_packages.is_none() {
@@ -603,6 +836,24 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .kotlin_tables
                 .get_or_insert_with(|| Arc::new(crate::kotlin_scope::KotlinTables::new())),
+        )
+    }
+
+    fn spring_tables(&self) -> Arc<crate::frameworks::spring::SpringTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .spring_tables
+                .get_or_insert_with(|| Arc::new(crate::frameworks::spring::SpringTables::new())),
+        )
+    }
+
+    fn drupal_tables(&self) -> Arc<crate::frameworks::drupal::DrupalTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .drupal_tables
+                .get_or_insert_with(|| Arc::new(crate::frameworks::drupal::DrupalTables::new())),
         )
     }
 
@@ -658,6 +909,10 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .lua_tables
                 .get_or_insert_with(|| Arc::new(crate::lua_scope::LuaTables::new())),
         )
+    }
+
+    fn lua_loaders(&self) -> &codegraph_extract::LuaLoaders {
+        &self.lua_loaders
     }
 
     fn dart_tables(&self) -> Arc<crate::dart_scope::DartTables> {
@@ -744,6 +999,15 @@ impl ResolutionContext for StoreResolutionContext<'_> {
                 .borrow_mut()
                 .solidity_tables
                 .get_or_insert_with(|| Arc::new(crate::solidity_scope::SolidityTables::new())),
+        )
+    }
+
+    fn route_tables(&self) -> Arc<crate::frameworks::route_href::RouteTables> {
+        Arc::clone(
+            self.caches
+                .borrow_mut()
+                .route_tables
+                .get_or_insert_with(Default::default),
         )
     }
 
@@ -907,6 +1171,19 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         crates
     }
 
+    fn list_directories(&self, dir: &str) -> Vec<String> {
+        crate::frameworks::cargo_workspace::list_directories_within(&self.project_root, dir)
+    }
+
+    fn cargo_workspace_crates(&self) -> Arc<crate::frameworks::cargo_workspace::CrateMap> {
+        if let Some(cached) = self.caches.borrow().cargo_workspace_crates.clone() {
+            return cached;
+        }
+        let crates = Arc::new(crate::frameworks::cargo_workspace::crate_map(self));
+        self.caches.borrow_mut().cargo_workspace_crates = Some(Arc::clone(&crates));
+        crates
+    }
+
     fn get_re_exports(&self, file_path: &str, language: Language) -> Vec<ReExport> {
         let mut c = self.caches.borrow_mut();
         if let Some(cached) = c.re_export_cache.get(file_path) {
@@ -917,8 +1194,7 @@ impl ResolutionContext for StoreResolutionContext<'_> {
         // Re-key on the BARREL file's own extension (index.ts:489-498).
         let re_exports = match content {
             Some(text) => {
-                let is_js_family = is_js_family_path(file_path);
-                let lang = if is_js_family {
+                let lang = if reads_re_exports_as_typescript(file_path) {
                     Language::TypeScript
                 } else {
                     language
@@ -938,6 +1214,13 @@ impl ResolutionContext for StoreResolutionContext<'_> {
 /// Shares [`is_js_family_path`] with the snapshot context.
 pub(crate) fn is_js_family_path_pub(file_path: &str) -> bool {
     is_js_family_path(file_path)
+}
+
+/// Whether a barrel at `file_path` has its re-exports read as TypeScript,
+/// whatever the importer's language: every JavaScript-family file and an
+/// ArkTS `.ets` one (upstream `b635dd46` index.ts:982, #1186).
+pub(crate) fn reads_re_exports_as_typescript(file_path: &str) -> bool {
+    is_js_family_path(file_path) || file_path.to_ascii_lowercase().ends_with(".ets")
 }
 
 /// Shares [`load_go_module`] with the snapshot context.
@@ -1048,33 +1331,51 @@ fn load_go_module_in(project_root: &str, dir: &str) -> Option<GoModule> {
 /// Ordered by `dir` and deduplicated, so the result does not depend on the file
 /// iteration order.
 fn load_go_modules(project_root: &str, files: &[String]) -> Vec<GoModule> {
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
-    for file in files {
-        if !file.ends_with(".go") {
-            continue;
-        }
-        let normalized = file.replace('\\', "/");
-        let mut dir = pathutil::dirname(&normalized);
-        loop {
-            dirs.insert(dir.clone());
-            if dir.is_empty() {
-                break;
-            }
-            dir = pathutil::dirname(&dir);
-        }
-    }
-    // A Go-less project keeps the previous behaviour: probe the root only.
-    if dirs.is_empty() {
-        return load_go_module(project_root).into_iter().collect();
-    }
-
-    let mut modules: Vec<GoModule> = dirs
+    let mut modules: Vec<GoModule> = go_module_inputs(files)
         .iter()
-        .filter_map(|dir| load_go_module_in(project_root, dir))
+        .filter_map(|relative| {
+            let dir = relative
+                .strip_suffix("go.mod")
+                .map_or("", |dir| dir.trim_end_matches('/'));
+            load_go_module_in(project_root, dir)
+        })
         .collect();
     modules.sort_by(|a, b| a.dir.cmp(&b.dir).then(a.module_path.cmp(&b.module_path)));
     modules.dedup_by(|a, b| a.dir == b.dir);
     modules
+}
+
+/// The project-relative `go.mod` paths [`load_go_modules`] reads for `files`:
+/// the root's (all a Go-less project reads), and one in every directory at or
+/// above an indexed `.go` file, a missing one included, sorted (W5-06 compares
+/// them). A file path that could leave the project root lexically (rooted,
+/// UNC, a Windows drive's, or `..` above the root) is skipped, by the rule
+/// `pathutil::lexical_path_within_root` applies, and the others are read
+/// normalized, so no probe leaves the root and the walk up ends.
+pub fn go_module_inputs(files: &[String]) -> Vec<String> {
+    let mut dirs: BTreeSet<String> = BTreeSet::from([String::new()]);
+    for file in files {
+        if !file.ends_with(".go") {
+            continue;
+        }
+        let Some(file) = pathutil::lexical_relative(file) else {
+            continue;
+        };
+        let mut dir = pathutil::dirname(&file);
+        while !dir.is_empty() {
+            dirs.insert(dir.clone());
+            dir = pathutil::dirname(&dir);
+        }
+    }
+    dirs.into_iter()
+        .map(|dir| {
+            if dir.is_empty() {
+                "go.mod".to_string()
+            } else {
+                format!("{dir}/go.mod")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1095,6 +1396,22 @@ mod tests {
 
     fn open_store(root: &std::path::Path) -> Store {
         Store::open(&root.join("index.db")).expect("open store")
+    }
+
+    /// W7-07: a pass's routers share one set of route tables, so each
+    /// router reads the route nodes once per pass, not once per call.
+    #[test]
+    fn a_pass_keeps_one_set_of_route_tables() {
+        let root = temp_root("route-tables");
+        let store = open_store(&root);
+        let context = StoreResolutionContext::new(&store, root.to_string_lossy());
+        assert!(Arc::ptr_eq(
+            &context.route_tables(),
+            &context.route_tables()
+        ));
+        let other = StoreResolutionContext::new(&store, root.to_string_lossy());
+        assert!(!Arc::ptr_eq(&context.route_tables(), &other.route_tables()));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn node(id: &str, name: &str, kind: NodeKind, file: &str, line: i64, col: i64) -> Node {
@@ -1147,6 +1464,27 @@ mod tests {
         assert!(is_js_family_path("A.TS"));
         assert!(!is_js_family_path("a.py"));
         assert!(!is_js_family_path("a.rs"));
+    }
+
+    /// W7-24a1: an `.ets` barrel has its re-exports read as TypeScript, as
+    /// the JavaScript family's are (upstream `b635dd46` index.ts:982); `.ets`
+    /// stays out of the JavaScript family itself, whose other readers (the
+    /// module surface, the Vue router) key on it.
+    #[test]
+    fn w724a1_ets_barrels_read_re_exports_as_typescript() {
+        for path in [
+            "core/Index.ets",
+            "core/INDEX.ETS",
+            "a.ts",
+            "a.d.ts",
+            "a.mjs",
+        ] {
+            assert!(reads_re_exports_as_typescript(path), "{path}");
+        }
+        for path in ["a.py", "a.vue", "a.ets.bak"] {
+            assert!(!reads_re_exports_as_typescript(path), "{path}");
+        }
+        assert!(!is_js_family_path("core/Index.ets"));
     }
 
     #[test]
@@ -1236,6 +1574,41 @@ mod tests {
         assert_eq!(modules[0].dir, "");
         assert_eq!(modules[0].module_path, "ex/m");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-15d1: what `load_go_modules` reads, and the Go control kind
+    /// compares: the root's `go.mod`, and one in every directory at or above
+    /// an indexed `.go` file, by directory, its path normalized; no other
+    /// file, and no path that could leave the project: rooted, UNC, a
+    /// Windows drive's, absolute or drive-relative, or `..` above the root.
+    #[test]
+    fn go_module_inputs_are_the_root_and_every_directory_above_a_go_file() {
+        assert_eq!(go_module_inputs(&[]), ["go.mod"]);
+        assert_eq!(
+            go_module_inputs(&[
+                "svc/api/handler.go".to_string(),
+                "svc\\cli\\main.go".to_string(),
+                "web/app.ts".to_string(),
+                "a/../b/z.go".to_string(),
+                "/abs/x.go".to_string(),
+                "\\rooted\\x.go".to_string(),
+                "\\\\server\\share\\x.go".to_string(),
+                "C:\\outside\\x.go".to_string(),
+                "C:/outside/x.go".to_string(),
+                "C:outside\\x.go".to_string(),
+                "./C:/outside/x.go".to_string(),
+                "a\\..\\C:\\outside\\x.go".to_string(),
+                "../out/y.go".to_string(),
+                "a/../../out/y.go".to_string(),
+            ]),
+            [
+                "go.mod",
+                "b/go.mod",
+                "svc/go.mod",
+                "svc/api/go.mod",
+                "svc/cli/go.mod"
+            ]
+        );
     }
 
     #[test]
@@ -1421,6 +1794,83 @@ mod tests {
         std::fs::remove_dir_all(&outside).ok();
     }
 
+    /// W7-19a: `files_containing` keeps `files`' order across batches,
+    /// answers a file read earlier from the cache, skips an unreadable one,
+    /// and caches each match as `read_file_shared` does.
+    #[test]
+    fn store_context_files_containing_keeps_order_and_the_cache() {
+        let root = temp_root("containing");
+        let store = open_store(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let count = 2 * FILES_CONTAINING_BATCH + 76;
+        let files: Vec<String> = (0..count).map(|i| format!("src/f{i:04}.js")).collect();
+        for (i, file) in files.iter().enumerate() {
+            let body = if i % 7 == 3 {
+                "app.use('/x', r);\n"
+            } else {
+                "const x = 1;\n"
+            };
+            std::fs::write(root.join(file), body).unwrap();
+        }
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        // Read before the search: the search answers from the cache.
+        assert!(
+            !ctx.read_file_shared("src/f0000.js")
+                .unwrap()
+                .contains(".use(")
+        );
+        std::fs::write(root.join("src/f0000.js"), "app.use('/late', r);\n").unwrap();
+        let mut searched = files.clone();
+        searched.insert(5, "src/missing.js".to_string());
+        let expected: Vec<String> = files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 7 == 3)
+            .map(|(_, file)| file.clone())
+            .collect();
+        assert_eq!(ctx.files_containing(&searched, &[".use("]), expected);
+        // A match is cached: an edit after the search is not read.
+        std::fs::write(root.join("src/f0003.js"), "const y = 2;\n").unwrap();
+        assert!(
+            ctx.read_file_shared("src/f0003.js")
+                .unwrap()
+                .contains(".use(")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-19b: with two needles, a file containing either is kept once, in
+    /// `files`' order, and only the matches are cached.
+    #[test]
+    fn store_context_files_containing_takes_any_needle() {
+        let root = temp_root("containing-any");
+        let store = open_store(&root);
+        std::fs::create_dir_all(root.join("api")).unwrap();
+        let bodies = [
+            ("api/a.py", "router = APIRouter()\n"),
+            ("api/b.py", "x = 1\n"),
+            ("api/c.py", "app.include_router(router)\n"),
+            ("api/d.py", "r = APIRouter()\napp.include_router(r)\n"),
+        ];
+        for (file, body) in bodies {
+            std::fs::write(root.join(file), body).unwrap();
+        }
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let files: Vec<String> = bodies.iter().map(|(file, _)| file.to_string()).collect();
+        assert_eq!(
+            ctx.files_containing(&files, &["APIRouter", "include_router"]),
+            ["api/a.py", "api/c.py", "api/d.py"]
+        );
+        // The file that matched neither was not cached: its edit is read.
+        std::fs::write(root.join("api/b.py"), "router = APIRouter()\n").unwrap();
+        assert!(
+            ctx.read_file_shared("api/b.py")
+                .unwrap()
+                .contains("APIRouter")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn store_context_reuses_file_list_and_basename_index() {
         let root = temp_root("file-index");
@@ -1515,6 +1965,49 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// W7-09a (upstream #2165): a file's nearest aliases are those of the
+    /// first directory up from it, below the root, whose own config declares
+    /// `paths`; a directory without one passes the lookup up, and a file
+    /// with none between it and the root has none.
+    #[test]
+    fn store_context_reads_the_nearest_configs_aliases() {
+        let root = temp_root("nearest-aliases");
+        std::fs::create_dir_all(root.join("apps/web/src/pages")).unwrap();
+        std::fs::create_dir_all(root.join("apps/docs")).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/tsconfig.json"),
+            r#"{ "compilerOptions": { "paths": { "@/*": ["./src/*"] } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/web/src/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("apps/docs/tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true } }"#,
+        )
+        .unwrap();
+        let store = open_store(&root);
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        for _ in 0..2 {
+            let web = ctx
+                .get_nearest_aliases("apps/web/src/pages/a.tsx")
+                .expect("the web app's aliases");
+            assert!(web.base_url.ends_with("/apps/web"));
+        }
+        assert!(ctx.get_nearest_aliases("apps/docs/a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("a.ts").is_none());
+        assert!(ctx.get_nearest_aliases("../a.ts").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn store_context_get_supertypes_reads_edges() {
         let root = temp_root("supertypes");
@@ -1580,6 +2073,167 @@ mod tests {
             load_go_module_pub(root.to_str().unwrap()).map(|g| g.module_path),
             Some("m/n".to_string())
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-21: with the bridge rows trusted, an unchanged indexed file's
+    /// facts are its row's, none without one, and a changed or unindexed
+    /// file's are read from its text; untrusted, every file's are read.
+    #[test]
+    fn store_context_reads_bridge_facts_from_the_rows_of_unchanged_files() {
+        use crate::frameworks::react_native::{BridgeFacts, row_key};
+        let root = temp_root("bridge-rows");
+        let store = open_store(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let text = |module: &str| format!("const m = NativeModules.{module}\n");
+        let row = |file: &str, module: &str| BridgeFacts::of_text(file, &text(module)).encode();
+        for (file, has_row) in [
+            ("src/changed.ts", true),
+            ("src/kept.ts", true),
+            ("src/rowless.ts", false),
+        ] {
+            store.upsert_file(&file_record(file, 0)).unwrap();
+            std::fs::write(root.join(file), text("Disk")).unwrap();
+            if has_row {
+                store
+                    .set_project_metadata(&row_key(file), &row(file, "Row"))
+                    .unwrap();
+            }
+        }
+        // A file on disk the index does not hold, with a row left behind.
+        std::fs::write(root.join("src/unindexed.ts"), text("Disk")).unwrap();
+        store
+            .set_project_metadata(
+                &row_key("src/unindexed.ts"),
+                &row("src/unindexed.ts", "Row"),
+            )
+            .unwrap();
+        let files: Vec<String> = [
+            "src/changed.ts",
+            "src/kept.ts",
+            "src/rowless.ts",
+            "src/unindexed.ts",
+        ]
+        .map(String::from)
+        .to_vec();
+        let modules = |ctx: &StoreResolutionContext<'_>| -> Vec<(String, String)> {
+            ctx.bridge_facts_of_files(&files)
+                .into_iter()
+                .map(|(file, facts)| (file, facts.aliases[0].1.clone()))
+                .collect()
+        };
+        let pairs = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+            rows.iter()
+                .map(|(file, module)| (file.to_string(), module.to_string()))
+                .collect()
+        };
+        let stale: std::collections::HashSet<String> =
+            std::iter::once("src/changed.ts".to_string()).collect();
+        let trusted = StoreResolutionContext::new(&store, root.to_str().unwrap())
+            .with_recorded_bridge_rows(Some(Arc::new(stale)));
+        assert_eq!(
+            modules(&trusted),
+            pairs(&[
+                ("src/changed.ts", "Disk"),
+                ("src/kept.ts", "Row"),
+                ("src/unindexed.ts", "Disk"),
+            ])
+        );
+        let untrusted = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        assert_eq!(
+            modules(&untrusted),
+            pairs(&[
+                ("src/changed.ts", "Disk"),
+                ("src/kept.ts", "Disk"),
+                ("src/rowless.ts", "Disk"),
+                ("src/unindexed.ts", "Disk"),
+            ])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// W7-21's cost revision: the store context reads a language's methods
+    /// by name and by first keyword as the default reads them from every
+    /// method of the language, over the same nodes.
+    #[test]
+    fn store_method_lookups_read_what_the_default_reads() {
+        use crate::frameworks::route_href::test_ctx::RouteCtx;
+        use crate::types::MethodKey;
+        let root = temp_root("methods-keyed");
+        let mut store = open_store(&root);
+        let method = |id: &str, name: &str, language: Language, line: i64| Node {
+            language,
+            ..node(id, name, NodeKind::Method, "src/A", line, 0)
+        };
+        let nodes = vec![
+            method("objc:kw", "kw", Language::ObjC, 1),
+            method("objc:kw:", "kw:", Language::ObjC, 2),
+            method("objc:kw:with:", "kw:with:", Language::ObjC, 3),
+            method("objc:kwx:", "kwx:", Language::ObjC, 4),
+            method("objc:Kw:", "Kw:", Language::ObjC, 5),
+            method("objc::odd", ":odd", Language::ObjC, 6),
+            Node {
+                kind: NodeKind::Function,
+                ..method("objc-function:kw:", "kw:", Language::ObjC, 7)
+            },
+            method("java:kw", "kw", Language::Java, 8),
+            method("java:kw:", "kw:", Language::Java, 9),
+            method("kotlin:run", "run", Language::Kotlin, 10),
+            method("swift:run", "run", Language::Swift, 11),
+            method("swift:run(x:)", "run(x:)", Language::Swift, 12),
+        ];
+        store.upsert_nodes(&nodes).unwrap();
+        let ctx = StoreResolutionContext::new(&store, root.to_str().unwrap());
+        let defaults = RouteCtx::default().routes("src/A", nodes.clone());
+        let ids = |found: Vec<Arc<Node>>| -> Vec<String> {
+            let mut ids: Vec<String> = found.iter().map(|node| node.id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        let lists: [&[&str]; 7] = [
+            &["kw"],
+            &["kw:", "run"],
+            &["Kw", "kwx", "run(x:)"],
+            &["kw:with"],
+            &[""],
+            &["absent"],
+            &[],
+        ];
+        for language in [
+            Language::ObjC,
+            Language::Java,
+            Language::Kotlin,
+            Language::Swift,
+        ] {
+            for key in [MethodKey::Name, MethodKey::FirstKeyword] {
+                for list in lists {
+                    let names: Vec<String> = list.iter().map(|name| (*name).to_string()).collect();
+                    assert_eq!(
+                        ids(ctx.get_methods_named_shared(language, key, &names)),
+                        ids(defaults.get_methods_named_shared(language, key, &names)),
+                        "{language:?} {key:?} {names:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ids(ctx.get_methods_named_shared(
+                Language::ObjC,
+                MethodKey::FirstKeyword,
+                &["kw".to_string(), String::new()]
+            )),
+            ["objc::odd", "objc:kw", "objc:kw:", "objc:kw:with:"]
+        );
+        assert_eq!(
+            ids(ctx.get_methods_named_shared(
+                Language::Swift,
+                MethodKey::Name,
+                &["run".to_string()]
+            )),
+            ["swift:run"]
+        );
+        drop(ctx);
+        drop(store);
         std::fs::remove_dir_all(&root).ok();
     }
 }

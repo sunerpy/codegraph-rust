@@ -2,11 +2,12 @@
 /*
  * The website's screenshots of the browser viewer: docs/site/public/screens/<name>-<theme>.webp.
  *
- * The viewer must already be serving the screenshot corpus. `capture-screens.sh` next to this
- * file builds that corpus, starts the viewer and runs this script; docs/site/README.md explains
- * the procedure.
+ * Two viewers must already be serving the screenshot corpora: this repository (`repo`) and the
+ * Angular RealWorld app (`app`), whose screens and conditions the Screens, Steps and condition
+ * captures show. `capture-screens.sh` next to this file builds both corpora, starts the viewers
+ * and runs this script; docs/site/README.md explains the procedure.
  *
- *   node docs/site/tools/capture-screens.mjs http://127.0.0.1:4791 [out-dir]
+ *   node docs/site/tools/capture-screens.mjs http://127.0.0.1:4791 http://127.0.0.1:4792 [out-dir]
  *
  * Every capture is 1440 × 900 at device pixel ratio 1, saved as WebP at quality 85, once in the
  * light theme and once in the dark one. Each one is a fresh document load, and the script waits
@@ -25,11 +26,12 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const [base, outArg] = process.argv.slice(2);
-if (!base) {
-  console.error("usage: node capture-screens.mjs <viewer-url> [out-dir]");
+const [repoBase, appBase, outArg] = process.argv.slice(2);
+if (!repoBase || !appBase) {
+  console.error("usage: node capture-screens.mjs <repo-viewer-url> <app-viewer-url> [out-dir]");
   process.exit(2);
 }
+const BASES = { repo: repoBase, app: appBase };
 const CHROME = process.env.CODEGRAPH_CHROME;
 if (!CHROME || !existsSync(CHROME)) {
   console.error("set CODEGRAPH_CHROME to a Chrome or Chromium executable");
@@ -42,34 +44,71 @@ const WIDTH = 1440;
 const HEIGHT = 900;
 const THEMES = ["light", "dark"];
 
-/** Symbols looked up by name, kind and file, so a capture never depends on a hard-coded id. */
+/** Symbols looked up by name, kind and file in their corpus, so a capture never depends on a hard-coded id. */
 const SYMBOLS = {
   resolve: {
+    corpus: "repo",
     query: "IndexPaths::resolve",
     qualifiedName: "IndexPaths::resolve",
     kind: "method",
     file: "crates/codegraph-core/src/index_paths.rs",
   },
   frameworkResolver: {
+    corpus: "repo",
     query: "FrameworkResolver",
     qualifiedName: "FrameworkResolver",
     kind: "trait",
     file: "crates/codegraph-resolve/src/framework.rs",
   },
+  submitForm: {
+    corpus: "app",
+    query: "AuthComponent::submitForm",
+    qualifiedName: "AuthComponent::submitForm",
+    kind: "method",
+    file: "src/app/core/auth/auth.component.ts",
+  },
+  toggleFollowing: {
+    corpus: "app",
+    query: "FollowButtonComponent::toggleFollowing",
+    qualifiedName: "FollowButtonComponent::toggleFollowing",
+    kind: "method",
+    file: "src/app/features/profile/components/follow-button.component.ts",
+  },
 };
 
-/** name, route (after `#`), text the view must show. The list is exhaustive. */
+/** corpus, name, route (after `#`), text the view must show. The list is exhaustive. */
 const CAPTURES = [
-  ["viewer-home", () => "/", "Index composition"],
-  ["viewer-symbol", (ids) => `/s/${ids.resolve}`, "Called by"],
-  ["viewer-hierarchy", (ids) => `/s/${ids.frameworkResolver}`, "Type hierarchy"],
-  ["viewer-file", () => "/file/crates/codegraph-core/src/index_paths.rs", "Outline"],
-  ["viewer-flow", () => "/flow?from=cmd_explore&to=explore_file_header", "Every hop"],
-  ["viewer-map", () => "/map?root=crates&depth=1", "Architecture map"],
-  ["viewer-dead", () => "/dead", "What the list leaves out"],
+  ["repo", "viewer-home", () => "/", "Index composition"],
+  ["repo", "viewer-symbol", (ids) => `/s/${ids.resolve}`, "Called by"],
+  ["repo", "viewer-hierarchy", (ids) => `/s/${ids.frameworkResolver}`, "Type hierarchy"],
+  ["repo", "viewer-file", () => "/file/crates/codegraph-core/src/index_paths.rs", "Outline"],
+  ["repo", "viewer-flow", () => "/flow?from=cmd_explore&to=explore_file_header", "Every hop"],
+  ["repo", "viewer-map", () => "/map?root=crates&depth=1", "Architecture map"],
+  ["repo", "viewer-dead", () => "/dead", "What the list leaves out"],
+  ["app", "viewer-screens", () => "/screens", "Most connected"],
+  ["app", "viewer-steps", () => "/steps?symbol=%2Flogin", "submitForm"],
+  [
+    "app",
+    "viewer-steps-order",
+    (ids) => `/steps?anchor=${ids.submitForm}&view=order`,
+    "this.authType === 'login'",
+  ],
+  [
+    "app",
+    "viewer-symbol-when",
+    (ids) => `/s/${ids.toggleFollowing}`,
+    "isAuthenticated && !this.profile.following",
+  ],
+  [
+    "app",
+    "viewer-flow-when",
+    () => "/flow?from=toggleFollowing&to=follow",
+    "isAuthenticated && !this.profile.following",
+  ],
 ];
 
-async function lookup({ query, qualifiedName, kind, file }) {
+async function lookup({ corpus, query, qualifiedName, kind, file }) {
+  const base = BASES[corpus];
   const response = await fetch(`${base}/api/search?q=${encodeURIComponent(query)}&limit=50`);
   if (!response.ok) throw new Error(`search for ${query} answered ${response.status}`);
   const body = await response.json();
@@ -204,7 +243,7 @@ try {
     }
   }
 
-  async function load(route) {
+  async function load(base, route) {
     await cmd("Page.navigate", { url: "about:blank" });
     drain();
     inFlight.clear();
@@ -232,27 +271,32 @@ try {
   const ids = {};
   for (const [key, symbol] of Object.entries(SYMBOLS)) ids[key] = await lookup(symbol);
 
-  // localStorage belongs to the viewer's origin, so the theme is set from one of its pages.
-  await load("/");
-  for (const theme of THEMES) {
-    await evaluate(`localStorage.setItem('codegraph-ui.theme', '${theme}'); true`);
-    for (const [name, route, expected] of CAPTURES) {
-      const hash = route(ids);
-      await load(hash);
-      drain();
-      if (problems.length > 0) throw new Error(`${name}-${theme}: ${problems.join("; ")}`);
-      if ((await evaluate("location.hash")) !== `#${hash}`)
-        throw new Error(`${name}-${theme}: the address moved away from #${hash}`);
-      if (!(await evaluate(`document.body.innerText.includes(${JSON.stringify(expected)})`))) {
-        throw new Error(`${name}-${theme}: the view does not show "${expected}"`);
+  for (const [corpus, base] of Object.entries(BASES)) {
+    // localStorage belongs to the viewer's origin (a port is an origin), so each corpus's theme
+    // is set from one of its own pages.
+    await load(base, "/");
+    for (const theme of THEMES) {
+      await evaluate(`localStorage.setItem('codegraph-ui.theme', '${theme}'); true`);
+      for (const [name, route, expected] of CAPTURES.filter(([of]) => of === corpus).map(
+        ([, ...capture]) => capture,
+      )) {
+        const hash = route(ids);
+        await load(base, hash);
+        drain();
+        if (problems.length > 0) throw new Error(`${name}-${theme}: ${problems.join("; ")}`);
+        if ((await evaluate("location.hash")) !== `#${hash}`)
+          throw new Error(`${name}-${theme}: the address moved away from #${hash}`);
+        if (!(await evaluate(`document.body.innerText.includes(${JSON.stringify(expected)})`))) {
+          throw new Error(`${name}-${theme}: the view does not show "${expected}"`);
+        }
+        if ((await evaluate("document.documentElement.dataset.theme")) !== theme) {
+          throw new Error(`${name}-${theme}: the page is not in the ${theme} theme`);
+        }
+        const shot = await cmd("Page.captureScreenshot", { format: "webp", quality: 85 });
+        const file = join(outDir, `${name}-${theme}.webp`);
+        writeFileSync(file, Buffer.from(shot.data, "base64"));
+        console.log(file);
       }
-      if ((await evaluate("document.documentElement.dataset.theme")) !== theme) {
-        throw new Error(`${name}-${theme}: the page is not in the ${theme} theme`);
-      }
-      const shot = await cmd("Page.captureScreenshot", { format: "webp", quality: 85 });
-      const file = join(outDir, `${name}-${theme}.webp`);
-      writeFileSync(file, Buffer.from(shot.data, "base64"));
-      console.log(file);
     }
   }
 } catch (error) {

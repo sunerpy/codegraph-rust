@@ -239,8 +239,9 @@ fn contains_path_segment(path: &str, segment: &str) -> bool {
 /// the whole path is equivalent — and case-sensitive, matching upstream's lack
 /// of an `i` flag (`Grpc.cs`, `OuterClass.java`).
 ///
-/// Mockgen's DEFAULT `mock_<src>.go` output is NOT here: upstream anchors it to
-/// the basename (`/^mock_[^/]+\.go$/`), so it needs [`is_mockgen_default_output`].
+/// Mockgen's DEFAULT `mock_<src>.go` output is NOT here: it is a prefix, not a
+/// suffix (upstream's `/^mock_[^/]+\.go$/`, tested against the whole path), so
+/// it needs [`is_mockgen_default_output`].
 const GENERATED_SUFFIXES: &[&str] = &[
     // Go — protobuf / gRPC / pulsar
     ".pb.go",
@@ -311,9 +312,10 @@ pub fn is_generated_file(path: &str) -> bool {
 }
 
 /// Mockgen's default output, `mock_<src>.go`, anchored to the final path
-/// segment. Upstream's `/^mock_[^/]+\.go$/` is basename-scoped, so a nested
-/// `src/mock_helpers.go` matches while a `mock_store/` DIRECTORY does not, and
-/// `[^/]+` requires a non-empty stem between the prefix and the extension.
+/// segment: a nested `src/mock_helpers.go` matches while a `mock_store/`
+/// DIRECTORY does not, and the stem between the prefix and the extension is
+/// not empty. Upstream's `/^mock_[^/]+\.go$/` tests the whole path, so only a
+/// root `mock_x.go` matches there (KEEP-RUST, `KNOWN_DIFFS.md`).
 fn is_mockgen_default_output(path: &str) -> bool {
     basename(path)
         .strip_prefix("mock_")

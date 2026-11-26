@@ -123,12 +123,12 @@ impl FrameworkResolver for GodotResolver {
         {
             if reference.reference_kind == EdgeKind::Calls {
                 if let Some(target) = resolve_autoload_func(context, access) {
-                    return Some(ResolvedRef {
-                        original: reference.clone(),
-                        target_node_id: target.id,
-                        confidence: 0.9,
-                        resolved_by: ResolvedBy::Framework,
-                    });
+                    return Some(ResolvedRef::new(
+                        reference.clone(),
+                        target.id,
+                        0.9,
+                        ResolvedBy::Framework,
+                    ));
                 }
             }
             return None;
@@ -164,24 +164,24 @@ impl FrameworkResolver for GodotResolver {
             if let Some(member) = member {
                 if !member.is_empty() {
                     if let Some(target) = resolve_class_member(context, receiver, member) {
-                        return Some(ResolvedRef {
-                            original: reference.clone(),
-                            target_node_id: target.id,
-                            confidence: 0.9,
-                            resolved_by: ResolvedBy::Framework,
-                        });
+                        return Some(ResolvedRef::new(
+                            reference.clone(),
+                            target.id,
+                            0.9,
+                            ResolvedBy::Framework,
+                        ));
                     }
                 }
             }
         }
 
         let singleton = find_autoload_singleton(context, receiver)?;
-        Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: singleton.id,
-            confidence: 0.9,
-            resolved_by: ResolvedBy::Framework,
-        })
+        Some(ResolvedRef::new(
+            reference.clone(),
+            singleton.id,
+            0.9,
+            ResolvedBy::Framework,
+        ))
     }
 
     /// Opt a `BuffManager.member` reference through the name-exists pre-filter.

@@ -254,10 +254,11 @@ fn framework_extraction_skips_a_file_too_large_to_extract() {
     assert_eq!(sources, vec!["src/app.ts"]);
 }
 
-/// Import resolution probes the same candidate paths (every extension of a
-/// specifier) from every file that imports it, and the tree does not change
-/// within a pass, so a pass answers each existence probe once (upstream
-/// v1.6.1's `fileExistsMemo`); the next pass probes afresh.
+/// The same paths are probed again and again within a pass, and the tree
+/// does not change within a pass, so a pass answers each existence probe
+/// once (upstream v1.6.1's `fileExistsMemo`, which upstream's import
+/// resolution reads; this port's asks `is_indexed_file`, W7-27); the next
+/// pass probes afresh.
 #[test]
 fn existence_probes_are_answered_once_per_pass() {
     let project = Project::new("exists-memo");

@@ -320,7 +320,7 @@ CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --m
 
 | Tool                | Purpose                                                                                                                                 |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `codegraph_explore` | PRIMARY tool: blast radius + relationship map + dynamic-dispatch boundaries + source blocks (output is size-adaptive to project scale). |
+| `codegraph_explore` | PRIMARY tool: named-symbol call flow + blast radius + relationship map + dispatch boundaries + source blocks (output is size-adaptive). |
 | `codegraph_search`  | FTS5 + multi-signal scored symbol search.                                                                                               |
 | `codegraph_node`    | Node detail (symbol view) or file view (line-numbered source). A smarter `Read`.                                                        |
 | `codegraph_callers` | Callers of a symbol (along calls/references/imports edges).                                                                             |
@@ -350,6 +350,46 @@ an index or a change to user files, so the hint stays `true`.
 returns the symbols relevant to a query, their verbatim source grouped by file,
 plus the call/impact graph around them. Prefer it over individual `callers`/
 `callees` chains when surveying an unfamiliar area.
+
+When the query names two or more callables that a call chain of three or more
+connects, the response opens with a **Flow** section: the longest chain among
+them, one numbered line per symbol (`2. run (src/app.ts:3)`) and one `↓` line
+per hop. At most one unnamed symbol may bridge two named ones, and of two
+equally long routes the Flow takes the one through the symbols the query names;
+the search is the viewer's Flow search. A hop reads as its edge kind (`calls`,
+`navigates`), or, for a synthesized hop, as `dynamic: <mechanism> @<wiring
+site>`, and names the conditions its call runs under, read from the caller's
+current source: `↓ calls (when !busy && ready)` lists the branches around the
+call site up to the enclosing function, with the early exits before it negated.
+Conditions are read for JavaScript, TypeScript, Swift, Python, Java, Kotlin,
+C#, Go, C, C++ and Objective-C callers; a caller file that changed since it was
+indexed, or one above 256 KiB, gets none rather than one read at a stale line.
+
+A **Dynamic-dispatch links among your symbols** section follows the Flow, or
+stands alone when there is none: one line per synthesized edge at a symbol the
+query names, whether or not it names the other end, such as
+`- Shape.area → Square.area   [dynamic: interface → impl @square.ts:4]`. It also
+lists the links of a query that names one callable, or only non-callable
+endpoints such as RTK thunks. Two same-name ends are each named by their owner
+(`Owner.member` for a method). An edge with both ends on the Flow is left out,
+and so is a line that reads like a Flow hop or a line already listed. At most
+six lines are listed. Links into test, spec, icon and translation files
+through an end the query did not name go last; before them, links whose ends
+the query names more precisely come first: a symbol a token picks out (at most
+three definitions) before a candidate of an ambiguous name. Links of one rank
+take turns by the named symbol they hang from, so one long fan-out cannot fill
+the list, and the graph's edge order settles the rest, so a synced index and a
+fresh one list the same lines.
+
+A **Dynamic boundaries** section lists the sites in the bodies of the symbols
+the query picks out whose call target is chosen at runtime (a computed member call, a
+dynamic import, a `send`, reflective or `Proxy` dispatch, a string-keyed or
+typed message dispatch, an Objective-C selector, Python's `getattr`): the
+symbol, its file and line, the form and the site's source line, and, for a
+site whose key the source spells, the candidates the key suggests. Each body
+is read with its comments and string contents blanked, in its language's
+forms, an ArkTS body as a TypeScript one; a file that changed since it was
+indexed is not read.
 
 Explicit source paths in the query are resolved before fuzzy search and pinned
 to the front of the result. Quoted/backticked paths, `./`, and Windows
@@ -386,9 +426,73 @@ file header instead.
 
 Each file's source is held to a per-file ceiling of 1.5 × the tier's per-file
 budget. A file the query names (by path, by an exact target, or by a symbol it
-defines) that this ceiling clipped is rendered again into whatever budget the
-rest of the response left unspent, so a question about one file can use the
-whole response while every other file keeps exactly the section it was given.
+defines), or one holding a node of the Flow's chain, that this ceiling clipped
+is rendered again into whatever budget the rest of the response left unspent,
+so a question about one file can use the whole response while every other file
+keeps exactly the section it was given.
+
+**What explore gathers.** The entry points are the search's eight best matches
+among functions, methods, classes and the other declaration kinds, variables
+and constants included; imports, exports, files, properties and parameters
+are not entry points. From them explore walks the graph the way upstream's
+`findRelevantContext` does: the supertypes of a type entry point, then three
+hops in both directions from each entry point, which shares a 200-node budget
+evenly with the others, keeping at most 40 nodes from one file and 30 from
+test and other non-production files unless the query mentions tests or specs,
+and then the edges among what was kept. The entry
+points' callers and callees in the files already gathered join, and so does
+every definition a query token names: a camelCase, PascalCase, snake_case or
+qualified token always, a bare lowercase word only where another query token
+is defined in the same file, so an ordinary English word in a question does
+not seed its namesake.
+
+**How explore orders the files.** Each file scores by how its symbols reached
+the subgraph (named by the query, an entry point, one edge from one, or
+around them), weighted by kind: a function or class outweighs a field, and a
+variable or constant nothing uses counts as a name collision. Generated files,
+declaration-only shims and test, spec, icon and translation files are damped,
+and test files leave the ranking unless the query is about tests. A floor
+relative to the best file's score drops the weak files, and backfills to three
+when it leaves fewer. Graph relevance is a random walk with restart from the
+entry points over the subgraph's call, reference, type and import edges; a
+file stays when it holds a meaningful share of the top file's walk mass,
+holds an entry point, is one of the one or two most central files that match
+a query word, or matches two query words. A named callable's signature type
+is added when its file has next to no walk mass and matches fewer than two
+query words. Files named by path come first, then files defining a symbol the
+query named, then entry or central files that two query words corroborate,
+then the rest by walk mass. `CODEGRAPH_RANK_NO_MULTITERM=1` turns the
+corroboration tier off. The summary line counts the files whose source the
+response shows and their listed symbols.
+
+**The Flow's chain in the source.** A symbol the query named ranks its cluster
+above the gathered context around it, even when the gather missed its
+definition. A cluster holding a node of the Flow's chain ranks after exact
+targets and before the rest, its members are kept ahead of incidental ones,
+and a window of it reaches the line where it calls the next hop; a chain
+method longer than 200 lines renders as its signature head and a window on
+that call. The one or two most central files come back whole up to 280 lines,
+the others up to 220.
+
+**Skeletons.** When the Flow has a chain, a file that holds no node of it and
+is one of several interchangeable implementations (a type in it implements or
+extends a supertype that at least three types do) renders symbol by symbol,
+and so does a file the chain runs through once its chain and uniquely named
+bodies overrun its ceiling while it also holds a uniquely named method off the
+chain. A file holding a callable the query names uniquely (at most three
+definitions) is spared and renders as usual, unless it defines such a
+supertype itself, as a base class with its subclasses does. In this view every
+symbol is its signature line except the bodies the question is about, within
+the per-file ceiling: exact targets and named chain steps first, windowed
+rather than dropped when too long, then the chain's other steps, uniquely
+named methods, and in a supertype's own file the methods the query names. The
+header ends with `· skeleton (signatures only — codegraph_explore a name for
+its full body; do NOT Read)` when no body is kept, else with `· focused (the
+methods you named in full, the rest as signatures — codegraph_explore a
+signature by name for its body; do NOT Read)`. A windowed body names each hole
+with the `codegraph_explore` query that returns it, and signatures past a cap
+end in `… +N more (signatures elided)`. `CODEGRAPH_ADAPTIVE_EXPLORE=0` (or
+`false`) turns the view off.
 
 Explore also resolves prose and camelCase query segments against indexed symbol
 names, then merges the resulting callable, Variable, and Constant names as
@@ -416,7 +520,9 @@ through a helper it usually was not.
 example, `node.id` from CLI `codegraph search --json`), or a file path. `file`
 and `line` can pin an overloaded symbol to one definition. When given a file
 path without a symbol it returns the file's source with line numbers, which is a
-more accurate alternative to a plain `Read` tool call.
+more accurate alternative to a plain `Read` tool call. Its trail tags a
+synthesized hop with the Flow's wording: `exportReport (src/pdf-exporter.ts:5)
+[dynamic: interface → impl @src/pdf-exporter.ts:5]`.
 
 File mode also accepts pasted editor/GitHub locations: `src/app.ts:42`,
 `src/app.ts:42-80`, `src/app.ts#L42`, and `src/app.ts#L42-L80` (the final `L` is
@@ -461,11 +567,15 @@ LLM a high-level structural summary of the entire codebase.
 
 ## Error Channels
 
-Two distinct error channels:
+Three error channels:
 
 - **Unknown tool name** — JSON-RPC error `-32602` (invalid params).
 - **Missing or invalid required argument** — tool result with
   `{content: ..., isError: true}` and `Error: <message>` body.
+- **A project whose index cannot be opened** — the same `isError` tool result,
+  `Failed to open project at <path>: <reason>`. An index a newer CodeGraph wrote
+  is one: the reason names both schema versions and nothing in the index changes
+  ([`cli.md`](cli.md#an-index-a-newer-codegraph-wrote)).
 
 ---
 
@@ -491,7 +601,8 @@ other request, and the daemon's handler answers it with
 The daemon runs a file watcher (`codegraph-watch`) that live-reindexes changed
 files. Events are debounced (default ~2 s; tunable via
 `CODEGRAPH_WATCH_DEBOUNCE_MS`) so a burst of saves triggers one incremental
-rebuild rather than many. A burst of more than 500 paths, or any sign that the
+rebuild rather than many; a save of one or two files waits only a 300 ms quiet
+window, or the debounce when that is shorter. A burst of more than 500 paths, or any sign that the
 OS dropped events, runs one full project reconcile instead (see
 [`cli.md`](cli.md#live-file-watch)). The watcher is auto-disabled on WSL2 `/mnt/` drives
 where recursive watch is too slow; set `CODEGRAPH_FORCE_WATCH=1` to override.
@@ -743,10 +854,10 @@ drifted file at them. Instead:
   (`FILE_MODE_MAX_LINES`, the same ceiling normal file mode uses). Over the cap,
   the body is omitted with a notice; the location and signature are still shown,
   flagged as possibly shifted.
-- **`codegraph_explore`** flags a drifted file and disables adaptive, skeleton,
-  and cluster slicing for it. Whole-file rendering is correct by construction, so
-  a small file still comes back in full; a large one is omitted rather than
-  sliced.
+- **`codegraph_explore`** flags a drifted file and disables the per-symbol
+  skeleton view and cluster slicing for it. Whole-file rendering is correct by
+  construction, so a small file still comes back in full; a large one is
+  omitted rather than sliced.
 
 Byte size stays gated separately by `indexing.max_file_size` (1 MiB default) —
 a file over that limit was never extracted, so its text is not served either way.

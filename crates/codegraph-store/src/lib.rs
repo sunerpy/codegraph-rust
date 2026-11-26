@@ -1,3 +1,4 @@
+pub mod change_log;
 pub mod connection;
 mod file_identity;
 pub mod index_lease;
@@ -7,15 +8,20 @@ pub mod migrations;
 pub mod queries;
 pub mod rebuild;
 pub mod schema;
+mod schema_probe;
 #[cfg(feature = "test-hooks")]
 pub mod test_support;
 pub mod uninit;
 pub mod viewer;
 pub mod wsl_shared_index;
 
+pub use change_log::{
+    ChangeSet, DEFAULT_CHANGE_LOG_CAP, EdgeImage, FileImage, NodeImage, RefImage, RowChanges,
+    SynthesizedEdge,
+};
 pub use connection::{
-    ExtractionStampIssue, Store, StoreError, StoreStatusOpen, StoreWriteAuthorization,
-    StoreWriteOpen, StoreWritePurpose,
+    ExtractionStampIssue, SchemaVersionReadError, Store, StoreError, StoreStatusOpen,
+    StoreWriteAuthorization, StoreWriteOpen, StoreWritePurpose,
 };
 pub use file_identity::{PathIdentity, path_still_names_file};
 pub use index_lease::{IndexLease, IndexLeaseError, IndexLeaseValidationError};
@@ -29,7 +35,7 @@ pub use index_state_publisher::{
 };
 pub use queries::{
     CODEGRAPH_NO_WAL_DEFER, CODEGRAPH_WAL_VALVE_MB, DEFAULT_WAL_VALVE_MB, import_path_keys,
-    reference_name_tail, wal_valve_threshold_bytes,
+    reference_name_tail, route_module_path, route_module_stem, wal_valve_threshold_bytes,
 };
 pub use rebuild::{
     ActiveFullRebuild, FullRebuild, RebuildError, RebuildKind, begin_full_rebuild,

@@ -26,7 +26,7 @@ grammar crates.
 | ------------------- | ------------------------ | ---------------------------------------------------------------------- |
 | `typescript`, `tsx` | `tree-sitter-typescript` | TypeScript and TSX entry points                                        |
 | `javascript`, `jsx` | `tree-sitter-javascript` | JS grammar includes JSX; separate specs preserve ID/extension behavior |
-| `arkts`             | `tree-sitter-arkts`      | `.ets`; ArkUI syntax; calls in `struct` methods such as `build()`      |
+| `arkts`             | `tree-sitter-arkts`      | `.ets`; ArkUI DSL as 0.3.0 parses it; upstream vendors 0.2.0           |
 | `python`            | `tree-sitter-python`     | `.py`, `.pyw`                                                          |
 | `go`                | `tree-sitter-go`         | `.go`                                                                  |
 | `rust`              | `tree-sitter-rust`       | `.rs`                                                                  |
@@ -48,7 +48,7 @@ grammar crates.
 | `solidity`          | `tree-sitter-solidity`   | `.sol`                                                                 |
 | `nix`               | `tree-sitter-nix`        | `.nix`                                                                 |
 | `terraform`         | `tree-sitter-hcl`        | `.tf`, `.tfvars`, `.tofu`                                              |
-| `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`                                                         |
+| `erlang`            | `tree-sitter-erlang`     | `.erl`, `.hrl`, `.escript`, `.app`, `.app.src`                         |
 | `cfml`              | `tree-sitter-cfml`       | script/tag entry by source; `<cfscript>`/`<cfquery>` bodies in place   |
 | `gdscript`          | `tree-sitter-gdscript`   | `.gd`; framework resolution adds Godot relationships                   |
 
@@ -75,14 +75,14 @@ merge invariants.
 
 ## File/framework-level IDs
 
-| Language ID      | Runtime behavior                                                     |
-| ---------------- | -------------------------------------------------------------------- |
-| `yaml`           | file-level only; no language symbols                                 |
-| `twig`           | file-level only; no language symbols                                 |
-| `properties`     | file-level only; no language symbols                                 |
-| `godot_scene`    | `.tscn`; file-level language ID plus Godot scene resolver extraction |
-| `godot_resource` | `.tres`; file-level language ID plus Godot resource relationships    |
-| `godot_project`  | `project.godot`; autoload/input/plugin/framework extraction          |
+| Language ID      | Runtime behavior                                                                                    |
+| ---------------- | --------------------------------------------------------------------------------------------------- |
+| `yaml`           | file-level only, Play routes files too; Spring config keys and Play routes are framework extraction |
+| `twig`           | file-level only; no language symbols                                                                |
+| `properties`     | file-level only; Spring config keys are framework extraction                                        |
+| `godot_scene`    | `.tscn`; file-level language ID plus Godot scene resolver extraction                                |
+| `godot_resource` | `.tres`; file-level language ID plus Godot resource relationships                                   |
+| `godot_project`  | `project.godot`; autoload/input/plugin/framework extraction                                         |
 
 The first three are part of the 38 public code/template language count. The three
 Godot resource-format IDs are reported separately so “38 languages” does not
@@ -125,6 +125,9 @@ classifications:
   and its mapping, like any of a built-in extension, leaves `.inc` PHP;
 - `.dfm` and `.fmx` use the Pascal language ID but custom extraction;
 - `project.godot` is detected by filename because it has no extension;
+- a Play routes file (`conf/routes`, a path ending in `/conf/routes`, or one
+  ending in `.routes`, case-sensitive) is YAML ahead of every other rule, an
+  extension override included (upstream `isPlayRoutesFile`);
 - project extension overrides can claim only extensions left unclaimed by built-in
   and embedded detection.
 
@@ -141,3 +144,15 @@ cargo test --locked -p codegraph-bench --test equivalence
 Review `cargo tree -p codegraph-extract` for duplicate/incompatible tree-sitter
 cores. Do not vendor a grammar or change a pin merely to match upstream's WASM
 packaging; the Rust crate ABI and actual fixtures decide compatibility.
+
+## Held grammar versions
+
+`tree-sitter-swift` is pinned exactly to 0.7.3. Its scanner builds the `try!`
+entry of a 64-bit mask as `1UL << 32`, which a compiler with 32-bit `long`
+(MSVC) folds to 0, so the Windows build reads `try! Foo()` as a call of `! Foo`
+(upstream #2683). 0.7.4 fixes that line but regenerates the grammar: a call
+after an infix or prefix operator (`a + b.c()`, `!a.b()`) comes out as another
+tree, which the walker does not yet recognize as a member call. Upgrade it
+together with that walker change; the probe
+`pr2683_a_call_after_try_bang_links_what_it_calls`, ignored on Windows until
+then, is the acceptance test.

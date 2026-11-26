@@ -26,6 +26,8 @@ pub enum CommentLang {
     Rust,
     /// C and C++ (upstream's `c` / `cpp`).
     Cpp,
+    /// Erlang (upstream's `erlang`, #1169).
+    Erlang,
 }
 
 /// Replace comments + string literals with spaces, preserving offsets.
@@ -34,6 +36,7 @@ pub enum CommentLang {
 pub fn strip_comments_for_regex(content: &str, lang: CommentLang) -> String {
     match lang {
         CommentLang::Python => strip_python(content),
+        CommentLang::Erlang => strip_erlang(content),
         CommentLang::Ruby => strip_ruby(content),
         CommentLang::Rust => strip_rust(content),
         CommentLang::Php => strip_php(content),
@@ -44,6 +47,55 @@ pub fn strip_comments_for_regex(content: &str, lang: CommentLang) -> String {
             strip_c_style(content, false)
         }
     }
+}
+
+/// `stripErlang` (upstream `strip-comments.ts`, #1169): `%` starts a line
+/// comment unless it sits in a `"string"`, a `'quoted atom'` or the
+/// character literal `$%`; strings and quoted atoms stay (a callback's name
+/// can be a quoted atom), and only the comment becomes spaces.
+fn strip_erlang(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = chars.clone();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        if c == '"' || c == '\'' {
+            i += 1;
+            while i < n && chars[i] != c {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+            continue;
+        }
+        // A character literal (`$x`, `$\n`, `$%`): the next character, or
+        // escape, is data.
+        if c == '$' {
+            i += 1;
+            if i < n && chars[i] == '\\' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '%' {
+            let mut end = i;
+            while end < n && chars[end] != '\n' {
+                end += 1;
+            }
+            blank_range(&mut out, &chars, i, end);
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
 }
 
 /// Replace `[start, end)` with spaces, keeping newlines so line numbers stay
@@ -213,6 +265,401 @@ fn strip_ruby(src: &str) -> String {
 /// function scan strips the function's code up to each reference in it, and
 /// typescript-large's `createTypeChecker` is three megabytes (W4d end).
 fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
+    strip_c_style_blanking(src, allow_single_quote_strings, Blanking::Characters)
+}
+
+/// [`strip_comments_for_regex`] for JavaScript and TypeScript with each
+/// comment BYTE but a newline a space (W7-09d): the result keeps every byte
+/// offset of `content`, so an offset found in it indexes `content` as well.
+/// The character-for-character blanking keeps character counts instead,
+/// which differ from byte offsets past a comment holding non-ASCII text.
+pub(crate) fn strip_js_comments_keeping_offsets(content: &str) -> String {
+    strip_c_style_blanking(content, true, Blanking::Bytes)
+}
+
+/// [`strip_comments_for_regex`] for Java (and the Kotlin a Spring resolver
+/// reads the same way, upstream `stripCommentsForRegex(content, 'java')`)
+/// with each comment BYTE but a newline a space (W7-19c), as
+/// [`strip_js_comments_keeping_offsets`] blanks JavaScript: a double-quoted
+/// string stays and a single quote opens none.
+pub(crate) fn strip_java_comments_keeping_offsets(content: &str) -> String {
+    strip_c_style_blanking(content, false, Blanking::Bytes)
+}
+
+/// [`strip_comments_for_regex`] for Python with each blanked BYTE but a
+/// newline a space (W7-19b), the way [`strip_js_comments_keeping_offsets`]
+/// blanks JavaScript: a triple-quoted string and a `#` comment become
+/// spaces, a one-line string stays, and every byte offset of `content` is
+/// an offset of the result. The scan is `strip_python`'s, byte by byte:
+/// every byte it looks for is ASCII, and a backslash skips the whole
+/// character after it.
+pub(crate) fn strip_python_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        // Triple-quoted string.
+        if (c == b'"' || c == b'\'') && bytes.get(i + 1) == Some(&c) && bytes.get(i + 2) == Some(&c)
+        {
+            let start = i;
+            i += 3;
+            while i < n {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == c && bytes.get(i + 1) == Some(&c) && bytes.get(i + 2) == Some(&c) {
+                    i += 3;
+                    break;
+                }
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        // One-line string.
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        // Line comment.
+        if c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// [`strip_comments_for_regex`] for PHP with each blanked BYTE but a newline
+/// a space (W7-19d), the way [`strip_js_comments_keeping_offsets`] blanks
+/// JavaScript: a `/* */` comment and a `//` or `#` comment to the end of its
+/// line become spaces, a `'`, `"` or `` ` `` string stays and ends at a
+/// newline, and every byte offset of `content` is an offset of the result.
+/// The scan is `strip_php`'s, byte by byte: every byte it looks for is
+/// ASCII, and a backslash skips the whole character after it.
+pub(crate) fn strip_php_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        let c2 = bytes.get(i + 1).copied().unwrap_or(0);
+        if c == b'/' && c2 == b'*' {
+            let start = i;
+            i += 2;
+            while i < n && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                i = next_char(i);
+            }
+            if i < n {
+                i += 2;
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if (c == b'/' && c2 == b'/') || c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if c == b'"' || c == b'\'' || c == b'`' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// [`strip_comments_for_regex`] for Ruby with each blanked BYTE but a
+/// newline a space (W7-19e), the way [`strip_js_comments_keeping_offsets`]
+/// blanks JavaScript: a `=begin` … `=end` block at the start of a line and a
+/// `#` comment to the end of its line become spaces, a `'` or `"` string
+/// stays and ends at a newline, and every byte offset of `content` is an
+/// offset of the result. The scan is `strip_ruby`'s, byte by byte: every
+/// byte it looks for is ASCII, and a backslash skips the whole character
+/// after it.
+pub(crate) fn strip_ruby_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    let mut at_line_start = true;
+    while i < n {
+        let c = bytes[i];
+        // `=begin` / `=end` block comments at the start of a line.
+        if at_line_start && c == b'=' && bytes[i..].starts_with(b"=begin") {
+            let start = i;
+            i += "=begin".len();
+            while i < n {
+                if bytes[i] == b'\n' {
+                    let mut j = i + 1;
+                    while j < n && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    if bytes[j..].starts_with(b"=end") {
+                        i = j + "=end".len();
+                        while i < n && bytes[i] != b'\n' {
+                            i = next_char(i);
+                        }
+                        break;
+                    }
+                }
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            at_line_start = i > 0 && bytes[i - 1] == b'\n';
+            continue;
+        }
+        // String literals.
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            at_line_start = false;
+            continue;
+        }
+        // Line comment.
+        if c == b'#' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            at_line_start = false;
+            continue;
+        }
+        if c == b'\n' {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if c == b' ' || c == b'\t' {
+            i += 1;
+            continue;
+        }
+        at_line_start = false;
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// [`strip_comments_for_regex`] for Rust with each blanked BYTE but a
+/// newline a space (W7-19h), the way [`strip_js_comments_keeping_offsets`]
+/// blanks JavaScript: a `/* */` comment, the nested ones in it counted, and
+/// a `//` comment to the end of its line become spaces, a `"` string stays
+/// across lines, a `'` literal (a lifetime too, as upstream reads it) stays
+/// to the next `'` or the end of its line, and every byte offset of
+/// `content` is an offset of the result. The scan is `strip_rust`'s, byte by
+/// byte: every byte it looks for is ASCII, and a backslash skips the byte
+/// after it, the first of its character; any more are bytes no delimiter
+/// equals.
+pub(crate) fn strip_rust_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        let c2 = bytes.get(i + 1).copied().unwrap_or(0);
+        if c == b'/' && c2 == b'*' {
+            let start = i;
+            i += 2;
+            let mut depth = 1;
+            while i < n && depth > 0 {
+                if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if c == b'/' && c2 == b'/' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i += 2;
+                    continue;
+                }
+                if c == b'\'' && bytes[i] == b'\n' {
+                    break;
+                }
+                i += 1;
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// [`strip_comments_for_regex`] for Go with each blanked BYTE but a newline
+/// a space (W7-19i), the way [`strip_js_comments_keeping_offsets`] blanks
+/// JavaScript: a `/* */` comment and a `//` comment to the end of its line
+/// become spaces, a `"` string and a `'` rune (each ending at a newline) and
+/// a backtick raw string stay, and every byte offset of `content` is an
+/// offset of the result. The scan is `strip_go`'s, byte by byte: every byte
+/// it looks for is ASCII, and a backslash skips the whole character after
+/// it.
+pub(crate) fn strip_go_comments_keeping_offsets(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0;
+    // The offset just past the character that starts at `at`.
+    let next_char = |at: usize| at + content[at..].chars().next().map_or(1, char::len_utf8);
+    let mut i = 0;
+    while i < n {
+        let c = bytes[i];
+        let c2 = bytes.get(i + 1).copied().unwrap_or(0);
+        // Block comment.
+        if c == b'/' && c2 == b'*' {
+            let start = i;
+            i += 2;
+            while i < n && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                i = next_char(i);
+            }
+            if i < n {
+                i += 2;
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        // Line comment.
+        if c == b'/' && c2 == b'/' {
+            let start = i;
+            while i < n && bytes[i] != b'\n' {
+                i = next_char(i);
+            }
+            blank_into(&mut out, content, &mut copied, start, i, Blanking::Bytes);
+            continue;
+        }
+        // Raw string: kept, with no escapes.
+        if c == b'`' {
+            i += 1;
+            while i < n && bytes[i] != b'`' {
+                i = next_char(i);
+            }
+            if i < n {
+                i += 1;
+            }
+            continue;
+        }
+        // String or rune: kept, up to a newline.
+        if c == b'"' || c == b'\'' {
+            i += 1;
+            while i < n && bytes[i] != c {
+                if bytes[i] == b'\\' && i + 1 < n {
+                    i = next_char(i + 1);
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    break;
+                }
+                i = next_char(i);
+            }
+            if i < n && bytes[i] == c {
+                i += 1;
+            }
+            continue;
+        }
+        i = next_char(i);
+    }
+    out.push_str(&content[copied..]);
+    out
+}
+
+/// How a comment's text is blanked: one space per character, or per byte.
+#[derive(Clone, Copy)]
+enum Blanking {
+    Characters,
+    Bytes,
+}
+
+fn strip_c_style_blanking(
+    src: &str,
+    allow_single_quote_strings: bool,
+    blanking: Blanking,
+) -> String {
     let bytes = src.as_bytes();
     let n = bytes.len();
     let mut out = String::with_capacity(n);
@@ -233,7 +680,7 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
             if i < n {
                 i += 2;
             }
-            blank_into(&mut out, src, &mut copied, start, i);
+            blank_into(&mut out, src, &mut copied, start, i, blanking);
             continue;
         }
 
@@ -243,7 +690,7 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
             while i < n && bytes[i] != b'\n' {
                 i += 1;
             }
-            blank_into(&mut out, src, &mut copied, start, i);
+            blank_into(&mut out, src, &mut copied, start, i, blanking);
             continue;
         }
 
@@ -276,14 +723,29 @@ fn strip_c_style(src: &str, allow_single_quote_strings: bool) -> String {
 }
 
 /// Copy `src[*copied..start]` to `out`, then `src[start..end]` with each
-/// character but a newline as a space ([`blank_range`] over a string).
-fn blank_into(out: &mut String, src: &str, copied: &mut usize, start: usize, end: usize) {
+/// character (or byte) but a newline as a space ([`blank_range`] over a
+/// string).
+fn blank_into(
+    out: &mut String,
+    src: &str,
+    copied: &mut usize,
+    start: usize,
+    end: usize,
+    blanking: Blanking,
+) {
     out.push_str(&src[*copied..start]);
-    out.extend(
-        src[start..end]
-            .chars()
-            .map(|c| if c == '\n' { '\n' } else { ' ' }),
-    );
+    match blanking {
+        Blanking::Characters => out.extend(
+            src[start..end]
+                .chars()
+                .map(|c| if c == '\n' { '\n' } else { ' ' }),
+        ),
+        Blanking::Bytes => out.extend(
+            src[start..end]
+                .bytes()
+                .map(|b| if b == b'\n' { '\n' } else { ' ' }),
+        ),
+    }
     *copied = end;
 }
 
@@ -1045,6 +1507,260 @@ mod tests {
         assert!(!out.contains("c"));
     }
 
+    /// W7-09d: blanked byte for byte, a comment holding non-ASCII text keeps
+    /// every byte offset after it, where blanking it character for character
+    /// keeps only the character count.
+    #[test]
+    fn js_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        let input = "// the app’s routes — é\nconst a = '// no'; /* ü */ b;\n";
+        let out = strip_js_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("const"), input.find("const"));
+        assert_eq!(out.find(" b;"), input.find(" b;"));
+        let first_line = input.find('\n').unwrap();
+        assert_eq!(out[..first_line], " ".repeat(first_line));
+        assert!(out.contains("'// no'"));
+        assert!(!out.contains('ü'));
+    }
+
+    /// W7-19b: the Python twin blanks what `strip_python` blanks, one space
+    /// per byte, so on ASCII text the two agree and past non-ASCII text in a
+    /// comment or a docstring every byte offset still holds.
+    #[test]
+    fn python_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "x = 1  # note\ny = 'a # b'\n",
+            "def f():\n    \"\"\"doc\n    more\"\"\"\n    return \"x\"\n",
+            "s = 'it\\'s' # c\nt = '''a\\''' b'''\n",
+            "u = 'open\n# next\n",
+            "\"\"\"never closed\n# x\n",
+            "x = '\\\n# not a comment\n",
+        ] {
+            assert_eq!(
+                strip_python_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Python),
+                "{ascii:?}"
+            );
+        }
+        let input = "# café — ü 😀\npath('/x', v)  # é\n\"\"\"日本\"\"\"\nurl('/y', w)\n";
+        let out = strip_python_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("path"), input.find("path"));
+        assert_eq!(out.find("url"), input.find("url"));
+        assert!(!out.contains('é') && !out.contains('日') && !out.contains('😀'));
+        assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+        // A backslash in a string skips the whole character after it.
+        let escaped = "s = 'a\\é' # c\n";
+        assert_eq!(
+            strip_python_comments_keeping_offsets(escaped).find('#'),
+            None
+        );
+        assert!(strip_python_comments_keeping_offsets(escaped).starts_with("s = 'a\\é'"));
+    }
+
+    /// W7-19d: the PHP twin blanks what `strip_php` blanks, one space per
+    /// byte: on ASCII text the two agree, and past non-ASCII text in a
+    /// comment every byte offset still holds.
+    #[test]
+    fn php_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "<?php\n// Route::prefix('old')->group(function () {\nRoute::get('kept', [X::class, 'y']);\n",
+            "<?php\n/* a\n b */ Route::get('/a', 'C@m'); # tail\n",
+            "<?php\n$s = \"it\\\"s // not\"; $t = 'a # b'; $u = `ls # x`;\n",
+            "<?php\n$open = 'never closed\n// next\n",
+            "<?php\n/* never closed\nRoute::get('x');\n",
+            "<?php\n#[Attribute]\nfunction f() {}\n",
+            "<?php\n$e = 'a\\\n// after\n",
+        ] {
+            assert_eq!(
+                strip_php_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Php),
+                "{ascii:?}"
+            );
+        }
+        let input = "<?php\n// café — ü 😀\nRoute::get('/é', 'C@m'); /* 日本 */ Route::post('/x', 'D@n');\n";
+        let out = strip_php_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("Route::get"), input.find("Route::get"));
+        assert_eq!(out.find("Route::post"), input.find("Route::post"));
+        // A string keeps its text; a comment's goes.
+        assert!(out.contains("'/é'"));
+        assert!(!out.contains('ü') && !out.contains('日') && !out.contains('😀'));
+        assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+        // A backslash in a string skips the whole character after it.
+        let escaped = "<?php $s = 'a\\é' # c\n";
+        let out = strip_php_comments_keeping_offsets(escaped);
+        assert_eq!(out.find('#'), None);
+        assert!(out.starts_with("<?php $s = 'a\\é'"));
+    }
+
+    /// W7-19e: the Ruby twin blanks what `strip_ruby` blanks, one space per
+    /// byte: on ASCII text the two agree, and past non-ASCII text in a
+    /// comment every byte offset still holds.
+    #[test]
+    fn ruby_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "# get '/fake', to: 'fake#index'\nget '/real', to: 'real#index' # tail\n",
+            "=begin\nget '/a', to: 'b#c'\n  =end trailing\nget '/d'\n",
+            "  =begin\nx\n=end\ny = 1\n",
+            "\t=begin\nget '/a', to: 'b#c'\n\t=end\nget '/d', to: 'e#f'\n",
+            " \t =begin\nx\n=end\n",
+            "x = 1 =begin\n=end\n",
+            "s = \"a # b\"; t = 'c # d' # e\n",
+            "s = \"it\\\"s # not\" # yes\n",
+            "open = 'never closed\n# next\n",
+            "=begin\nnever closed\n",
+            "e = 'a\\\n# after\n",
+        ] {
+            assert_eq!(
+                strip_ruby_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Ruby),
+                "{ascii:?}"
+            );
+        }
+        let input =
+            "# café — ü 😀\nget '/é', to: 'a#b' # 日本\n=begin\nünïcode 😀\n=end\nresources :x\n";
+        let out = strip_ruby_comments_keeping_offsets(input);
+        assert_eq!(out.len(), input.len());
+        assert_eq!(out.find("get"), input.find("get"));
+        assert_eq!(out.find("resources"), input.find("resources"));
+        // A string keeps its text; a comment's goes.
+        assert!(out.contains("'/é'") && out.contains("'a#b'"));
+        assert!(!out.contains('ü') && !out.contains('日') && !out.contains('😀'));
+        assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+        // A backslash in a string skips the whole character after it.
+        let escaped = "s = 'a\\é' # c\n";
+        let out = strip_ruby_comments_keeping_offsets(escaped);
+        assert_eq!(out.find('#'), None);
+        assert!(out.starts_with("s = 'a\\é'"));
+    }
+
+    /// `stripped`, a character-for-character stripping of `input`, with each
+    /// character it blanked a space per byte of it.
+    fn blanked_by_bytes(input: &str, stripped: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        for (original, kept) in input.chars().zip(stripped.chars()) {
+            if kept == original {
+                out.push(original);
+            } else {
+                assert_eq!(kept, ' ', "{input:?}");
+                out.extend(std::iter::repeat_n(' ', original.len_utf8()));
+            }
+        }
+        out
+    }
+
+    /// W7-19h: the Rust twin blanks what `strip_rust` blanks, one space per
+    /// byte: on ASCII text the two agree, and on any text each character
+    /// `strip_rust` blanks is a space per byte of it.
+    #[test]
+    fn rust_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "// .route(\"/fake\", get(fake_handler))\nlet app = Router::new().route(\"/real\", get(list_users));\n",
+            "/* outer /* inner .route(\"/x\", get(x)) */ still */ let b = 2;",
+            "let s = \"a//b /* c */\"; // trailing\nlet x = 1;",
+            "let s = \"multi\nline // kept\"; // gone\n",
+            "let c = 'x'; let s = \"esc\\\"y\"; // note",
+            "fn f<'a>(x: &'a str) // not a comment\n// a comment\n",
+            "let c = 'a\nlet x = 1; // c\n",
+            "code /* open /* nested\nlet s = \"open",
+            "let e = '\\''; // c\n",
+            "let s = \"a\\\n// kept\"; // gone\n",
+            "x /* a */ y /**/ z /*/ w */ v\n",
+            "",
+        ] {
+            assert_eq!(
+                strip_rust_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Rust),
+                "{ascii:?}"
+            );
+        }
+        for input in [
+            "// caf\u{e9} \u{2014} \u{fc} \u{1F600}\nlet s = \"/\u{e9} // \u{e9}\"; /* \u{65e5}\u{672c} /* \u{1F600} */ \u{fc} */ let t = '\u{e9}';\n",
+            "fn f<'\u{e9}>(x: &'\u{e9} str) // \u{e9}\n// \u{1F600}\n",
+            "let s = \"a\\\u{e9}\" // c\n",
+            "/* never closed \u{1F600}\n",
+        ] {
+            let out = strip_rust_comments_keeping_offsets(input);
+            assert_eq!(out.len(), input.len(), "{input:?}");
+            assert_eq!(
+                out,
+                blanked_by_bytes(input, &strip_comments_for_regex(input, CommentLang::Rust)),
+                "{input:?}"
+            );
+        }
+        // A string keeps its text; a comment's goes.
+        let input = "let s = \"/\u{e9}\"; // \u{e9}\n";
+        let out = strip_rust_comments_keeping_offsets(input);
+        assert_eq!(out.matches('\u{e9}').count(), 1);
+        assert_eq!(out.find("let"), input.find("let"));
+    }
+
+    /// W7-19i: the Go twin blanks what `strip_go` blanks, one space per
+    /// byte: on ASCII text the two agree, and on any text each character is
+    /// kept or blanked by both, a string's, a raw string's and a rune's
+    /// characters kept, a comment's blanked, an unclosed one's to the end.
+    #[test]
+    fn go_comments_blanked_byte_for_byte_keep_byte_offsets() {
+        for ascii in [
+            "r.GET(\"/a\", h) // tail\n/* r.POST(\"/b\", h) */\nr.PUT(\"/c\", h)\n",
+            "s := \"it\\\"s // not\"; t := 'x'; u := `raw // kept\n/* also kept */`\n",
+            "open := \"never closed\n// next\n",
+            "/* never closed\nr.GET(\"/x\", h)\n",
+            "e := \"a\\\n// after\n",
+            "r := '\\'' // c\n",
+            // A rune holding a quote or a backtick opens no string.
+            "q := '\"' // c\n",
+            "b := '`' // c\n",
+            "x := `never closed\n// in the raw string\n",
+        ] {
+            assert_eq!(
+                strip_go_comments_keeping_offsets(ascii),
+                strip_comments_for_regex(ascii, CommentLang::Go),
+                "{ascii:?}"
+            );
+        }
+        // Each character of `source` as the byte-blanked text holds it: kept,
+        // or a space when its bytes were blanked.
+        let per_character = |source: &str, blanked: &str| -> String {
+            source
+                .char_indices()
+                .map(|(at, ch)| {
+                    let width = ch.len_utf8();
+                    let kept = &blanked.as_bytes()[at..at + width];
+                    if kept == &source.as_bytes()[at..at + width] {
+                        ch
+                    } else {
+                        assert!(kept.iter().all(|&byte| byte == b' '), "{source:?} at {at}");
+                        ' '
+                    }
+                })
+                .collect()
+        };
+        for input in [
+            "// café — ü 😀\nr.GET(\"/é\", h) /* 日本 */ r.POST(\"/x\", g)\n",
+            "s := \"é // not\" // ü\nt := `😀 /* raw */`\n",
+            "c := 'é' /* 😀\n */ x\n",
+            "/* 日本 never closed\nr.GET(\"/x\", h)\n",
+            "e := \"a\\é\" // c\n",
+        ] {
+            let out = strip_go_comments_keeping_offsets(input);
+            assert_eq!(out.len(), input.len(), "{input:?}");
+            assert_eq!(out.matches('\n').count(), input.matches('\n').count());
+            assert_eq!(
+                per_character(input, &out),
+                strip_comments_for_regex(input, CommentLang::Go),
+                "{input:?}"
+            );
+        }
+        let out = strip_go_comments_keeping_offsets(
+            "// café — ü 😀\nr.GET(\"/é\", h) /* 日本 */ r.POST(\"/x\", g)\n",
+        );
+        assert!(out.starts_with(&" ".repeat("// café — ü 😀".len())));
+        assert!(out.contains("r.GET(\"/é\", h)") && out.contains("r.POST(\"/x\", g)"));
+        assert!(!out.contains('日'));
+    }
+
     #[test]
     fn java_single_quote_not_a_string() {
         // For Java, single quotes are NOT string delimiters (char literal path
@@ -1201,6 +1917,19 @@ mod tests {
         ] {
             assert_eq!(strip_comments_for_regex("", lang), "");
         }
+    }
+
+    /// W7-24d: Erlang's `%` comments become spaces; a string, a quoted atom
+    /// and a `$%` character literal stay, and every offset holds (upstream
+    /// `stripErlang`).
+    #[test]
+    fn w724d_strip_erlang_keeps_strings_atoms_and_char_literals() {
+        let src = "f() -> \"%s\", '%a', $%, ok. % trailing note\n-callback g() -> ok. %% doc\n";
+        let out = strip_comments_for_regex(src, CommentLang::Erlang);
+        let expected = src
+            .replace("% trailing note", &" ".repeat(15))
+            .replace("%% doc", &" ".repeat(6));
+        assert_eq!(out, expected);
     }
 
     #[test]

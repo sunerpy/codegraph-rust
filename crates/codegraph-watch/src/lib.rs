@@ -1,3 +1,4 @@
+pub mod binding_facts;
 pub mod case_folded;
 pub mod cfml_heads;
 pub mod class_heads;
@@ -8,28 +9,38 @@ pub mod csharp_surfaces;
 mod dart_chains;
 pub mod dart_heads;
 pub mod dart_libraries;
+pub mod drupal_refs;
 mod git;
 pub mod git_pending;
 pub mod go_heads;
 pub mod java_heads;
 pub mod kotlin_surfaces;
+pub mod laravel_routes;
 mod link_state;
 pub mod lua_modules;
 pub mod member_surfaces;
 mod migrate;
 pub mod module_surfaces;
+mod navigation;
 pub mod objc_heads;
 pub mod php_heads;
+pub mod play_routes;
 mod policy;
 pub mod r_bindings;
+pub mod rails_routes;
 pub mod resolved_refs;
+pub mod rn_bridges;
+mod route_modules;
 pub mod ruby_heads;
+pub mod rust_crate_roots;
 pub mod rust_receivers;
 pub mod scala_surfaces;
 pub mod shopify_themes;
 pub mod solidity_heads;
 pub mod swift_heads;
 mod sync;
+pub mod terraform_wiring;
+pub mod vapor_routes;
 mod watcher;
 mod worktree;
 
@@ -45,9 +56,10 @@ pub use policy::{
     CODEGRAPH_NO_WATCH, TooBroadRoot, WatchPolicy, too_broad_root_reason, watch_disabled_reason,
 };
 pub use sync::{
-    OutdatedUpgrade, PendingChanges, SyncCancellation, SyncOutcome, pending_full_inventory,
-    pending_project_changes, pending_project_changes_detailed, sync_changed_paths,
-    sync_project_once, sync_project_once_cancellable, sync_project_once_with_progress,
+    OutdatedUpgrade, PendingChanges, SyncCancellation, SyncOutcome, SyncTimings,
+    pending_full_inventory, pending_project_changes, pending_project_changes_detailed,
+    sync_changed_paths, sync_project_once, sync_project_once_cancellable,
+    sync_project_once_with_progress, sync_project_once_with_progress_timed,
     upgrade_outdated_index_once,
 };
 pub use watcher::{

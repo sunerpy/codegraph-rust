@@ -1,7 +1,7 @@
 //! Terraform / OpenTofu (`.tf` / `.tfvars` / `.tofu`) `LanguageSpec`.
 //!
-//! Extraction-tier port of `upstream extraction/languages/terraform.ts` (commit
-//! `6c24f4b`, #1173 — the extraction slice only). HCL is intentionally generic:
+//! Port of `upstream extraction/languages/terraform.ts` (#1173, #1174,
+//! behaviour as of `b635dd46`). HCL is intentionally generic:
 //! ALL Terraform top-level constructs share the AST node kind `block`,
 //! distinguished only by the first `identifier` child (the block "type":
 //! `resource` / `data` / `module` / `variable` / `output` / `provider` /
@@ -12,13 +12,14 @@
 //! `Language::Terraform`-guarded `visit_terraform_node` walker extension in
 //! [`crate::walker`].
 //!
-//! The module-boundary framework RESOLVER (`resolution/frameworks/terraform.ts`),
-//! its registration, the directory-scoping resolution gate, and the
-//! extraction-side emitters that feed ONLY that resolver (`emitModuleWiring`'s
-//! `module.M:file` / `module.M:var.X` / `module.M:output.X` `:`-scoped refs, the
-//! `.tfvars` top-level-assignment `var.X` ref, and the `module.M:output.<out>`
-//! scoped half of `qualifyReference`) are DEFERRED — the port has exactly one
-//! concrete `FrameworkResolver` (`GodotResolver`).
+//! Besides the declarations and their references, the walker emits what only
+//! the Terraform framework resolver (`codegraph_resolve::frameworks::terraform`)
+//! reads: a module block's `:`-scoped wiring (`module.M:file`,
+//! `module.M:var.X`), a module chain's `module.M:output.O` and
+//! `module.M:remote-output.X`, a `.tfvars` assignment's `var.X`, a provider
+//! selection's `provider.P[.alias]`, and the state-migration and check-assert
+//! blocks' references from the file. A reference is where its variable is
+//! written (`variable_expr`), as upstream records it.
 //!
 //! The pure AST helper fns below are `pub(crate)` and re-exported through
 //! [`crate::lang`] so the walker can reach them as `crate::lang::<fn>`.
@@ -233,9 +234,7 @@ pub(crate) fn describe_terraform_block(
 }
 
 /// Turn a reference head + attribute chain into qualified name(s). Ports
-/// `qualifyReference` (terraform.ts:158-189) MINUS the DEFERRED
-/// `module.M:output.<out>` scoped half — a `module.M.out` chain emits ONLY the
-/// plain `module.M`.
+/// `qualifyReference` (terraform.ts:158-189).
 fn qualify_terraform_reference(head: &str, attrs: &[String]) -> Vec<String> {
     match head {
         "var" => attrs
@@ -246,13 +245,25 @@ fn qualify_terraform_reference(head: &str, attrs: &[String]) -> Vec<String> {
             .first()
             .map(|a| vec![format!("local.{a}")])
             .unwrap_or_default(),
+        // module.M[.OUTPUT]: the module, and for a two-segment chain the
+        // output inside it, `module.M:output.O`, a scoped spelling only the
+        // Terraform resolver reads; `module.M.outputs.X`, the cloudposse
+        // remote-state shape, also names the other component's output X
+        // (upstream #1174).
         "module" => {
-            // Plain `module.M` only; the `module.M:output.<out>` scoped half is
-            // DEFERRED (it feeds the deferred TerraformResolver).
-            attrs
-                .first()
-                .map(|a| vec![format!("module.{a}")])
-                .unwrap_or_default()
+            let Some(module) = attrs.first() else {
+                return Vec::new();
+            };
+            let mut refs = vec![format!("module.{module}")];
+            if let Some(output) = attrs.get(1) {
+                refs.push(format!("module.{module}:output.{output}"));
+                if output == "outputs"
+                    && let Some(remote) = attrs.get(2)
+                {
+                    refs.push(format!("module.{module}:remote-output.{remote}"));
+                }
+            }
+            refs
         }
         "data" => match (attrs.first(), attrs.get(1)) {
             (Some(t), Some(n)) => vec![format!("data.{t}.{n}")],
@@ -287,8 +298,27 @@ fn emit_ref_from_variable_expr(
         return;
     }
 
+    // tree-sitter-hcl 1.1.0 hangs the traversal of an operation's last
+    // operand on the whole operation: `var.left + var.right` reads
+    // `operation(binary_operation(var.left + var)) .right`, and `!var.flag`
+    // `operation(unary_operation(!var)) .flag`. A variable that ends the
+    // operations around it takes the chain after the outermost of them, as
+    // upstream's grammar gives it (OD-B49). A parenthesised operation is an
+    // expression of its own, so a chain after the parentheses stays theirs.
+    let mut anchor = var_expr;
+    while anchor.next_named_sibling().is_none() {
+        let Some(parent) = anchor.parent().filter(|parent| {
+            matches!(
+                parent.kind(),
+                "operation" | "binary_operation" | "unary_operation"
+            )
+        }) else {
+            break;
+        };
+        anchor = parent;
+    }
     let mut attrs: Vec<String> = Vec::new();
-    let mut cursor = var_expr.next_named_sibling();
+    let mut cursor = anchor.next_named_sibling();
     while let Some(node) = cursor {
         match node.kind() {
             "get_attr" => {
@@ -336,6 +366,86 @@ pub(crate) fn collect_terraform_references(
         }
     }
     out
+}
+
+/// The name of a body `attribute` (`alias` of `alias = "east"`).
+pub(crate) fn terraform_attribute_name(attr: Node<'_>, source: &str) -> Option<String> {
+    attr.named_children(&mut attr.walk())
+        .find(|c| c.kind() == "identifier")
+        .map(|id| node_text(id, source))
+}
+
+/// An `attribute`'s value expression.
+pub(crate) fn terraform_attribute_expression(attr: Node<'_>) -> Option<Node<'_>> {
+    attr.named_children(&mut attr.walk())
+        .find(|c| c.kind() == "expression")
+}
+
+/// The first `string_lit` anywhere under `expr`, breadth first (upstream
+/// `findStringLit`).
+pub(crate) fn find_terraform_string_lit(expr: Node<'_>) -> Option<Node<'_>> {
+    let mut queue: std::collections::VecDeque<Node<'_>> = std::collections::VecDeque::new();
+    queue.push_back(expr);
+    while let Some(node) = queue.pop_front() {
+        if node.kind() == "string_lit" {
+            return Some(node);
+        }
+        for child in node.named_children(&mut node.walk()) {
+            queue.push_back(child);
+        }
+    }
+    None
+}
+
+/// The value of `body`'s first attribute named `name` when it holds a
+/// string literal (upstream `readStringAttr`): `alias = "east"`.
+pub(crate) fn terraform_string_attr(body: Node<'_>, name: &str, source: &str) -> Option<String> {
+    for attr in body.named_children(&mut body.walk()) {
+        if attr.kind() != "attribute"
+            || terraform_attribute_name(attr, source).as_deref() != Some(name)
+        {
+            continue;
+        }
+        let literal = terraform_attribute_expression(attr).and_then(find_terraform_string_lit)?;
+        return Some(terraform_string_lit_value(literal, source));
+    }
+    None
+}
+
+/// The provider configuration an expression selects (upstream
+/// `providerSelectionFromExpr`): `aws`, `aws.east`, `google-beta`; `None` for
+/// anything more (a longer chain, a call, a conditional, a `for`).
+pub(crate) fn terraform_provider_selection(expr: Node<'_>, source: &str) -> Option<String> {
+    let mut queue: std::collections::VecDeque<Node<'_>> = std::collections::VecDeque::new();
+    queue.push_back(expr);
+    while let Some(node) = queue.pop_front() {
+        if node.kind() == "variable_expr" {
+            let id = node
+                .named_children(&mut node.walk())
+                .find(|c| c.kind() == "identifier")?;
+            let head = node_text(id, source);
+            return match node.next_named_sibling() {
+                Some(next) if next.kind() == "get_attr" => {
+                    let attr = next
+                        .named_children(&mut next.walk())
+                        .find(|c| c.kind() == "identifier")?;
+                    if next.next_named_sibling().is_some() {
+                        return None;
+                    }
+                    Some(format!("{head}.{}", node_text(attr, source)))
+                }
+                Some(_) => None,
+                None => Some(head),
+            };
+        }
+        if matches!(node.kind(), "function_call" | "conditional" | "for_expr") {
+            return None;
+        }
+        for child in node.named_children(&mut node.walk()) {
+            queue.push_back(child);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -418,13 +528,25 @@ mod tests {
         assert!(describe_terraform_block("resource", &["only_one".into()]).is_none());
     }
 
+    /// W7-24c: a two-segment module chain also names the output inside the
+    /// module, and `module.M.outputs.X` a remote-state output (upstream
+    /// #1174's `qualifyReference`).
     #[test]
-    fn qualify_terraform_reference_module_output_is_plain() {
-        // A two-segment module.M.out chain emits ONLY plain module.M (the
-        // module.M:output.out scoped half is DEFERRED).
+    fn qualify_terraform_reference_module_output_has_its_scoped_half() {
         assert_eq!(
             qualify_terraform_reference("module", &["vpc".into(), "id".into()]),
-            vec!["module.vpc".to_string()]
+            vec!["module.vpc".to_string(), "module.vpc:output.id".to_string()]
+        );
+        assert_eq!(
+            qualify_terraform_reference(
+                "module",
+                &["vpc".into(), "outputs".into(), "vpc_id".into()]
+            ),
+            vec![
+                "module.vpc".to_string(),
+                "module.vpc:output.outputs".to_string(),
+                "module.vpc:remote-output.vpc_id".to_string()
+            ]
         );
     }
 

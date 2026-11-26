@@ -337,7 +337,6 @@ pub fn assert_parity(fixture: &str, old: &Value, new: &Value, ctx: &str) {
                     let mut v: Vec<String> = t
                         .lines()
                         .filter(|l| !l.trim().is_empty())
-                        .filter(|l| !l.starts_with("Found "))
                         .map(|l| normalize_header_line(l.to_string()))
                         .collect();
                     v.sort();

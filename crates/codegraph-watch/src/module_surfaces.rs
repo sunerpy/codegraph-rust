@@ -156,9 +156,20 @@ pub(crate) struct SurfaceRefresh {
     rows: BTreeMap<String, Option<SurfaceRow>>,
     /// Whether every row was rebuilt, so the prefix is cleared first.
     rebuilt: bool,
+    /// The barrels the closure walked, kept for
+    /// [`Self::forwarding_closure`]; `None` when no walk ran.
+    barrels: Option<Vec<Barrel>>,
 }
 
 impl SurfaceRefresh {
+    /// Whether the lane read past the changed files' own surfaces: a
+    /// surface moved, a file came or went, the JavaScript controls changed,
+    /// or every row was rebuilt. Only then can what a file's unchanged
+    /// imports resolve to have moved through the modules they name.
+    pub(crate) fn walked(&self) -> bool {
+        self.rebuilt || self.barrels.is_some()
+    }
+
     /// Write the rows. Called after the sync's resolution is persisted.
     pub(crate) fn write_rows(&self, store: &Store) -> Result<()> {
         if self.rebuilt {
@@ -178,9 +189,42 @@ impl SurfaceRefresh {
         }
         Ok(())
     }
+
+    /// The files that forward one of `seeds` on, up the barrels as the
+    /// surface lane walks them (W7-23a): what a route's lazily loaded module
+    /// can be when a page below it changed. The barrels the lane collected
+    /// serve when it walked any; otherwise they are read the same way, from
+    /// the changed files' surfaces and the rows of the others. `seeds` are
+    /// in the result.
+    pub(crate) fn forwarding_closure(
+        &self,
+        store: &Store,
+        project_root: &Path,
+        max_file_size: u64,
+        changes: &BTreeMap<String, SurfaceChange>,
+        seeds: &BTreeSet<String>,
+        file_set_changed: bool,
+    ) -> Result<BTreeSet<String>> {
+        let mut closure = seeds.clone();
+        match &self.barrels {
+            Some(barrels) => close_over(&mut closure, barrels),
+            None => {
+                let barrels = collect_barrels(
+                    store,
+                    project_root,
+                    max_file_size,
+                    changes,
+                    file_set_changed,
+                )?;
+                close_over(&mut closure, &barrels);
+            }
+        }
+        Ok(closure)
+    }
 }
 
 /// A file that forwards other modules, for the closure.
+#[derive(Debug)]
 struct Barrel {
     path: String,
     /// What its sources resolved to when its row was written.
@@ -319,25 +363,7 @@ pub(crate) fn note_surface_changes(
             now,
         });
     }
-    // Up the barrels that forward a member, by what they recorded or resolve
-    // to now: a deleted or renamed member is only found the first way.
-    loop {
-        let before = closure.len();
-        for barrel in &barrels {
-            if !closure.contains(&barrel.path)
-                && barrel
-                    .recorded
-                    .iter()
-                    .chain(&barrel.now)
-                    .any(|target| closure.contains(target))
-            {
-                closure.insert(barrel.path.clone());
-            }
-        }
-        if closure.len() == before {
-            break;
-        }
-    }
+    close_over(&mut closure, &barrels);
     // Every direct dependent of the closure re-resolves whole.
     for member in &closure {
         let importers = match changes.get(member) {
@@ -354,5 +380,100 @@ pub(crate) fn note_surface_changes(
                 .filter(|importer| !reindexed.contains(importer)),
         );
     }
+    refresh.barrels = Some(barrels);
     Ok(refresh)
+}
+
+/// Add to `closure` every barrel that forwards a member of it, until none
+/// does: up the barrels by what they recorded or resolve to now, since a
+/// deleted or renamed member is only found the first way.
+fn close_over(closure: &mut BTreeSet<String>, barrels: &[Barrel]) {
+    loop {
+        let before = closure.len();
+        for barrel in barrels {
+            if !closure.contains(&barrel.path)
+                && barrel
+                    .recorded
+                    .iter()
+                    .chain(&barrel.now)
+                    .any(|target| closure.contains(target))
+            {
+                closure.insert(barrel.path.clone());
+            }
+        }
+        if closure.len() == before {
+            break;
+        }
+    }
+}
+
+/// The barrels [`note_surface_changes`] walks, read without writing a row:
+/// each changed file by its old row's targets and what its new surface
+/// resolves to, and each other row by what it recorded and, when the file
+/// set moved, what its sources resolve to now. A row this build cannot read
+/// is read from the file's surface on disk.
+fn collect_barrels(
+    store: &Store,
+    project_root: &Path,
+    max_file_size: u64,
+    changes: &BTreeMap<String, SurfaceChange>,
+    file_set_changed: bool,
+) -> Result<Vec<Barrel>> {
+    let context = StoreResolutionContext::new(store, project_root.to_string_lossy())
+        .with_max_file_size(max_file_size);
+    let mut barrels = Vec::new();
+    for (path, change) in changes {
+        let now = change
+            .new
+            .as_ref()
+            .map(|surface| SurfaceRow::resolved(path, surface, &context).targets)
+            .unwrap_or_default();
+        if !change.old.targets().is_empty() || !now.is_empty() {
+            barrels.push(Barrel {
+                path: path.clone(),
+                recorded: change.old.targets().to_vec(),
+                now,
+            });
+        }
+    }
+    for (key, value) in store.project_metadata_with_prefix(ROW_KEY_PREFIX)? {
+        let path = key[ROW_KEY_PREFIX.len()..].to_string();
+        if changes.contains_key(&path) {
+            continue;
+        }
+        let Some(row) = SurfaceRow::decode(&value) else {
+            let now = store
+                .file_by_path(&path)?
+                .and_then(|file| {
+                    let full = project_root.join(&path);
+                    codegraph_core::source_file::read_source_file(&full, &path, max_file_size)
+                        .ok()
+                        .and_then(|(_, source)| surface_of(&path, file.language, &source))
+                })
+                .map(|surface| SurfaceRow::resolved(&path, &surface, &context).targets)
+                .unwrap_or_default();
+            if !now.is_empty() {
+                barrels.push(Barrel {
+                    path,
+                    recorded: Vec::new(),
+                    now,
+                });
+            }
+            continue;
+        };
+        if row.sources.is_empty() {
+            continue;
+        }
+        let now = if file_set_changed {
+            module_surface::resolve_targets(&path, &row.sources, &context)
+        } else {
+            row.targets.clone()
+        };
+        barrels.push(Barrel {
+            path,
+            recorded: row.targets,
+            now,
+        });
+    }
+    Ok(barrels)
 }

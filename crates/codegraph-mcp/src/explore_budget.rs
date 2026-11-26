@@ -37,9 +37,6 @@ pub struct ExploreOutputBudget {
     pub include_completeness_signal: bool,
     /// Include the explore-budget reminder at the end.
     pub include_budget_note: bool,
-    /// Hard-drop test/spec/icon/i18n files from the relevant-file set unless
-    /// the query itself mentions tests (`tools.ts:149-157`).
-    pub exclude_low_value_files: bool,
 }
 
 /// Tiered budget, scaled to project size (`tools.ts:160-258`). Tier
@@ -61,7 +58,6 @@ pub fn get_explore_output_budget(file_count: i64) -> ExploreOutputBudget {
             include_additional_files: false,
             include_completeness_signal: false,
             include_budget_note: false,
-            exclude_low_value_files: true,
         };
     }
     if file_count < 500 {
@@ -77,7 +73,6 @@ pub fn get_explore_output_budget(file_count: i64) -> ExploreOutputBudget {
             include_additional_files: false,
             include_completeness_signal: false,
             include_budget_note: false,
-            exclude_low_value_files: true,
         };
     }
     if file_count < 5000 {
@@ -94,7 +89,6 @@ pub fn get_explore_output_budget(file_count: i64) -> ExploreOutputBudget {
             include_additional_files: true,
             include_completeness_signal: true,
             include_budget_note: true,
-            exclude_low_value_files: false,
         };
     }
     // Large + very-large repos share the same ~24K inline ceiling with per-file
@@ -110,7 +104,6 @@ pub fn get_explore_output_budget(file_count: i64) -> ExploreOutputBudget {
         include_additional_files: true,
         include_completeness_signal: true,
         include_budget_note: true,
-        exclude_low_value_files: false,
     }
 }
 
@@ -136,7 +129,7 @@ mod tests {
 
     #[test]
     fn tier_breakpoints_match_upstream() {
-        // <150: tight 13K cap, all meta gated off, low-value excluded.
+        // <150: tight 13K cap, all meta gated off.
         let tiny = get_explore_output_budget(3);
         assert_eq!(tiny.max_output_chars, 13000);
         assert_eq!(tiny.default_max_files, 4);
@@ -148,16 +141,14 @@ mod tests {
         assert!(!tiny.include_additional_files);
         assert!(!tiny.include_completeness_signal);
         assert!(!tiny.include_budget_note);
-        assert!(tiny.exclude_low_value_files);
 
-        // <500: 18K, still meta-gated, still low-value excluded.
+        // <500: 18K, still meta-gated.
         let small = get_explore_output_budget(200);
         assert_eq!(small.max_output_chars, 18000);
         assert_eq!(small.default_max_files, 5);
         assert!(!small.include_relationships);
-        assert!(small.exclude_low_value_files);
 
-        // <5000: meta turns on, low-value exclude turns off.
+        // <5000: meta turns on.
         let mid = get_explore_output_budget(1000);
         assert_eq!(mid.max_output_chars, 24000);
         assert_eq!(mid.max_chars_per_file, 6500);
@@ -165,7 +156,6 @@ mod tests {
         assert!(mid.include_additional_files);
         assert!(mid.include_completeness_signal);
         assert!(mid.include_budget_note);
-        assert!(!mid.exclude_low_value_files);
 
         // <15000 and >=15000 share the 7000 per-file cap.
         assert_eq!(get_explore_output_budget(10_000).max_chars_per_file, 7000);

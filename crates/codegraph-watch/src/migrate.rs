@@ -102,9 +102,12 @@ pub(crate) fn migrate_project(
     let mut go_rows = Vec::new();
     let mut php_rows = Vec::new();
     let mut class_head_rows = Vec::new();
+    let mut bridge_rows = Vec::new();
+    let mut terraform_rows = Vec::new();
     let mut lua_rows = Vec::new();
     let mut dart_rows = Vec::new();
     let mut dart_library_rows = Vec::new();
+    let mut binding_facts_rows = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
     let mut refs: Vec<UnresolvedRef> = Vec::new();
     let mut outcome = SyncOutcome {
@@ -195,6 +198,12 @@ pub(crate) fn migrate_project(
         if let Some(row) = crate::class_heads::row_of(file.language, &source, &result.nodes) {
             class_head_rows.push((relative.clone(), row));
         }
+        if let Some(row) = crate::rn_bridges::row_of(relative, &source, &result.nodes) {
+            bridge_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::terraform_wiring::row_of(file.language, &source, &result.nodes) {
+            terraform_rows.push((relative.clone(), row));
+        }
         if let Some(row) = crate::lua_modules::row_of(file.language, &source, &result.nodes) {
             lua_rows.push((relative.clone(), row));
         }
@@ -203,6 +212,15 @@ pub(crate) fn migrate_project(
         }
         if let Some(row) = crate::dart_libraries::row_of(file.language, &source) {
             dart_library_rows.push((relative.clone(), row));
+        }
+        if let Some(row) = crate::binding_facts::row_of(
+            relative,
+            file.language,
+            &source,
+            &result.nodes,
+            &result.edges,
+        ) {
+            binding_facts_rows.push((relative.clone(), row));
         }
         pending_nodes.append(&mut result.nodes);
         if pending_nodes.len() >= NODE_FLUSH_ROWS {
@@ -258,12 +276,18 @@ pub(crate) fn migrate_project(
     drop(php_rows);
     crate::class_heads::write_index_rows(rebuild.store(), &mut class_head_rows)?;
     drop(class_head_rows);
+    crate::rn_bridges::write_index_rows(rebuild.store(), &mut bridge_rows)?;
+    drop(bridge_rows);
+    crate::terraform_wiring::write_index_rows(rebuild.store(), &mut terraform_rows)?;
+    drop(terraform_rows);
     crate::lua_modules::write_index_rows(rebuild.store(), &mut lua_rows)?;
     drop(lua_rows);
     crate::dart_heads::write_index_rows(rebuild.store(), &mut dart_rows)?;
     drop(dart_rows);
     crate::dart_libraries::write_index_rows(rebuild.store(), &mut dart_library_rows)?;
     drop(dart_library_rows);
+    crate::binding_facts::write_index_rows(rebuild.store(), &mut binding_facts_rows)?;
+    drop(binding_facts_rows);
     crate::dart_libraries::write_pubspec_rows(rebuild.store(), project_root)?;
     crate::cpp_dependents::write_marker(rebuild.store())?;
     crate::java_heads::write_marker(rebuild.store())?;
@@ -283,7 +307,16 @@ pub(crate) fn migrate_project(
     crate::class_heads::write_marker(rebuild.store())?;
     crate::case_folded::write_marker(rebuild.store())?;
     crate::lua_modules::write_marker(rebuild.store())?;
+    crate::lua_modules::write_loaders(rebuild.store(), &options.lua_loaders)?;
     crate::r_bindings::write_marker(rebuild.store())?;
+    crate::play_routes::write_marker(rebuild.store())?;
+    crate::laravel_routes::write_marker(rebuild.store())?;
+    crate::drupal_refs::write_marker(rebuild.store())?;
+    crate::rails_routes::write_marker(rebuild.store())?;
+    crate::vapor_routes::write_marker(rebuild.store())?;
+    crate::rn_bridges::write_marker(rebuild.store())?;
+    crate::terraform_wiring::write_marker(rebuild.store())?;
+    crate::rust_crate_roots::write_marker(rebuild.store())?;
     crate::dart_heads::write_marker(rebuild.store())?;
     crate::dart_libraries::write_marker(rebuild.store())?;
 
@@ -303,7 +336,8 @@ pub(crate) fn migrate_project(
     drop(refs);
 
     let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
-        .with_max_file_size(options.max_file_size);
+        .with_max_file_size(options.max_file_size)
+        .with_lua_loaders(std::sync::Arc::clone(&options.lua_loaders));
     {
         let context = resolver.store_context(rebuild.store());
         resolver.initialize(&context);
@@ -313,7 +347,7 @@ pub(crate) fn migrate_project(
     crate::control_inputs::write_index_rows(
         rebuild.store(),
         project_root,
-        &resolver.framework_names(),
+        &resolver.framework_signature(),
     )?;
     if resolver.has_framework_resolvers() {
         let relative_files = rebuild
@@ -329,8 +363,15 @@ pub(crate) fn migrate_project(
             &options.extensions,
         )?;
     }
-    resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
+    // Cross-file framework finalization before resolution, as a full index
+    // runs it.
     resolver.run_post_extract(rebuild.store_mut())?;
+    resolver.run_cross_file_nodes(rebuild.store_mut())?;
+    resolver.resolve_and_persist_batched(rebuild.store_mut(), RESOLVE_BATCH_ROWS)?;
+    // The dispatch edges no reference names, as a full index adds them
+    // (W7-14).
+    codegraph_resolve::synthesis::run_stage(rebuild.store_mut(), project_root, options)?;
+    codegraph_resolve::synthesis::write_marker(rebuild.store())?;
     // Every reference is now in `unresolved_refs` or `resolved_refs` (W5-09e).
     crate::resolved_refs::write_marker(rebuild.store(), options, &scope.framework)?;
     rebuild

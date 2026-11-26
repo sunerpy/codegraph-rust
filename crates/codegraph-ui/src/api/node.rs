@@ -6,8 +6,9 @@
 //! tell the truth: every list carries its true total, and the ordering puts the
 //! useful end first (same file, then production code, then tests).
 //!
-//! Branch conditions on call sites (`when`, family F11) are phase 2: the field
-//! is never set here yet.
+//! Every rail edge carries the conditions its call site runs under (`when`,
+//! family F11), read from the caller's current source by [`super::when`]: the
+//! right rail's sites are in the focal file, the left rail's in each caller's.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,6 +22,7 @@ use serde_json::{Value, json};
 
 use super::Ctx;
 use super::source::{find_indexed_file, has_drifted_on_disk, max_file_size};
+use super::when::{WhenBatch, annotate_when};
 use super::wire::*;
 use crate::respond::{ApiError, ApiResult};
 
@@ -199,6 +201,23 @@ pub fn build(ctx: &Ctx<'_>, node_id: &str) -> ApiResult<Value> {
         .take(MAX_OUTGOING_GROUPS)
         .cloned()
         .collect();
+
+    // Branch conditions per call site (upstream `node.ts:150-155`): the right
+    // rail's sites are all in this file; the left rail's are in each caller's
+    // own file. The focal file goes first, so a budget that runs out never
+    // leaves the focal symbol's own calls unlabelled.
+    let mut batches = vec![WhenBatch {
+        file: focal_file.clone(),
+        edges: shown_outgoing
+            .iter_mut()
+            .flat_map(|relation| relation.edges.iter_mut())
+            .collect(),
+    }];
+    batches.extend(shown_incoming.iter_mut().map(|relation| WhenBatch {
+        file: relation.node.file.clone(),
+        edges: relation.edges.iter_mut().collect(),
+    }));
+    annotate_when(ctx, batches);
 
     let fan_ids: Vec<String> = shown_incoming
         .iter()

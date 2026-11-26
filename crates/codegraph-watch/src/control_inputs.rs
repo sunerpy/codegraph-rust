@@ -1,23 +1,42 @@
 //! What resolution reads of a project's control files, which are no source
 //! files (W5-06): the JS/TS path aliases, workspace and package manifests,
-//! the C# project files and the Cargo manifests, and which frameworks the
-//! project uses.
+//! the C# project files, the Cargo manifests and the Go module files
+//! (W7-15d1), the root files the Python frameworks are detected by
+//! (W7-19b), Spring and Play are (W7-19c), Laravel and Drupal are (W7-19d),
+//! Rails is (W7-19e), ASP.NET is (W7-19f) and Vapor is (W7-19g), the
+//! workspace packages React Native's view components are detected by
+//! (W7-21), and which frameworks the project uses.
 //!
 //! Each reader reports what it read or probed in the same traversal that
 //! reads it ([`codegraph_resolve::path_aliases::alias_config_inputs`],
+//! [`codegraph_resolve::path_aliases::nearest_alias_inputs`],
 //! [`codegraph_resolve::workspace_packages::workspace_inputs`],
 //! [`codegraph_resolve::package_manifests::manifest_inputs`],
 //! [`codegraph_resolve::csharp_types::csharp_project_inputs`],
-//! [`codegraph_resolve::rust_scope::rust_manifest_inputs`]); every full index,
+//! [`codegraph_resolve::rust_scope::rust_manifest_inputs`],
+//! [`codegraph_resolve::context::go_module_inputs`],
+//! [`codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::spring::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::play::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::laravel::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES`],
+//! [`codegraph_resolve::frameworks::fabric::workspace_listings`]); every
+//! full index,
 //! migration and sync writes one row per kind holding a digest of each input
 //! (a file's text, a directory's listing, `null` for a missing one), and one
 //! row naming the detected frameworks. A sync re-reads a kind's inputs (the
 //! CLI's full sync always, the watcher's when a changed path is one of them,
 //! names a control file, is a folder coming into a workspace glob's listing,
 //! or changes which files the kind's readers start from) and compares: a kind
-//! that moved re-resolves every file of its languages whole; a framework that
-//! came or went re-extracts every file, since framework nodes are made at
-//! extraction. The rows are written last;
+//! that moved re-resolves every file of its languages whole (the Python,
+//! JVM, PHP, Ruby, .NET and Swift kinds' languages are none: they move only
+//! which frameworks a sync detects); a framework that
+//! came or went, or a manifest edit that moves which files a framework that
+//! runs only in its own apps extracts, re-extracts every file, since
+//! framework nodes are made at extraction. The rows are written last;
 //! `control_inputs_version` is withdrawn and restored with the other
 //! markers, and `frameworks_version` only by a sync that re-extracts for a
 //! framework change.
@@ -39,7 +58,9 @@ pub const VERSION_KEY: &str = "control_inputs_version";
 pub const VERSION: &str = "1";
 /// Metadata key prefix of a kind's row.
 pub const ROW_KEY_PREFIX: &str = "control_inputs:";
-/// Metadata key of the detected frameworks, sorted, as JSON.
+/// Metadata key of the detected frameworks, sorted, as JSON, then the digest
+/// of which files the frameworks that run only in their own apps extract
+/// ([`codegraph_resolve::ReferenceResolver::framework_signature`]).
 pub const FRAMEWORKS_KEY: &str = "frameworks_detected";
 /// Metadata key present when no sync left a framework change unextracted.
 pub const FRAMEWORKS_VERSION_KEY: &str = "frameworks_version";
@@ -52,16 +73,61 @@ pub enum ControlKind {
     Js,
     Csharp,
     Rust,
+    Go,
+    /// The root files Django, Flask and FastAPI are detected by, which
+    /// resolution reads whether or not they are indexed: no file re-resolves
+    /// when one moves, but the sync detects the frameworks again.
+    Python,
+    /// The root files Spring and Play are detected by, the same way: a
+    /// `build.gradle`, a `build.sbt` and a `conf/application.conf` are never
+    /// indexed, and a configuration may leave out a `pom.xml`, a
+    /// `build.gradle.kts` or a `conf/routes`.
+    Jvm,
+    /// The root files Laravel and Drupal are detected by, the same way: an
+    /// `artisan` and a `composer.json` are never indexed, and a
+    /// configuration may leave out an `app/Http/Kernel.php`.
+    Php,
+    /// The root files Rails is detected by, the same way: a `Gemfile` is
+    /// never indexed, and a configuration may leave out a
+    /// `config/application.rb`, an
+    /// `app/controllers/application_controller.rb` or a `config/routes.rb`.
+    Ruby,
+    /// The root files ASP.NET is detected by, the same way: a configuration
+    /// may leave out a `Program.cs` or a `Startup.cs`. Not [`Self::Csharp`],
+    /// whose project files and listings C# type resolution reads.
+    Dotnet,
+    /// The root file Vapor is detected by, the same way: a configuration
+    /// may leave out the root `Package.swift`, which is an indexed Swift
+    /// file otherwise.
+    Swift,
 }
 
 impl ControlKind {
-    pub const ALL: [Self; 3] = [Self::Js, Self::Csharp, Self::Rust];
+    pub const ALL: [Self; 10] = [
+        Self::Js,
+        Self::Csharp,
+        Self::Rust,
+        Self::Go,
+        Self::Python,
+        Self::Jvm,
+        Self::Php,
+        Self::Ruby,
+        Self::Dotnet,
+        Self::Swift,
+    ];
 
     fn key(self) -> &'static str {
         match self {
             Self::Js => "js",
             Self::Csharp => "csharp",
             Self::Rust => "rust",
+            Self::Go => "go",
+            Self::Python => "python",
+            Self::Jvm => "jvm",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+            Self::Dotnet => "dotnet",
+            Self::Swift => "swift",
         }
     }
 
@@ -73,6 +139,8 @@ impl ControlKind {
     /// Whether a file named `name` is a control file of this kind.
     fn names_file(self, name: &str) -> bool {
         match self {
+            // `oh-package.json5`: the ohpm manifests whose `file:`
+            // dependencies are workspace members (W7-24a1).
             Self::Js => matches!(
                 name,
                 "package.json"
@@ -82,12 +150,17 @@ impl ControlKind {
                     | "tsconfig.json"
                     | "jsconfig.json"
                     | "tsconfig.base.json"
+                    | "oh-package.json5"
             ),
             Self::Csharp => {
                 let lower = name.to_ascii_lowercase();
                 lower.ends_with(".csproj") || lower.ends_with(".props")
             }
             Self::Rust => name == "Cargo.toml",
+            Self::Go => name == "go.mod",
+            // Their files are named by their root paths
+            // ([`is_control_file`]).
+            Self::Python | Self::Jvm | Self::Php | Self::Ruby | Self::Dotnet | Self::Swift => false,
         }
     }
 
@@ -98,6 +171,8 @@ impl ControlKind {
             Self::Js => has_module_surface(path, language),
             Self::Csharp => language == Language::CSharp,
             Self::Rust => path.ends_with(".rs"),
+            Self::Go => path.ends_with(".go"),
+            Self::Python | Self::Jvm | Self::Php | Self::Ruby | Self::Dotnet | Self::Swift => false,
         }
     }
 }
@@ -111,17 +186,40 @@ const TAURI_MARKERS: [&str; 4] = [
     "tauri.conf.json5",
 ];
 
+/// The root files Spring and Play are detected by, by their project paths.
+fn jvm_root_files() -> impl Iterator<Item = &'static str> {
+    codegraph_resolve::frameworks::spring::ROOT_DETECTION_FILES
+        .into_iter()
+        .chain(codegraph_resolve::frameworks::play::ROOT_DETECTION_FILES)
+}
+
+/// The root files Laravel and Drupal are detected by, by their project
+/// paths.
+fn php_root_files() -> impl Iterator<Item = &'static str> {
+    codegraph_resolve::frameworks::laravel::ROOT_DETECTION_FILES
+        .into_iter()
+        .chain(codegraph_resolve::frameworks::drupal::ROOT_DETECTION_FILES)
+}
+
 /// Whether `relative` is one of [`TAURI_MARKERS`].
 pub fn is_tauri_marker(relative: &str) -> bool {
     TAURI_MARKERS.contains(&relative)
 }
 
-/// Whether `relative` names a control file of any kind, a Tauri marker, or
-/// a Dart pubspec manifest (the Dart library lane's): the watcher hands its
-/// events to the sync, though it is no source file.
+/// Whether `relative` names a control file of any kind, a Tauri marker, a
+/// root file the Python, Spring, Play, Laravel, Drupal, Rails, ASP.NET or
+/// Vapor frameworks are detected by, or a Dart pubspec manifest (the Dart
+/// library lane's):
+/// the watcher hands its events to the sync, though it is no source file.
 pub fn is_control_file(relative: &str) -> bool {
     let name = relative.rsplit('/').next().unwrap_or(relative);
     is_tauri_marker(relative)
+        || codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES.contains(&relative)
+        || jvm_root_files().any(|file| file == relative)
+        || php_root_files().any(|file| file == relative)
+        || codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES.contains(&relative)
+        || codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES.contains(&relative)
+        || codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES.contains(&relative)
         || ControlKind::ALL.iter().any(|kind| kind.names_file(name))
         || crate::dart_libraries::is_pubspec_path(relative)
 }
@@ -205,12 +303,60 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
             for marker in TAURI_MARKERS {
                 out.insert(marker.to_string(), file_digest(&project_root.join(marker)));
             }
+            // React Native's view components are detected by a workspace
+            // package's `package.json` one level below `packages/`, `apps/`,
+            // `modules/` or `libraries/` (W7-21): each root's listing of the
+            // directories holding one, and each of those manifests. A
+            // directory holding none is nothing detection can tell from no
+            // directory, so an empty one left behind changes no digest.
+            for (dir, names) in codegraph_resolve::frameworks::fabric::workspace_listings(&root) {
+                let manifests: Vec<(String, String)> = names
+                    .into_iter()
+                    .filter_map(|name| {
+                        let relative = format!("{dir}/{name}/package.json");
+                        let digest = file_digest(&project_root.join(&relative))?;
+                        Some((name, digest))
+                    })
+                    .collect();
+                let held: Vec<String> = manifests.iter().map(|(name, _)| name.clone()).collect();
+                out.insert(
+                    format!("dir:{dir}"),
+                    (!held.is_empty()).then(|| hash_content(&held.join("\n"))),
+                );
+                for (name, digest) in manifests {
+                    out.insert(format!("{dir}/{name}/package.json"), Some(digest));
+                }
+            }
             let js: Vec<String> = files
                 .iter()
                 .filter(|file| kind.reads_from(&file.path, file.language))
                 .map(|file| file.path.clone())
                 .collect();
+            // The configs nearer a file than the root's, which its imports
+            // try first (upstream #2165).
+            for path in codegraph_resolve::path_aliases::nearest_alias_inputs(&root, &js) {
+                out.insert(key_of(project_root, &path), file_digest(&path));
+            }
             for relative in codegraph_resolve::package_manifests::manifest_inputs(&js) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
+            // The Angular workspace markers an app root is found by
+            // (W7-23c), recorded whether or not the project uses Angular
+            // (OD-B44), in the directories the manifests are read in: above
+            // each JavaScript-family file, which holds every Angular routes
+            // file, so a file that comes or goes moves them only where it
+            // moves the manifests too.
+            for relative in codegraph_resolve::frameworks::angular_router::app_marker_inputs(&js) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
+            // The manifests framework detection reads (upstream #2395): the
+            // root's, the ones one or two directories down from any indexed
+            // file, and the ones deeper above JavaScript-family code.
+            let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            for relative in codegraph_resolve::frameworks::package_deps::manifest_candidates(&paths)
+            {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
             }
@@ -241,6 +387,61 @@ pub fn digests_of(kind: ControlKind, project_root: &Path, files: &[FileRecord]) 
             for relative in codegraph_resolve::rust_scope::rust_manifest_inputs(&paths) {
                 let digest = file_digest(&project_root.join(&relative));
                 out.insert(relative, digest);
+            }
+        }
+        ControlKind::Go => {
+            let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            for relative in codegraph_resolve::context::go_module_inputs(&paths) {
+                let digest = file_digest(&project_root.join(&relative));
+                out.insert(relative, digest);
+            }
+        }
+        ControlKind::Python => {
+            for relative in codegraph_resolve::frameworks::python::ROOT_DETECTION_FILES {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Jvm => {
+            for relative in jvm_root_files() {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Php => {
+            for relative in php_root_files() {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Ruby => {
+            for relative in codegraph_resolve::frameworks::rails::ROOT_DETECTION_FILES {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Dotnet => {
+            for relative in codegraph_resolve::frameworks::aspnet::ROOT_DETECTION_FILES {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
+            }
+        }
+        ControlKind::Swift => {
+            for relative in codegraph_resolve::frameworks::swift::ROOT_DETECTION_FILES {
+                out.insert(
+                    relative.to_string(),
+                    file_digest(&project_root.join(relative)),
+                );
             }
         }
     }
@@ -302,8 +503,9 @@ fn parent_of(path: &str) -> &str {
 }
 
 /// The recorded inputs an event can name, by project path, as the rows hold
-/// them once a sync is done (W5-06): the watcher hands their events to the
-/// next sync, though they are no source files.
+/// them once a sync is done (W5-06, and the synthesis stage's, W7-17b): the
+/// watcher hands their events to the next sync, though they are no source
+/// files.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecordedInputs {
     /// Every input inside the project, a listed directory by its own path.
@@ -343,6 +545,11 @@ pub fn recorded_paths(store: &Store) -> Result<RecordedInputs> {
             out.paths.insert(path.to_string());
         }
     }
+    // The files the synthesis stage last read beside the index, or found
+    // missing (W7-17b): a sync compares them.
+    if let Some(inputs) = codegraph_resolve::synthesis::recorded_inputs(store)? {
+        out.paths.extend(inputs.into_keys());
+    }
     Ok(out)
 }
 
@@ -379,9 +586,9 @@ impl ControlCheck {
 /// kind; otherwise a kind is re-read when a `requested` path is one of its
 /// recorded inputs, is a listed directory or one directly in a workspace
 /// glob's listing, or names one of its control files, or a `membership`
-/// change touches a file its readers start from. A `bootstrap` (the marker
-/// was missing when the sync began) re-reads every kind and counts each as
-/// moved.
+/// change touches a file its readers start from (for the JS kind, any file
+/// that comes or goes). A `bootstrap` (the marker was missing when the sync
+/// began) re-reads every kind and counts each as moved.
 pub(crate) fn check(
     store: &Store,
     project_root: &Path,
@@ -412,10 +619,15 @@ pub(crate) fn check(
                 || (kind == ControlKind::Js
                     && row.contains_key(&format!("dir:{}", parent_of(path))))
         }) || membership.iter().any(|(path, before, after)| {
-            before
-                .iter()
-                .chain(after)
-                .any(|language| kind.reads_from(path, *language))
+            // Framework detection reads the manifests one or two directories
+            // down from every indexed file, whatever its language (upstream
+            // #2395), so a file of any language that comes or goes may move
+            // the JS kind's inputs.
+            (kind == ControlKind::Js && (before.is_none() || after.is_none()))
+                || before
+                    .iter()
+                    .chain(after)
+                    .any(|language| kind.reads_from(path, *language))
         })
     };
     let mut out = ControlCheck::default();
@@ -435,6 +647,12 @@ pub(crate) fn check(
         out.rows.insert(kind, now);
     }
     Ok(out)
+}
+
+/// The frameworks the last finished index or sync recorded, `None` without
+/// a row.
+pub(crate) fn recorded_frameworks(store: &Store) -> Result<Option<Vec<String>>> {
+    read_frameworks(store)
 }
 
 /// Whether no finished sync recorded the frameworks: the row or the
@@ -492,6 +710,46 @@ pub(crate) fn files_of(store: &Store, changed: &BTreeSet<ControlKind>) -> Result
 mod tests {
     use super::*;
 
+    /// W7-24a1: an ohpm manifest is a JavaScript control file wherever it
+    /// sits, and each one the workspace walk reads is a Js input.
+    #[test]
+    fn w724a1_ohpm_manifests_are_js_control_inputs() {
+        assert!(is_control_file("oh-package.json5"));
+        assert!(is_control_file("feature/goods/oh-package.json5"));
+        assert!(!is_control_file("feature/goods/oh-package-lock.json5"));
+        let dir = std::env::temp_dir().join(format!(
+            "cg-ctl-ohpm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("core/data")).unwrap();
+        std::fs::create_dir_all(dir.join("feature/goods")).unwrap();
+        std::fs::write(
+            dir.join("core/data/oh-package.json5"),
+            "{ \"name\": \"data\", \"main\": \"Index.ets\" }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("feature/goods/oh-package.json5"),
+            "{ \"dependencies\": { \"data\": \"file:../../core/data\" } }",
+        )
+        .unwrap();
+        let digests = digests_of(ControlKind::Js, &dir, &[]);
+        for manifest in [
+            "core/data/oh-package.json5",
+            "feature/goods/oh-package.json5",
+        ] {
+            assert!(
+                digests.get(manifest).is_some_and(Option::is_some),
+                "{manifest} missing from {digests:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn control_files_are_named_by_kind() {
         assert!(is_control_file("package.json"));
@@ -499,6 +757,10 @@ mod tests {
         assert!(is_control_file("src/App.CSPROJ"));
         assert!(is_control_file("Directory.Build.props"));
         assert!(is_control_file("crates/a/Cargo.toml"));
+        assert!(is_control_file("go.mod"));
+        assert!(is_control_file("services/api/go.mod"));
+        assert!(!is_control_file("go.sum"));
+        assert!(!is_control_file("main.go"));
         assert!(is_control_file("src-tauri/tauri.conf.json"));
         assert!(is_control_file("packages/kit/pubspec.yaml"));
         assert!(is_control_file("pubspec_overrides.yaml"));
@@ -506,5 +768,423 @@ mod tests {
         assert!(!is_control_file("apps/tauri.conf.json"));
         assert!(!is_control_file("src/main.ts"));
         assert!(!is_control_file("cargo.toml"));
+        // The Python frameworks' root files, at the root only.
+        for file in [
+            "requirements.txt",
+            "setup.py",
+            "pyproject.toml",
+            "Pipfile",
+            "manage.py",
+            "app.py",
+            "main.py",
+            "api.py",
+        ] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("svc/{file}")), "svc/{file}");
+        }
+        assert!(!is_control_file("requirements-dev.txt"));
+        // Spring's and Play's root files, at the root only.
+        for file in [
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "build.sbt",
+            "conf/routes",
+            "conf/application.conf",
+        ] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("svc/{file}")), "svc/{file}");
+        }
+        assert!(!is_control_file("conf/api.routes"));
+        assert!(!is_control_file("settings.gradle"));
+        // Laravel's and Drupal's root files, at the root only.
+        for file in ["artisan", "app/Http/Kernel.php", "composer.json"] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("svc/{file}")), "svc/{file}");
+        }
+        assert!(!is_control_file("composer.lock"));
+        assert!(!is_control_file("app/Http/Controllers/Kernel.php"));
+        // Rails' root files, at the root only: an engine's
+        // `config/routes.rb` is an indexed source file.
+        for file in [
+            "Gemfile",
+            "config/application.rb",
+            "app/controllers/application_controller.rb",
+            "config/routes.rb",
+        ] {
+            assert!(is_control_file(file), "{file}");
+            assert!(!is_control_file(&format!("engine/{file}")), "engine/{file}");
+        }
+        assert!(!is_control_file("Gemfile.lock"));
+        assert!(!is_control_file("config/routes/admin.rb"));
+    }
+
+    /// The Python kind reads its eight root files, present or not, and names
+    /// no file to re-resolve.
+    #[test]
+    fn the_python_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-python-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("requirements.txt"), "Django>=5\n").unwrap();
+        let digests = digests_of(ControlKind::Python, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Pipfile",
+                "api.py",
+                "app.py",
+                "main.py",
+                "manage.py",
+                "pyproject.toml",
+                "requirements.txt",
+                "setup.py",
+            ]
+        );
+        assert_eq!(
+            digests["requirements.txt"],
+            Some(hash_content("Django>=5\n"))
+        );
+        assert_eq!(digests["manage.py"], None);
+        assert!(!ControlKind::Python.reads_from("app/views.py", Language::Python));
+        assert!(!ControlKind::Python.names_file("requirements.txt"));
+        assert_eq!(ControlKind::Python.row_key(), "control_inputs:python");
+    }
+
+    /// The JVM kind reads Spring's and Play's six root files, present or
+    /// not, and names no file to re-resolve.
+    #[test]
+    fn the_jvm_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-jvm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        std::fs::write(dir.join("build.sbt"), "enablePlugins(PlayScala)\n").unwrap();
+        std::fs::write(dir.join("conf/routes"), "GET / C.m\n").unwrap();
+        let digests = digests_of(ControlKind::Jvm, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "build.gradle",
+                "build.gradle.kts",
+                "build.sbt",
+                "conf/application.conf",
+                "conf/routes",
+                "pom.xml",
+            ]
+        );
+        assert_eq!(
+            digests["build.sbt"],
+            Some(hash_content("enablePlugins(PlayScala)\n"))
+        );
+        assert_eq!(digests["conf/routes"], Some(hash_content("GET / C.m\n")));
+        assert_eq!(digests["pom.xml"], None);
+        assert!(!ControlKind::Jvm.reads_from("app/C.java", Language::Java));
+        assert!(!ControlKind::Jvm.reads_from("conf/routes", Language::Yaml));
+        assert!(!ControlKind::Jvm.names_file("pom.xml"));
+        assert_eq!(ControlKind::Jvm.row_key(), "control_inputs:jvm");
+    }
+
+    /// The PHP kind reads Laravel's and Drupal's three root files, present
+    /// or not, and names no file to re-resolve (W7-19d).
+    #[test]
+    fn the_php_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-php-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("composer.json"), "{\"name\": \"acme/site\"}\n").unwrap();
+        let digests = digests_of(ControlKind::Php, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["app/Http/Kernel.php", "artisan", "composer.json"]
+        );
+        assert_eq!(
+            digests["composer.json"],
+            Some(hash_content("{\"name\": \"acme/site\"}\n"))
+        );
+        assert_eq!(digests["artisan"], None);
+        assert_eq!(digests["app/Http/Kernel.php"], None);
+        assert!(!ControlKind::Php.reads_from("app/Http/Kernel.php", Language::Php));
+        assert!(!ControlKind::Php.names_file("composer.json"));
+        assert_eq!(ControlKind::Php.row_key(), "control_inputs:php");
+    }
+
+    /// The Ruby kind reads Rails' four root files, present or not, and names
+    /// no file to re-resolve (W7-19e).
+    #[test]
+    fn the_ruby_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-ruby-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("Gemfile"), "gem \"rails\"\n").unwrap();
+        std::fs::write(
+            dir.join("config/routes.rb"),
+            "Rails.application.routes.draw do\nend\n",
+        )
+        .unwrap();
+        let digests = digests_of(ControlKind::Ruby, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "Gemfile",
+                "app/controllers/application_controller.rb",
+                "config/application.rb",
+                "config/routes.rb",
+            ]
+        );
+        assert_eq!(digests["Gemfile"], Some(hash_content("gem \"rails\"\n")));
+        assert_eq!(
+            digests["config/routes.rb"],
+            Some(hash_content("Rails.application.routes.draw do\nend\n"))
+        );
+        assert_eq!(digests["config/application.rb"], None);
+        assert!(!ControlKind::Ruby.reads_from("config/routes.rb", Language::Ruby));
+        assert!(!ControlKind::Ruby.names_file("Gemfile"));
+        assert_eq!(ControlKind::Ruby.row_key(), "control_inputs:ruby");
+    }
+
+    /// The .NET kind reads ASP.NET's two root files, present or not, and
+    /// names no file to re-resolve; the watcher hands their events to the
+    /// sync (W7-19f).
+    #[test]
+    fn the_dotnet_kind_digests_its_root_files_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-dotnet-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Program.cs"),
+            "var app = WebApplication.Create();\n",
+        )
+        .unwrap();
+        let digests = digests_of(ControlKind::Dotnet, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            digests.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Program.cs", "Startup.cs"]
+        );
+        assert_eq!(
+            digests["Program.cs"],
+            Some(hash_content("var app = WebApplication.Create();\n"))
+        );
+        assert_eq!(digests["Startup.cs"], None);
+        assert!(!ControlKind::Dotnet.reads_from("Program.cs", Language::CSharp));
+        assert!(!ControlKind::Dotnet.names_file("Startup.cs"));
+        assert!(is_control_file("Program.cs"));
+        assert!(is_control_file("Startup.cs"));
+        assert!(!is_control_file("src/Program.cs"));
+        assert_eq!(ControlKind::Dotnet.row_key(), "control_inputs:dotnet");
+    }
+
+    /// The Swift kind reads Vapor's root `Package.swift`, present or not,
+    /// and names no file to re-resolve; the watcher hands its events to the
+    /// sync (W7-19g).
+    #[test]
+    fn the_swift_kind_digests_its_root_file_and_reresolves_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-swift-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = digests_of(ControlKind::Swift, &dir, &[]);
+        std::fs::write(dir.join("Package.swift"), "// vapor\n").unwrap();
+        let digests = digests_of(ControlKind::Swift, &dir, &[]);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            missing.into_iter().collect::<Vec<_>>(),
+            [("Package.swift".to_string(), None)]
+        );
+        assert_eq!(
+            digests.into_iter().collect::<Vec<_>>(),
+            [(
+                "Package.swift".to_string(),
+                Some(hash_content("// vapor\n"))
+            )]
+        );
+        assert!(!ControlKind::Swift.reads_from("Package.swift", Language::Swift));
+        assert!(!ControlKind::Swift.names_file("Package.swift"));
+        assert!(is_control_file("Package.swift"));
+        assert!(!is_control_file("Sources/App/Package.swift"));
+        assert!(!is_control_file("Sources/App/routes.swift"));
+        assert_eq!(ControlKind::Swift.row_key(), "control_inputs:swift");
+    }
+
+    /// The JS kind reads the four workspace roots Fabric's detection lists
+    /// (W7-21): each root's listing of the directories that hold a
+    /// `package.json`, and each such manifest; a directory holding none, or
+    /// no root at all, is no listing.
+    #[test]
+    fn the_js_kind_digests_the_workspace_packages_fabric_detection_reads() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-fabric-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fabric = |digests: Digests| -> Vec<(String, Option<String>)> {
+            digests
+                .into_iter()
+                .filter(|(key, _)| {
+                    ["packages", "apps", "modules", "libraries"]
+                        .iter()
+                        .any(|root| {
+                            key == &format!("dir:{root}") || key.starts_with(&format!("{root}/"))
+                        })
+                })
+                .collect()
+        };
+        let none = fabric(digests_of(ControlKind::Js, &dir, &[]));
+        std::fs::create_dir_all(dir.join("packages/native")).unwrap();
+        std::fs::create_dir_all(dir.join("apps/empty")).unwrap();
+        let empty = fabric(digests_of(ControlKind::Js, &dir, &[]));
+        let manifest = "{\"peerDependencies\":{\"react-native\":\"*\"}}\n";
+        std::fs::write(dir.join("packages/native/package.json"), manifest).unwrap();
+        let held = fabric(digests_of(ControlKind::Js, &dir, &[]));
+        std::fs::remove_dir_all(&dir).ok();
+        let roots = |packages: Option<String>| {
+            vec![
+                ("dir:apps".to_string(), None),
+                ("dir:libraries".to_string(), None),
+                ("dir:modules".to_string(), None),
+                ("dir:packages".to_string(), packages),
+            ]
+        };
+        assert_eq!(none, roots(None));
+        assert_eq!(empty, roots(None));
+        let mut expected = roots(Some(hash_content("native")));
+        expected.push((
+            "packages/native/package.json".to_string(),
+            Some(hash_content(manifest)),
+        ));
+        assert_eq!(held, expected);
+    }
+
+    /// W7-23c (KEEP-RUST, OD-B44): the JS kind reads the Angular workspace
+    /// markers an app root is found by, `angular.json` and `nx.json` in each
+    /// directory from a JavaScript-family file's up to the root (where it
+    /// reads the manifests), a missing one as `None`, whether or not the
+    /// project uses Angular. Other languages' files add none.
+    #[test]
+    fn the_js_kind_digests_the_angular_workspace_markers_above_each_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-angular-markers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        std::fs::write(dir.join("ws/nx.json"), "{}\n").unwrap();
+        let record = |path: &str, language: Language| FileRecord {
+            path: path.to_string(),
+            content_hash: String::new(),
+            language,
+            size: 0,
+            modified_at: 0,
+            indexed_at: 0,
+            node_count: 0,
+            errors: Vec::new(),
+            generated: false,
+        };
+        let files = [
+            record("ws/apps/x/main.ts", Language::TypeScript),
+            record("ws/libs/nav.js", Language::JavaScript),
+            record("web/App.vue", Language::Vue),
+            record("tools/build.py", Language::Python),
+        ];
+        let markers: Vec<(String, Option<String>)> = digests_of(ControlKind::Js, &dir, &files)
+            .into_iter()
+            .filter(|(key, _)| key.ends_with("angular.json") || key.ends_with("nx.json"))
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        let mut expected: Vec<(String, Option<String>)> = [
+            "angular.json",
+            "nx.json",
+            "ws/angular.json",
+            "ws/apps/angular.json",
+            "ws/apps/nx.json",
+            "ws/apps/x/angular.json",
+            "ws/apps/x/nx.json",
+            "ws/libs/angular.json",
+            "ws/libs/nx.json",
+            "web/angular.json",
+            "web/nx.json",
+        ]
+        .iter()
+        .map(|key| (key.to_string(), None))
+        .collect();
+        expected.push(("ws/nx.json".to_string(), Some(hash_content("{}\n"))));
+        expected.sort();
+        assert_eq!(markers, expected);
+    }
+
+    /// The files the synthesis stage last read beside the index, and the
+    /// candidates it found no file at, are inputs whose events the watcher
+    /// hands to a sync (W7-17b).
+    #[test]
+    fn the_synthesis_stage_inputs_are_recorded_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cg-control-inputs-synthesis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("index.db")).unwrap();
+        assert_eq!(recorded_paths(&store).unwrap(), RecordedInputs::default());
+        store
+            .set_project_metadata(
+                codegraph_resolve::synthesis::INPUTS_KEY,
+                r#"{"missing.def":null,"src/ops.def":"0123"}"#,
+            )
+            .unwrap();
+        let recorded = recorded_paths(&store).unwrap();
+        assert!(recorded.may_move("src/ops.def", false));
+        assert!(recorded.may_move("missing.def", false));
+        assert!(!recorded.may_move("src/other.def", false));
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

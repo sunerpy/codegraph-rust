@@ -1,8 +1,8 @@
 //! Where a route's code starts: the symbol that runs when a request arrives at
 //! `POST /users`, or when a navigation lands on `/capture/review`. Upstream
-//! `src/ui-server/api/route-roots.ts`; the routes list (upstream #2264) is its
-//! reader here, the Steps and Screens pictures that also read it upstream are
-//! a later port.
+//! `src/ui-server/api/route-roots.ts`; the routes list (upstream #2264) and
+//! the Screens picture read it here, the Screens picture the layouts around
+//! each route too ([`route_layouts`]).
 //!
 //! Every framework resolver binds a route node to what serves it, but not with
 //! the same edge: a file-routed screen draws a `calls` edge to the component
@@ -164,6 +164,56 @@ pub fn roots_from(
         }
     }
     out
+}
+
+/// Route id → the layouts it renders inside (upstream `routeLayouts`,
+/// `route-roots.ts:55-70`): the components a resolver marks `layout: true`
+/// on a route's `references` edges — an Angular parent route's component
+/// around its `<router-outlet>`, a React Router `<Route element>` around its
+/// children. What happens in a layout, its tabs and its buttons, happens on
+/// every screen nested in it. Routes come in `routes`' order, each one's
+/// layouts by the line, column and target of the edge that names them, so
+/// the answer never depends on the order the store returned the edges in.
+pub fn layouts_from(routes: &[Node], edges: &[Edge]) -> Vec<(String, Vec<String>)> {
+    let mut by_route: HashMap<&str, Vec<&Edge>> = HashMap::new();
+    for edge in edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::References && is_layout(edge))
+    {
+        by_route.entry(edge.source.as_str()).or_default().push(edge);
+    }
+    let mut out = Vec::new();
+    for route in routes {
+        let Some(list) = by_route.get_mut(route.id.as_str()) else {
+            continue;
+        };
+        list.sort_by(|a, b| {
+            a.line
+                .cmp(&b.line)
+                .then(a.col.cmp(&b.col))
+                .then_with(|| a.target.cmp(&b.target))
+        });
+        let mut layouts: Vec<String> = Vec::new();
+        for edge in list.iter() {
+            if !layouts.contains(&edge.target) {
+                layouts.push(edge.target.clone());
+            }
+        }
+        out.push((route.id.clone(), layouts));
+    }
+    out
+}
+
+/// [`layouts_from`] over the routes' outgoing `references` edges.
+pub fn route_layouts(ctx: &Ctx<'_>, routes: &[Node]) -> ApiResult<Vec<(String, Vec<String>)>> {
+    if routes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<String> = routes.iter().map(|route| route.id.clone()).collect();
+    let edges = ctx
+        .store
+        .outgoing_edges_from(&ids, &[EdgeKind::References])?;
+    Ok(layouts_from(routes, &edges))
 }
 
 /// Route id → where its code starts, for every route that has an answer.

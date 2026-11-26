@@ -203,8 +203,9 @@ pub trait LanguageSpec: Sync {
 
     /// Extra symbol-level modifiers merged into the node's decorators list.
     /// Mirrors the upstream `extractModifiers` hook (`tree-sitter.ts:626-634`),
-    /// used by Kotlin for `expect`/`actual` markers (kotlin.ts:271-293).
-    fn extract_modifiers(&self, _node: Node<'_>) -> Vec<String> {
+    /// used by Kotlin for `expect`/`actual` markers (kotlin.ts:271-293) and
+    /// by ArkTS for its decorators' names (`arkts.ts`, upstream #1186).
+    fn extract_modifiers(&self, _node: Node<'_>, _source: &str) -> Vec<String> {
         Vec::new()
     }
 }

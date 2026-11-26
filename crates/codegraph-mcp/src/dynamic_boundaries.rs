@@ -528,6 +528,7 @@ const JS_FAMILY: &[&str] = &[
     "vue",
     "svelte",
     "astro",
+    "arkts",
 ];
 const PY: &[&str] = &["python"];
 const RB: &[&str] = &["ruby"];
@@ -800,7 +801,9 @@ fn comment_lang(language: &str) -> Option<CommentLang> {
         "php" => Some(CommentLang::Php),
         "go" => Some(CommentLang::Go),
         "javascript" | "jsx" => Some(CommentLang::Javascript),
-        "typescript" | "tsx" | "vue" | "svelte" | "astro" => Some(CommentLang::Typescript),
+        "typescript" | "tsx" | "vue" | "svelte" | "astro" | "arkts" => {
+            Some(CommentLang::Typescript)
+        }
         "java" | "kotlin" | "scala" | "dart" => Some(CommentLang::Java),
         "csharp" => Some(CommentLang::CSharp),
         "swift" => Some(CommentLang::Swift),
@@ -1118,6 +1121,24 @@ pub fn scan_dynamic_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W7-24a1: ArkTS is in the JavaScript family of the boundary forms, its
+    /// comments stripped as TypeScript's (upstream `dynamic-boundaries.ts`
+    /// 75 and 242, #1186).
+    #[test]
+    fn w724a1_arkts_bodies_scan_like_typescript() {
+        let forms = |body: &str, language: &str| {
+            scan_dynamic_dispatch(body, language, 1)
+                .into_iter()
+                .map(|m| m.form)
+                .collect::<Vec<_>>()
+        };
+        let body = "async load() {\n  const m = await import(name);\n}";
+        assert!(!forms(body, "typescript").is_empty());
+        assert_eq!(forms(body, "arkts"), forms(body, "typescript"));
+        let commented = "load() {\n  // const m = await import(name);\n  return 1;\n}";
+        assert!(forms(commented, "arkts").is_empty());
+    }
 
     /// A JS dynamic import is a runtime boundary unless its argument is exactly
     /// one complete string literal (upstream #1967).

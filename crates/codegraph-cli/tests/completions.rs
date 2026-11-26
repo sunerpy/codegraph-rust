@@ -125,3 +125,47 @@ fn completions_powershell_install_is_idempotent() {
     std::fs::remove_dir_all(&local).ok();
     std::fs::remove_dir_all(&profile_dir).ok();
 }
+
+/// `codegraph context` (W9-01) and its flags complete in bash, zsh and fish,
+/// each written in its shell's own form.
+#[test]
+fn completions_offer_context_and_its_flags() {
+    for (shell, words) in [
+        (
+            "bash",
+            &[
+                "codegraph__subcmd__context)",
+                "--max-nodes",
+                "--no-code",
+                "--format",
+            ][..],
+        ),
+        (
+            "zsh",
+            &["(context)", "'--max-nodes=[", "'--no-code[", "'--format=["][..],
+        ),
+        (
+            "fish",
+            &[
+                "__fish_codegraph_using_subcommand context",
+                "-l max-nodes",
+                "-l no-code",
+                "-l format",
+            ][..],
+        ),
+    ] {
+        let assert = Command::cargo_bin("codegraph")
+            .expect("locate codegraph binary")
+            .args(["completions", shell])
+            .assert()
+            .success();
+        let stdout = String::from_utf8(assert.get_output().stdout.clone())
+            .expect("completion script is valid utf-8");
+        for word in words {
+            assert!(
+                stdout.contains(word),
+                "{shell} completion script lacks {word:?}"
+            );
+        }
+    }
+}

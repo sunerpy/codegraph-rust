@@ -280,3 +280,162 @@ fn a_qualified_reference_is_found_by_its_tail_never_by_its_whole_name() {
         ["Foo.Bar"]
     );
 }
+
+/// `store` with every one of its parked references resolved: each row moved
+/// into `resolved_refs` as a resolution pass moves it, and a parked
+/// `package:app/z.dart` left in `unresolved_refs`.
+fn resolved_store(label: &str) -> Store {
+    let mut store = store(label);
+    let ids: Vec<i64> = store
+        .all_unresolved_refs()
+        .unwrap()
+        .into_iter()
+        .filter_map(|reference| reference.id)
+        .collect();
+    store.delete_resolved_unresolved_refs(&ids).unwrap();
+    store
+        .insert_unresolved_refs(&[UnresolvedRef {
+            id: None,
+            from_node_id: "file:h.ts".to_string(),
+            reference_name: "package:app/z.dart".to_string(),
+            reference_kind: EdgeKind::Imports,
+            line: 2,
+            col: 0,
+            candidates: None,
+            file_path: "h.ts".to_string(),
+            language: Language::Dart,
+            is_function_ref: false,
+            reference_subkind: None,
+        }])
+        .unwrap();
+    store
+}
+
+/// W7-27: a resolved import is found as a parked one is, by the stem of its
+/// path or by its whole name, among the resolved references alone.
+#[test]
+fn a_resolved_import_is_found_by_the_stem_of_its_path_or_by_its_whole_name() {
+    let store = resolved_store("resolved-stem");
+    assert_eq!(
+        names(store.resolved_imports_naming(&keys(&["b"])).unwrap()),
+        ["../b.dart", "package:app/b.dart", "src/b.dart"]
+    );
+    assert_eq!(
+        names(store.resolved_imports_naming(&keys(&["b.dart"])).unwrap()),
+        ["b.dart"]
+    );
+    assert_eq!(
+        names(store.resolved_imports_naming(&keys(&["useState"])).unwrap()),
+        ["useState"]
+    );
+    // A dotted name keeps its dotted tail.
+    assert_eq!(
+        names(store.resolved_imports_naming(&keys(&["Bar"])).unwrap()),
+        ["Foo.Bar"]
+    );
+    // A call is no import, and the parked `z.dart` is not a resolved one.
+    assert!(
+        store
+            .resolved_imports_naming(&keys(&["x.b", "z", "z.dart"]))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.resolved_imports_naming(&[]).unwrap().is_empty());
+    // The parked lookup reads the other table.
+    assert!(
+        store
+            .retryable_failed_imports(&keys(&["b", "b.dart"]), &[], 500)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// W7-27: a reference written as a path is looked up as an import is.
+#[test]
+fn a_resolved_path_reference_is_found_by_the_stem_of_its_file() {
+    let mut store = store("resolved-path");
+    store
+        .insert_unresolved_refs(&[
+            UnresolvedRef {
+                id: None,
+                from_node_id: "file:a.dart".to_string(),
+                reference_name: "snippets/price.liquid".to_string(),
+                reference_kind: EdgeKind::References,
+                line: 3,
+                col: 0,
+                candidates: None,
+                file_path: "a.dart".to_string(),
+                language: Language::Liquid,
+                is_function_ref: false,
+                reference_subkind: None,
+            },
+            UnresolvedRef {
+                id: None,
+                from_node_id: "file:a.dart".to_string(),
+                reference_name: "price".to_string(),
+                reference_kind: EdgeKind::References,
+                line: 4,
+                col: 0,
+                candidates: None,
+                file_path: "a.dart".to_string(),
+                language: Language::Liquid,
+                is_function_ref: false,
+                reference_subkind: None,
+            },
+        ])
+        .unwrap();
+    let ids: Vec<i64> = store
+        .all_unresolved_refs()
+        .unwrap()
+        .into_iter()
+        .filter_map(|reference| reference.id)
+        .collect();
+    store.delete_resolved_unresolved_refs(&ids).unwrap();
+    assert_eq!(
+        names(store.resolved_imports_naming(&keys(&["price"])).unwrap()),
+        ["snippets/price.liquid"]
+    );
+}
+
+/// W7-27: every resolved import a key names is kept, however many share
+/// it: no ceiling, as a parked import's lookup has.
+#[test]
+fn a_key_many_resolved_imports_share_keeps_them_all() {
+    let mut store = store("resolved-many");
+    let many: Vec<UnresolvedRef> = (0..501)
+        .map(|line| UnresolvedRef {
+            id: None,
+            from_node_id: "file:a.dart".to_string(),
+            reference_name: format!("lib/m{line}/b.dart"),
+            reference_kind: EdgeKind::Imports,
+            line,
+            col: 0,
+            candidates: None,
+            file_path: "a.dart".to_string(),
+            language: Language::Dart,
+            is_function_ref: false,
+            reference_subkind: None,
+        })
+        .collect();
+    store.insert_unresolved_refs(&many).unwrap();
+    let ids: Vec<i64> = store
+        .all_unresolved_refs()
+        .unwrap()
+        .into_iter()
+        .filter_map(|reference| reference.id)
+        .collect();
+    store.delete_resolved_unresolved_refs(&ids).unwrap();
+    let found = store.resolved_imports_naming(&keys(&["b"])).unwrap();
+    assert_eq!(found.len(), 504, "the 501 and the three of the fixture");
+    let ids: Vec<i64> = found.iter().filter_map(|reference| reference.id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "in id order");
+    assert!(
+        store
+            .retryable_failed_imports(&keys(&["b"]), &[], 500)
+            .unwrap()
+            .is_empty(),
+        "nothing parked"
+    );
+}

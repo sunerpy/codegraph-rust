@@ -16,6 +16,11 @@
 //! (`useState<User>()`, `<PaginatedList<Document>`, `<Entry extends Base>(…)
 //! =>`); the walker emits a tag's reference from the syntax tree, where those
 //! are no tags.
+//!
+//! A JavaScript file's tags are references too (W7-28, OD-B46), and there
+//! the tag rules read only a tag ([`is_javascript_tag`]): colby's jsx-render
+//! pass reads the tags of every file that can write JSX, while its Pattern 1
+//! reads no reference of a JavaScript file.
 
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 
@@ -32,7 +37,10 @@ pub(crate) fn gate_jsx_local_tag(
     let result = result?;
     let name = reference.reference_name.as_str();
     if reference.reference_kind != EdgeKind::References
-        || !matches!(reference.language, Language::Tsx | Language::Jsx)
+        || !matches!(
+            reference.language,
+            Language::Tsx | Language::Jsx | Language::JavaScript
+        )
         || !is_tag_at(reference, context)
         || js_function_local_scope(name, reference, context).is_none()
     {
@@ -66,6 +74,18 @@ pub(crate) fn gate_jsx_local_tag(
         target_node_id: inner.id.clone(),
         ..result
     })
+}
+
+/// Whether `reference` is a JSX tag of a JavaScript file (W7-28, OD-B61): a
+/// `references` reference, no function value, written right after a `<`.
+/// It is the one reference of a JavaScript file React's component rules
+/// read, as colby finds a tag's child by those rules in its jsx-render pass
+/// and its Pattern 1 reads only tsx and jsx references.
+pub(crate) fn is_javascript_tag(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    reference.language == Language::JavaScript
+        && reference.reference_kind == EdgeKind::References
+        && !reference.is_function_ref
+        && is_tag_at(reference, context)
 }
 
 /// Whether the reference is a JSX tag's name: written right after `<`, a

@@ -98,8 +98,8 @@ fn pipeline_project(files: &[(&str, &str)]) -> TestProject {
     resolver
         .extract_and_persist_frameworks(&mut store, &relative)
         .unwrap();
-    resolver.resolve_and_persist(&mut store).unwrap();
     resolver.run_post_extract(&mut store).unwrap();
+    resolver.resolve_and_persist(&mut store).unwrap();
     drop(store);
     let paths = codegraph_core::IndexPaths::resolve(&base, None).unwrap();
     codegraph_store::test_support::finalize_current_test_fixture(&paths).unwrap();
