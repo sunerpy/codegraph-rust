@@ -98,7 +98,8 @@ fn is_literal_receiver(node: SyntaxNode<'_>) -> bool {
 
 /// G4 (upstream `STATIC_MEMBER_LANGS`) — the languages whose static-member
 /// and enum-value reads (`Enum.value`, `Type.CONST`, `Foo::BAR`) reference the
-/// type they read through. VB.NET's reads are its own (W8).
+/// type they read through. Upstream's list also names VB.NET, which this port
+/// does not extract.
 fn has_static_member_reads(language: Language) -> bool {
     matches!(
         language,
@@ -6069,8 +6070,9 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     /// walker (upstream `propertyBodies`, #2345 and #2348): each C#
     /// accessor's body (`get { … }`, `set => …`) and the property's `value`,
     /// an expression body's `=> …` or an `= initializer`. Its attributes are
-    /// not walked. Other languages have none here (VB.NET's whole
-    /// declaration joins with VB.NET support).
+    /// not walked. Other languages have none here (upstream also walks a
+    /// VB.NET property's whole declaration; this port does not extract
+    /// VB.NET).
     fn property_bodies(&self, node: SyntaxNode<'tree>) -> Vec<SyntaxNode<'tree>> {
         if self.spec.language() != Language::CSharp {
             return Vec::new();

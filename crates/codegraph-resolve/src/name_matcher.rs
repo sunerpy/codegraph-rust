@@ -2036,8 +2036,8 @@ fn is_unnamed_test_double(
 }
 
 /// Languages whose identifiers resolve regardless of case (upstream
-/// `CASE_INSENSITIVE_LANGUAGES`: PHP, Pascal/Delphi, CFML; COBOL is not
-/// extracted, and VB.NET joins with its extractor).
+/// `CASE_INSENSITIVE_LANGUAGES`: PHP, Pascal/Delphi, CFML; its COBOL and
+/// VB.NET are languages this port does not extract).
 pub const CASE_INSENSITIVE_LANGUAGES: [Language; 3] =
     [Language::Php, Language::Pascal, Language::Cfml];
 

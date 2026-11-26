@@ -18,8 +18,8 @@ use regex::Regex;
 
 use crate::types::{RefView, ResolutionContext, ResolvedRef};
 
-/// Languages whose methods overload by arity (upstream `OVERLOADING_LANGUAGES`;
-/// VB.NET joins with its extractor).
+/// Languages whose methods overload by arity (upstream `OVERLOADING_LANGUAGES`,
+/// less VB.NET, which this port does not extract).
 fn overloads_by_arity(language: Language) -> bool {
     matches!(
         language,
