@@ -1,3 +1,4 @@
+pub mod change_log;
 pub mod connection;
 mod file_identity;
 pub mod index_lease;
@@ -14,6 +15,9 @@ pub mod uninit;
 pub mod viewer;
 pub mod wsl_shared_index;
 
+pub use change_log::{
+    ChangeSet, DEFAULT_CHANGE_LOG_CAP, EdgeImage, FileImage, NodeImage, RefImage, RowChanges,
+};
 pub use connection::{
     ExtractionStampIssue, SchemaVersionReadError, Store, StoreError, StoreStatusOpen,
     StoreWriteAuthorization, StoreWriteOpen, StoreWritePurpose,
