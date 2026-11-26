@@ -2,6 +2,7 @@ pub mod ab;
 pub mod corpus;
 pub mod go_std_gen;
 pub mod graph_diff;
+pub mod load_guard;
 pub mod markdown;
 pub mod metrics;
 pub mod oracle;

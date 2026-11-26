@@ -4,11 +4,13 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use codegraph_bench::ab::{
-    AbConfig, AbCorpus, DEFAULT_RUN_TIMEOUT, run_ab, write_ab_markdown, write_ab_report,
+    AbConfig, AbCorpus, AbOp, DEFAULT_RUN_TIMEOUT, Threads, logical_cpus, run_ab,
+    write_ab_markdown, write_ab_report,
 };
 use codegraph_bench::corpus::{corpora_root, fetch_all_in, list_statuses, list_statuses_in};
 use codegraph_bench::go_std_gen;
 use codegraph_bench::graph_diff::run_graph_diff;
+use codegraph_bench::load_guard::{GuardOverrides, LoadGuard};
 use codegraph_bench::markdown::{render_from_json, write_markdown};
 use codegraph_bench::oracle::golden::write_golden;
 use codegraph_bench::pipeline::{PipelineConfig, run_pipeline, select_corpora};
@@ -57,23 +59,71 @@ struct Args {
 
     #[arg(
         long,
-        help = "A/B-time a cold `init` of --baseline against --candidate on --corpora"
+        help = "A/B-time --op (a cold `init` by default) of --baseline against each --candidate \
+                on --corpora"
     )]
     ab: bool,
 
     #[arg(long, value_name = "BIN", help = "Baseline codegraph binary for --ab")]
     baseline: Option<PathBuf>,
 
-    #[arg(long, value_name = "BIN", help = "Candidate codegraph binary for --ab")]
-    candidate: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "BIN",
+        help = "Candidate codegraph binary for --ab; repeat it to time several candidates in \
+                one rotation, each compared with the baseline"
+    )]
+    candidate: Vec<PathBuf>,
 
     #[arg(
         long,
         value_name = "N",
         value_delimiter = ',',
-        help = "RAYON_NUM_THREADS values for --ab, comma-separated; each is its own cell"
+        help = "RAYON_NUM_THREADS values for --ab, comma-separated; each is its own cell. \
+                `default` is a cell with the variable unset, and the default when omitted"
     )]
-    threads: Vec<usize>,
+    threads: Vec<String>,
+
+    #[arg(
+        long,
+        value_name = "OP",
+        default_value = "init",
+        help = "What --ab times: `init`, `sync-edit:<N>` (a sync after a comment line is \
+                appended to the first N indexed files that take one) or `sync-edit:1:<path>`"
+    )]
+    op: String,
+
+    #[arg(
+        long,
+        help = "Time --ab without the load guard (no quiet start, no waits, no void runs)"
+    )]
+    no_load_guard: bool,
+
+    #[arg(
+        long,
+        value_name = "CPUS",
+        conflicts_with = "no_load_guard",
+        help = "The foreign CPUs a run may share its time with when its threads cover every \
+                CPU (the `default` cell included) before the guard voids it (default 0.5)"
+    )]
+    guard_max_foreign_saturating: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "CPUS",
+        conflicts_with = "no_load_guard",
+        help = "The foreign CPUs a run of fewer threads than CPUs may share its time with \
+                before the guard voids it (default 2)"
+    )]
+    guard_max_foreign_partial: Option<f64>,
+
+    #[arg(
+        long,
+        value_name = "LOAD",
+        conflicts_with = "no_load_guard",
+        help = "The 1-minute load each quiet-start check must stay below (default 3)"
+    )]
+    guard_start_max_load: Option<f64>,
 
     #[arg(
         long,
@@ -313,16 +363,22 @@ fn run_ab_command(args: &Args) -> Result<()> {
         .baseline
         .clone()
         .context("--ab needs --baseline <BIN>")?;
-    let candidate = args
-        .candidate
-        .clone()
-        .context("--ab needs --candidate <BIN>")?;
+    if args.candidate.is_empty() {
+        bail!("--ab needs --candidate <BIN>");
+    }
     if args.corpora.is_empty() {
         bail!("--ab needs --corpora <NAME[,NAME...]> (or 'all')");
     }
-    if args.threads.is_empty() {
-        bail!("--ab needs --threads <N[,M...]>");
-    }
+    let threads = if args.threads.is_empty() {
+        vec![Threads::Default]
+    } else {
+        args.threads
+            .iter()
+            .map(|text| Threads::parse(text))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let op = AbOp::parse(&args.op)?;
+    let load_guard = load_guard_of(args, Path::new("/proc/stat").is_file(), logical_cpus())?;
     let names: Vec<String> = args
         .corpora
         .iter()
@@ -336,11 +392,13 @@ fn run_ab_command(args: &Args) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let config = AbConfig {
         baseline,
-        candidate,
+        candidates: args.candidate.clone(),
         corpora,
-        threads: args.threads.clone(),
+        threads,
         runs: args.runs,
         run_timeout: DEFAULT_RUN_TIMEOUT,
+        op,
+        load_guard,
         workspace_root: workspace_root().ok(),
         argv: std::env::args_os()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -359,6 +417,21 @@ fn run_ab_command(args: &Args) -> Result<()> {
         eprintln!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// The load guard of an `--ab` run: the standard limits for `cpus` CPUs with
+/// the `--guard-*` overrides, or none with `--no-load-guard` or on a host
+/// without `/proc/stat` (`proc_stat`), where it cannot read the load.
+fn load_guard_of(args: &Args, proc_stat: bool, cpus: usize) -> Result<Option<LoadGuard>> {
+    if args.no_load_guard || !proc_stat {
+        return Ok(None);
+    }
+    let overrides = GuardOverrides {
+        foreign_cpus_saturating: args.guard_max_foreign_saturating,
+        foreign_cpus_partial: args.guard_max_foreign_partial,
+        start_load1_max: args.guard_start_max_load,
+    };
+    LoadGuard::standard(cpus).overridden(&overrides).map(Some)
 }
 
 fn selected_corpora_root(args: &Args) -> Result<PathBuf> {
@@ -412,5 +485,54 @@ fn workspace_root() -> Result<PathBuf> {
         if !dir.pop() {
             bail!("cannot locate workspace root from current directory");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn guard(args: &[&str]) -> Result<Option<LoadGuard>> {
+        let args = Args::try_parse_from(std::iter::once("bench").chain(args.iter().copied()))?;
+        load_guard_of(&args, true, 32)
+    }
+
+    /// A `--guard-*` flag replaces its default and leaves the others.
+    #[test]
+    fn a_guard_flag_overrides_its_default() {
+        let standard = LoadGuard::standard(32);
+        assert_eq!(guard(&["--ab"]).unwrap(), Some(standard.clone()));
+        let tuned = guard(&[
+            "--ab",
+            "--guard-max-foreign-partial",
+            "3.5",
+            "--guard-start-max-load",
+            "6",
+        ])
+        .unwrap()
+        .expect("the guard is on");
+        assert_eq!(tuned.foreign_cpus_partial, 3.5);
+        assert_eq!(tuned.start_load1_max, 6.0);
+        assert_eq!(
+            tuned.foreign_cpus_saturating,
+            standard.foreign_cpus_saturating
+        );
+        let saturating = guard(&["--ab", "--guard-max-foreign-saturating", "1.25"])
+            .unwrap()
+            .expect("the guard is on");
+        assert_eq!(saturating.foreign_cpus_saturating, 1.25);
+        assert_eq!(
+            saturating.foreign_cpus_partial,
+            standard.foreign_cpus_partial
+        );
+        assert!(guard(&["--ab", "--guard-max-foreign-partial", "-1"]).is_err());
+        assert!(guard(&["--ab", "--no-load-guard", "--guard-start-max-load", "4"]).is_err());
+        assert_eq!(guard(&["--ab", "--no-load-guard"]).unwrap(), None);
+        let args = Args::try_parse_from(["bench", "--ab"]).unwrap();
+        assert_eq!(
+            load_guard_of(&args, false, 32).unwrap(),
+            None,
+            "no /proc/stat"
+        );
     }
 }

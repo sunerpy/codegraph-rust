@@ -116,10 +116,10 @@ cargo run --locked -p codegraph-bench --bin bench -- \
 
 ## A/B comparison
 
-`--ab` times a cold `init` of two CodeGraph binaries on the same pinned corpora,
-and checks that each binary builds the same graph on every run. It compares two
-builds of this project, such as release builds of a base commit and of a change;
-the upstream CLI is not involved.
+`--ab` times one operation of a baseline CodeGraph binary and one or more
+candidates on the same pinned corpora, and checks that each binary builds the
+same graph on every run. It compares builds of this project, such as release
+builds of a base commit and of a change; the upstream CLI is not involved.
 
 ```bash
 cargo build --locked --release -p codegraph-rs -p codegraph-bench
@@ -140,84 +140,211 @@ target/release/bench --ab \
 commit than its pin, or modified (non-empty `git status --porcelain`) is
 refused. `--runs` counts every run of a cell, the warm-up included, and must be
 at least 2. Without `--out` the JSON report goes to stdout; progress goes to
-stderr.
+stderr. The other options:
+
+- `--candidate <BIN>` may be repeated: every candidate is timed in the same
+  session, in one rotation with the baseline, and compared with the baseline
+  on its own.
+- `--threads` takes `RAYON_NUM_THREADS` values, comma-separated, each its own
+  cell. `default` is a cell with the variable removed, so rayon sizes its
+  pool to the CPUs the process may use; it is the only cell when `--threads`
+  is omitted.
+- `--op` picks what each run times: `init` (the default), `sync-edit:<N>`, or
+  `sync-edit:1:<path>` (see [What each run does](#what-each-run-does)).
+- `--no-load-guard` times without the [load guard](#load-guard). On a host
+  without `/proc/stat` the guard is off.
+- `--guard-max-foreign-saturating <CPUS>`, `--guard-max-foreign-partial <CPUS>`,
+  and `--guard-start-max-load <LOAD>` replace the guard's foreign-CPU limit for
+  a cell whose threads cover every CPU, its limit for any other cell, and the
+  load each quiet-start check must stay below (defaults 0.5, 2, and 3). Each
+  takes a non-negative number and is refused with `--no-load-guard`.
 
 ### What each run does
 
-For each corpus, thread count, and run, the harness:
+Every child runs with `RAYON_NUM_THREADS=<threads>` (removed for the `default`
+cell), `CODEGRAPH_NO_DAEMON=1`, `CODEGRAPH_NO_WATCH=1`, and
+`CODEGRAPH_PHASE_TIMINGS=1`, with `CODEGRAPH_DIR` removed from the
+environment. The CLI has no thread-count flag. Indexing parses and resolves on
+rayon's global thread pool, which takes its size from `RAYON_NUM_THREADS`, so
+each thread count is a separate cell with that variable set.
+
+With `--op init`, for each corpus, thread count, and run, the harness:
 
 1. copies the corpus's benchmark directory into a fresh temporary project,
    leaving out `.git`, `.codegraph`, and `.codegraph-wsl` and skipping symlinks;
-2. runs `<binary> init <project>` with `RAYON_NUM_THREADS=<threads>`,
-   `CODEGRAPH_NO_DAEMON=1`, and `CODEGRAPH_NO_WATCH=1`, and with `CODEGRAPH_DIR`
-   removed from the environment;
-3. records the wall time from spawn to exit, polled every millisecond, and the
+2. runs `<binary> init <project>`;
+3. records the wall time from spawn to exit, polled every millisecond; the
    peak RSS: on Linux the child's own `VmHWM`, read from `/proc/<pid>/status`
    at each poll, since `wait4`'s `ru_maxrss` also counts the address space the
    child was forked from (the harness's, which grows with every database it
    canonicalizes); `ru_maxrss` on other Unix hosts; not collected on Windows;
+   the child's user and system CPU time from `wait4`; and the phase-timing
+   lines of its stderr (the
+   [CLI's Index diagnostics](cli.md#index-diagnostics)), in milliseconds by
+   phase;
 4. checks `.codegraph/codegraph.db` with `PRAGMA quick_check`, canonicalizes it
    through the [equivalence oracle](equivalence.md), and fingerprints it; and
 5. deletes the project.
 
-The CLI has no thread-count flag. Indexing parses and resolves on rayon's global
-thread pool, which takes its size from `RAYON_NUM_THREADS`, so each thread count
-is a separate cell with that variable set.
+With `--op sync-edit:<N>` or `--op sync-edit:1:<path>`, each binary of a cell
+gets its own copy of the corpus, indexed by an untimed `init`. The edit
+appends one line, `<comment>codegraph-bench sync-edit <run>`, to each edited
+file: the first `N` indexed files in path order whose language takes a line
+comment (`//` for the C family, JavaScript, TypeScript, Rust, Go, Java, Kotlin,
+Swift, Dart, Scala, and Solidity; `#` for Python, Ruby, R, Nix, YAML,
+Terraform, properties, and GDScript; `--` for Lua; `%` for Erlang), or the one
+indexed file `<path>`. One untimed warm-up sync comes first; then each run
+appends another line and times `<binary> sync <project>`, recording what an
+`init` run records except the graph. Every sync must print
+`Synced: <n> reindexed` with `<n>` the number of edited files. At the end of
+the cell each edited file is set to its original text plus one final comment
+line, an untimed sync indexes that, and the synced graph must equal a fresh
+`init` of the same source by the same binary. That graph is the cell's graph
+for the comparisons below.
 
-The binaries alternate: even runs time the baseline first and odd runs the
-candidate first. The first run of every (corpus, binary, thread count) cell is a
-warm-up. It is checked like every other run but left out of the statistics.
-"Cold" means that no index exists when `init` starts; the page cache is warm,
-because the project was just copied.
+Run `r` of a cell starts with arm `r mod n` of its `n` binaries, the baseline
+first and then the candidates in order: with one candidate, even runs time the
+baseline first and odd runs the candidate first. The first run of every
+(corpus, binary, thread count) cell is a warm-up. It is checked like every
+other run but left out of the statistics. "Cold" means that no index exists
+when `init` starts; the page cache is warm, because the project was just
+copied.
 
 The fingerprint hashes each canonical surface with SHA-256: for `nodes`,
 `edges`, `unresolved_refs`, and `files`, the compact JSON array of the
 surface's canonical rows; for `schema`, the normalized schema text. The graph
 hash is the SHA-256 of the five lines `<surface> <sha256>`, in that order.
 
+### Load guard
+
+Timing starts on a quiet host, and a run that shares its CPUs with other work
+is void and runs again:
+
+- At the start of a session, three checks in a row, 20 s apart, must each find
+  the 1-minute load below 3, no `cargo`, `cargo-*`, `rustc`, `rustdoc`, or
+  `clippy-driver` process of any user, and at least 90% of the CPU time idle
+  over a 1 s read of `/proc/stat`. After 80 minutes without them the harness
+  exits and times nothing.
+- Before each run, the 1-minute load must be below 8 and a 1 s sample must find
+  the cell's idle CPUs: 7/8 of the CPUs, rounded down, when the cell's threads
+  cover every CPU (`default` included), and 3/4 otherwise. On 32 CPUs that is
+  28 idle CPUs for 32 threads and 24 for 4; on a 4-CPU runner, 3 for 4. A run
+  waits for both, 10 minutes at most, or the harness stops.
+- After each run, the CPU time all CPUs spent busy during it (`/proc/stat`),
+  less the child's own (`wait4`) and the harness's, divided by the run's wall
+  time, is its foreign load. Above 0.5 CPU (threads covering every CPU) or 2
+  CPUs (fewer threads) the run is void: it stays in the report with the reason
+  and runs again at once. A warm-up is never void. Each binary of a cell runs
+  at most twice the requested runs.
+
+The start check's load limit and the two foreign-CPU limits are
+defaults; the `--guard-*` options above set them for a session, and the
+report's `settings.load_guard` records the ones in force. Every run's foreign
+load is in the report, a void run's included, so a result can cite the
+contamination it was timed under. The counters tick at the kernel's clock
+rate, so a run of a fraction of a second can read a few tenths of a CPU of
+foreign load that was not there; on a host shared with other work the
+background alone can exceed the defaults.
+
 ### Failure policy
 
 The harness stops with a non-zero exit status, and writes no report, when:
 
 - a run exits non-zero, is killed by a signal, or runs longer than 30 minutes;
-- a run exits 0 but leaves no database, or leaves one that fails
-  `PRAGMA quick_check` or canonicalization; or
+- an `init` exits 0 but leaves no database, or leaves one that fails
+  `PRAGMA quick_check` or canonicalization;
 - two runs of the same binary on one corpus produce different graph hashes, at
-  the same or at different thread counts.
+  the same or at different thread counts;
+- a sync re-indexes another number of files than the run edited, or its graph
+  differs from a fresh `init` of the same source;
+- a phase-timing line is malformed, comes from another command, or repeats a
+  phase, or two runs of one binary in a cell report different phases; or
+- the load guard finds no quiet start, waits out a run, or voids so many runs
+  that a cell cannot collect its runs.
 
-A difference between the baseline and candidate graphs is not a failure. The
+A difference between the baseline and a candidate graph is not a failure. The
 report records it per corpus, so a change that alters the graph can still be
 timed against its row growth; `--graph-diff` shows the rows.
 
 ### Report
 
-The JSON report has `kind` `codegraph-ab` and `schema_version` 1. Its fields:
+The JSON report has `kind` `codegraph-ab` and `schema_version` 2. Its fields:
 
 - `argv`: the `bench` command line.
 - `environment`: CPU model, logical CPUs, memory, OS, kernel, `rustc --version`,
   the harness commit and whether its worktree was dirty, and how RSS was
   collected.
-- `settings`: the invocation, environment overrides, thread variable, thread
-  counts, runs, discarded warm-ups, run order, run timeout, and budget limits.
-- `baseline`, `candidate`: the path, SHA-256, size, and `--version` line of each
-  binary.
+- `settings`: the invocation, the operation (`op`), environment overrides,
+  thread variable, thread counts (`threads`, a `default` cell's being the
+  CPUs) and `thread_settings` as given, runs, discarded warm-ups, run order,
+  run timeout, budget limits, and the load guard's limits (`null` when off).
+- `session_start`: the load guard's start checks, each with its load, idle
+  fraction and builds, and how long they took.
+- `baseline`, `candidate`, `candidates`: the path, SHA-256, size, and
+  `--version` line of each binary; `candidate` is the first of `candidates`.
 - `corpora[]`: the name, pinned commit and tag, source directory, copied files,
-  and skipped symlinks of each corpus.
-- `corpora[].graph`: `identical`, `differing_surfaces`, and each binary's
-  fingerprint: `hash`, per-surface hashes, and canonical row counts.
-- `corpora[].cells[]`: one entry per thread count, holding every run of each
-  binary (`wall_ms`, `peak_rss_kb`, `warmup`, `canonical_hash`), the median and
-  MAD of the measured runs, canonical rows per second at the median, the
-  candidate/baseline `ratio` of wall time, peak RSS, rows, and rows per second,
-  and the `budget` verdict.
+  skipped symlinks, and for a sync op the edited files of each corpus.
+- `corpora[].graphs[]`, one per candidate: `identical`, `differing_surfaces`,
+  and both binaries' fingerprints: `hash`, per-surface hashes, and canonical
+  row counts. `graph` is the first candidate's.
+- `corpora[].cells[]`: one entry per thread count, with `default_threads` for
+  the `default` cell, the baseline's runs, and in `candidates[]` each
+  candidate's runs, its candidate/baseline `ratio` of wall time, peak RSS,
+  rows, and rows per second, its `budget` verdict, and its `phase_ratio` of
+  each phase both report; `candidate`, `ratio`, and `budget` are the first
+  candidate's. A binary's runs hold every run (`run`, `warmup`, `wall_ms`,
+  `peak_rss_kb`, `cpu_ms`, `phase_ms`, an `init` run's `canonical_hash`, the
+  guard's `load` with its `load1`, `idle_cpus`, `waited_ms`, and
+  `foreign_cpus`, and `void` with its reason), and the median and MAD of the
+  measured runs, those neither warm-up nor void: wall time, peak RSS, CPU
+  time, foreign CPUs (`foreign_cpus`), each phase, and for `init` the
+  canonical rows per second at the median.
 
-`--report-md` renders the same data as a Markdown table with one row per corpus
-and thread count, below a table of the binaries, their hashes, and the
-environment.
+`--report-md` renders the same data as Markdown: a table of the binaries,
+their hashes, and the environment; one row per corpus, thread count, and
+candidate; one row per phase both binaries of a cell report; and with the
+guard on, one row per binary and cell listing the foreign CPUs of its
+warm-up, its measured runs, and its void runs, in run order.
 
 Publishing an A/B result follows the
 [evidence requirements](#evidence-requirements): the report carries the binary
 hashes, the environment, every run, and the graph fingerprints.
+
+### Adoption verdict
+
+`crates/codegraph-bench/scripts/od9-verdict.py` applies the adoption rule of a
+performance strategy (OD-9) to one or more reports:
+
+```bash
+python3 -I crates/codegraph-bench/scripts/od9-verdict.py \
+  --target reference_resolution --noise-floor-ms 1.5 \
+  --profile release --goldens-ok target/ab.json
+```
+
+`--target` names the phases the strategy changes, the phase its cost moves
+into included, or `wall`; a run's target is the sum of their times. A
+strategy is `ADOPTED` only when, for the candidate (`--candidate`, default the
+first):
+
+- every corpus's graph is identical to the baseline's, and `--goldens-ok`
+  attests that `scripts/regen-goldens.sh --check` and the `golden_reextract`
+  test passed on the candidate build;
+- in every required cell (`--threads`, default `32,4`, on every corpus or
+  those `--corpora` names), with `B` and `C` the baseline and candidate
+  medians of the target over at least five measured runs each and the MAD
+  unscaled, `(B - C) / B >= 0.05` and `B - C > 2 * max(MAD_B, MAD_C)`; and
+- in every required cell no other phase both binaries report, nor the wall
+  time, nor the peak RSS regresses: `C / B > 1.02` together with
+  `C - B > 2 * max(MAD_B, MAD_C)`. A phase whose baseline median is below
+  `--noise-floor-ms` is judged by its increase alone, `C - B` above the floor.
+
+Any failed rule makes it `REJECTED_BY_PROFILE`, exit status 1; a rule it
+cannot evaluate (a missing cell, too few measured runs, no golden
+attestation) gives `INCOMPLETE`, exit 3. The verdict needs release-profile
+builds: `--profile fast` prints the evaluation as attribution only, exit 3.
+Cells may come from several reports, such as 32-thread cells timed on one host
+and 4-thread cells on another, each cell from one report only. `--json`
+prints the result as JSON.
 
 ### Regression budget
 
@@ -231,10 +358,12 @@ project's performance budget when:
 - the `explore` p50 is at most 1.10× the baseline's; and
 - the peak RSS median is at most 1.15× the baseline's.
 
-`--ab` measures the `init` and peak RSS terms and reports them per cell as
-`budget.init_wall_ok` and `budget.peak_rss_ok`. It never fails a run for being
-over budget; `sync` and `explore` are measured separately. A change over budget
-is fixed, or kept only with its A/B report attached for the owner to accept.
+`--ab` measures the `init`, single-file `sync`, and peak RSS terms and reports
+them per cell as `budget.init_wall_ok` (`--op init`), `budget.sync_wall_ok`
+(`--op sync-edit:1` and `sync-edit:1:<path>`), and `budget.peak_rss_ok`. It
+never fails a run for being over budget; `explore` is measured separately. A
+change over budget is fixed, or kept only with its A/B report attached for the
+owner to accept.
 
 ### Graph diff
 
