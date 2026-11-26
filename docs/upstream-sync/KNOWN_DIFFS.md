@@ -240,6 +240,43 @@ These are Tier-2 text-formatting differences (identical input schemas; equal
 output structure), not Tier-3 allowlist rules: they do not change a value the
 oracle compares on the SQLite golden surfaces.
 
+## `codegraph context` (Tier-2 content differences)
+
+`codegraph context <task...>` follows colby's `codegraph context`
+(`src/bin/codegraph.ts`, `src/context/`; `b635dd46` plus #2428 from
+`e8ddc4e2`): the same flags, the same defaults (`maxNodes` 20,
+`maxCodeBlocks` 5, `maxCodeBlockSize` 1500, `searchLimit` 3,
+`traversalDepth` 1, `minScore` 0.3, code on), the same error sentences,
+Markdown sections and JSON keys, and `--max-nodes` read as `parseInt` reads
+it. For the mini corpus's `Counter add runDemo` (the CLI test's snapshot) it
+prints what colby's `e8ddc4e2` build prints, byte for byte. What it lists can
+differ:
+
+- The entry points are the first three matches of the Rust explore search
+  (colby's high-value kinds, the identifier-segment seeds), not colby's
+  multi-channel `findRelevantContext` search (exact names, definition
+  prefixes, camelCase and compound-term channels, the test-file and
+  multi-term re-scoring, the core-directory boost of #2575 and #2785, the
+  `minScore` floor). From them the port walks the way `findRelevantContext`
+  does, at context's limits: the type hierarchy, a one-hop walk over every
+  edge kind onto the high-value kinds, the node budget, the per-file and
+  non-production caps, and the edges among the kept nodes.
+- The low-confidence note is colby's rule (no entry point corroborated by two
+  query terms or named as a distinctive identifier), applied to those entry
+  points.
+- A code block whose file changed after its last sync is left out, and a
+  `warning:` line on stderr names the file; colby slices the current file at
+  the indexed lines. The same kind of line says so when the engine reports
+  auto-sync recovering or disabled. stdout does not change.
+- Lengths and the 1500-unit cut count UTF-16 code units, as colby does; a cut
+  that would split a surrogate pair stops before it.
+- Errors print with the CLI's `Error: ` prefix where colby prints `✗ `; an
+  index that is missing or not readable reports the shared lifecycle message,
+  which for a missing index begins with colby's sentence. A missing `<task>`
+  is a clap usage error (exit status 2; colby's commander exits 1).
+- CLI only. colby's other entry point is its JavaScript library API
+  (`CodeGraph.buildContext`); neither side has an MCP context tool.
+
 ## Kept different on purpose (KEEP-RUST)
 
 Where the port reads a shape differently from colby on purpose, the decision is

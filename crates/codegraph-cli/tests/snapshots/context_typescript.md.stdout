@@ -1,0 +1,75 @@
+## Code Context
+
+**Query:** Screen callableSemanticsUniqueHelper generatorTask
+
+### Entry Points
+
+- **generatorTask** (function) - callable_semantics.ts:12
+  `()`
+- **callableSemanticsUniqueHelper** (function) - callable_semantics.ts:8
+  `(): number`
+- **Screen** (function) - callable_semantics.ts:16
+  `()`
+
+### Related Symbols
+
+- callable_semantics.ts: plainHandler:17, callbackHandler:18
+
+### Code
+
+#### generatorTask (callable_semantics.ts:12)
+
+```typescript
+export function* generatorTask() {
+  yield callableSemanticsUniqueHelper();
+}
+```
+
+#### callableSemanticsUniqueHelper (callable_semantics.ts:8)
+
+```typescript
+function callableSemanticsUniqueHelper(): number {
+  return 1;
+}
+```
+
+#### Screen (callable_semantics.ts:16)
+
+```typescript
+export function Screen() {
+  const plainHandler = () => callableSemanticsUniqueHelper();
+  const callbackHandler = useCallback(() => callableSemanticsUniqueHelper(), []);
+  const eventHandler = useEffectEvent(function () {
+    return callableSemanticsUniqueHelper();
+  });
+  const wrappedHandler = Effect.fn("Screen.wrapped")(function* () {
+    yield callableSemanticsUniqueHelper();
+  });
+  const memoValue = useMemo(() => callableSemanticsUniqueHelper(), []);
+  const mappedValue = [1].map(() => callableSemanticsUniqueHelper());
+  return plainHandler() + callbackHandler() + eventHandler() + memoValue + mappedValue.length;
+}
+```
+
+#### plainHandler (callable_semantics.ts:17)
+
+```typescript
+  const plainHandler = () => callableSemanticsUniqueHelper();
+```
+
+#### callbackHandler (callable_semantics.ts:18)
+
+```typescript
+  const callbackHandler = useCallback(() => callableSemanticsUniqueHelper(), []);
+```
+
+
+## Call paths
+
+Execution flow among the key symbols (traced through the call graph):
+
+- Screen → plainHandler → callableSemanticsUniqueHelper
+- Screen → callbackHandler → callableSemanticsUniqueHelper
+
+_codegraph_node any symbol above for its source + its own callers/callees._
+

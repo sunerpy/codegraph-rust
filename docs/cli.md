@@ -6,7 +6,8 @@
 
 - **Positional or `-p/--path`:** `init`, `uninit`, `index`, `sync`, `status`,
   `callers`, `callees`, `impact`, `affected`, `unlock`, `check`, `export`.
-- **`-p/--path` only:** `search`, `files`, `serve`, `audit`, `explore`, `node`.
+- **`-p/--path` only:** `search`, `files`, `serve`, `audit`, `explore`, `node`,
+  `context`.
 - **No project path:** `install`, `uninstall`, `skill`, `version`, `self-update`,
   `completions`, `http`, `mcp`.
 
@@ -41,6 +42,7 @@
 | `export`          | Export the whole code graph as NetworkX node-link JSON                                                                        | `-p/--path`, `-o/--out <file>`, `--no-centrality`                                                                                          |
 | `explore`         | Explore an area with the same deterministic engine/output as `codegraph_explore`                                              | `<query>`, `-p`, `--max-files <1..20>`, `-j/--json`                                                                                        |
 | `node`            | Read a symbol name, exact node ID, or indexed file with the `codegraph_node` engine                                           | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
+| `context`         | Build task context: entry points, related symbols, code blocks and call paths, as Markdown or JSON                            | `<task...>`, `-p`, `-f/--format markdown\|json`, `-n/--max-nodes <N>`, `--no-code`                                                         |
 | `http`            | Inspect or stop detached HTTP MCP servers                                                                                     | `<action>` (`list`, `status`, `stop`)                                                                                                      |
 | `mcp`             | Inspect foreground stdio MCP processes                                                                                        | `list`, optional `--json`                                                                                                                  |
 | `ui`              | Open the browser viewer over the existing index (preview: refused unless `CODEGRAPH_UI=1`; see [the viewer reference](ui.md)) | `[path]`, `--port <N>`, `--no-open`, `--read-only`; alias `web`                                                                            |
@@ -107,11 +109,14 @@ codegraph sync .
 codegraph search "handle_node" -p . --json
 codegraph explore "node lookup flow" -p .
 codegraph node "handle_node" -p .
+codegraph context "node lookup flow" -p . --format json
 ```
 
 Do not append `.` as a second positional argument to `search`, `explore`, or
-`node`. On an argument error, use `codegraph <command> --help`; a CLI-shape
-mismatch is not a reason to abandon the index for grep.
+`node`; `context` takes every positional word as part of its task, so a `.`
+there becomes a word of the query. On an argument error, use
+`codegraph <command> --help`; a CLI-shape mismatch is not a reason to abandon
+the index for grep.
 
 `search --json` includes each result's stable internal `node.id`. That ID can be
 passed directly to `node`, avoiding name ambiguity:
@@ -444,6 +449,88 @@ If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run with
 appropriate privileges. Windows assets are `.zip`; if `self-update` cannot fetch
 them automatically, reinstall via
 `cargo install --git https://github.com/sunerpy/codegraph-rust codegraph-rs`.
+
+---
+
+## `codegraph context` — task context as Markdown or JSON
+
+`codegraph context <task...>` builds what upstream's `codegraph context` builds
+for a task: its entry points, the symbols around them, their code and the call
+paths among them. The words of the task are joined with spaces. Scripts and
+tools call it the way Memorix does:
+
+```bash
+codegraph context -p . --format json --max-nodes 8 --no-code "where is the token refreshed"
+codegraph context "parseToken expiry handling" -p .
+```
+
+| Flag                         | Default                                                          | Meaning                   |
+| ---------------------------- | ---------------------------------------------------------------- | ------------------------- |
+| `-p/--path <PATH>`           | the current directory, or the nearest indexed directory above it | Project root              |
+| `-f/--format markdown\|json` | `markdown`                                                       | Output format             |
+| `-n/--max-nodes <N>`         | 20                                                               | Symbols at most           |
+| `--no-code`                  | code blocks on                                                   | Leave the code blocks out |
+
+The other limits are upstream's defaults and have no flag: 3 entry points, a
+walk of one hop, and at most 5 code blocks of at most 1500 UTF-16 code units
+each (a longer block is cut and ends with `... (truncated) ...`).
+
+How the answer is built:
+
+- **Entry points:** the first three results of the search `codegraph explore`
+  runs for the same words (the high-value kinds, the identifier-segment
+  seeds), with no score floor. Unlike explore, `context` keeps any path the
+  task names as words of the query.
+- **Subgraph:** explore's walk from the entry points, at context's limits:
+  each class-like entry point's type hierarchy, one hop over every edge kind
+  onto the high-value kinds, the node budget, at most `max(5, ⌈0.2·N⌉)` nodes
+  of one file, at most `max(3, ⌈0.15·N⌉)` nodes of test, example or fixture
+  files unless the task mentions `test` or `spec`, then the `calls`,
+  `extends`, `implements`, `references`, `overrides` and `navigates` edges
+  among the kept nodes.
+- **Code blocks:** the entry points, then the other functions and methods,
+  then the other classes, in the subgraph's order. Source goes through the
+  freshness check `codegraph node` uses: a file changed since the last sync
+  gives no block, never one cut at the indexed lines, and a `warning:` line on
+  stderr names it. A YAML or properties key gives its key alone, never the
+  value on its line.
+- **Call paths:** chains of three to six symbols along the `calls` edges
+  between kept nodes that pass through at least two entry points, three at
+  most. A hop a synthesis pass bridged reads
+  `→[interface → impl @src/pdf-exporter.ts:5]`, in the wording of explore's
+  Flow, and the footnote says so.
+- **Low-confidence note:** when the task has two or more terms and no entry
+  point is named in it as a distinctive identifier or carries two of its terms
+  in its name or directory, the Markdown ends with
+  `### ⚠️ Low-confidence match` and points to `codegraph_explore`,
+  `codegraph_search` and `codegraph_files`.
+
+Markdown has `## Code Context`, `**Query:**`, `### Entry Points` (generated
+files last), `### Related Symbols` (up to ten other symbols outside generated
+files, grouped by file), `### Code`, then `## Call paths` and the note.
+`--format json` prints one object with `query`, `summary`, `entryPoints`,
+`nodes`, `edges`, `codeBlocks`, `relatedFiles` and `stats`. A node has `id`,
+`kind`, `name`, `qualifiedName`, `filePath`, `language`, `startLine`,
+`endLine`, `signature`, `docstring`, `visibility`, `isExported`, `isAsync` and
+`isStatic`; a missing `signature` or `docstring` leaves its key out and a
+missing `visibility` is `null`. An edge has `source`, `target`, `kind`, `line`
+and `column`, the last two left out when unknown. `relatedFiles` sorts by
+UTF-16 code units and `stats.totalCodeSize` counts them. JSON carries neither
+the call paths nor the note.
+
+stdout holds the answer alone. Errors go to stderr with exit status 1:
+`Unknown format "<x>" — use "markdown" or "json".` and
+`--max-nodes expects a positive integer, got "<x>".`, both checked before the
+project, then the shared lifecycle errors, which for a missing index begin
+`CodeGraph not initialized in <path>`. `--max-nodes` reads its leading number
+as JavaScript's `parseInt` does, so `5abc` is 5 and `1.9` is 1. A missing task
+is a usage error (exit status 2). When the engine reports auto-sync recovering
+or disabled, a `warning:` line says the context may be stale; stdout does not
+change.
+
+`context` is CLI-only, as upstream's is; there is no MCP context tool. Where
+it differs from upstream's command, its entry points above all, is listed in
+[KNOWN_DIFFS](upstream-sync/KNOWN_DIFFS.md#codegraph-context-tier-2-content-differences).
 
 ---
 

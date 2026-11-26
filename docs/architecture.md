@@ -70,7 +70,7 @@ graph TD
 | `codegraph-store`   | SQLite/FTS5 schema, migrations, persistence, queries, leases          |
 | `codegraph-resolve` | generic import/name matching and framework-aware resolution           |
 | `codegraph-graph`   | traversal, impact, query parsing, search ranking                      |
-| `codegraph-mcp`     | tool schemas/engine, rmcp stdio and streamable-HTTP transports        |
+| `codegraph-mcp`     | tool schemas/engine, `context`, rmcp stdio/streamable-HTTP transports |
 | `codegraph-watch`   | incremental reconciliation and filesystem watcher                     |
 | `codegraph-daemon`  | detached shared process, IPC, and process registries                  |
 | `codegraph-ui`      | browser viewer: loopback JSON API, live channel, embedded `ui/` build |

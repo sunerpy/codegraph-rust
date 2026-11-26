@@ -31,6 +31,7 @@ use codegraph_graph::synthesized_hop::describe_synthesized_hop;
 use codegraph_store::Store;
 use serde_json::Value;
 
+use crate::context::{self, CodeBlock, ContextFormat, ContextOptions, TaskContext};
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::explore_gather::{self, HIGH_VALUE_KINDS};
@@ -4700,6 +4701,145 @@ impl CodeGraphEngine {
         let start_idx = start_idx.min(end_idx);
         Ok(Some(lines[start_idx..end_idx].join("\n")))
     }
+
+    /// `codegraph context <task>` (W9-01): upstream `ContextBuilder.buildContext`
+    /// (`context/index.ts` b635dd46 241-302) over explore's search and walk.
+    ///
+    /// The entry points are the first `search_limit` seeds of
+    /// [`Self::explore_seed_search`] for the task as written (upstream's
+    /// context strips no paths), with no score floor (OD-B81). The subgraph
+    /// is [`explore_gather::walk`] at the options' limits (OD-B79), and the
+    /// low-confidence note is upstream's rule over those entry points
+    /// (OD-B80). Code comes through the drift-safe reader
+    /// ([`Self::get_code`]): a file whose freshness cannot be proven gives no
+    /// block, never one cut at stale lines, and a notice names it; a YAML or
+    /// properties key gives its key alone (#383).
+    pub fn build_context(
+        &self,
+        task: &str,
+        options: &ContextOptions,
+    ) -> anyhow::Result<BuiltContext> {
+        self.source_probes.borrow_mut().clear();
+        self.source_citations.borrow_mut().clear();
+        self.answer_files.borrow_mut().clear();
+        self.symbol_memo.borrow_mut().clear();
+        let health = codegraph_watch::watch_health(&self.project_root);
+
+        let entries: Vec<Node> = self
+            .explore_seed_search(task)?
+            .into_iter()
+            .take(options.search_limit)
+            .collect();
+        let low_confidence = context::is_low_confidence(task, &entries);
+        // `isTestQuery`, as explore reads it (`context/index.ts` 713).
+        let lowered = task.to_lowercase();
+        let test_query = lowered.contains("test") || lowered.contains("spec");
+        let explore_gather::Walk {
+            gathered, roots, ..
+        } = explore_gather::walk(
+            &self.store,
+            &entries,
+            test_query,
+            explore_gather::WalkLimits {
+                max_nodes: options.max_nodes,
+                depth: options.traversal_depth,
+            },
+        )?;
+
+        let mut code_blocks: Vec<CodeBlock> = Vec::new();
+        let mut drifted: BTreeSet<String> = BTreeSet::new();
+        if options.include_code {
+            for node in context::code_block_candidates(&gathered.nodes, &roots) {
+                if code_blocks.len() >= options.max_code_blocks {
+                    break;
+                }
+                let code = if explore_rank::is_config_leaf(node) {
+                    Some(context::config_leaf_code(node).to_string())
+                } else {
+                    let code = self.get_code(node)?;
+                    if code.is_none() && self.project_source(&node.file_path).is_possibly_drifted()
+                    {
+                        drifted.insert(node.file_path.clone());
+                    }
+                    code
+                };
+                // A block with no code takes no slot (`if (code)`).
+                if let Some(code) = code.filter(|code| !code.is_empty()) {
+                    code_blocks.push(CodeBlock {
+                        node: node.clone(),
+                        content: context::truncate_code_block(&code, options.max_code_block_size),
+                    });
+                }
+            }
+        }
+
+        let task_context = TaskContext {
+            query: task.to_string(),
+            nodes: gathered.nodes,
+            edges: gathered.edges,
+            roots,
+            code_blocks,
+            low_confidence,
+        };
+        let output = match options.format {
+            ContextFormat::Markdown => {
+                // Upstream's `generatedPredicateFor` over the answer's paths:
+                // the index's header verdicts and the file-name rule, in one
+                // query over the sorted paths.
+                let mut paths: Vec<String> = task_context
+                    .nodes
+                    .iter()
+                    .map(|node| node.file_path.clone())
+                    .collect();
+                paths.sort_unstable();
+                paths.dedup();
+                let flagged = self.store.generated_paths_among(&paths)?;
+                context::format_markdown(&task_context, &|path| {
+                    flagged.contains(path) || is_generated_file(path)
+                })
+            }
+            ContextFormat::Json => context::format_json(&task_context)?,
+        };
+
+        let mut notices = Vec::new();
+        match &health {
+            Some(codegraph_watch::WatchHealth::Recovering { reason }) => notices.push(format!(
+                "CodeGraph auto-sync is RECOVERING — a full index catch-up has not completed yet, so this context may be stale; read files directly to confirm current content. Reason: {}",
+                one_line(reason)
+            )),
+            Some(codegraph_watch::WatchHealth::Disabled { reason }) => notices.push(format!(
+                "CodeGraph auto-sync is DISABLED — live file watching stopped, so the index is frozen and this context may be stale; read files directly to confirm current content. Reason: {}",
+                one_line(reason)
+            )),
+            Some(codegraph_watch::WatchHealth::Healthy) | None => {}
+        }
+        if !drifted.is_empty() {
+            notices.push(format!(
+                "left out the code of symbols in files that changed since the last index sync: {}; run `codegraph sync` to index them again",
+                drifted.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        Ok(BuiltContext { output, notices })
+    }
+}
+
+/// What `codegraph context` prints (W9-01): the answer for stdout, unchanged
+/// by the index's health, and one-line notices for stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltContext {
+    /// The Markdown or JSON answer, without the newline the CLI ends it with.
+    pub output: String,
+    /// Auto-sync recovering or disabled, and the files whose code was left
+    /// out because they changed since the last index sync.
+    pub notices: Vec<String>,
+}
+
+/// `text` on one line: its line breaks become spaces.
+fn one_line(text: &str) -> String {
+    text.split(['\r', '\n'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -14829,6 +14969,262 @@ mod tests {
         assert_eq!(&w901a_ids(&sub.nodes)[..walked.len()], walked.as_slice());
         assert!(walked.contains(&leaf.id.as_str()), "{walked:?}");
         assert!(engine.explore_seed_search("  ").unwrap().is_empty());
+    }
+
+    // === W9-01b: `codegraph context` =========================================
+
+    /// Four seeds the query names (`southStep` … `northStep`), the first
+    /// calling `deltaHelper`, which calls `epsilonLeaf`; every source file is
+    /// indexed as it is on disk.
+    fn w901_project(engine: &mut CodeGraphEngine) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        for (name, file) in [
+            ("southStep", "src/south.ts"),
+            ("eastStep", "src/east.ts"),
+            ("westStep", "src/west.ts"),
+            ("northStep", "src/north.ts"),
+            ("deltaHelper", "src/delta.ts"),
+            ("epsilonLeaf", "src/epsilon.ts"),
+        ] {
+            let node = w725_fn(name, file, 1);
+            put_indexed_source(
+                engine,
+                file,
+                &format!("export function {name}() {{\n  return 1;\n}}\n"),
+                Language::TypeScript,
+                1,
+            );
+            nodes.push(node);
+        }
+        put_nodes(engine, &nodes);
+        put_edges(
+            engine,
+            &[
+                w725_edge_at(&nodes[0], &nodes[4], EdgeKind::Calls, 2),
+                w725_edge_at(&nodes[4], &nodes[5], EdgeKind::Calls, 2),
+            ],
+        );
+        nodes
+    }
+
+    fn w901_json(
+        engine: &CodeGraphEngine,
+        task: &str,
+        options: ContextOptions,
+    ) -> (serde_json::Value, Vec<String>) {
+        let built = engine
+            .build_context(
+                task,
+                &ContextOptions {
+                    format: ContextFormat::Json,
+                    ..options
+                },
+            )
+            .unwrap();
+        (serde_json::from_str(&built.output).unwrap(), built.notices)
+    }
+
+    fn w901_names(list: &serde_json::Value) -> Vec<&str> {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect()
+    }
+
+    /// OD-B81, OD-B79: the entry points are the first three of explore's
+    /// seeds for the task as written, and the walk goes one hop out.
+    #[test]
+    fn w901_context_walks_one_hop_from_explore_s_first_three_seeds() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        let task = "southStep eastStep westStep northStep";
+        let seeds = engine.explore_seed_search(task).unwrap();
+        assert!(seeds.len() >= 4, "{:?}", w901a_ids(&seeds));
+        let (json, notices) = w901_json(&engine, task, ContextOptions::default());
+        assert!(notices.is_empty(), "{notices:?}");
+        let first_three: Vec<&str> = seeds.iter().take(3).map(|n| n.name.as_str()).collect();
+        assert_eq!(w901_names(&json["entryPoints"]), first_three);
+        let names = w901_names(&json["nodes"]);
+        assert!(!names.contains(&seeds[3].name.as_str()), "{names:?}");
+        if first_three.contains(&"southStep") {
+            assert!(names.contains(&"deltaHelper"), "{names:?}");
+        }
+        assert!(!names.contains(&"epsilonLeaf"), "{names:?}");
+        assert_eq!(json["codeBlocks"].as_array().unwrap().len(), names.len());
+        assert_eq!(json["query"], task);
+    }
+
+    /// #383: a Spring properties key's block is its key, and its value is
+    /// never read off the disk.
+    #[test]
+    fn w901_context_gives_a_config_key_s_block_as_the_key_alone() {
+        let mut engine = test_engine();
+        let file = "src/main/resources/application.properties";
+        put_indexed_source(
+            &engine,
+            file,
+            "db.password=s3cr3t-value\n",
+            Language::Properties,
+            1,
+        );
+        let mut key = node_lang(
+            "password",
+            "db.password",
+            file,
+            1,
+            1,
+            NodeKind::Constant,
+            Language::Properties,
+        );
+        key.id = format!("spring-config:{file}:1:db.password");
+        key.signature = Some("db.password".to_string());
+        put_nodes(&mut engine, &[key]);
+        let (json, _) = w901_json(&engine, "password", ContextOptions::default());
+        assert_eq!(json["codeBlocks"][0]["content"], "db.password", "{json}");
+        let markdown = engine
+            .build_context("password", &ContextOptions::default())
+            .unwrap()
+            .output;
+        assert!(
+            markdown.contains("```properties\ndb.password\n```"),
+            "{markdown}"
+        );
+        assert!(
+            !markdown.contains("s3cr3t") && !json.to_string().contains("s3cr3t"),
+            "{markdown}"
+        );
+    }
+
+    /// A file changed since its last sync gives no block, is never sliced at
+    /// its stale lines, and a notice names it; its symbols stay listed.
+    #[test]
+    fn w901_context_leaves_a_drifted_file_s_code_out_and_says_so() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        write_src(
+            &engine,
+            "src/south.ts",
+            "// moved down\nexport function southStep() {\n  return 2;\n}\n",
+        );
+        let (json, notices) = w901_json(&engine, "southStep", ContextOptions::default());
+        assert!(w901_names(&json["nodes"]).contains(&"southStep"), "{json}");
+        let blocks = json["codeBlocks"].as_array().unwrap();
+        assert!(
+            blocks.iter().all(|block| block["nodeName"] != "southStep"),
+            "{json}"
+        );
+        assert!(
+            blocks.iter().all(|block| {
+                let content = block["content"].as_str().unwrap();
+                !content.contains("moved down") && !content.contains("return 2")
+            }),
+            "{json}"
+        );
+        assert_eq!(
+            notices,
+            [
+                "left out the code of symbols in files that changed since the last index sync: src/south.ts; run `codegraph sync` to index them again"
+            ]
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["nodeName"] == "deltaHelper"),
+            "{json}"
+        );
+    }
+
+    /// The 取舍 of W9-01's pre-start revision (draft Q7): the answer is the
+    /// same while auto-sync recovers; a notice for stderr says so.
+    #[test]
+    fn w901_context_notices_auto_sync_that_is_not_healthy() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        let healthy = engine
+            .build_context("southStep", &ContextOptions::default())
+            .unwrap();
+        assert!(healthy.notices.is_empty(), "{:?}", healthy.notices);
+        let guard = codegraph_watch::register_watch_health_for_tests(
+            &engine.project_root,
+            codegraph_watch::WatchHealth::Recovering {
+                reason: "lock held\nby another writer".to_string(),
+            },
+        );
+        let recovering = engine
+            .build_context("southStep", &ContextOptions::default())
+            .unwrap();
+        assert_eq!(recovering.output, healthy.output);
+        assert_eq!(recovering.notices.len(), 1, "{:?}", recovering.notices);
+        assert!(
+            recovering.notices[0].starts_with("CodeGraph auto-sync is RECOVERING")
+                && recovering.notices[0].ends_with("Reason: lock held by another writer"),
+            "{:?}",
+            recovering.notices
+        );
+        drop(guard);
+        let _disabled = codegraph_watch::register_watch_health_for_tests(
+            &engine.project_root,
+            codegraph_watch::WatchHealth::Disabled {
+                reason: "inotify limit".to_string(),
+            },
+        );
+        let disabled = engine
+            .build_context("southStep", &ContextOptions::default())
+            .unwrap();
+        assert_eq!(disabled.output, healthy.output);
+        assert!(
+            disabled.notices[0].starts_with("CodeGraph auto-sync is DISABLED"),
+            "{:?}",
+            disabled.notices
+        );
+    }
+
+    /// `--no-code` reads no file; `--max-nodes 1` keeps the first entry
+    /// point alone.
+    #[test]
+    fn w901_context_options_turn_code_off_and_bound_the_nodes() {
+        let mut engine = test_engine();
+        w901_project(&mut engine);
+        let task = "southStep eastStep westStep";
+        let (json, _) = w901_json(
+            &engine,
+            task,
+            ContextOptions {
+                include_code: false,
+                ..ContextOptions::default()
+            },
+        );
+        assert_eq!(json["codeBlocks"], serde_json::json!([]));
+        assert!(!json["nodes"].as_array().unwrap().is_empty());
+        let (one, _) = w901_json(
+            &engine,
+            task,
+            ContextOptions {
+                max_nodes: 1,
+                ..ContextOptions::default()
+            },
+        );
+        let seeds = engine.explore_seed_search(task).unwrap();
+        assert_eq!(w901_names(&one["nodes"]), [seeds[0].name.as_str()]);
+        assert_eq!(w901_names(&one["entryPoints"]), [seeds[0].name.as_str()]);
+        let markdown = engine
+            .build_context(
+                task,
+                &ContextOptions {
+                    include_code: false,
+                    ..ContextOptions::default()
+                },
+            )
+            .unwrap()
+            .output;
+        assert!(!markdown.contains("### Code"), "{markdown}");
+        assert!(
+            markdown.starts_with(
+                "## Code Context\n\n**Query:** southStep eastStep westStep\n\n### Entry Points\n\n"
+            ),
+            "{markdown}"
+        );
     }
 
     /// W7-25a: at most ⌈200 × 0.2⌉ = 40 nodes of one file stay in the

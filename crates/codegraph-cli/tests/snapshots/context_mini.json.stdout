@@ -1,0 +1,195 @@
+{
+  "query": "Counter add runDemo",
+  "summary": "Found 4 relevant code symbols across 2 files. Key entry points: runDemo, add, Counter. 5 relationships identified.",
+  "entryPoints": [
+    {
+      "id": "function:60629aa3876961b8bd3c07c43bbe6a37",
+      "kind": "function",
+      "name": "runDemo",
+      "qualifiedName": "runDemo",
+      "filePath": "src/app.ts",
+      "language": "typescript",
+      "startLine": 3,
+      "endLine": 7,
+      "signature": "(): number",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:cce15011e0125d59f6bef014ae79c04f",
+      "kind": "function",
+      "name": "add",
+      "qualifiedName": "add",
+      "filePath": "src/math.ts",
+      "language": "typescript",
+      "startLine": 1,
+      "endLine": 3,
+      "signature": "(left: number, right: number): number",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+      "kind": "class",
+      "name": "Counter",
+      "qualifiedName": "Counter",
+      "filePath": "src/math.ts",
+      "language": "typescript",
+      "startLine": 5,
+      "endLine": 12,
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    }
+  ],
+  "nodes": [
+    {
+      "id": "function:60629aa3876961b8bd3c07c43bbe6a37",
+      "kind": "function",
+      "name": "runDemo",
+      "qualifiedName": "runDemo",
+      "filePath": "src/app.ts",
+      "language": "typescript",
+      "startLine": 3,
+      "endLine": 7,
+      "signature": "(): number",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "function:cce15011e0125d59f6bef014ae79c04f",
+      "kind": "function",
+      "name": "add",
+      "qualifiedName": "add",
+      "filePath": "src/math.ts",
+      "language": "typescript",
+      "startLine": 1,
+      "endLine": 3,
+      "signature": "(left: number, right: number): number",
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "class:7ac92ae0dce4208dfad9148e025726c4",
+      "kind": "class",
+      "name": "Counter",
+      "qualifiedName": "Counter",
+      "filePath": "src/math.ts",
+      "language": "typescript",
+      "startLine": 5,
+      "endLine": 12,
+      "visibility": null,
+      "isExported": true,
+      "isAsync": false,
+      "isStatic": false
+    },
+    {
+      "id": "method:f501ba98441869bd251c636e30d31e3d",
+      "kind": "method",
+      "name": "increment",
+      "qualifiedName": "Counter::increment",
+      "filePath": "src/math.ts",
+      "language": "typescript",
+      "startLine": 8,
+      "endLine": 11,
+      "signature": "(step: number = 1): number",
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false
+    }
+  ],
+  "edges": [
+    {
+      "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+      "target": "function:cce15011e0125d59f6bef014ae79c04f",
+      "kind": "calls",
+      "line": 5,
+      "column": 20
+    },
+    {
+      "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+      "target": "method:f501ba98441869bd251c636e30d31e3d",
+      "kind": "calls",
+      "line": 5,
+      "column": 2
+    },
+    {
+      "source": "function:60629aa3876961b8bd3c07c43bbe6a37",
+      "target": "class:7ac92ae0dce4208dfad9148e025726c4",
+      "kind": "instantiates",
+      "line": 4,
+      "column": 18
+    },
+    {
+      "source": "method:f501ba98441869bd251c636e30d31e3d",
+      "target": "function:cce15011e0125d59f6bef014ae79c04f",
+      "kind": "calls",
+      "line": 9,
+      "column": 17
+    },
+    {
+      "source": "class:7ac92ae0dce4208dfad9148e025726c4",
+      "target": "method:f501ba98441869bd251c636e30d31e3d",
+      "kind": "contains"
+    }
+  ],
+  "codeBlocks": [
+    {
+      "filePath": "src/app.ts",
+      "startLine": 3,
+      "endLine": 7,
+      "language": "typescript",
+      "content": "export function runDemo(): number {\n  const counter = new Counter();\n  counter.increment(add(1, 2));\n  return counter.increment();\n}",
+      "nodeName": "runDemo",
+      "nodeKind": "function"
+    },
+    {
+      "filePath": "src/math.ts",
+      "startLine": 1,
+      "endLine": 3,
+      "language": "typescript",
+      "content": "export function add(left: number, right: number): number {\n  return left + right;\n}",
+      "nodeName": "add",
+      "nodeKind": "function"
+    },
+    {
+      "filePath": "src/math.ts",
+      "startLine": 5,
+      "endLine": 12,
+      "language": "typescript",
+      "content": "export class Counter {\n  private value = 0;\n\n  increment(step: number = 1): number {\n    this.value = add(this.value, step);\n    return this.value;\n  }\n}",
+      "nodeName": "Counter",
+      "nodeKind": "class"
+    },
+    {
+      "filePath": "src/math.ts",
+      "startLine": 8,
+      "endLine": 11,
+      "language": "typescript",
+      "content": "  increment(step: number = 1): number {\n    this.value = add(this.value, step);\n    return this.value;\n  }",
+      "nodeName": "increment",
+      "nodeKind": "method"
+    }
+  ],
+  "relatedFiles": [
+    "src/app.ts",
+    "src/math.ts"
+  ],
+  "stats": {
+    "nodeCount": 4,
+    "edgeCount": 5,
+    "fileCount": 2,
+    "codeBlockCount": 4,
+    "totalCodeSize": 474
+  }
+}

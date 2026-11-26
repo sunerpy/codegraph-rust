@@ -267,3 +267,75 @@ fn stdio_serve_stdout_is_pure_jsonrpc_and_logs_go_to_stderr() {
         "expected at least one RFC3339-timestamped log line on stderr, got: {stderr:?}"
     );
 }
+
+/// `codegraph context` (W9-01): stdout holds the answer alone, one JSON value
+/// under `--format json`, at every log level; what it reports beside the
+/// answer (here, code left out of a file edited since the sync) goes to
+/// stderr. The read path writes no tracing event even at `RUST_LOG=trace`, so
+/// the notice is the stderr line this test can rely on.
+#[test]
+fn context_stdout_is_the_answer_and_notices_go_to_stderr() {
+    let home = TestDir::new("context");
+    let indexed = indexed_project(&home);
+    let math = indexed.join("src/math.ts");
+    let source = std::fs::read_to_string(&math).unwrap();
+    std::fs::write(&math, format!("// edited after the sync\n{source}")).unwrap();
+    let run = |format: &str, log: (&str, &str)| {
+        let output = Command::new(bin())
+            .args([
+                "context",
+                "--format",
+                format,
+                "-p",
+                indexed.to_str().unwrap(),
+                "Counter",
+                "add",
+                "runDemo",
+            ])
+            .env("CODEGRAPH_NO_DAEMON", "1")
+            .env_remove("RUST_LOG")
+            .env_remove("CODEGRAPH_DEBUG")
+            .env(log.0, log.1)
+            .output()
+            .expect("run codegraph context");
+        assert!(
+            output.status.success(),
+            "context failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let notice = "warning: left out the code of symbols in files that changed since the last index sync: src/math.ts; run `codegraph sync` to index them again";
+    for log in [("CODEGRAPH_DEBUG", "1"), ("RUST_LOG", "trace")] {
+        let (stdout, stderr) = run("json", log);
+        let parsed: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout is not one JSON value ({e}): {stdout:?}"));
+        assert_eq!(parsed["query"], json!("Counter add runDemo"), "{log:?}");
+        assert!(
+            stdout.starts_with("{\n") && stdout.ends_with("}\n"),
+            "{stdout:?}"
+        );
+        assert!(!stdout.contains("warning:"), "{log:?}: {stdout:?}");
+        assert!(
+            stderr.lines().any(|line| line == notice),
+            "{log:?}: the notice belongs on stderr: {stderr:?}"
+        );
+        for line in stderr.lines() {
+            assert!(
+                line == notice || has_rfc3339_prefix(line),
+                "{log:?}: stderr holds only the notice and log lines: {line:?}"
+            );
+        }
+
+        let (markdown, stderr) = run("markdown", log);
+        assert!(
+            markdown.starts_with("## Code Context\n\n**Query:** Counter add runDemo\n"),
+            "{markdown:?}"
+        );
+        assert!(!markdown.contains("warning:"), "{markdown:?}");
+        assert!(stderr.lines().any(|line| line == notice), "{stderr:?}");
+    }
+}

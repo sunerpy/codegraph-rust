@@ -556,6 +556,33 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    // Upstream flags/output: upstream bin/codegraph.ts b635dd46 1421-1478.
+    /// Build context for a task: relevant symbols, relationships, and code
+    /// blocks, as Markdown or JSON. Its entry points come from the same
+    /// deterministic search as `explore`. NO LLM.
+    Context {
+        /// The task, in words; they are joined with spaces.
+        #[arg(required = true, value_name = "TASK")]
+        task: Vec<String>,
+        /// Project root. Query commands require `-p/--path`; do not append the
+        /// project as another positional argument (it would join the task).
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// Output format: markdown or json
+        #[arg(short = 'f', long, default_value = "markdown", value_name = "FORMAT")]
+        format: String,
+        /// Maximum number of symbols to include
+        #[arg(
+            short = 'n',
+            long = "max-nodes",
+            value_name = "NUMBER",
+            allow_hyphen_values = true
+        )]
+        max_nodes: Option<String>,
+        /// Omit code blocks (structure only)
+        #[arg(long = "no-code")]
+        no_code: bool,
+    },
     // Upstream flags/output: upstream bin/codegraph.ts:1864-1870, 1871-1920.
     // `--global`/`--local` are convenience aliases for `--location` (task spec).
     Install {
@@ -867,6 +894,13 @@ fn run(cli: Cli) -> Result<()> {
             json,
             strict,
         } => cmd_node(target, path, file, symbols_only, json, strict),
+        Command::Context {
+            task,
+            path,
+            format,
+            max_nodes,
+            no_code,
+        } => cmd_context(&task, path, &format, max_nodes.as_deref(), no_code),
         Command::Install {
             target,
             location,
@@ -5220,6 +5254,45 @@ fn cmd_node(
     };
     let result = engine.execute("codegraph_node", &args);
     print_engine_result("node", &target, &result, json_output, strict)
+}
+
+/// `codegraph context <task...>` (W9-01): colby's command
+/// (`src/bin/codegraph.ts` b635dd46 1421-1478). The format and `--max-nodes`
+/// are checked before the project, as there, with colby's sentences behind
+/// the CLI's `Error:` (OD-B81); the project is resolved as every read command
+/// resolves it. The answer alone goes to stdout; a notice (auto-sync not
+/// healthy, code left out for drift) goes to stderr.
+fn cmd_context(
+    task: &[String],
+    path: Option<PathBuf>,
+    format: &str,
+    max_nodes: Option<&str>,
+    no_code: bool,
+) -> Result<()> {
+    use codegraph_mcp::context::{
+        ContextFormat, ContextOptions, max_nodes_message, parse_max_nodes, unknown_format_message,
+    };
+    let Some(format) = ContextFormat::parse(format) else {
+        bail!("{}", unknown_format_message(format));
+    };
+    let mut options = ContextOptions {
+        format,
+        include_code: !no_code,
+        ..ContextOptions::default()
+    };
+    if let Some(raw) = max_nodes {
+        options.max_nodes =
+            parse_max_nodes(raw).ok_or_else(|| anyhow!("{}", max_nodes_message(raw)))?;
+    }
+    let project = resolve_required_project(path)?;
+    let built = codegraph_mcp::CodeGraphEngine::open(&project)
+        .and_then(|engine| engine.build_context(&task.join(" "), &options))
+        .context("Context build failed")?;
+    for notice in &built.notices {
+        eprintln!("warning: {notice}");
+    }
+    println!("{}", built.output);
+    Ok(())
 }
 
 /// Decide whether a `codegraph node <target>` argument names an indexed FILE (→

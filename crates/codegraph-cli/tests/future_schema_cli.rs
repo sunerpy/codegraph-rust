@@ -148,6 +148,17 @@ fn reads_sync_and_init_refuse_a_newer_schema_and_uninit_discards_it() {
     );
     assert_unchanged(&paths, &before, "search");
 
+    // `codegraph context` (W9-01) reads through the same engine.
+    let context = cli(&["context", "-p", path_str(&project), "add"]);
+    assert!(!context.ok, "context read a newer codegraph's index");
+    assert!(
+        context.stderr.contains("newer CodeGraph") && context.stderr.contains("uninit --force"),
+        "{}",
+        context.stderr
+    );
+    assert!(context.stdout.is_empty(), "{}", context.stdout);
+    assert_unchanged(&paths, &before, "context");
+
     let sync = cli(&["sync", path_str(&project)]);
     assert!(!sync.ok, "sync wrote a newer codegraph's index");
     assert!(sync.stderr.contains("newer CodeGraph"), "{}", sync.stderr);

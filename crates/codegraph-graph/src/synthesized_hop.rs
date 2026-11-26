@@ -9,8 +9,10 @@
 //! `metadata.registeredAt` wiring site). Whatever prints that hop has to say
 //! what bridged it, or the hop reads as a direct call, or as the wrong
 //! mechanism. `codegraph_explore`'s Flow and the `codegraph_node` trail tag it
-//! `dynamic: callback via `subscribe` @src/store.ts:4`; the wording lives here
-//! once, and each surface renders it.
+//! `dynamic: callback via `subscribe` @src/store.ts:4`; `codegraph context`'s
+//! call paths write it inside the arrow with the detail,
+//! `→[callback via `subscribe` @src/store.ts:4]`. The wording lives here once,
+//! and each surface renders it.
 
 use codegraph_core::types::Edge;
 use serde_json::Value;
@@ -37,6 +39,17 @@ impl SynthesizedHop {
         match &self.registered_at {
             Some(at) => format!("dynamic: {} @{at}", self.summary),
             None => format!("dynamic: {}", self.summary),
+        }
+    }
+
+    /// The label `codegraph context`'s call paths write inside the arrow,
+    /// `→[<label>]`: the summary, the detail, and ` @<registeredAt>` when the
+    /// site is not empty (upstream `buildCallPathsSection`,
+    /// `context/index.ts` e8ddc4e2 411-418, tests the site's truthiness).
+    pub fn call_path_label(&self) -> String {
+        match self.registered_at.as_deref() {
+            Some(at) if !at.is_empty() => format!("{}{} @{at}", self.summary, self.detail),
+            _ => format!("{}{}", self.summary, self.detail),
         }
     }
 }
@@ -362,6 +375,48 @@ mod tests {
         assert_eq!(
             describe_synthesized_hop(&unwired).unwrap().tag(),
             "dynamic: React re-render via setState"
+        );
+    }
+
+    /// `codegraph context`'s call-path label (upstream `buildCallPathsSection`,
+    /// e8ddc4e2 411-418; its test `synthesized-hop.test.ts` 18-83 expects
+    /// `→[interface → impl @src/pdf-exporter.ts:5]`): the summary, the detail,
+    /// then the site, which an empty site leaves out as upstream's truthiness
+    /// test does (W9-01).
+    #[test]
+    fn the_call_path_label_adds_the_detail_and_a_site_that_is_not_empty() {
+        let mut iface = edge(json!({"synthesizedBy": "interface-impl", "via": "exportReport"}));
+        iface.metadata.as_mut().unwrap()["registeredAt"] = json!("src/pdf-exporter.ts:5");
+        assert_eq!(
+            describe_synthesized_hop(&iface).unwrap().call_path_label(),
+            "interface → impl @src/pdf-exporter.ts:5"
+        );
+        let job = edge(json!({"synthesizedBy": "queue-job", "event": "send", "queue": "mail"}));
+        assert_eq!(
+            describe_synthesized_hop(&job).unwrap().call_path_label(),
+            "queue job `send` on `mail` @src/wire.ts:7"
+        );
+        let mut empty_site = edge(json!({"synthesizedBy": "redux-thunk"}));
+        empty_site.metadata.as_mut().unwrap()["registeredAt"] = json!("");
+        assert_eq!(
+            describe_synthesized_hop(&empty_site)
+                .unwrap()
+                .call_path_label(),
+            "redux thunk"
+        );
+        let mut unwired = edge(json!({"synthesizedBy": "react-render"}));
+        unwired
+            .metadata
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("registeredAt");
+        assert_eq!(
+            describe_synthesized_hop(&unwired)
+                .unwrap()
+                .call_path_label(),
+            "React re-render via setState"
         );
     }
 

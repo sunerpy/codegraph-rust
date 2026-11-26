@@ -137,8 +137,9 @@ fn is_type_kind(kind: NodeKind) -> bool {
 
 /// A key lifted out of a YAML or properties file (upstream
 /// `isConfigLeafNode`, #383): its line is `key = <value>`, routinely a
-/// secret, so it never makes its file a candidate.
-fn is_config_leaf(node: &Node) -> bool {
+/// secret, so it never makes its file a candidate, and `codegraph context`
+/// gives its key alone as its code block.
+pub(crate) fn is_config_leaf(node: &Node) -> bool {
     node.kind == NodeKind::Constant
         && matches!(node.language, Language::Yaml | Language::Properties)
 }
