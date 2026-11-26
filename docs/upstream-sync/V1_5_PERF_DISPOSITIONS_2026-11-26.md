@@ -32,35 +32,35 @@ Code base: `2d56231`. Evidence paths are relative to the v0.56 evidence root;
 
 ## Dispositions
 
-| #   | Upstream  | Strategy                                                | Disposition                                                 | Evidence                                        | Commit    |
-| --- | --------- | ------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------- | --------- |
-| 1   | `18f0745` | defer the WAL autocheckpoint for the whole sync         | REJECTED_BY_PROFILE (K5)                                    | `W9/w9c/rows.md`, `W9/0a4ca58/`                 | —         |
-| 2   | `a2f3c31` | defer checkpoints during resolution; double buffer      | deferral ALREADY-HAVE; double buffer ADOPTED (K1)           | `W9/w9c/rows.md`, `W9/bc9cc95/`                 | `bc9cc95` |
-| 3   | `6e52295` | writer backpressure under parallel resolution           | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —         |
-| 4   | `ca88d3b` | WAL file cap; cgroup cache budget and pool sizes        | WAL cap ALREADY-HAVE; the rest N/A                          | `W9/w9c/rows.md`                                | —         |
-| 5   | `2adc7f6` | truncate the WAL only at a parked barrier               | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —         |
-| 6   | `971a5a0` | recycle worker read connections                         | N/A                                                         | `W9/w9c/rows.md`                                | —         |
-| 7   | `c74e8b0` | quick-fire debounce for one or two saved files          | ADOPTED (K6)                                                | `W9/w9c/rows.md`, `W9/1be277d/`                 | `1be277d` |
-| 8   | `5736e24` | faster fresh index (bulk FTS, multi-row INSERT, …)      | mostly ALREADY-HAVE or N/A; 8a, 8b REJECTED_BY_PROFILE (K2) | `W9/w9c/rows.md`, `W9/811e8fa/`, `W9/3506888/`  | —         |
-| 9   | `cf38ef6` | run the synthesis passes in parallel                    | DEFER (next round, OD-B93)                                  | `W9/w9c/rows.md`, `W9/w9c/row9-wip-note.md`     | —         |
-| 10  | `567b4ad` | drop the non-unique edge indexes during bulk resolution | REJECTED_BY_PROFILE (OD-B86)                                | `W9/w9c/schema/`                                | —         |
-| 11  | `4efc6c7` | OOM-safe pass skip, watchdog-safe index rebuild         | N/A                                                         | `W9/w9c/rows.md`                                | —         |
-| 12  | `28068fa` | decode straight into the store (kernel)                 | N/A                                                         | `W9/w9c/rows.md`                                | —         |
-| 13  | `b8833fe` | memory-aware, cgroup-aware pool size                    | CPU term ALREADY-HAVE; memory term N/A                      | `W9/w9c/rows.md`                                | —         |
-| 14  | `7cc2366` | de-quadratic batch loop; valve scaled by database size  | ①② ALREADY-HAVE; ③ REJECTED_BY_PROFILE; ④ N/A               | `W9/w9c/rows.md`, `W9/w9c/schema/`              | —         |
-| 15  | `d510de4` | faster cFnPtrEdges                                      | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —         |
-| 16  | `c6850d7` | cFnPtr: fuse, then link; registration filter            | body ALREADY-HAVE; filter REJECTED_BY_PROFILE               | `W9/w9c/prescreen/summary-r2.md`                | —         |
-| 17  | `69ea438` | cFnPtr native extraction sweep                          | N/A                                                         | `W9/w9c/rows.md`                                | —         |
-| 18  | `f6d8e8f` | defer the parse lane's indexes                          | REJECTED_BY_PROFILE (OD-B86)                                | `W9/w9c/schema/`                                | —         |
-| 19  | `ce0ae30` | resolution-time reference index window                  | REJECTED_BY_PROFILE (OD-B86)                                | `W9/w9c/schema/`                                | —         |
-| 20  | `27c3c55` | macOS memory budget                                     | N/A                                                         | `W9/w9c/rows.md`                                | —         |
-| 21  | `082ea65` | skip provably empty synthesis passes                    | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —         |
-| 22  | `1aa4de6` | start the resolution pool adaptively                    | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —         |
-| 23  | `abb0a91` | index Lua require targets by basename                   | REJECTED_BY_PROFILE (K4)                                    | `W9/w9c/prescreen/summary-r2.md`, `W9/be7999e/` | —         |
-| 24  | `974e6c8` | memoize receiver-inference scans and compiled patterns  | ADOPTED (K4)                                                | `W9/w9c/prescreen/summary-r1.md`, `W9/330166d/` | `330166d` |
-| 25  | `157c8e7` | generation-tagged supertype memo; method owner index    | ① and ② REJECTED_BY_PROFILE                                 | `W9/w9c/prescreen/summary-r1.md`                | —         |
-| 26  | `8c1e821` | the WAL valve truncates at a parked barrier             | ALREADY-HAVE, with a regression test                        | `W9/w900/`                                      | `2d56231` |
-| 27  | (OD-B89)  | reuse synthesis per pass at sync                        | TODO (another W9-00 item)                                   | `W9/row27/`                                     | —         |
+| #   | Upstream  | Strategy                                                | Disposition                                                 | Evidence                                        | Commit                                                                                       |
+| --- | --------- | ------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 1   | `18f0745` | defer the WAL autocheckpoint for the whole sync         | REJECTED_BY_PROFILE (K5)                                    | `W9/w9c/rows.md`, `W9/0a4ca58/`                 | —                                                                                            |
+| 2   | `a2f3c31` | defer checkpoints during resolution; double buffer      | deferral ALREADY-HAVE; double buffer ADOPTED (K1)           | `W9/w9c/rows.md`, `W9/bc9cc95/`                 | `305e07d` (from `bc9cc95`)                                                                   |
+| 3   | `6e52295` | writer backpressure under parallel resolution           | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —                                                                                            |
+| 4   | `ca88d3b` | WAL file cap; cgroup cache budget and pool sizes        | WAL cap ALREADY-HAVE; the rest N/A                          | `W9/w9c/rows.md`                                | —                                                                                            |
+| 5   | `2adc7f6` | truncate the WAL only at a parked barrier               | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —                                                                                            |
+| 6   | `971a5a0` | recycle worker read connections                         | N/A                                                         | `W9/w9c/rows.md`                                | —                                                                                            |
+| 7   | `c74e8b0` | quick-fire debounce for one or two saved files          | ADOPTED (K6)                                                | `W9/w9c/rows.md`, `W9/1be277d/`                 | `4412d1b` (from `1be277d`)                                                                   |
+| 8   | `5736e24` | faster fresh index (bulk FTS, multi-row INSERT, …)      | mostly ALREADY-HAVE or N/A; 8a, 8b REJECTED_BY_PROFILE (K2) | `W9/w9c/rows.md`, `W9/811e8fa/`, `W9/3506888/`  | —                                                                                            |
+| 9   | `cf38ef6` | run the synthesis passes in parallel                    | DEFER (next round, OD-B93)                                  | `W9/w9c/rows.md`, `W9/w9c/row9-wip-note.md`     | —                                                                                            |
+| 10  | `567b4ad` | drop the non-unique edge indexes during bulk resolution | REJECTED_BY_PROFILE (OD-B86)                                | `W9/w9c/schema/`                                | —                                                                                            |
+| 11  | `4efc6c7` | OOM-safe pass skip, watchdog-safe index rebuild         | N/A                                                         | `W9/w9c/rows.md`                                | —                                                                                            |
+| 12  | `28068fa` | decode straight into the store (kernel)                 | N/A                                                         | `W9/w9c/rows.md`                                | —                                                                                            |
+| 13  | `b8833fe` | memory-aware, cgroup-aware pool size                    | CPU term ALREADY-HAVE; memory term N/A                      | `W9/w9c/rows.md`                                | —                                                                                            |
+| 14  | `7cc2366` | de-quadratic batch loop; valve scaled by database size  | ①② ALREADY-HAVE; ③ REJECTED_BY_PROFILE; ④ N/A               | `W9/w9c/rows.md`, `W9/w9c/schema/`              | —                                                                                            |
+| 15  | `d510de4` | faster cFnPtrEdges                                      | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —                                                                                            |
+| 16  | `c6850d7` | cFnPtr: fuse, then link; registration filter            | body ALREADY-HAVE; filter REJECTED_BY_PROFILE               | `W9/w9c/prescreen/summary-r2.md`                | —                                                                                            |
+| 17  | `69ea438` | cFnPtr native extraction sweep                          | N/A                                                         | `W9/w9c/rows.md`                                | —                                                                                            |
+| 18  | `f6d8e8f` | defer the parse lane's indexes                          | REJECTED_BY_PROFILE (OD-B86)                                | `W9/w9c/schema/`                                | —                                                                                            |
+| 19  | `ce0ae30` | resolution-time reference index window                  | REJECTED_BY_PROFILE (OD-B86)                                | `W9/w9c/schema/`                                | —                                                                                            |
+| 20  | `27c3c55` | macOS memory budget                                     | N/A                                                         | `W9/w9c/rows.md`                                | —                                                                                            |
+| 21  | `082ea65` | skip provably empty synthesis passes                    | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —                                                                                            |
+| 22  | `1aa4de6` | start the resolution pool adaptively                    | ALREADY-HAVE                                                | `W9/w9c/rows.md`                                | —                                                                                            |
+| 23  | `abb0a91` | index Lua require targets by basename                   | REJECTED_BY_PROFILE (K4)                                    | `W9/w9c/prescreen/summary-r2.md`, `W9/be7999e/` | —                                                                                            |
+| 24  | `974e6c8` | memoize receiver-inference scans and compiled patterns  | ADOPTED (K4)                                                | `W9/w9c/prescreen/summary-r1.md`, `W9/330166d/` | `1b8e42f` (from `330166d`)                                                                   |
+| 25  | `157c8e7` | generation-tagged supertype memo; method owner index    | ① and ② REJECTED_BY_PROFILE                                 | `W9/w9c/prescreen/summary-r1.md`                | —                                                                                            |
+| 26  | `8c1e821` | the WAL valve truncates at a parked barrier             | ALREADY-HAVE, with a regression test                        | `W9/w900/`                                      | `2d56231`                                                                                    |
+| 27  | (OD-B89)  | reuse synthesis per pass at sync                        | ADOPTED (final re-measurement after one fix round, OD-B95)  | `W9/row27/`, `W9/w927/timing2/`                 | `7c0cb28`, `e9d5d65`, `941561e` (from `f3d8563`, `decaab2`, `3ccafcd`, `80e46f2`, `bf2b314`) |
 
 ## Profile bounds behind the profile-only rejections
 
@@ -167,3 +167,23 @@ express-medium): row 24 regressed nothing; row 2 raised the peak RSS by
 2.3–5.8% in five of six cells, `publish` by 4.0% (tokio-medium, 4 threads)
 and `parse_write` by 6.4% (express-medium, 32 threads)
 (`W9/w9c/campaigns/out/K1/guard-rails-information.txt`).
+
+## Row 27: a sync reruns only the synthesis passes whose inputs changed
+
+Row 27 is not a colby strategy: the owner added it to W9-00 (OD-B89, OD-B90)
+for the synthesis stage, which every sync recomputed whole. Its implementation
+landed as `7c0cb28` (the store's change log), `e9d5d65` (what each pass reads)
+and `941561e` (the reuse in sync). The first timing judged it
+`REJECTED_BY_PROFILE` on rule (c): nix-darwin's peak RSS rose by 2.4%, because
+the records grow the database file, which the store's read-only opens hold
+whole. One fix round (OD-B95) stored each pass's output in its own deflated
+row and wrote the cascade's edges back without a merge. The single final
+re-measurement timed release builds of `2d56231` and the stack with the
+evidence harness `W9/w927/scripts/timing2.sh` (the guard above, twelve
+measured runs per arm and cell after a dropped warm-up, fresh copies of both
+binaries per cell) and judged it at the 31 ms floor: `ADOPTED`. The one-file
+sync wall went from 4267.9 to 2859.1 ms (×0.670) at 32 threads and from
+4313.4 to 2912.4 ms (×0.675) at 4 on the whole TypeScript checkout, ×0.807
+and ×0.811 on nix-darwin, ×0.742 and ×0.740 on erl-cowboy, and ×0.807 and
+×0.837 on erl-rebar3; the peak RSS stayed within ×1.0011–1.0185 and no other
+timing regressed (`W9/w927/timing2/report.txt`, `od9-verdict.txt`).

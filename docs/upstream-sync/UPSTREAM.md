@@ -55,8 +55,9 @@
   syncs below: the per-language framework-resolution bridges of `1.2.0 → 1.4.1`
   (ArkUI, Nix, Terraform and Erlang; CFML's landed in #322), and the deferred
   `codegraph context` and #1617 of `1.5.0 → 1.6.0`. The 26 strategies of
-  `1.4.1 → 1.5.0` close with W9-00's dispositions
-  <!-- TODO(main): W9-00 — name the dated dispositions file and row 27's verdict -->.
+  `1.4.1 → 1.5.0` close with W9-00's dispositions in [`V1_5_PERF_DISPOSITIONS_2026-11-26.md`](V1_5_PERF_DISPOSITIONS_2026-11-26.md):
+  rows 2, 7 and 24 and the added row 27 are `ADOPTED`, row 9 is deferred to the
+  next round, and the others are `ALREADY-HAVE`, `N/A` or `REJECTED_BY_PROFILE`.
   VB.NET, which `1.2.0 → 1.4.1` recorded as having no crate at all, has one
   now, and it failed that trial.
 - **Left for the next round** (each by the owner decision named, in the plan of
@@ -180,7 +181,7 @@ below remain immutable historical evidence.
 >   VB.NET, `codegraph context`, #1617 and the 26 v1.5.0 performance
 >   strategies. They landed in #338 (merged, release pending), except VB.NET,
 >   `OWNER-EXCLUDED` after its trial; W9-00 decides the 26 strategies
->   <!-- TODO(main): W9-00 — the dispositions file -->.
+>   in [`V1_5_PERF_DISPOSITIONS_2026-11-26.md`](V1_5_PERF_DISPOSITIONS_2026-11-26.md).
 > - **KEEP-RUST divergences** are recorded row by row in the audit. Three of
 >   them add behavior upstream does not have: property type references for
 >   Kotlin and PHP, C# extension methods reached from an outside receiver
@@ -312,10 +313,13 @@ below remain immutable historical evidence.
   module loaders; Rust-side sync and watcher fixes (W7-27, W7-29, W7-31); and a
   JSX tag in a `.js` file rendering its component (W7-28). The KEEP-RUST
   divergences each item chose are in [`KNOWN_DIFFS.md`](KNOWN_DIFFS.md).
-  <!-- TODO(main): W9-00 — add the ADOPTED strategies and row 27 if they land -->
+  W9-00 adopts four performance strategies: resolving the next batch while the
+  current one is written, reading each scope's receiver declarations once per
+  file, a short quiet window for one or two saved files, and a sync that reruns
+  only the synthesis passes whose inputs changed.
 - **The 2026-10-10 audit:** every `PLANNED (follow-up PR)` row landed, except
   VB.NET and its rows, `OWNER-EXCLUDED`, and the 26 strategies, which W9-00
-  decides <!-- TODO(main): W9-00 — the dispositions -->. Its new "Follow-up
+  decides in [`V1_5_PERF_DISPOSITIONS_2026-11-26.md`](V1_5_PERF_DISPOSITIONS_2026-11-26.md). Its new "Follow-up
   pull request status" section lists the commits.
 - **The 2026-10-22 audit:** 18 of the 21 `DEFER` rows landed, with #2420 (B 17)
   and A 56 and A 57 whole and B 84's Go half; A 106 is `OWNER-EXCLUDED`; B 60
@@ -346,7 +350,9 @@ below remain immutable historical evidence.
     with #1562 (`81e1f4a9`), recorded "N/A (pass absent)": the pass exists now,
     and its caches are not ported, since the Rust pass compiles no pattern per
     name. Table 9.1's rows 15–17 (`d510de4`, `c6850d7`, `69ea438`) measure
-    the pass in W9-00 <!-- TODO(main): W9-00 — rows 15-17's dispositions -->;
+    the pass in W9-00: row 15 is `ALREADY-HAVE`, row 16's fused body is
+    `ALREADY-HAVE` and its registration filter `REJECTED_BY_PROFILE`, and row 17
+    is `N/A`;
   - the deferred framework bridges of the H1 (ArkTS), H3 (Nix), H4 (Terraform)
     and H5 (Erlang) entries of 2026-07-15 and 2026-07-16, in W7-24a to
     W7-24d, with three upstream commits no ledger had recorded: #1174
