@@ -25,7 +25,10 @@
 //! is 28 idle CPUs for 32 threads and 24 for 4, and on a 4-CPU runner 3 for 4
 //! threads.
 
+// Only the Linux probe reads `/proc`.
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
