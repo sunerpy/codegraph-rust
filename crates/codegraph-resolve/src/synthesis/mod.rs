@@ -23,9 +23,11 @@
 //! packages, `package.json` manifests), JavaScript's control inputs
 //! (W7-18a), so a sync that changes none of them keeps its edges. Its Go
 //! prerequisite steps add edges the passes read as base edges first
-//! (W7-15b). `codegraph-watch` recomputes them whole after any sync that
-//! changes the index or finds a recorded file reading differently, under
-//! [`VERSION_KEY`].
+//! (W7-15b). After a sync that changes the index or finds a recorded file
+//! reading differently, `codegraph-watch` reruns only the passes whose
+//! recorded inputs changed and keeps the other passes' stored output (W9-00
+//! row 27); it runs the whole stage when it cannot show that, or when the
+//! marker under [`VERSION_KEY`] is missing or another version.
 
 mod angular;
 mod arkui;
