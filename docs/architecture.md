@@ -137,6 +137,11 @@ indexes, and migration history.
 
 `ReferenceResolver` reads the complete extracted snapshot (or the bounded
 streaming path for very large graphs), then applies deterministic strategies.
+On the snapshot path a full index resolves its references in batches, and the
+next batch resolves on the thread pool while the one before it is written; that
+batch's `extends`/`implements` edges join the snapshot's inheritance adjacency
+before the next batch's context is built, and the batches' edges are inserted in
+batch order, so the graph is the one a batch-by-batch loop writes.
 Every entry (the full index's batches, the serial pass, a sync's scoped pass)
 resolves and persists the wiring references first, imports and `extends`/
 `implements` supertypes, and the rest after them, so a call on a receiver

@@ -4648,6 +4648,85 @@ pub(crate) mod tests {
         );
     }
 
+    /// Table 9.1 row 2 (upstream a2f3c31): the orphan sweep resolves its
+    /// parked references in batches of [`ORPHAN_SWEEP_BATCH_ROWS`], each next
+    /// batch resolving while the one before it is written. Over more than one
+    /// batch, with calls whose receiver's type reaches the method through an
+    /// `extends` edge the wiring batch resolves, the healed index equals a
+    /// fresh one.
+    #[test]
+    fn an_orphan_sweep_over_several_batches_converges() {
+        let calls_per_function = 100;
+        let functions = ORPHAN_SWEEP_BATCH_ROWS / calls_per_function + 2;
+        let app: String = (0..functions)
+            .map(|f| {
+                let calls: String = (0..calls_per_function).map(|_| "  s.ping();\n").collect();
+                format!("export function run{f}(): void {{\n  const s = new Sub();\n{calls}}}\n")
+            })
+            .collect();
+        let app = format!("import {{ Sub }} from './sub';\n{app}");
+        let files = [
+            (
+                "src/base.ts",
+                "export class Base {\n  ping(): number {\n    return 1;\n  }\n}\n",
+            ),
+            (
+                "src/sub.ts",
+                "import { Base } from './base';\nexport class Sub extends Base {}\n",
+            ),
+            ("src/app.ts", app.as_str()),
+        ];
+        let dir = TestDir::new("sweep-batches");
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(dir.path(), &files);
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        // Park every resolved reference again, without the edges it made, as
+        // a full index stopped before its resolution would leave them.
+        {
+            let store = Store::open(&db).unwrap();
+            let parked = store
+                .connection()
+                .execute(
+                    "INSERT INTO unresolved_refs (id, from_node_id, reference_name, reference_kind, \
+                     line, col, candidates, file_path, language, reference_subkind) \
+                     SELECT id, from_node_id, reference_name, reference_kind, line, col, \
+                     candidates, file_path, language, reference_subkind \
+                     FROM resolved_refs ORDER BY id",
+                    [],
+                )
+                .unwrap();
+            assert!(
+                parked > ORPHAN_SWEEP_BATCH_ROWS,
+                "the sweep needs more than one batch: {parked} parked"
+            );
+            store
+                .connection()
+                .execute_batch(
+                    "DELETE FROM resolved_refs; \
+                     DELETE FROM edges WHERE json_extract(metadata, '$.resolvedBy') IS NOT NULL;",
+                )
+                .unwrap();
+            store.set_resolution_incomplete().unwrap();
+        }
+        assert_ne!(
+            edge_projection(&db),
+            fresh_edges("sweep-batches-parked", &files),
+            "the parked index lacks the resolved edges"
+        );
+        let outcome = sync_changed_paths(dir.path(), &db, Vec::<&str>::new()).unwrap();
+        assert!(outcome.pending_refs_processed > ORPHAN_SWEEP_BATCH_ROWS);
+        assert!(
+            !Store::open(&db)
+                .unwrap()
+                .is_resolution_incomplete()
+                .unwrap()
+        );
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("sweep-batches-fresh", &files)
+        );
+    }
+
     /// The orphan sweep resolves new base edges on a sync with nothing
     /// changed, so the stage recomputes after it (W7-14).
     #[test]

@@ -1655,7 +1655,9 @@ Each phase name appears once per command:
   - `reference_resolution.<part>`, each summed over the batches: `setup`
     (the incomplete marker, the cache warm-up, the counts), `read` (reading a
     batch of references), `snapshot` (each batch's resolution context, the
-    node snapshot included), `resolve`, `create_edges`, `insert_edges`,
+    node snapshot included), `resolve` (the first batch's resolution, then the
+    wait for each next batch's, which runs while the batch before it is
+    written), `create_edges`, `insert_edges`,
     `move_refs` (moving the resolved rows to `resolved_refs`), `wal_fold` (the
     WAL valve), and the two passes after the batches, `conformance` and
     `this_members`;

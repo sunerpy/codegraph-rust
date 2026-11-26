@@ -414,12 +414,14 @@ pub struct ResolutionTimings {
     /// Building each batch's resolution context: the node snapshot and the
     /// inheritance adjacency on the first batch, the adjacency's copy on each.
     pub snapshot: Duration,
-    /// Resolving the batch's references.
+    /// Resolving the batch's references. On the snapshot path, the first
+    /// batch's resolution and then the wait for each next batch's, which
+    /// runs while the batch before it is written (table 9.1 row 2).
     pub resolve: Duration,
-    /// Turning the resolved references into edges.
+    /// Turning the resolved references into edges, and on the snapshot path
+    /// folding the new inheritance edges into the adjacency.
     pub create_edges: Duration,
-    /// Inserting the edges and folding the new inheritance edges into the
-    /// adjacency.
+    /// Inserting the edges.
     pub insert_edges: Duration,
     /// Moving the resolved rows from `unresolved_refs` to `resolved_refs`.
     pub move_refs: Duration,
@@ -3724,32 +3726,39 @@ impl ReferenceResolver {
 
         // The wiring references first, every batch of them persisted, then
         // the rest from the start of the table (upstream #1789).
-        let mut cursor: i64 = 0;
-        let mut wiring_phase = true;
-        loop {
-            let started = Instant::now();
-            let batch = store.unresolved_refs_batch_by_kinds(
-                cursor,
-                batch_size,
-                &WIRING_KINDS,
-                wiring_phase,
+        let mut reader = BatchReader {
+            cursor: 0,
+            wiring_phase: true,
+            batch_size,
+        };
+        // Write a resolved batch, count it, and report it.
+        let mut finish_batch = |store: &mut Store,
+                                batch: &[UnresolvedRef],
+                                result: ResolutionResult,
+                                edges: &[Edge],
+                                timings: &mut ResolutionTimings|
+         -> anyhow::Result<()> {
+            persist_resolved_batch(
+                store,
+                batch,
+                result,
+                edges,
+                wal_valve_bytes,
+                timings,
+                &mut telemetry,
+                &mut aggregate,
             )?;
-            timings.read += started.elapsed();
-            if batch.is_empty() {
-                if wiring_phase {
-                    wiring_phase = false;
-                    cursor = 0;
-                    continue;
-                }
-                break;
-            }
-            cursor = batch
-                .iter()
-                .filter_map(|reference| reference.id)
-                .max()
-                .unwrap_or(cursor);
-
-            let result = if streaming {
+            processed += batch.len() as u64;
+            on_observation(ResolutionObservation::BatchComplete {
+                batch: telemetry.batches,
+                processed,
+                total: total_refs,
+            });
+            on_progress(processed, total_refs);
+            Ok(())
+        };
+        if streaming {
+            while let Some(batch) = reader.next(store, &mut timings)? {
                 // STREAMING FALLBACK: resolve serially over a per-batch live-store
                 // context. Prior batches' inheritance edges are already committed
                 // (persisted at the bottom of this loop), so `get_supertypes`
@@ -3760,42 +3769,43 @@ impl ReferenceResolver {
                 let started = Instant::now();
                 let result = self.resolve_all(&batch, &context);
                 timings.resolve += started.elapsed();
-                result
-            } else {
+                drop(context);
                 let started = Instant::now();
-                let base = match &node_snapshot {
-                    Some(snapshot) => snapshot,
-                    None => {
-                        base_adjacency = (*build_edge_adjacency(store)?).clone();
-                        node_snapshot.insert(
-                            SnapshotResolutionContext::from_store(store, &self.project_root)?
-                                .with_max_file_size(self.max_file_size)
-                                .with_lua_loaders(Arc::clone(&self.lua_loaders)),
-                        )
-                    }
-                };
-                // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
-                // (matches the old per-chunk full rebuild's observable state).
-                let chunk_ctx = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
-                timings.snapshot += started.elapsed();
-                let started = Instant::now();
-                let result = self.resolve_chunk_parallel(&batch, &chunk_ctx);
-                timings.resolve += started.elapsed();
-                result
-            };
-
-            let started = Instant::now();
-            let edges = self.create_edges(&result.resolved, store);
-            timings.create_edges += started.elapsed();
-            let started = Instant::now();
-            if !edges.is_empty() {
-                store.insert_edges(&edges)?;
+                let edges = self.create_edges(&result.resolved, store);
+                timings.create_edges += started.elapsed();
+                finish_batch(store, &batch, result, &edges, &mut timings)?;
             }
-            // Fold this chunk's NEW Implements/Extends edges into the adjacency
-            // AFTER inserting them, so chunk N+1 sees chunks 0..N — the same
-            // forward visibility the per-chunk rebuild produced. No-op on the
-            // streaming path (the store commit above IS the visibility source).
-            if !streaming {
+        } else {
+            // Double buffer (table 9.1 row 2, upstream a2f3c31): batch k+1
+            // resolves on the pool while batch k's edges and moved references
+            // are written. Batch k's inheritance edges join the adjacency
+            // before k+1's context is built, so k+1 sees batches 0..k as the
+            // serial loop shows them; k's edges are still inserted before
+            // k+1's, and the deferred references are queued in batch order.
+            // Resolution reads only `&self` and the snapshot, never the store,
+            // so the writes can run beside it.
+            let mut resolved = match reader.next(store, &mut timings)? {
+                Some(batch) => {
+                    let context = self.chunk_context(
+                        store,
+                        &mut node_snapshot,
+                        &mut base_adjacency,
+                        &mut timings,
+                    )?;
+                    let started = Instant::now();
+                    let result = self.resolve_chunk_parallel(&batch, &context);
+                    timings.resolve += started.elapsed();
+                    Some((batch, result))
+                }
+                None => None,
+            };
+            while let Some((batch, result)) = resolved.take() {
+                let started = Instant::now();
+                let edges = self.create_edges(&result.resolved, store);
+                // Fold this chunk's NEW Implements/Extends edges into the
+                // adjacency before the next chunk's context is built, so chunk
+                // N+1 sees chunks 0..N — the same forward visibility the
+                // per-chunk rebuild produced.
                 for edge in &edges {
                     if matches!(edge.kind, EdgeKind::Implements | EdgeKind::Extends) {
                         base_adjacency
@@ -3804,58 +3814,55 @@ impl ReferenceResolver {
                             .push((edge.target.clone(), edge.kind));
                     }
                 }
+                timings.create_edges += started.elapsed();
+                #[cfg(test)]
+                if tests::SERIAL_BATCHES.with(std::cell::Cell::get) {
+                    // The loop as it was before the double buffer: write this
+                    // batch, then read and resolve the next.
+                    finish_batch(store, &batch, result, &edges, &mut timings)?;
+                    resolved = match reader.next(store, &mut timings)? {
+                        Some(next) => {
+                            let context = self.chunk_context(
+                                store,
+                                &mut node_snapshot,
+                                &mut base_adjacency,
+                                &mut timings,
+                            )?;
+                            let started = Instant::now();
+                            let result = self.resolve_chunk_parallel(&next, &context);
+                            timings.resolve += started.elapsed();
+                            Some((next, result))
+                        }
+                        None => None,
+                    };
+                    continue;
+                }
+                let Some(next) = reader.next(store, &mut timings)? else {
+                    finish_batch(store, &batch, result, &edges, &mut timings)?;
+                    break;
+                };
+                let context = self.chunk_context(
+                    store,
+                    &mut node_snapshot,
+                    &mut base_adjacency,
+                    &mut timings,
+                )?;
+                let this: &Self = self;
+                let (written, next_result, waited) = std::thread::scope(|scope| {
+                    let worker = scope.spawn(|| this.resolve_chunk_parallel(&next, &context));
+                    let written = finish_batch(store, &batch, result, &edges, &mut timings);
+                    let waiting = Instant::now();
+                    let next_result = worker.join();
+                    (written, next_result, waiting.elapsed())
+                });
+                // The time the loop waited for the next batch's resolution;
+                // the rest of it ran beside this batch's writes.
+                timings.resolve += waited;
+                let next_result =
+                    next_result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                written?;
+                resolved = Some((next, next_result));
             }
-            timings.insert_edges += started.elapsed();
-
-            // Per-batch deletion (peak-memory bound on large graphs) is precise
-            // because the key is `row_id`: a batch can only delete rows it read, so
-            // neither a later batch's row nor a sibling call site sharing this
-            // row's (from,name,kind) tuple is reachable from here.
-            let started = Instant::now();
-            let batch_row_ids: Vec<i64> = result
-                .resolved
-                .iter()
-                .filter_map(|reference| reference.original.row_id)
-                .chain(batch.iter().filter_map(|reference| {
-                    parse_cpp_constructor_reference_name(&reference.reference_name)
-                        .is_some()
-                        .then_some(reference.id)
-                        .flatten()
-                }))
-                .collect();
-            if !batch_row_ids.is_empty() {
-                store.delete_resolved_unresolved_refs(&batch_row_ids)?;
-            }
-            timings.move_refs += started.elapsed();
-
-            // WAL valve in the resolution write loop (#1212 port / resolution-loop
-            // half of #1231): fold the WAL back into the main DB once it grows past
-            // `wal_valve_bytes`, bounding WAL growth through the resolution tail too
-            // — not just spill-replay. TRUNCATE is row-neutral, so index output stays
-            // byte-identical. `CODEGRAPH_NO_WAL_DEFER=1` keeps SQLite's default
-            // autocheckpoint; the valve is then a cheap size check.
-            let started = Instant::now();
-            if store.checkpoint_wal_if_over(wal_valve_bytes)? {
-                telemetry.wal_checkpoints += 1;
-            }
-            timings.wal_fold += started.elapsed();
-
-            aggregate.stats.total += result.stats.total;
-            aggregate.stats.resolved += result.stats.resolved;
-            aggregate.stats.unresolved += result.stats.unresolved;
-            for (method, count) in result.stats.by_method {
-                *aggregate.stats.by_method.entry(method).or_insert(0) += count;
-            }
-
-            telemetry.batches += 1;
-            timings.batches += 1;
-            processed += batch.len() as u64;
-            on_observation(ResolutionObservation::BatchComplete {
-                batch: telemetry.batches,
-                processed,
-                total: total_refs,
-            });
-            on_progress(processed, total_refs);
         }
 
         // #750 conformance pass then #808 supertype pass, after implements/extends
@@ -3872,6 +3879,36 @@ impl ReferenceResolver {
         on_observation(ResolutionObservation::Timings(timings));
 
         Ok((aggregate, telemetry))
+    }
+
+    /// The resolution context of the next chunk: the node snapshot, built
+    /// on the first chunk after framework extraction injected its nodes
+    /// (never in `new`/`initialize`, which would miss them), with the
+    /// inheritance adjacency of the chunks before it installed.
+    fn chunk_context(
+        &self,
+        store: &Store,
+        node_snapshot: &mut Option<SnapshotResolutionContext>,
+        base_adjacency: &mut HashMap<String, Vec<(String, EdgeKind)>>,
+        timings: &mut ResolutionTimings,
+    ) -> anyhow::Result<SnapshotResolutionContext> {
+        let started = Instant::now();
+        let base = match node_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                *base_adjacency = (*build_edge_adjacency(store)?).clone();
+                node_snapshot.insert(
+                    SnapshotResolutionContext::from_store(store, &self.project_root)?
+                        .with_max_file_size(self.max_file_size)
+                        .with_lua_loaders(Arc::clone(&self.lua_loaders)),
+                )
+            }
+        };
+        // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
+        // (matches the old per-chunk full rebuild's observable state).
+        let context = base.with_edge_adjacency(Arc::new(base_adjacency.clone()));
+        timings.snapshot += started.elapsed();
+        Ok(context)
     }
 
     /// Resolve one chunk's refs in parallel over the `Sync` snapshot context,
@@ -4591,9 +4628,123 @@ fn strip_erlang_arity(name: &str) -> &str {
     }
 }
 
+/// Where the batched resolution reads its next batch: past `cursor`, the
+/// wiring references first, then from the start of the table the rest once
+/// they run out (upstream #1789). A batch's writes only remove its own rows,
+/// so reading the next one before they land reads the same rows.
+struct BatchReader {
+    cursor: i64,
+    wiring_phase: bool,
+    batch_size: usize,
+}
+
+impl BatchReader {
+    fn next(
+        &mut self,
+        store: &Store,
+        timings: &mut ResolutionTimings,
+    ) -> anyhow::Result<Option<Vec<UnresolvedRef>>> {
+        loop {
+            let started = Instant::now();
+            let batch = store.unresolved_refs_batch_by_kinds(
+                self.cursor,
+                self.batch_size,
+                &WIRING_KINDS,
+                self.wiring_phase,
+            )?;
+            timings.read += started.elapsed();
+            if batch.is_empty() {
+                if self.wiring_phase {
+                    self.wiring_phase = false;
+                    self.cursor = 0;
+                    continue;
+                }
+                return Ok(None);
+            }
+            self.cursor = batch
+                .iter()
+                .filter_map(|reference| reference.id)
+                .max()
+                .unwrap_or(self.cursor);
+            return Ok(Some(batch));
+        }
+    }
+}
+
+/// Write one resolved batch: its edges; the rows it resolved moved to
+/// `resolved_refs` (with the C++ constructor references it consumed); and
+/// the WAL valve; then add its stats.
+#[allow(clippy::too_many_arguments)]
+fn persist_resolved_batch(
+    store: &mut Store,
+    batch: &[UnresolvedRef],
+    result: ResolutionResult,
+    edges: &[Edge],
+    wal_valve_bytes: u64,
+    timings: &mut ResolutionTimings,
+    telemetry: &mut BatchedRunTelemetry,
+    aggregate: &mut ResolutionResult,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    if !edges.is_empty() {
+        store.insert_edges(edges)?;
+    }
+    timings.insert_edges += started.elapsed();
+
+    // Per-batch deletion (peak-memory bound on large graphs) is precise
+    // because the key is `row_id`: a batch can only delete rows it read, so
+    // neither a later batch's row nor a sibling call site sharing this
+    // row's (from,name,kind) tuple is reachable from here.
+    let started = Instant::now();
+    let batch_row_ids: Vec<i64> = result
+        .resolved
+        .iter()
+        .filter_map(|reference| reference.original.row_id)
+        .chain(batch.iter().filter_map(|reference| {
+            parse_cpp_constructor_reference_name(&reference.reference_name)
+                .is_some()
+                .then_some(reference.id)
+                .flatten()
+        }))
+        .collect();
+    if !batch_row_ids.is_empty() {
+        store.delete_resolved_unresolved_refs(&batch_row_ids)?;
+    }
+    timings.move_refs += started.elapsed();
+
+    // WAL valve in the resolution write loop (#1212 port / resolution-loop
+    // half of #1231): fold the WAL back into the main DB once it grows past
+    // `wal_valve_bytes`, bounding WAL growth through the resolution tail too
+    // — not just spill-replay. TRUNCATE is row-neutral, so index output stays
+    // byte-identical. `CODEGRAPH_NO_WAL_DEFER=1` keeps SQLite's default
+    // autocheckpoint; the valve is then a cheap size check.
+    let started = Instant::now();
+    if store.checkpoint_wal_if_over(wal_valve_bytes)? {
+        telemetry.wal_checkpoints += 1;
+    }
+    timings.wal_fold += started.elapsed();
+
+    aggregate.stats.total += result.stats.total;
+    aggregate.stats.resolved += result.stats.resolved;
+    aggregate.stats.unresolved += result.stats.unresolved;
+    for (method, count) in result.stats.by_method {
+        *aggregate.stats.by_method.entry(method).or_insert(0) += count;
+    }
+    telemetry.batches += 1;
+    timings.batches += 1;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Run the snapshot path's batches one after the other, each written
+        /// before the next is read and resolved, as before the double buffer.
+        pub(super) static SERIAL_BATCHES: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
     use crate::types::ImportMapping;
     use codegraph_core::types::FileRecord;
     use std::collections::HashMap;
@@ -5861,6 +6012,91 @@ mod tests {
 
         let _ = std::fs::remove_file(&snap_db);
         let _ = std::fs::remove_file(&stream_db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every row of `table` with every column, in rowid order.
+    fn table_rows(store: &Store, table: &str) -> Vec<String> {
+        let mut stmt = store
+            .connection()
+            .prepare(&format!("SELECT rowid, * FROM {table} ORDER BY rowid"))
+            .expect("prepare the table dump");
+        let columns = stmt.column_count();
+        let mut rows = stmt.query([]).expect("dump the table");
+        let mut dumped = Vec::new();
+        while let Some(row) = rows.next().expect("read a row") {
+            let fields: Vec<String> = (0..columns)
+                .map(|column| {
+                    let value = row.get_ref(column).expect("read a column");
+                    value
+                        .as_str()
+                        .map(|text| format!("{text:?}"))
+                        .unwrap_or_else(|_| format!("{value:?}"))
+                })
+                .collect();
+            dumped.push(fields.join("|"));
+        }
+        dumped
+    }
+
+    /// Table 9.1 row 2 (upstream a2f3c31): with batch k+1 resolving while
+    /// batch k is written, every table is what the loop writing each batch
+    /// before reading the next writes, row ids included, for batches of 1, 2
+    /// and 3 over the cross-batch inheritance fixture: `sub.ping()` reaches
+    /// `Base.ping` only through the `extends` edge an earlier batch resolved.
+    #[test]
+    fn double_buffered_batches_write_what_the_serial_loop_writes() {
+        let dir = fresh_fixture_dir("doublebuffer");
+        let files = write_cross_batch_fixture(&dir);
+        let root = dir.to_string_lossy().to_string();
+        for batch_size in [1, 2, 3] {
+            let run = |label: &str, serial: bool| {
+                let (mut store, db) =
+                    index_java_fixture(&format!("dbuf-{label}-{batch_size}"), &dir, &files);
+                SERIAL_BATCHES.with(|flag| flag.set(serial));
+                let outcome = ReferenceResolver::new(root.clone())
+                    .resolve_and_persist_batched_inner(
+                        &mut store,
+                        batch_size,
+                        usize::MAX,
+                        u64::MAX,
+                        |_, _| {},
+                        |_| {},
+                    );
+                SERIAL_BATCHES.with(|flag| flag.set(false));
+                let (_, telemetry) = outcome.expect("batched resolution");
+                let tables: Vec<Vec<String>> =
+                    ["nodes", "edges", "unresolved_refs", "resolved_refs"]
+                        .iter()
+                        .map(|table| table_rows(&store, table))
+                        .collect();
+                drop(store);
+                let _ = std::fs::remove_file(&db);
+                (telemetry, tables)
+            };
+            let (piped, piped_tables) = run("piped", false);
+            let (serial, serial_tables) = run("serial", true);
+            assert!(!piped.streaming, "the snapshot path runs");
+            assert!(
+                piped.batches >= 2,
+                "batch size {batch_size} splits the fixture, got {} batches",
+                piped.batches
+            );
+            assert_eq!(piped.batches, serial.batches);
+            for (table, (piped, serial)) in ["nodes", "edges", "unresolved_refs", "resolved_refs"]
+                .iter()
+                .zip(piped_tables.iter().zip(&serial_tables))
+            {
+                assert_eq!(piped, serial, "{table} with batches of {batch_size}");
+            }
+            assert!(
+                piped_tables[1]
+                    .iter()
+                    .any(|edge| edge.contains("\"calls\"")),
+                "the fixture resolves calls: {:?}",
+                piped_tables[1]
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
