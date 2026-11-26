@@ -178,13 +178,21 @@ impl Project {
     /// Runs `codegraph init` on the tree and reads the published graph.
     #[track_caller]
     pub fn index(self) -> Indexed {
-        codegraph(&self.root, [OsStr::new("init"), self.root.as_os_str()]);
+        self.index_capturing().0
+    }
+
+    /// [`Self::index`], with what `codegraph init` printed: a probe of a
+    /// warning reads its stderr.
+    #[track_caller]
+    pub fn index_capturing(self) -> (Indexed, Output) {
+        let output = codegraph(&self.root, [OsStr::new("init"), self.root.as_os_str()]);
         let graph = Graph::load(&db_path(&self.root));
-        Indexed {
+        let indexed = Indexed {
             project: self,
             graph,
             generation: 0,
-        }
+        };
+        (indexed, output)
     }
 }
 

@@ -19,6 +19,7 @@ use tree_sitter::Parser;
 use crate::ext_config::ExtensionOverrides;
 use crate::lang::{cpp_code_mask, spec_for_language};
 use crate::links::LinkWalk;
+use crate::lua_loaders::LuaLoaders;
 use crate::walker::TreeSitterWalker;
 use codegraph_core::source_file::{SourceText, read_source_file};
 
@@ -46,6 +47,11 @@ pub struct ExtractOptions {
     /// before. Passed explicitly instead of discovered, so two projects handled
     /// by one process can never see each other's overrides.
     pub extensions: Arc<ExtensionOverrides>,
+    /// The addressed project's custom Lua module loaders and module roots
+    /// (#1617), merged from its `config.toml` `[lua]` table and its
+    /// `codegraph.json` `lua` object ([`LuaLoaders::merge`]). Empty by
+    /// default, and for a project that names none.
+    pub lua_loaders: Arc<LuaLoaders>,
 }
 
 /// Coarse, read-only extraction stages for diagnostics.
@@ -86,6 +92,7 @@ impl Default for ExtractOptions {
             include: indexing.include,
             parallel: true,
             extensions: ExtensionOverrides::empty(),
+            lua_loaders: LuaLoaders::empty(),
         }
     }
 }
@@ -93,9 +100,15 @@ impl Default for ExtractOptions {
 impl ExtractOptions {
     /// Build the scan/extract options for ONE project from its own immutable
     /// [`Config`] and extension overrides. This is the only shape production
-    /// callers use; nothing here consults a process-global value.
+    /// callers use; nothing here consults a process-global value. The Lua
+    /// loader settings are validated here, each dropped part named in a
+    /// warning on stderr.
     #[must_use]
     pub fn for_project(config: &Config, extensions: Arc<ExtensionOverrides>) -> Self {
+        let lua_loaders = Arc::new(LuaLoaders::merge(
+            config.lua.as_ref(),
+            extensions.lua_block(),
+        ));
         Self {
             max_file_size: config.indexing.max_file_size,
             ignore_dirs: config.indexing.ignore_dirs.clone(),
@@ -104,6 +117,7 @@ impl ExtractOptions {
             include: config.indexing.include.clone(),
             parallel: true,
             extensions,
+            lua_loaders,
         }
     }
 }
@@ -1488,6 +1502,46 @@ fn normalize_path(path: impl AsRef<Path>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// One project's options carry its Lua loader settings, `config.toml`'s
+    /// keys replacing `codegraph.json`'s whole (#1617); a project naming
+    /// none has the empty settings.
+    #[test]
+    fn for_project_merges_the_lua_settings() {
+        use super::{Config, ExtensionOverrides, ExtractOptions};
+        let dir = std::env::temp_dir().join(format!(
+            "codegraph-engine-lua-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = dir.join("codegraph.json");
+        std::fs::write(
+            &json,
+            r#"{"lua": {"loaderFunctions": ["Include"], "moduleRoots": ["Lib"]}}"#,
+        )
+        .unwrap();
+        let extensions = ExtensionOverrides::load_from_file(&json);
+        let config = Config {
+            lua: Some(serde_json::json!({"loader_functions": ["Require"]})),
+            ..Config::default()
+        };
+        let options = ExtractOptions::for_project(&config, std::sync::Arc::clone(&extensions));
+        assert_eq!(options.lua_loaders.loader_functions(), ["Require"]);
+        assert_eq!(options.lua_loaders.module_roots(), ["Lib"]);
+
+        let options = ExtractOptions::for_project(&Config::default(), extensions);
+        assert_eq!(options.lua_loaders.loader_functions(), ["Include"]);
+        assert_eq!(options.lua_loaders.module_roots(), ["Lib"]);
+
+        let options = ExtractOptions::for_project(&Config::default(), ExtensionOverrides::empty());
+        assert!(!options.lua_loaders.is_configured());
+        assert!(!ExtractOptions::default().lua_loaders.is_configured());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn missing_symbols_classifies_stored_rows_like_upstream() {
         use codegraph_core::types::FileRecord;

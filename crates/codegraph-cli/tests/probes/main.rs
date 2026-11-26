@@ -14700,6 +14700,95 @@ mod lua {
             "{report}"
         );
     }
+
+    /// `output`'s stderr as text, terminal escapes removed: the logger
+    /// colors its field names on a terminal and wherever `NO_COLOR` is unset.
+    fn plain_stderr(output: &std::process::Output) -> String {
+        let text = String::from_utf8_lossy(&output.stderr);
+        let mut plain = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for end in chars.by_ref() {
+                    if end.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            plain.push(c);
+        }
+        plain
+    }
+
+    /// W9-02 (#1617, OD-11): an invalid Lua loader setting is dropped with
+    /// one warning on stderr naming it, element by element, and indexing
+    /// goes on: the project's other settings, its `codegraph.json`
+    /// extensions among them, still apply, and stdout carries no warning.
+    #[test]
+    fn w902_invalid_lua_settings_are_dropped_with_a_warning() {
+        let (project, output) = Project::new()
+            .file(
+                ".codegraph/config.toml",
+                "[app]\nname = \"w902\"\n\n[lua]\nloader_functions = [\"Require\", \"1bad\", 7, \"Re quire\"]\nmodule_roots = [\"Script\", \"/abs\", \"../out\", \"a\\\\b\"]\nloaderFunctions = [\"Oops\"]\n",
+            )
+            .file(
+                ".codegraph/codegraph.json",
+                "{\"extensions\": {\".luax\": \"lua\"}, \"lua\": {\"loaderFunctions\": \"Include\", \"moduleRoots\": [\"C:/x\", \"Lib\"]}}\n",
+            )
+            .file("main.lua", "local util = require(\"util\")\nreturn util\n")
+            .file("util.luax", "local M = {}\nfunction M.clamp(v) return v end\nreturn M\n")
+            .index_capturing();
+        let stderr = plain_stderr(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for dropped in [
+            r#"element="1bad""#,
+            "element=7",
+            r#"element="Re quire""#,
+            r#"element="/abs""#,
+            r#"element="../out""#,
+            r#"element="a\\b""#,
+            r#"element="C:/x""#,
+            r#"key=loaderFunctions value="Include""#,
+        ] {
+            assert_eq!(
+                stderr.matches(dropped).count(),
+                1,
+                "one warning names {dropped}\n--- stderr\n{stderr}"
+            );
+        }
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(
+                    |line| line.contains("ignoring an unknown Lua loader setting")
+                        && line.contains(r#"source="config.toml [lua]""#)
+                        && line.contains("key=loaderFunctions")
+                )
+                .count(),
+            1,
+            "the TOML block's JSON key name is an unknown key\n--- stderr\n{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("codegraph_extract::lua_loaders").count(),
+            9,
+            "nothing valid is warned about\n--- stderr\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("lua_loaders") && !stdout.contains("ignoring"),
+            "warnings stay off stdout\n--- stdout\n{stdout}"
+        );
+        assert!(
+            project
+                .graph()
+                .nodes
+                .iter()
+                .any(|node| node.file_path == "util.luax" && node.name == "clamp"),
+            "codegraph.json's extensions still apply\n{}",
+            project.graph().report()
+        );
+    }
 }
 
 mod r {

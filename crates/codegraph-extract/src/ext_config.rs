@@ -13,6 +13,10 @@
 //! Absence and malformed content stay tolerant (empty overrides, logged), which
 //! is the documented opt-in contract: a project with no `codegraph.json` behaves
 //! byte-identically to a build without the feature.
+//!
+//! The file's `lua` object (custom Lua module loaders, #1617) is kept as
+//! written, whatever its shape, and validated by [`crate::lua_loaders`]: a
+//! mistyped one never costs the file its `extensions`.
 
 use codegraph_core::IndexPaths;
 use codegraph_core::types::Language;
@@ -25,6 +29,9 @@ use std::sync::Arc;
 struct CodegraphJson {
     #[serde(default)]
     extensions: BTreeMap<String, String>,
+    /// The `lua` object as written ([`crate::lua_loaders`]).
+    #[serde(default)]
+    lua: Option<serde_json::Value>,
 }
 
 /// One project's parsed extension overrides: lowercased dot-free extension →
@@ -39,6 +46,8 @@ pub struct ExtensionOverrides {
     /// Shopify theme's JSON templates apart from other JSON (W4-LIQ-01,
     /// upstream #2393); `None` where there is no project to look in.
     project_root: Option<PathBuf>,
+    /// The file's `lua` object as written, `None` when it has none.
+    lua: Option<serde_json::Value>,
 }
 
 impl ExtensionOverrides {
@@ -67,6 +76,7 @@ impl ExtensionOverrides {
         Arc::new(Self {
             map: loaded.map.clone(),
             project_root: Some(paths.project().to_path_buf()),
+            lua: loaded.lua.clone(),
         })
     }
 
@@ -76,6 +86,7 @@ impl ExtensionOverrides {
         Arc::new(Self {
             map: self.map.clone(),
             project_root: Some(project_root.to_path_buf()),
+            lua: self.lua.clone(),
         })
     }
 
@@ -83,6 +94,12 @@ impl ExtensionOverrides {
     #[must_use]
     pub fn project_root(&self) -> Option<&Path> {
         self.project_root.as_deref()
+    }
+
+    /// The file's `lua` object as written, for [`crate::lua_loaders`].
+    #[must_use]
+    pub fn lua_block(&self) -> Option<&serde_json::Value> {
+        self.lua.as_ref()
     }
 
     /// Load overrides from an explicit `codegraph.json` path. Exposed so a
@@ -133,6 +150,7 @@ impl ExtensionOverrides {
         Self {
             map,
             project_root: None,
+            lua: parsed.lua,
         }
     }
 
@@ -190,6 +208,31 @@ mod tests {
         assert!(overrides("{ not json ").is_empty());
     }
 
+    /// The `lua` object is kept as written, whatever its shape, beside the
+    /// extensions: a mistyped one never makes the file malformed.
+    #[test]
+    fn a_mistyped_lua_block_keeps_the_extensions() {
+        for lua in [
+            r#""Require""#,
+            r#"["Require"]"#,
+            r#"{"loaderFunctions": "Require"}"#,
+            r#"{"loaderFunctions": [1, {"x": null}], "moduleRoots": {"a": 1}}"#,
+            r#"{"unknown": true}"#,
+        ] {
+            let parsed = overrides(&format!(r#"{{"extensions":{{".x":"lua"}},"lua":{lua}}}"#));
+            assert_eq!(parsed.language_for("x"), Some(Language::Lua), "{lua}");
+            assert_eq!(
+                parsed.lua_block(),
+                Some(&serde_json::from_str::<serde_json::Value>(lua).unwrap()),
+                "{lua}"
+            );
+        }
+        assert_eq!(
+            overrides(r#"{"extensions":{".x":"lua"}}"#).lua_block(),
+            None
+        );
+    }
+
     #[test]
     fn missing_file_yields_empty_overrides() {
         let missing = std::env::temp_dir().join(format!(
@@ -222,10 +265,21 @@ mod tests {
         .unwrap();
         let paths = IndexPaths::resolve(&project, None).expect("resolve paths");
         std::fs::create_dir_all(paths.current_root()).unwrap();
-        std::fs::write(paths.extension_config(), r#"{"extensions":{".zz":"lua"}}"#).unwrap();
+        std::fs::write(
+            paths.extension_config(),
+            r#"{"extensions":{".zz":"lua"},"lua":{"moduleRoots":["Script"]}}"#,
+        )
+        .unwrap();
 
         let loaded = ExtensionOverrides::load_for_paths(&paths);
         assert_eq!(loaded.language_for("zz"), Some(Language::Lua));
+        let lua = serde_json::json!({"moduleRoots": ["Script"]});
+        assert_eq!(loaded.lua_block(), Some(&lua));
+        assert_eq!(
+            loaded.with_project_root(&project).lua_block(),
+            Some(&lua),
+            "the scope's project root keeps the lua block"
+        );
 
         let _ = std::fs::remove_dir_all(&project);
     }

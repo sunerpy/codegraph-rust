@@ -15,6 +15,7 @@ pub mod ext_config;
 pub mod function_ref;
 pub mod lang;
 mod links;
+pub mod lua_loaders;
 mod pascal_include;
 pub mod spec;
 pub mod syntax_tokens;
@@ -32,3 +33,4 @@ pub use engine::{
     is_extraction_warning, is_play_routes_file,
 };
 pub use ext_config::ExtensionOverrides;
+pub use lua_loaders::LuaLoaders;
