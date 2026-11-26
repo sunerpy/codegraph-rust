@@ -1987,6 +1987,21 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             print_stage_timings(&diagnostic_run, stage);
         }
     }
+    // Which synthesis steps the sync ran and how many kept their recorded
+    // output (W9-00 row 27), when it ran the stage.
+    let (synthesis_rerun, synthesis_reused) = match &outcome.synthesis {
+        Some(stats) => (
+            serde_json::Value::from(
+                codegraph_resolve::synthesis::step_names()
+                    .enumerate()
+                    .filter(|(at, _)| stats.rerun & (1 << at) != 0)
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>(),
+            ),
+            serde_json::Value::from(stats.reused),
+        ),
+        None => (serde_json::Value::Null, serde_json::Value::Null),
+    };
     diagnostic_run.phase_end(
         "sync",
         sync_started.elapsed(),
@@ -1995,6 +2010,8 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             "filesReindexed": outcome.files_reindexed,
             "filesSkipped": outcome.files_skipped_unchanged,
             "filesRemoved": outcome.files_removed,
+            "synthesisRerun": synthesis_rerun,
+            "synthesisReused": synthesis_reused,
         }),
     );
     if !quiet {
@@ -5829,11 +5846,20 @@ fn print_stage_timings(run: &DiagnosticRun, stage: &codegraph_resolve::synthesis
         return;
     }
     run.phase_part("synthesis.read", stage.read);
+    if stage.reusing {
+        run.phase_part("synthesis.decide", stage.decide);
+    }
     for (pass, took) in &stage.passes {
         run.phase_part(&format!("synthesis.{pass}"), *took);
     }
+    for (pass, took) in &stage.kept {
+        run.phase_part(&format!("synthesis.{pass}.reused"), *took);
+    }
     run.phase_part("synthesis.merge", stage.merge);
     run.phase_part("synthesis.replace", stage.replace);
+    if let Some(took) = stage.restore {
+        run.phase_part("synthesis.restore", took);
+    }
     run.phase_part("synthesis.inputs", stage.inputs);
 }
 

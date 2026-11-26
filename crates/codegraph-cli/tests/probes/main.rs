@@ -29834,7 +29834,7 @@ mod synthesis {
         assert_eq!((edge.line, edge.col), (Some(7), None), "{edge:?}");
         assert_eq!(
             project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "23".to_string())]
+            [("synthesis_version".to_string(), "24".to_string())]
         );
     }
 

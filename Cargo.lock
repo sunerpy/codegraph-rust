@@ -631,6 +631,7 @@ dependencies = [
  "codegraph-core",
  "codegraph-extract",
  "codegraph-store",
+ "miniz_oxide",
  "rayon",
  "regex",
  "serde",

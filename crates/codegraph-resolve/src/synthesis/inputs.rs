@@ -80,7 +80,12 @@ impl UnindexedReader {
 /// admits it as a file, whatever its extension, no symbolic link on its
 /// way, and it is a regular file no larger than `max_file_size`, read as
 /// the index reads source.
-fn read(root: &Path, scope: &ScanScope, max_file_size: u64, relative: &str) -> Option<Arc<str>> {
+pub(super) fn read(
+    root: &Path,
+    scope: &ScanScope,
+    max_file_size: u64,
+    relative: &str,
+) -> Option<Arc<str>> {
     if scope.admits_file(relative) != Membership::Admitted {
         return None;
     }

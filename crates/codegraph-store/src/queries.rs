@@ -9,6 +9,7 @@ use rusqlite::{
 };
 use serde_json::Value;
 
+use crate::change_log::SynthesizedEdge;
 use crate::connection::Store;
 
 /// Whether the edge row `$alias` names is one the synthesis stage owns
@@ -1335,16 +1336,86 @@ impl Store {
                 params![prefix, prefix.chars().count() as i64],
             )?;
         }
-        let now = now_millis();
-        for (key, value) in rows {
-            tx.execute(
-                "INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) \
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                params![key, value, now],
-            )?;
-        }
+        write_metadata_rows(&tx, rows)?;
         tx.commit()?;
         Ok((stale.len(), inserted))
+    }
+
+    /// Write `edges` back, synthesized rows a sync's cascade dropped (W9-00
+    /// row 27), as [`Self::replace_synthesized_edges`] inserts the rest of
+    /// its edges: one whose node is gone is skipped, and one whose identity
+    /// an edge holds now is ignored. In the same transaction each of `rows`
+    /// is written to `project_metadata`. Returns how many rows came.
+    pub fn restore_synthesized_edges(
+        &mut self,
+        edges: &[SynthesizedEdge],
+        rows: &[(String, String)],
+    ) -> rusqlite::Result<usize> {
+        if edges.is_empty() && rows.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let endpoint_ids = edges
+            .iter()
+            .flat_map(|edge| [edge.source.as_str(), edge.target.as_str()])
+            .collect::<Vec<_>>();
+        let existing_node_ids = existing_node_ids(&tx, &endpoint_ids)?;
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for edge in edges {
+                if !existing_node_ids.contains(&edge.source)
+                    || !existing_node_ids.contains(&edge.target)
+                {
+                    continue;
+                }
+                inserted += stmt.execute(params![
+                    edge.source,
+                    edge.target,
+                    edge.kind,
+                    edge.metadata,
+                    edge.line,
+                    edge.col,
+                    edge.provenance,
+                ])?;
+            }
+        }
+        write_metadata_rows(&tx, rows)?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// How many synthesized edges the index holds.
+    pub fn synthesized_edge_count(&self) -> rusqlite::Result<usize> {
+        let count: i64 = self.conn.query_row(
+            &format!("SELECT count(*) FROM edges WHERE {SYNTHESIZED}"),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or_default())
+    }
+
+    /// Whether `text LIKE pattern` holds, with SQLite's own operator (the
+    /// synthesis stage asks a changed node's name of a recorded lookup's
+    /// pattern, W9-00 row 27).
+    pub fn sql_like(&self, text: &str, pattern: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row("SELECT ?1 LIKE ?2", params![text, pattern], |row| {
+                row.get(0)
+            })
+    }
+
+    /// Whether `text GLOB pattern` holds, with SQLite's own operator.
+    pub fn sql_glob(&self, text: &str, pattern: &str) -> rusqlite::Result<bool> {
+        self.conn
+            .query_row("SELECT ?1 GLOB ?2", params![text, pattern], |row| {
+                row.get(0)
+            })
     }
 
     /// Ports `getOutgoingEdges` from `upstream db/queries.ts:1310-1337`.
@@ -2617,6 +2688,21 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()
+    }
+
+    /// The byte length of `key`'s `project_metadata` value, `None` without
+    /// the row (W9-00 row 27). SQLite's `octet_length` takes it from the
+    /// row's header and never reads a value's overflow pages.
+    pub fn project_metadata_bytes(&self, key: &str) -> rusqlite::Result<Option<u64>> {
+        let bytes: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT octet_length(value) FROM project_metadata WHERE key = ?",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bytes.flatten().and_then(|bytes| u64::try_from(bytes).ok()))
     }
 
     /// Ports `setMetadata` from `upstream db/queries.ts:1806-1813`.
@@ -4375,6 +4461,19 @@ fn insert_edges_in(tx: &Connection, edges: &[Edge]) -> rusqlite::Result<usize> {
     insert_edge_refs_in(tx, &edges.iter().collect::<Vec<_>>())
 }
 
+/// Each of `rows` written to `project_metadata`, its key's old row replaced.
+fn write_metadata_rows(tx: &Connection, rows: &[(String, String)]) -> rusqlite::Result<()> {
+    let now = now_millis();
+    for (key, value) in rows {
+        tx.execute(
+            "INSERT INTO project_metadata (key, value, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, now],
+        )?;
+    }
+    Ok(())
+}
+
 /// [`insert_edges_in`] over borrowed edges.
 fn insert_edge_refs_in(tx: &Connection, edges: &[&Edge]) -> rusqlite::Result<usize> {
     if edges.is_empty() {
@@ -4748,6 +4847,33 @@ mod tests {
 
     fn store(test_name: &str) -> Store {
         Store::open(&temp_db_path(test_name)).expect("open temp store")
+    }
+
+    /// A value's byte length (W9-00 row 27): its UTF-8 bytes, for a value
+    /// past a page, and `None` without the row. SQLite codes the column read
+    /// for `octet_length` with `OPFLAG_BYTELENARG`, which takes the length
+    /// from the row's header and leaves the overflow pages unread.
+    #[test]
+    fn project_metadata_bytes_reads_a_length_from_the_row_header() {
+        let store = store("metadata-bytes");
+        store
+            .set_project_metadata("big", &"\u{e9}".repeat(5000))
+            .unwrap();
+        assert_eq!(store.project_metadata_bytes("big").unwrap(), Some(10_000));
+        assert_eq!(store.project_metadata_bytes("missing").unwrap(), None);
+        let flags: Vec<i64> = store
+            .conn
+            .prepare("EXPLAIN SELECT octet_length(value) FROM project_metadata WHERE key = ?")
+            .unwrap()
+            .query_map(["big"], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(6)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|(opcode, _)| opcode == "Column")
+            .map(|(_, p5)| p5)
+            .collect();
+        assert!(flags.iter().any(|p5| p5 & 0xc0 == 0xc0), "{flags:?}");
     }
 
     #[test]
@@ -5540,6 +5666,71 @@ mod tests {
             .collect();
         rows.sort();
         rows
+    }
+
+    /// Writing back the synthesized edges a cascade dropped (W9-00 row 27)
+    /// inserts each as stored, its metadata text and provenance kept, skips
+    /// one whose node is gone, ignores one whose identity an edge holds, and
+    /// writes the rows beside them; the count is of the synthesized edges
+    /// the index holds.
+    #[test]
+    fn restore_synthesized_edges_writes_back_what_a_cascade_dropped() {
+        let mut store = store("restore-synthesized");
+        store
+            .upsert_nodes(&[
+                node("function:a", "alpha", "src/a.rs"),
+                node("function:b", "beta", "src/b.rs"),
+            ])
+            .unwrap();
+        store
+            .insert_edges(&[Edge {
+                line: Some(3),
+                col: Some(4),
+                ..edge("function:a", "function:b", EdgeKind::Calls)
+            }])
+            .unwrap();
+        let dropped = |source: &str, target: &str, line: Option<i64>| SynthesizedEdge {
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: "calls".to_string(),
+            metadata: Some(
+                r#"{"synthesizedBy":"callback","registeredAt":"src/a.rs:1"}"#.to_string(),
+            ),
+            line,
+            col: line.map(|_| 4),
+            provenance: Some("heuristic".to_string()),
+        };
+        let inserted = store
+            .restore_synthesized_edges(
+                &[
+                    dropped("function:b", "function:a", None),
+                    dropped("function:a", "function:b", Some(3)),
+                    dropped("function:a", "function:gone", None),
+                ],
+                &[("synthesis_pass:x".to_string(), "{}".to_string())],
+            )
+            .unwrap();
+        assert_eq!(inserted, 1);
+        assert_eq!(store.synthesized_edge_count().unwrap(), 1);
+        let written = store
+            .all_edges()
+            .unwrap()
+            .into_iter()
+            .find(|edge| edge.source == "function:b")
+            .unwrap();
+        assert_eq!(written.provenance.as_deref(), Some("heuristic"));
+        assert_eq!(
+            written.metadata,
+            Some(serde_json::json!({"synthesizedBy": "callback", "registeredAt": "src/a.rs:1"}))
+        );
+        assert_eq!(
+            store
+                .get_project_metadata("synthesis_pass:x")
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+        assert_eq!(store.restore_synthesized_edges(&[], &[]).unwrap(), 0);
     }
 
     /// The replacement swaps the synthesized edges alone (W7-14): the base

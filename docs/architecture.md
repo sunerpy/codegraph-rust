@@ -540,6 +540,44 @@ sync's site machinery never selects or deletes a synthesized edge. The
 watcher hands an event for a recorded path to the next sync, as it does a
 control input's.
 
+Every stage run records what each step read and emitted (`synthesis_pass:{pass}`
+and its `:edges` row in `project_metadata`, `data-model.md`): the `View` and its
+resolution context, the only way a step reads the base graph, record the key of
+each lookup's rows, its pattern lookups, the files its per-file text checks pass
+(a file a check fails is read and dropped), the node lines it reads with their
+hash, and the files beside the index. A sync that finds the marker current when
+it begins, read before its first change as the lanes' markers are, turns a
+change log on: TEMP triggers on its one write connection record every `nodes`,
+`edges`, `unresolved_refs`, `resolved_refs` and `files` row it writes, old image
+and new, a synthesized edge's whole row apart from the base graph's, and the net
+change by content is read before the stage. The stage then runs step by step
+(W9-00 row 27): a step keeps its recorded raw output when its record is
+reusable, no changed row's key is among its keys, no changed node matches its
+patterns, no changed file is one its checks passed or passes its check now, its
+recorded lines read the same, and its files beside the index read as recorded; a
+prerequisite step that ran again and emitted other edges moves those edges' keys
+for the steps after it. The decision reads each step's footprint row; its raw
+output has a row of its own (the JSON deflated, in base64), read only to be
+merged and used only when it is the row the footprint row names by length and
+SHA-256. When a step runs again, the kept and the new outputs are merged and the
+stored synthesized edges replaced as a whole run does, which writes back the
+edges a re-extraction's cascade dropped. When every step keeps its output, and
+the sync removed no base edge, added no node under a new id and wrote no
+synthesized edge, the stored edges are already the merge but for the ones the
+cascade dropped: those are written back from the change log, and no output row
+is read. Only the rows of the steps that ran and changed are rewritten. The
+stage runs whole, as before, when the marker was away or another version, when
+the records were written by another build (a digest of the sources taken at
+compile time), over another schema, options, languages or steps, when a lane
+bootstrapped, a control input or the frameworks moved, the Dart manifests moved,
+the orphan sweep ran, the change log passed its cap of 100,000 images, or a
+step's record does not vouch for itself: a footprint row missing, unreadable or
+of another version, or an output row missing, of another length than named, or,
+once read, another text or one that does not decode. A step that probed the
+disk, listed a directory, read a table built from the store, or read a drifted
+file is never kept. The TEMP objects live in the connection's temporary schema
+and never reach the database file.
+
 ## Query layer
 
 `codegraph-graph` operates on persisted nodes and edges. It owns callers,

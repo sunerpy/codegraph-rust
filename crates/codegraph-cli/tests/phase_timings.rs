@@ -224,11 +224,18 @@ fn init_and_sync_print_each_phase_once_under_the_variable() {
             "sync reported an unknown phase {phase}"
         );
     }
-    // The edit changed the base graph, so the stage ran, all of it.
+    // The edit changed the base graph, so the stage ran, deciding step by
+    // step (W9-00 row 27): the field pass, which the new function does not
+    // reach, kept its output.
     for part in STAGE_PARTS {
         assert!(phases.contains_key(*part), "sync lacks {part}: {phases:?}");
     }
-    assert!(phases.contains_key("synthesis.fieldEdges"), "{phases:?}");
+    assert!(phases.contains_key("synthesis.decide"), "{phases:?}");
+    assert!(
+        phases.contains_key("synthesis.fieldEdges.reused"),
+        "{phases:?}"
+    );
+    assert!(!phases.contains_key("synthesis.fieldEdges"), "{phases:?}");
     // The six parts follow one another inside the whole sync.
     assert!(sum_of(&phases, "sync.") <= phases["sync"]);
     assert!(sum_of(&phases, "synthesis.") <= phases["sync.synthesis"]);

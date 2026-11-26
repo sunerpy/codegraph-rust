@@ -13,10 +13,13 @@
 //! Rows compare by content only: a node without `updated_at`, an edge or a
 //! reference without its `id`, a file by its path, language and `generated`
 //! flag, with its content hash compared on its own (the file's text moved).
-//! A synthesized edge is never logged. A row deleted and written back with
-//! the same content cancels out, so the log's net change is what the sync
-//! moved. Past [`DEFAULT_CHANGE_LOG_CAP`] logged images (or the cap given) the
-//! log stops recording and reads as unknown.
+//! A synthesized edge is logged apart from the base graph, its whole row
+//! ([`ChangeSet::synthesized`]), so a sync that keeps every synthesis step
+//! can write back the ones a cascade dropped. A row deleted and written back
+//! with the same content cancels out, so the log's net change is what the
+//! sync moved. Past [`DEFAULT_CHANGE_LOG_CAP`] logged images (or the cap
+//! given), synthesized ones included, the log stops recording and reads as
+//! unknown.
 
 use std::collections::BTreeSet;
 
@@ -55,6 +58,7 @@ const UNRESOLVED: i64 = 2;
 const RESOLVED: i64 = 3;
 const FILES: i64 = 4;
 const TEXTS: i64 = 5;
+const SYNTHESIZED_EDGES: i64 = 6;
 
 /// A node row's image: every column but `updated_at`.
 macro_rules! node_image {
@@ -225,6 +229,19 @@ pub struct EdgeImage {
     pub col: Option<i64>,
 }
 
+/// A synthesized edge row, every column but `id`, as stored: what writing
+/// it back inserts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SynthesizedEdge {
+    pub source: String,
+    pub target: String,
+    pub kind: String,
+    pub metadata: Option<String>,
+    pub line: Option<i64>,
+    pub col: Option<i64>,
+    pub provenance: Option<String>,
+}
+
 /// An `unresolved_refs` or `resolved_refs` row as the log compares it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RefImage {
@@ -297,6 +314,8 @@ pub struct ChangeSet {
     pub files: RowChanges<FileImage>,
     /// The files whose content hash moved, or that came or went, by path.
     pub texts: BTreeSet<String>,
+    /// The synthesized edges, apart from the base graph's.
+    pub synthesized: RowChanges<SynthesizedEdge>,
 }
 
 impl ChangeSet {
@@ -308,12 +327,14 @@ impl ChangeSet {
             && self.resolved_refs.is_empty()
             && self.files.is_empty()
             && self.texts.is_empty()
+            && self.synthesized.is_empty()
     }
 }
 
 /// `CREATE TEMP TRIGGER` for `table`'s `event`, its body each of `inserts`
-/// (`(code, sign, image, guard)`: the log row and the condition it is
-/// written under).
+/// (`(code, sign, image, apart)`: the log row, and for an edge row the
+/// synthesized-edge predicate under which it is logged as
+/// [`SYNTHESIZED_EDGES`] instead of `code`).
 fn trigger(
     name: &str,
     event: &str,
@@ -321,10 +342,15 @@ fn trigger(
     inserts: &[(i64, i64, &str, Option<&str>)],
 ) -> String {
     let mut body = String::new();
-    for (code, sign, image, guard) in inserts {
-        let guard = guard.map_or(String::new(), |guard| format!(" WHERE NOT {guard}"));
+    for (code, sign, image, apart) in inserts {
+        let code = match apart {
+            Some(synthesized) => {
+                format!("CASE WHEN {synthesized} THEN {SYNTHESIZED_EDGES} ELSE {code} END")
+            }
+            None => code.to_string(),
+        };
         body.push_str(&format!(
-            "INSERT INTO cg_change_log (tbl, sign, image) SELECT {code}, {sign}, {image}{guard};\n"
+            "INSERT INTO cg_change_log (tbl, sign, image) SELECT {code}, {sign}, {image};\n"
         ));
     }
     format!(
@@ -601,6 +627,18 @@ impl Store {
                 TEXTS => {
                     changes.texts.insert(text_at(&image, 0));
                 }
+                SYNTHESIZED_EDGES => changes.synthesized.push(
+                    SynthesizedEdge {
+                        source: text_at(&image, 0),
+                        target: text_at(&image, 1),
+                        kind: text_at(&image, 2),
+                        metadata: optional_text_at(&image, 3),
+                        line: integer_at(&image, 4),
+                        col: integer_at(&image, 5),
+                        provenance: optional_text_at(&image, 6),
+                    },
+                    net,
+                ),
                 _ => return Err(bad_image(code, &raw)),
             }
         }
@@ -775,9 +813,9 @@ mod tests {
     }
 
     /// Deleting a node logs the edges and references its foreign keys
-    /// cascade to; a synthesized edge is never logged.
+    /// cascade to; a synthesized edge is logged apart, its whole row.
     #[test]
-    fn a_cascade_is_logged_and_a_synthesized_edge_is_not() {
+    fn a_cascade_is_logged_and_a_synthesized_edge_apart() {
         let (mut store, dir) = store("cascade");
         store
             .upsert_nodes(&[
@@ -808,9 +846,55 @@ mod tests {
         assert_eq!(ids(&changes.nodes), (vec!["f:a"], vec![]));
         assert_eq!(changes.edges.removed.len(), 1, "{:?}", changes.edges);
         assert_eq!(changes.edges.removed[0].line, Some(2), "the base edge");
+        assert_eq!(
+            changes.synthesized.removed,
+            [SynthesizedEdge {
+                source: "f:b".to_string(),
+                target: "f:a".to_string(),
+                kind: "calls".to_string(),
+                metadata: Some(r#"{"synthesizedBy":"callback"}"#.to_string()),
+                line: Some(7),
+                col: Some(0),
+                provenance: None,
+            }],
+            "the synthesized edge, as stored"
+        );
+        assert!(changes.synthesized.added.is_empty());
         assert_eq!(changes.unresolved_refs.removed.len(), 1);
         assert_eq!(changes.resolved_refs.removed.len(), 1);
         assert_eq!(changes.resolved_refs.removed[0].reference_name, "y");
+
+        // Written, rewritten and deleted, a synthesized edge is logged as
+        // the rows it was and is; one written back the same cancels out.
+        store
+            .upsert_nodes(&[node("f:a", "a", "src/a.ts", 1)])
+            .unwrap();
+        store.begin_change_log(DEFAULT_CHANGE_LOG_CAP).unwrap();
+        let mut again = edge("f:b", "f:a", 7);
+        again.metadata = Some(json!({ "synthesizedBy": "callback" }));
+        store.insert_edges(&[again]).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE edges SET line = 8 WHERE source = 'f:b' AND target = 'f:a'",
+                [],
+            )
+            .unwrap();
+        let changes = store.take_change_log().unwrap().unwrap();
+        assert!(changes.synthesized.removed.is_empty(), "{changes:?}");
+        assert_eq!(changes.synthesized.added.len(), 1, "{changes:?}");
+        assert_eq!(changes.synthesized.added[0].line, Some(8));
+        assert!(changes.edges.is_empty(), "no base edge moved");
+        store.begin_change_log(DEFAULT_CHANGE_LOG_CAP).unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM edges WHERE source = 'f:b'", [])
+            .unwrap();
+        let mut back = edge("f:b", "f:a", 8);
+        back.metadata = Some(json!({ "synthesizedBy": "callback" }));
+        store.insert_edges(&[back]).unwrap();
+        let changes = store.take_change_log().unwrap().unwrap();
+        assert!(changes.is_empty(), "{changes:?}");
         drop(store);
         std::fs::remove_dir_all(dir).ok();
     }

@@ -1666,7 +1666,8 @@ Each phase name appears once per command:
   - `synthesis.<part>`: `read` (the indexed files' text), one line for each
     prerequisite step and pass that ran, under its upstream name (for example
     `synthesis.fieldEdges`; a pass whose language gate is closed does not run
-    and prints nothing), then `merge`, `replace`, and `inputs`.
+    and prints nothing), then `merge`, `replace` (the edges and the step
+    records, in one transaction), and `inputs` (encoding the records).
 - `sync` reports `sync`, its six consecutive parts `sync.scan` (the index
   lease, opening the index, and the scan), `sync.files` (re-extracting and
   writing the changed files, and the change checks before the framework
@@ -1674,7 +1675,15 @@ Each phase name appears once per command:
   finalization), `sync.resolve` (the dependents' references, re-resolution,
   the lane rows and markers, and the orphan sweep), `sync.synthesis`, and
   `sync.finish`, and the stage's `synthesis.<part>` lines when the stage ran.
-  A sync that rebuilds an outdated index prints only `sync`.
+  When the sync kept steps' recorded outputs, the stage's lines add
+  `synthesis.decide` (reading the records and the sync's changes) and a
+  `synthesis.<pass>.reused` line for each step kept, with the time its
+  decision took; a step that ran again keeps its `synthesis.<pass>` line,
+  which then includes its decision, and `read` is zero unless a step that
+  ran scans files. When it kept every step, `synthesis.restore` is the
+  writing back of the edges the re-extraction's cascade dropped, and `merge`
+  and `replace` are zero. A sync that rebuilds an outdated index prints only
+  `sync`.
 
 The parts are printed only on stderr, never into the JSONL log, so its
 `phase_end` durations still add up to the command. Stdout and the index are

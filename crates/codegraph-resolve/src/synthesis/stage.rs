@@ -14,20 +14,21 @@ use codegraph_core::node_id::hash_content;
 use codegraph_core::source_file::{SourceText, oversize_stamp, read_source_file};
 use codegraph_core::types::{Edge, EdgeKind, FileRecord, Language, Node, NodeKind, UnresolvedRef};
 use codegraph_extract::ExtractOptions;
-use codegraph_store::Store;
 use codegraph_store::queries::{MethodHeader, NodeSpan, ReferenceSite};
+use codegraph_store::{ChangeSet, Store};
 use rayon::prelude::*;
 
 use super::context::ViewContext;
 use super::footprint::{
-    GateInput, PassRecord, Predicate, Recorder, STAGE_RECORD_SCHEME, Slice, StageRecord, TextGate,
-    keys,
+    GateInput, PASS_RECORD_VERSION, PassRecord, PassRecordHead, Predicate, Recorder,
+    STAGE_RECORD_SCHEME, Slice, StageRecord, TextGate, decode_output_row, keys,
 };
 use super::inputs::{INPUTS_KEY, Inputs, UnindexedReader};
+use super::reuse::{Now, Probe, rerun_reason};
 use super::{
-    PASS_KEY_PREFIX, STAGE_KEY, angular, arkui, c_fnptr, callback, dispatch, erlang, framework, go,
-    go_dispatch, go_func_field, goframe, iface, is_synthesized, jsx, links, nix, react_native,
-    registry, sveltekit, tier, vue,
+    EDGES_KEY_SUFFIX, PASS_KEY_PREFIX, STAGE_KEY, angular, arkui, c_fnptr, callback, dispatch,
+    erlang, framework, go, go_dispatch, go_func_field, goframe, iface, is_synthesized, jsx, links,
+    nix, react_native, registry, sveltekit, tier, vue,
 };
 use crate::context::StoreResolutionContext;
 use crate::frameworks::route_href::{RouteTableObserver, RouteTables};
@@ -35,7 +36,9 @@ use crate::frameworks::route_href::{RouteTableObserver, RouteTables};
 /// What one run of the stage did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StageStats {
-    /// The merged edges the passes produced.
+    /// The merged edges the passes produced; for a sync that kept every step
+    /// and wrote back what the cascade dropped, the synthesized edges the
+    /// index holds after it.
     pub edges: usize,
     /// The stored synthesized edges the replacement removed: each one the
     /// stage did not make again unchanged (W7-18c0).
@@ -72,8 +75,21 @@ pub struct StageTimings {
     pub merge: Duration,
     /// Replacing the stored synthesized edges with the merged ones.
     pub replace: Duration,
-    /// Recording the files the stage read beside the index.
+    /// Encoding the records of what the stage read: the files beside the
+    /// index and each step's record.
     pub inputs: Duration,
+    /// Whether a sync's run kept steps' recorded outputs ([`run_stage_reusing`]),
+    /// rather than running every step.
+    pub reusing: bool,
+    /// A reusing run's reading of the records and the sync's changes.
+    pub decide: Duration,
+    /// Each step a reusing run kept, by its upstream name, in run order, with
+    /// the time its decision took.
+    pub kept: Vec<(&'static str, Duration)>,
+    /// A reusing run that kept every step: writing back the synthesized
+    /// edges the sync's cascade dropped, in place of the merge and the
+    /// replacement.
+    pub restore: Option<Duration>,
 }
 
 /// A pass: the edges it synthesizes over the view, in its own order.
@@ -308,6 +324,413 @@ pub fn run_stage_timed(
     ))
 }
 
+/// [`run_stage_timed`] for a sync that knows which base-graph rows it moved
+/// (`changes`, the store's change log, W9-00 row 27): each step whose record
+/// says nothing it read moved keeps its recorded output, the others run
+/// again. The decision reads each step's record head; a step's raw output
+/// is in a row of its own, read only when a step runs again and the outputs
+/// must be merged, and used only once it is the row its head names by
+/// length and hash. Then the stored synthesized edges are replaced with the
+/// merged ones as a whole run does. When every step is kept, and the sync
+/// removed no base edge, added no node under a new id and wrote no
+/// synthesized edge, the stored edges are already the merge but for the
+/// ones a re-extraction's cascade dropped, which the change log holds whole,
+/// and those are written back instead: no output row is read. Only the rows
+/// of the steps that ran and changed are rewritten. `None`, with nothing
+/// written, when the records cannot vouch for the stage: none written,
+/// written by another build, over another schema, engine version, options,
+/// languages or steps, a head missing, unreadable or of another version, an
+/// output row missing or of another length than its head names, or, when it
+/// is read, another text; the caller runs the stage whole.
+pub fn run_stage_reusing(
+    store: &mut Store,
+    project_root: &Path,
+    options: &ExtractOptions,
+    changes: &ChangeSet,
+) -> Result<Option<(StageStats, StageTimings)>> {
+    let mut timings = StageTimings::default();
+    let output = {
+        let mut view = View::new(store, project_root, options.max_file_size);
+        view.unindexed = Some(UnindexedReader::new(project_root, options));
+        let Some(output) = synthesize_reusing(
+            &mut view,
+            store,
+            project_root,
+            options,
+            changes,
+            &mut timings,
+        )?
+        else {
+            return Ok(None);
+        };
+        output
+    };
+    let started = Instant::now();
+    let mut rows = Vec::new();
+    for (name, record) in &output.records {
+        // A head names its output row by length and hash: an unchanged one
+        // is an unchanged output, and an output row is written only when
+        // the hash it is named by moves.
+        let written = record.to_rows()?;
+        let key = head_key(name);
+        if store.get_project_metadata(&key)?.as_deref() == Some(written.head_row.as_str()) {
+            continue;
+        }
+        let same_output = output.heads.get(name).is_some_and(|old| {
+            old.edges_bytes == written.head.edges_bytes && old.edges_hash == written.head.edges_hash
+        });
+        rows.push((key, written.head_row));
+        if !same_output {
+            rows.push((edges_key(name), written.edges_row));
+        }
+    }
+    let inputs = serde_json::to_string(&output.read)?;
+    if store.get_project_metadata(INPUTS_KEY)?.as_deref() != Some(inputs.as_str()) {
+        rows.push((INPUTS_KEY.to_string(), inputs));
+    }
+    timings.inputs = started.elapsed();
+    let started = Instant::now();
+    let (edges, removed, inserted) = match &output.edges {
+        Some(edges) => {
+            let (removed, inserted) =
+                store.replace_synthesized_edges_and_rows(edges, &[], &rows)?;
+            timings.replace = started.elapsed();
+            (edges.len(), removed, inserted)
+        }
+        None => {
+            let inserted = store.restore_synthesized_edges(&changes.synthesized.removed, &rows)?;
+            let held = store.synthesized_edge_count()?;
+            timings.restore = Some(started.elapsed());
+            (held, 0, inserted)
+        }
+    };
+    Ok(Some((
+        StageStats {
+            edges,
+            removed,
+            inserted,
+            rerun: output.rerun,
+            reused: output.reused,
+        },
+        timings,
+    )))
+}
+
+/// What a reusing stage run made: its edges, `None` when every step kept its
+/// output and the cascade's edges are written back instead; what its steps
+/// read beside the index (the kept steps' records and the others' reads);
+/// the records of the steps that ran; the stored heads the decision read;
+/// and which ran and how many kept their output.
+struct ReusingOutput {
+    edges: Option<Vec<Edge>>,
+    read: Inputs,
+    records: Vec<(&'static str, PassRecord)>,
+    heads: HashMap<&'static str, PassRecordHead>,
+    rerun: u64,
+    reused: usize,
+}
+
+/// The `project_metadata` key of `step`'s record head.
+fn head_key(step: &str) -> String {
+    format!("{PASS_KEY_PREFIX}{step}")
+}
+
+/// The `project_metadata` key of `step`'s raw-output row.
+fn edges_key(step: &str) -> String {
+    format!("{PASS_KEY_PREFIX}{step}{EDGES_KEY_SUFFIX}")
+}
+
+/// A step's stored record head: `None` when it is missing, does not read
+/// as this layout, or is of another version, the single-row layout of
+/// version 1 among them, so a record is never read in part.
+fn record_head(store: &Store, step: &str) -> Result<Option<PassRecordHead>> {
+    Ok(store
+        .get_project_metadata(&head_key(step))?
+        .and_then(|row| serde_json::from_str::<PassRecordHead>(&row).ok())
+        .filter(|head| head.version == PASS_RECORD_VERSION))
+}
+
+/// Whether `step`'s output row is there with the length its head names,
+/// read from the row's header (`octet_length`), not its text.
+fn edges_row_present(store: &Store, step: &str, head: &PassRecordHead) -> Result<bool> {
+    Ok(store.project_metadata_bytes(&edges_key(step))? == Some(head.edges_bytes))
+}
+
+/// A step's recorded raw output, read to be merged: `None` when its row is
+/// missing, is not the one its head names (length and SHA-256), or does not
+/// decode (base64, inflate, JSON).
+fn recorded_edges(store: &Store, step: &str, head: &PassRecordHead) -> Result<Option<Vec<Edge>>> {
+    Ok(store
+        .get_project_metadata(&edges_key(step))?
+        .filter(|row| head.holds(row))
+        .and_then(|row| output_edges(&row)))
+}
+
+/// The edges an `:edges` row holds: `None` when it does not decode.
+fn output_edges(row: &str) -> Option<Vec<Edge>> {
+    let json = decode_output_row(row)?;
+    serde_json::from_str::<Vec<Edge>>(&json).ok()
+}
+
+/// The stage over `view` keeping each step its record vouches for (see
+/// [`run_stage_reusing`]); `None` when the records cannot vouch for it.
+fn synthesize_reusing(
+    view: &mut View<'_>,
+    store: &Store,
+    project_root: &Path,
+    options: &ExtractOptions,
+    changes: &ChangeSet,
+    timings: &mut StageTimings,
+) -> Result<Option<ReusingOutput>> {
+    let started = Instant::now();
+    let languages = view.file_languages()?;
+    let mut language_names: Vec<String> = languages
+        .iter()
+        .map(|language| language.as_str().to_string())
+        .collect();
+    language_names.sort();
+    let expected = StageRecord {
+        scheme: STAGE_RECORD_SCHEME,
+        engine: super::VERSION.to_string(),
+        build: super::BUILD_IDENTITY.to_string(),
+        schema: codegraph_store::migrations::CURRENT_SCHEMA_VERSION,
+        options: options_digest(options),
+        languages: language_names,
+        passes: PREREQUISITES
+            .iter()
+            .chain(PASSES)
+            .filter(|(_, gate, _)| gate(&languages))
+            .map(|(name, _, _)| (*name).to_string())
+            .collect(),
+    };
+    let recorded = store
+        .get_project_metadata(STAGE_KEY)?
+        .and_then(|row| serde_json::from_str::<StageRecord>(&row).ok());
+    if recorded.as_ref() != Some(&expected) {
+        return Ok(None);
+    }
+    // Every step's head, and its output row there with the length the head
+    // names: anything else leaves the stage unvouched for.
+    let mut heads: HashMap<&'static str, PassRecordHead> = HashMap::new();
+    for (name, gate, _) in PREREQUISITES.iter().chain(PASSES) {
+        if !gate(&languages) {
+            continue;
+        }
+        let Some(head) = record_head(store, name)? else {
+            return Ok(None);
+        };
+        if !edges_row_present(store, name, &head)? {
+            return Ok(None);
+        }
+        heads.insert(*name, head);
+    }
+    let mut probe = Probe::new(changes);
+    let now = Now::new(store, project_root, options);
+    timings.reusing = true;
+    timings.decide = started.elapsed();
+
+    let mut read = Inputs::new();
+    let mut records = Vec::new();
+    let mut rerun = 0_u64;
+    let mut reused = 0_usize;
+    // Each prerequisite step that ran, its edges as made; a kept one's are
+    // decoded into the overlay only once a later step reads them.
+    let mut prerequisites: Vec<(&'static str, Option<Vec<Edge>>)> = Vec::new();
+    let mut overlaid = 0;
+    for (at, (name, gate, step)) in PREREQUISITES.iter().enumerate() {
+        if !gate(&languages) {
+            continue;
+        }
+        let started = Instant::now();
+        let head = &heads[name];
+        if rerun_reason(head, &probe, &now, view)?.is_none() {
+            read.extend(head.unindexed.clone());
+            prerequisites.push((*name, None));
+            reused += 1;
+            timings.kept.push((*name, started.elapsed()));
+            continue;
+        }
+        // A prerequisite step's last output is what the later steps read:
+        // a record past its size keeps none to tell what moved, and without
+        // it nothing after the step can be vouched for.
+        if head.untracked.iter().any(|what| what == "record-size") {
+            return Ok(None);
+        }
+        let Some(before) = recorded_edges(store, name, head)? else {
+            return Ok(None);
+        };
+        if !overlay_kept(view, store, &heads, &mut prerequisites, overlaid)? {
+            return Ok(None);
+        }
+        view.recorder.begin_pass();
+        let made = step(view)?;
+        let footprint = view.recorder.end_pass();
+        probe.moved_overlay(&before, &made);
+        read.extend(footprint.unindexed.clone());
+        records.push((*name, PassRecord::new(&made, &footprint)));
+        view.overlay.extend(made.iter().cloned());
+        prerequisites.push((*name, Some(made)));
+        overlaid = prerequisites.len();
+        rerun |= 1 << at;
+        timings.passes.push((*name, started.elapsed()));
+    }
+    // Every pass decided against the final probe first, on its record's
+    // decision fields.
+    let mut decided = Vec::with_capacity(PASSES.len());
+    for (at, (name, gate, pass)) in PASSES.iter().enumerate() {
+        if !gate(&languages) {
+            continue;
+        }
+        let started = Instant::now();
+        let head = &heads[name];
+        let keep = rerun_reason(head, &probe, &now, view)?.is_none();
+        if keep {
+            read.extend(head.unindexed.clone());
+        }
+        decided.push((
+            at,
+            *name,
+            *pass,
+            keep,
+            !head.gates.is_empty(),
+            started.elapsed(),
+        ));
+    }
+    let all_kept = rerun == 0 && decided.iter().all(|(_, _, _, keep, _, _)| *keep);
+    if all_kept && can_restore(changes) {
+        for (_, name, _, _, _, decide) in &decided {
+            reused += 1;
+            timings.kept.push((*name, *decide));
+        }
+        return Ok(Some(ReusingOutput {
+            edges: None,
+            read,
+            records,
+            heads,
+            rerun,
+            reused,
+        }));
+    }
+    // The outputs are merged: the kept steps' are read, a pass that runs
+    // again and scans files has the texts read at once, as a whole run does.
+    if !overlay_kept(view, store, &heads, &mut prerequisites, overlaid)? {
+        return Ok(None);
+    }
+    if decided
+        .iter()
+        .any(|(_, _, _, keep, gated, _)| !keep && *gated)
+    {
+        let started = Instant::now();
+        view.read_texts()?;
+        timings.read = started.elapsed();
+    }
+    let mut passes = Vec::with_capacity(decided.len());
+    for (at, name, pass, keep, _, decide) in decided {
+        if keep {
+            let started = Instant::now();
+            let Some(edges) = recorded_edges(store, name, &heads[name])? else {
+                return Ok(None);
+            };
+            passes.push(edges);
+            reused += 1;
+            timings.kept.push((name, decide + started.elapsed()));
+            continue;
+        }
+        let started = Instant::now();
+        view.recorder.begin_pass();
+        let made = pass(view)?;
+        let footprint = view.recorder.end_pass();
+        read.extend(footprint.unindexed.clone());
+        records.push((name, PassRecord::new(&made, &footprint)));
+        passes.push(made);
+        rerun |= 1 << (PREREQUISITES.len() + at);
+        timings.passes.push((name, decide + started.elapsed()));
+    }
+    let edges: Vec<Edge> = prerequisites
+        .into_iter()
+        .flat_map(|(_, made)| made.unwrap_or_default())
+        .collect();
+    let started = Instant::now();
+    let edges = combine(edges, passes);
+    timings.merge = started.elapsed();
+    Ok(Some(ReusingOutput {
+        edges: Some(edges),
+        read,
+        records,
+        heads,
+        rerun,
+        reused,
+    }))
+}
+
+/// The kept prerequisite steps from `from` on, their recorded edges read
+/// into `prerequisites` and the overlay in step order, before a later step
+/// reads them; `false` when an output row is not the one its head names.
+fn overlay_kept(
+    view: &mut View<'_>,
+    store: &Store,
+    heads: &HashMap<&'static str, PassRecordHead>,
+    prerequisites: &mut [(&'static str, Option<Vec<Edge>>)],
+    from: usize,
+) -> Result<bool> {
+    for &mut (step, ref mut made) in prerequisites.iter_mut().skip(from) {
+        if made.is_none() {
+            let Some(edges) = recorded_edges(store, step, &heads[step])? else {
+                return Ok(false);
+            };
+            view.overlay.extend(edges.iter().cloned());
+            *made = Some(edges);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether, for a run that kept every step, writing back the synthesized
+/// edges the sync's cascade dropped leaves what replacing the stored ones
+/// with the kept outputs merged would. The stored ones were that merge but
+/// for the edges the insert skipped, an identity a base edge held or a node
+/// that was not there, so the sync must have removed no base edge (it frees
+/// an identity such an edge takes), added no node under a new id (such an
+/// edge now has its node) and written no synthesized edge.
+fn can_restore(changes: &ChangeSet) -> bool {
+    if !changes.edges.removed.is_empty() || !changes.synthesized.added.is_empty() {
+        return false;
+    }
+    let removed: HashSet<&str> = changes
+        .nodes
+        .removed
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect();
+    changes
+        .nodes
+        .added
+        .iter()
+        .all(|node| removed.contains(node.id.as_str()))
+}
+
+/// Every per-file text check a pass scans with ([`View::gated_texts`]), by
+/// name: what a sync asks again of a changed file (W9-00 row 27).
+static GATES: [&TextGate; 12] = [
+    &callback::EMITTER_GATE,
+    &registry::REGISTRY_GATE,
+    &tier::TIER_GATE,
+    &jsx::JSX_GATE,
+    &framework::PINIA_FACTORY_GATE,
+    &framework::PINIA_USE_GATE,
+    &framework::VUEX_GATE,
+    &framework::CELERY_GATE,
+    &framework::SPRING_GATE,
+    &framework::SIDEKIQ_GATE,
+    &erlang::CALLBACK_GATE,
+    &erlang::DISPATCH_GATE,
+];
+
+/// The gate a record names.
+pub(super) fn gate_named(name: &str) -> Option<&'static TextGate> {
+    GATES.iter().copied().find(|gate| gate.name == name)
+}
+
 /// Every synthesized edge over `store`'s base graph: each prerequisite
 /// step's, and each pass's merged in registry order, sorted. It reads the
 /// indexed files only, never a file the index does not hold.
@@ -361,8 +784,9 @@ pub fn records_alone(
         }
         view.recorder.begin_pass();
         let made = run(&view)?;
-        let record = PassRecord::new(&made, &view.recorder.end_pass());
-        rows.push((format!("{PASS_KEY_PREFIX}{name}"), record.to_row()?));
+        let written = PassRecord::new(&made, &view.recorder.end_pass()).to_rows()?;
+        rows.push((head_key(name), written.head_row));
+        rows.push((edges_key(name), written.edges_row));
     }
     Ok(rows)
 }
@@ -380,8 +804,9 @@ pub(super) struct StageOutput {
 }
 
 impl StageOutput {
-    /// The `project_metadata` rows the run writes: [`STAGE_KEY`], one
-    /// [`PASS_KEY_PREFIX`] row a step that ran, and [`INPUTS_KEY`].
+    /// The `project_metadata` rows the run writes: [`STAGE_KEY`], the two
+    /// rows of each step that ran (its head under [`PASS_KEY_PREFIX`] and its
+    /// output's row), and [`INPUTS_KEY`].
     pub(super) fn rows(&self, options: &ExtractOptions) -> Result<Vec<(String, String)>> {
         let stage = StageRecord {
             scheme: STAGE_RECORD_SCHEME,
@@ -398,7 +823,9 @@ impl StageOutput {
         };
         let mut rows = vec![(STAGE_KEY.to_string(), serde_json::to_string(&stage)?)];
         for (name, record) in &self.records {
-            rows.push((format!("{PASS_KEY_PREFIX}{name}"), record.to_row()?));
+            let written = record.to_rows()?;
+            rows.push((head_key(name), written.head_row));
+            rows.push((edges_key(name), written.edges_row));
         }
         rows.push((INPUTS_KEY.to_string(), serde_json::to_string(&self.read)?));
         Ok(rows)
@@ -1497,6 +1924,60 @@ mod tests {
             })
             .collect();
         assert_eq!(rows, [("a", "b", "calls"), ("a", "b", "contains")]);
+    }
+
+    /// A run that kept every step writes back what the cascade dropped only
+    /// while that leaves the merge's rows (W9-00 row 27): a base edge the
+    /// sync removed frees an identity an edge the insert ignored takes now,
+    /// a node under a new id gives an edge the insert skipped its node, and
+    /// a synthesized edge written before the stage is not the merge's.
+    #[test]
+    fn the_cascade_is_written_back_only_while_no_identity_moved() {
+        use codegraph_store::{EdgeImage, NodeImage, SynthesizedEdge};
+        let node = |id: &str, end_line: i64| NodeImage {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            name: id.to_string(),
+            qualified_name: id.to_string(),
+            file_path: "src/a.ts".to_string(),
+            language: "typescript".to_string(),
+            start_line: 1,
+            end_line,
+            signature: None,
+            decorators: None,
+        };
+        let base = EdgeImage {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            kind: "calls".to_string(),
+            line: Some(3),
+            col: Some(4),
+        };
+        let dropped = SynthesizedEdge {
+            source: "b".to_string(),
+            target: "a".to_string(),
+            kind: "calls".to_string(),
+            metadata: Some(r#"{"synthesizedBy":"callback"}"#.to_string()),
+            line: None,
+            col: None,
+            provenance: Some("heuristic".to_string()),
+        };
+        let mut changes = ChangeSet::default();
+        changes.synthesized.removed.push(dropped.clone());
+        assert!(can_restore(&changes), "the cascade alone");
+        changes.edges.added.push(base.clone());
+        assert!(can_restore(&changes), "an added base edge frees nothing");
+        changes.edges.removed.push(base);
+        assert!(!can_restore(&changes), "a removed one does");
+        let mut changes = ChangeSet::default();
+        changes.synthesized.added.push(dropped);
+        assert!(!can_restore(&changes), "a synthesized edge written");
+        let mut changes = ChangeSet::default();
+        changes.nodes.removed.push(node("a", 3));
+        changes.nodes.added.push(node("a", 4));
+        assert!(can_restore(&changes), "a node rewritten under its id");
+        changes.nodes.added.push(node("b", 3));
+        assert!(!can_restore(&changes), "a node under a new id");
     }
 
     /// A pass reads the base graph: the stored synthesized edges of the last

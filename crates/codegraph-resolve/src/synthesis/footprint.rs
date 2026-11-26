@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 
+use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, Language};
 use serde::{Deserialize, Serialize};
 
@@ -374,17 +375,39 @@ pub(super) fn encode_keys(keys: &[u64]) -> String {
     text
 }
 
-/// The version of the pass records' shape and of what they hold.
-pub(super) const PASS_RECORD_VERSION: u32 = 1;
+/// Whether [`encode_keys`]' `text` holds `key`; text of another shape holds
+/// every key, so a record that does not read as written reruns its step.
+pub(super) fn encoded_holds(text: &str, key: u64) -> bool {
+    if !text.len().is_multiple_of(16) || !text.is_ascii() {
+        return true;
+    }
+    let wanted = format!("{key:016x}");
+    let (mut low, mut high) = (0, text.len() / 16);
+    while low < high {
+        let middle = (low + high) / 2;
+        match text[middle * 16..middle * 16 + 16].cmp(wanted.as_str()) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
 
-/// One pass's `synthesis_pass:{pass}` row: its raw output in the order it
-/// emitted it, and what it read.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// The version of the pass records' layout and of what they hold: 2 since
+/// each step's raw output has a row of its own (W9-00 row 27's fix round).
+/// A head of another version, the single-row layout of version 1 among
+/// them, runs the stage whole.
+pub(super) const PASS_RECORD_VERSION: u32 = 2;
+
+/// One step's record as a run makes it: its raw output in the order it
+/// emitted it, and what it read. It is written as two rows
+/// ([`Self::to_rows`]): its [`PassRecordHead`], `synthesis_pass:{pass}`,
+/// and its raw output, `synthesis_pass:{pass}:edges`.
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct PassRecord {
-    pub(super) version: u32,
     /// Whether a later stage run may keep the output: no untracked read, no
-    /// drifted file, and the record within [`MAX_RECORD_BYTES`].
+    /// drifted file, and the rows within [`MAX_RECORD_BYTES`].
     pub(super) reusable: bool,
     pub(super) edges: Vec<Edge>,
     pub(super) keys: String,
@@ -395,14 +418,136 @@ pub(super) struct PassRecord {
     pub(super) untracked: Vec<String>,
 }
 
-/// The size past which a pass's record keeps no output and is not reused.
+/// A step's `synthesis_pass:{pass}` row: what the step read, whether it may
+/// be kept, and the byte length and SHA-256 of the `:edges` row's stored text
+/// written with it. A sync decides on the heads alone; it uses an `:edges`
+/// row only after [`Self::holds`] says it is that row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PassRecordHead {
+    pub(super) version: u32,
+    pub(super) reusable: bool,
+    pub(super) keys: String,
+    pub(super) predicates: Vec<Predicate>,
+    pub(super) gates: Vec<GateUse>,
+    pub(super) slices: Vec<Slice>,
+    pub(super) unindexed: BTreeMap<String, Option<String>>,
+    pub(super) untracked: Vec<String>,
+    pub(super) edges_bytes: u64,
+    pub(super) edges_hash: String,
+}
+
+impl PassRecordHead {
+    /// Whether `row` is the `:edges` row written with this head: its length
+    /// and its SHA-256.
+    pub(super) fn holds(&self, row: &str) -> bool {
+        u64::try_from(row.len()).is_ok_and(|bytes| bytes == self.edges_bytes)
+            && hash_content(row) == self.edges_hash
+    }
+}
+
+/// A record's two rows, and its head as written.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RecordRows {
+    pub(super) head: PassRecordHead,
+    pub(super) head_row: String,
+    pub(super) edges_row: String,
+}
+
+/// The size past which a pass's record keeps no output and is not reused:
+/// its head and its output's JSON together.
 pub(super) const MAX_RECORD_BYTES: usize = 32 << 20;
+
+/// The deflate level of the output rows, fixed with the codec (miniz_oxide,
+/// whatever backend another crate picks for flate2) so equal outputs give
+/// byte-identical rows.
+const OUTPUT_LEVEL: u8 = 6;
+
+/// An `:edges` row's text for an output's JSON: the raw deflate stream of it
+/// (miniz_oxide at [`OUTPUT_LEVEL`]) in standard base64 with padding.
+#[doc(hidden)]
+pub fn encode_output_row(json: &str) -> String {
+    base64_encode(&miniz_oxide::deflate::compress_to_vec(
+        json.as_bytes(),
+        OUTPUT_LEVEL,
+    ))
+}
+
+/// The output's JSON an `:edges` row holds: `None` for text that is not
+/// base64, a stream that does not inflate within [`MAX_RECORD_BYTES`], or
+/// bytes that are not UTF-8.
+#[doc(hidden)]
+pub fn decode_output_row(row: &str) -> Option<String> {
+    let deflated = base64_decode(row)?;
+    let json =
+        miniz_oxide::inflate::decompress_to_vec_with_limit(&deflated, MAX_RECORD_BYTES).ok()?;
+    String::from_utf8(json).ok()
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let at = |index: usize| u32::from(chunk.get(index).copied().unwrap_or(0));
+        let group = (at(0) << 16) | (at(1) << 8) | at(2);
+        let digit = |shift: u32| char::from(BASE64[((group >> shift) & 63) as usize]);
+        text.push(digit(18));
+        text.push(digit(12));
+        text.push(if chunk.len() > 1 { digit(6) } else { '=' });
+        text.push(if chunk.len() > 2 { digit(0) } else { '=' });
+    }
+    text
+}
+
+/// Standard base64 with padding; `None` for any other text.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let digits = text.as_bytes();
+    if !digits.len().is_multiple_of(4) {
+        return None;
+    }
+    let value = |digit: u8| -> Option<u32> {
+        match digit {
+            b'A'..=b'Z' => Some(u32::from(digit - b'A')),
+            b'a'..=b'z' => Some(u32::from(digit - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(digit - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let groups = digits.len() / 4;
+    let mut bytes = Vec::with_capacity(groups * 3);
+    for (index, group) in digits.chunks(4).enumerate() {
+        let padding = group
+            .iter()
+            .rev()
+            .take_while(|digit| **digit == b'=')
+            .count();
+        if padding > 2 || (padding > 0 && index + 1 != groups) {
+            return None;
+        }
+        let mut bits = 0_u32;
+        for digit in &group[..4 - padding] {
+            bits = (bits << 6) | value(*digit)?;
+        }
+        bits <<= 6 * padding as u32;
+        let [_, first, second, third] = bits.to_be_bytes();
+        bytes.push(first);
+        if padding < 2 {
+            bytes.push(second);
+        }
+        if padding < 1 {
+            bytes.push(third);
+        }
+    }
+    Some(bytes)
+}
 
 impl PassRecord {
     /// The record of a pass that emitted `edges` reading `footprint`.
     pub(super) fn new(edges: &[Edge], footprint: &Footprint) -> Self {
         Self {
-            version: PASS_RECORD_VERSION,
             reusable: footprint.reusable(),
             edges: edges.to_vec(),
             keys: encode_keys(&footprint.keys),
@@ -426,15 +571,24 @@ impl PassRecord {
         }
     }
 
-    /// The row's text: the record, or past [`MAX_RECORD_BYTES`] one that
-    /// keeps nothing and is not reused.
-    pub(super) fn to_row(&self) -> serde_json::Result<String> {
-        let row = serde_json::to_string(self)?;
-        if row.len() <= MAX_RECORD_BYTES {
-            return Ok(row);
+    /// The record's rows: its head and its `:edges` row (the output's JSON
+    /// through [`encode_output_row`]), or, when the head and that JSON pass
+    /// [`MAX_RECORD_BYTES`] together, a head that keeps nothing and is not
+    /// reused, with the row of an empty output.
+    pub(super) fn to_rows(&self) -> serde_json::Result<RecordRows> {
+        let json = serde_json::to_string(&self.edges)?;
+        let edges_row = encode_output_row(&json);
+        let head = self.head_with(&edges_row);
+        let head_row = serde_json::to_string(&head)?;
+        if head_row.len() + json.len() <= MAX_RECORD_BYTES {
+            return Ok(RecordRows {
+                head,
+                head_row,
+                edges_row,
+            });
         }
-        serde_json::to_string(&Self {
-            version: self.version,
+        let edges_row = encode_output_row("[]");
+        let head = Self {
             reusable: false,
             edges: Vec::new(),
             keys: String::new(),
@@ -443,7 +597,29 @@ impl PassRecord {
             slices: Vec::new(),
             unindexed: self.unindexed.clone(),
             untracked: vec!["record-size".to_string()],
+        }
+        .head_with(&edges_row);
+        Ok(RecordRows {
+            head_row: serde_json::to_string(&head)?,
+            head,
+            edges_row,
         })
+    }
+
+    /// The head written with `edges_row`, this record's `:edges` row.
+    fn head_with(&self, edges_row: &str) -> PassRecordHead {
+        PassRecordHead {
+            version: PASS_RECORD_VERSION,
+            reusable: self.reusable,
+            keys: self.keys.clone(),
+            predicates: self.predicates.clone(),
+            gates: self.gates.clone(),
+            slices: self.slices.clone(),
+            unindexed: self.unindexed.clone(),
+            untracked: self.untracked.clone(),
+            edges_bytes: u64::try_from(edges_row.len()).unwrap_or(u64::MAX),
+            edges_hash: hash_content(edges_row),
+        }
     }
 }
 
@@ -473,6 +649,135 @@ pub(super) struct StageRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record is written as two rows (W9-00 row 27's fix round): its head,
+    /// which holds no output and names the `:edges` row's stored text by
+    /// length and SHA-256, and the output in the order the step emitted it,
+    /// its JSON deflated and in base64. A row of the same length with other
+    /// text is not the one; past the size bound the head keeps nothing, is
+    /// not reused, and names the row of an empty output.
+    #[test]
+    fn a_record_head_names_its_output_row() {
+        use codegraph_core::types::EdgeKind;
+        let edge = |source: &str, target: &str| Edge {
+            id: None,
+            source: source.to_string(),
+            target: target.to_string(),
+            kind: EdgeKind::Calls,
+            metadata: Some(serde_json::json!({ "synthesizedBy": "callback" })),
+            line: None,
+            col: None,
+            provenance: Some("heuristic".to_string()),
+        };
+        let record = PassRecord {
+            reusable: true,
+            edges: vec![edge("method:b", "method:a"), edge("method:a", "method:c")],
+            keys: encode_keys(&[keys::node("method:a")]),
+            predicates: Vec::new(),
+            gates: Vec::new(),
+            slices: Vec::new(),
+            unindexed: BTreeMap::new(),
+            untracked: Vec::new(),
+        };
+        let rows = record.to_rows().unwrap();
+        assert_eq!(
+            decode_output_row(&rows.edges_row).unwrap(),
+            serde_json::to_string(&record.edges).unwrap()
+        );
+        assert_eq!(record.to_rows().unwrap(), rows, "equal input, equal rows");
+        assert_eq!(
+            serde_json::from_str::<PassRecordHead>(&rows.head_row).unwrap(),
+            rows.head
+        );
+        assert_eq!(rows.head.version, PASS_RECORD_VERSION);
+        assert!(rows.head.reusable);
+        assert!(!rows.head_row.contains("method:c"), "{}", rows.head_row);
+        assert!(rows.head.holds(&rows.edges_row));
+        let mut other = rows.edges_row.clone().into_bytes();
+        other[4] = if other[4] == b'A' { b'B' } else { b'A' };
+        let other = String::from_utf8(other).unwrap();
+        assert_eq!(other.len(), rows.edges_row.len());
+        assert!(!rows.head.holds(&other));
+        assert!(!rows.head.holds(&encode_output_row("[]")));
+
+        let oversized = PassRecord {
+            keys: "0".repeat(MAX_RECORD_BYTES),
+            ..record
+        };
+        let rows = oversized.to_rows().unwrap();
+        assert_eq!(decode_output_row(&rows.edges_row).as_deref(), Some("[]"));
+        assert!(!rows.head.reusable);
+        assert_eq!(rows.head.untracked, ["record-size"]);
+        assert!(rows.head.keys.is_empty());
+        assert!(rows.head.holds(&encode_output_row("[]")));
+    }
+
+    /// Standard base64 with padding (RFC 4648's vectors), and nothing else:
+    /// a wrong length, a digit outside the alphabet, padding of three or
+    /// before the last group.
+    #[test]
+    fn output_rows_are_standard_base64() {
+        for (bytes, text) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(bytes.as_bytes()), text);
+            assert_eq!(base64_decode(text).as_deref(), Some(bytes.as_bytes()));
+        }
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(base64_decode(&base64_encode(&all)), Some(all));
+        for bad in ["Zg=", "Zm9v!", "Z===", "Zg==Zg==", "Zm=v"] {
+            assert_eq!(base64_decode(bad), None, "{bad}");
+        }
+    }
+
+    /// A row that does not decode reads as nothing: not base64, a stream
+    /// that does not inflate (a reserved block type), bytes that are not
+    /// UTF-8.
+    #[test]
+    fn an_output_row_that_does_not_decode_reads_as_nothing() {
+        assert_eq!(decode_output_row("not base64!"), None);
+        assert_eq!(decode_output_row(&base64_encode(&[0x07, 0, 0])), None);
+        let not_utf8 = miniz_oxide::deflate::compress_to_vec(&[0xff, 0xfe], OUTPUT_LEVEL);
+        assert_eq!(decode_output_row(&base64_encode(&not_utf8)), None);
+        assert_eq!(
+            decode_output_row(&encode_output_row("[]")).as_deref(),
+            Some("[]")
+        );
+    }
+
+    /// The codec's output is pinned (a known answer): a miniz_oxide that
+    /// deflates these bytes otherwise fails here, beside moving the build
+    /// identity the records are written under.
+    #[test]
+    fn the_output_codec_gives_a_known_answer() {
+        let json = r#"[{"id":null,"source":"method:a","target":"method:b","kind":"calls","metadata":{"synthesizedBy":"callback"},"line":null,"col":null,"provenance":"heuristic"}]"#;
+        assert_eq!(encode_output_row(json), KNOWN_ANSWER);
+        assert_eq!(decode_output_row(KNOWN_ANSWER).as_deref(), Some(json));
+    }
+
+    /// The test's JSON deflated by miniz_oxide 0.8.9 at level 6, in base64
+    /// (zlib's raw inflate reads it back to the same JSON).
+    const KNOWN_ANSWER: &str = "RY1NCsIwEIXv8tY5QZZeQ1xMk8EMHSeSTIRaeneDWNy9X77rDsmINlQDeh0tMSIe7KXmSAhwanf2f7bMbBWbHyRS7dPOhjI5Ie7om3nhLm/Ol+23WSitOAJUjE9UqnrKZ6svNrIvufBo0l0SjtsH";
+
+    /// A key is found in its encoding and a key that is not is not; text
+    /// that does not read as an encoding holds every key.
+    #[test]
+    fn encoded_keys_answer_membership() {
+        let keys = [keys::node("a"), keys::name("b"), keys::node("a"), 7, 0];
+        let text = encode_keys(&keys);
+        for key in keys {
+            assert!(encoded_holds(&text, key));
+        }
+        assert!(!encoded_holds(&text, keys::node("c")));
+        assert!(!encoded_holds("", keys::node("c")));
+        assert!(encoded_holds("not hex", keys::node("c")));
+    }
 
     /// Keys are written sorted, once each, sixteen hex digits a key.
     #[test]

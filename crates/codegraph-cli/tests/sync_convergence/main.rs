@@ -132,6 +132,14 @@ pub struct Case {
     names_after: Vec<(&'static str, &'static str)>,
     detected_before: Vec<(&'static str, bool)>,
     detected_after: Vec<(&'static str, bool)>,
+    /// Edits after the first, each applied and synced in turn.
+    later: Vec<Vec<Op>>,
+    /// The synthesis steps the last sync must run again (W9-00 row 27).
+    reruns: Vec<&'static str>,
+    /// The synthesis steps the last sync must keep the recorded output of.
+    keeps: Vec<&'static str>,
+    /// Whether the last sync must run the synthesis stage whole.
+    whole: bool,
 }
 
 impl Case {
@@ -154,7 +162,85 @@ impl Case {
             names_after: Vec::new(),
             detected_before: Vec::new(),
             detected_after: Vec::new(),
+            later: Vec::new(),
+            reruns: Vec::new(),
+            keeps: Vec::new(),
+            whole: false,
         }
+    }
+
+    /// The edit operations being written: the last later edit's, else the
+    /// first edit's.
+    fn current(&mut self) -> &mut Vec<Op> {
+        match self.later.last_mut() {
+            Some(step) => step,
+            None => &mut self.edit,
+        }
+    }
+
+    /// Start another edit, applied and synced after the ones before it.
+    pub fn then(mut self) -> Self {
+        assert!(!self.current().is_empty(), "a step needs an edit");
+        self.later.push(Vec::new());
+        self
+    }
+
+    /// The last sync runs `step` again (W9-00 row 27).
+    pub fn reruns(mut self, step: &'static str) -> Self {
+        self.reruns.push(step);
+        self
+    }
+
+    /// The last sync keeps `step`'s recorded output (W9-00 row 27).
+    pub fn keeps(mut self, step: &'static str) -> Self {
+        self.keeps.push(step);
+        self
+    }
+
+    /// The last sync runs the synthesis stage whole: no step keeps its
+    /// output.
+    pub fn whole_stage(mut self) -> Self {
+        self.whole = true;
+        self
+    }
+
+    /// This case's `before` tree with a bystander beside it, and one edit
+    /// that appends a comment line to the bystander alone: the sync runs the
+    /// synthesis stage, and `step`, which reads no YAML file, keeps its
+    /// output. The edges, metadata and names of the `before` index hold
+    /// throughout (W9-00 row 27).
+    pub fn bystander_edit(self, step: &'static str) -> Self {
+        self.bystander_edit_in(step, BYSTANDER, BYSTANDER_TEXT, BYSTANDER_EDITED)
+    }
+
+    /// [`Self::bystander_edit`] with the bystander `path`, written `text`
+    /// before and `edited` after: a file of a language the case's steps
+    /// read, as the metric edits append a comment to one (W9-00 row 27).
+    pub fn bystander_edit_in(
+        mut self,
+        step: &'static str,
+        path: &'static str,
+        text: &'static str,
+        edited: &'static str,
+    ) -> Self {
+        self.change = Change::BodyEdit;
+        // The step's own case declares its languages; this one may index
+        // only the `before` tree's.
+        self.languages.clear();
+        self.before.push((path, text));
+        self.edit = vec![Op::Write(path, edited)];
+        self.later.clear();
+        self.edges_after = self.edges_before.clone();
+        self.absent_after.clear();
+        self.metadata_after = self.metadata_before.clone();
+        self.absent_metadata_after.clear();
+        self.languages_after.clear();
+        self.names_after = self.names_before.clone();
+        self.detected_after = self.detected_before.clone();
+        self.reruns.clear();
+        self.keeps = vec![step];
+        self.whole = false;
+        self
     }
 
     /// A file of the `before` tree.
@@ -165,25 +251,25 @@ impl Case {
 
     /// Edit: add or rewrite a file.
     pub fn write(mut self, path: &'static str, contents: &'static str) -> Self {
-        self.edit.push(Op::Write(path, contents));
+        self.current().push(Op::Write(path, contents));
         self
     }
 
     /// Edit: delete a file.
     /// Rewrite `path` keeping its modification time (see [`Op::Replace`]).
     pub fn replace(mut self, path: &'static str, contents: &'static str) -> Self {
-        self.edit.push(Op::Replace(path, contents));
+        self.current().push(Op::Replace(path, contents));
         self
     }
 
     pub fn remove(mut self, path: &'static str) -> Self {
-        self.edit.push(Op::Remove(path));
+        self.current().push(Op::Remove(path));
         self
     }
 
     /// Edit: move a file.
     pub fn rename(mut self, from: &'static str, to: &'static str) -> Self {
-        self.edit.push(Op::Rename(from, to));
+        self.current().push(Op::Rename(from, to));
         self
     }
 
@@ -317,7 +403,11 @@ impl Case {
             );
         }
         assert!(!self.edit.is_empty(), "a case needs an edit");
-        for op in &self.edit {
+        assert!(
+            self.later.iter().all(|step| !step.is_empty()),
+            "a later step needs an edit"
+        );
+        for op in self.edit.iter().chain(self.later.iter().flatten()) {
             match *op {
                 Op::Write(path, contents) | Op::Replace(path, contents) => {
                     tree.insert(path.to_string(), contents.to_string());
@@ -351,10 +441,15 @@ impl Case {
             .index()
     }
 
-    /// Applies the edit on disk and returns the paths a watcher would report.
-    fn apply(&self, project: &mut Indexed) -> Vec<&'static str> {
+    /// Every edit, in the order they are applied and synced.
+    fn steps(&self) -> impl Iterator<Item = &[Op]> {
+        std::iter::once(self.edit.as_slice()).chain(self.later.iter().map(Vec::as_slice))
+    }
+
+    /// Applies one edit on disk and returns the paths a watcher would report.
+    fn apply(project: &mut Indexed, edit: &[Op]) -> Vec<&'static str> {
         let mut changed = Vec::new();
-        for op in &self.edit {
+        for op in edit {
             match *op {
                 Op::Write(path, contents) => {
                     project.write(path, contents);
@@ -392,12 +487,18 @@ fn run_case(name: &str, case: &Case) {
     expect_names(name, "before", cli.graph(), &case.names_before);
     expect_detected(name, "before", &cli.db(), &case.detected_before);
     let mut languages = indexed_languages(cli.graph());
-    case.apply(&mut cli);
-    cli.sync();
+    let mut cli_stage = None;
+    for edit in case.steps() {
+        Case::apply(&mut cli, edit);
+        cli_stage = Some(cli_sync(&mut cli));
+    }
 
     let mut watch = case.index_before("watch");
-    let changed = case.apply(&mut watch);
-    watcher_sync(&watch, &changed);
+    let mut watch_stage = None;
+    for edit in case.steps() {
+        let changed = Case::apply(&mut watch, edit);
+        watch_stage = Some(watcher_sync(&watch, &changed));
+    }
     watch.reload();
 
     let fresh = final_tree
@@ -435,6 +536,9 @@ fn run_case(name: &str, case: &Case) {
     }
     for project in [&cli, &watch] {
         assert_tree(name, project.root(), &final_tree);
+    }
+    for (driver, stage) in [("cli", &cli_stage), ("watch", &watch_stage)] {
+        expect_stage(name, driver, case, stage.as_ref().expect("a case syncs"));
     }
 
     let expected = canonicalize_db(&fresh.db()).expect("canonicalize the fresh index");
@@ -503,7 +607,11 @@ fn run_case(name: &str, case: &Case) {
         "synthesis_unindexed_inputs",
         // What each synthesis step read and emitted (W9-00 row 27): a step a
         // sync kept must hold what a fresh index records for it, so this
-        // compares every kept output and footprint byte for byte.
+        // compares, under both drivers, every footprint row and every
+        // `synthesis_pass:{pass}:edges` output row byte for byte: the
+        // output's text, not only the length and hash its footprint row
+        // names, so a writer that writes another output under a matching
+        // hash still differs from the fresh index here.
         "synthesis_pass",
         // The Play routes marker (W7-19c).
         "play_routes",
@@ -530,6 +638,16 @@ fn run_case(name: &str, case: &Case) {
                      synced: {rows:#?}\nfresh: {fresh_rows:#?}"
                 ));
             }
+        }
+    }
+    // The fresh index writes each synthesis step's output row beside its
+    // footprint row (W9-00 row 27's fix round), so the comparison above
+    // covers every output.
+    let fresh_records = support::project_metadata_with_prefix(&fresh.db(), "synthesis_pass:");
+    for (key, _) in &fresh_records {
+        let edges = format!("{key}:edges");
+        if !key.ends_with(":edges") && !fresh_records.iter().any(|(other, _)| *other == edges) {
+            divergent.push(format!("=== the fresh index has no {edges} row"));
         }
     }
     for (driver, project) in [("cli", &cli), ("watch", &watch)] {
@@ -672,7 +790,10 @@ fn run_case(name: &str, case: &Case) {
         "[{name}] incremental sync after a {:?} edit diverges from a fresh index\n\
          edit: {}\n{}\n=== fresh index\n{}",
         case.change,
-        describe_edit(&case.edit),
+        case.steps()
+            .map(describe_edit)
+            .collect::<Vec<_>>()
+            .join("; then "),
         divergent.join("\n"),
         fresh.graph().report(),
     );
@@ -701,8 +822,9 @@ fn comparable_rows(db: &Path, prefix: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The watcher-path driver: what the real watcher runs for one event batch.
-fn watcher_sync(project: &Indexed, changed: &[&str]) {
+/// The watcher-path driver: what the real watcher runs for one event batch,
+/// and what its synthesis stage did.
+fn watcher_sync(project: &Indexed, changed: &[&str]) -> StageRun {
     let root = project.root();
     let paths = support::index_paths(root);
     let controls = [
@@ -728,7 +850,136 @@ fn watcher_sync(project: &Indexed, changed: &[&str]) {
                 .map(|path| root.join(support::checked_relative(path))),
         )
     };
-    outcome.unwrap_or_else(|err| panic!("watcher-path sync of {}: {err:#}", root.display()));
+    let outcome =
+        outcome.unwrap_or_else(|err| panic!("watcher-path sync of {}: {err:#}", root.display()));
+    StageRun::of_stats(outcome.synthesis.as_deref().copied(), &project.db())
+}
+
+/// The bystander a [`Case::bystander_edit`] edits: a YAML file, which has no
+/// extractor and only a file node, and no synthesis step scans.
+const BYSTANDER: &str = "zz-bystander.yaml";
+const BYSTANDER_TEXT: &str = "bystander: 1\n";
+const BYSTANDER_EDITED: &str = "bystander: 1\n# touched\n";
+
+/// What one sync's synthesis stage did (W9-00 row 27): `None` when it did not
+/// run, else the steps it ran again and the steps it kept the recorded
+/// output of.
+#[derive(Debug, Default)]
+struct StageRun {
+    ran: Option<(BTreeSet<String>, BTreeSet<String>)>,
+}
+
+impl StageRun {
+    /// From the in-process sync's stage statistics: the steps that ran are
+    /// its bitmap's, the kept ones the other steps the index's stage record
+    /// lists as run.
+    fn of_stats(stats: Option<codegraph_resolve::synthesis::StageStats>, db: &Path) -> Self {
+        let Some(stats) = stats else {
+            return Self::default();
+        };
+        let rerun: BTreeSet<String> = codegraph_resolve::synthesis::step_names()
+            .enumerate()
+            .filter(|(at, _)| stats.rerun & (1 << at) != 0)
+            .map(|(_, name)| name.to_string())
+            .collect();
+        let listed = support::project_metadata_with_prefix(db, "synthesis_passes")
+            .into_iter()
+            .next()
+            .map(|(_, value)| value)
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .and_then(|record| record["passes"].as_array().cloned())
+            .unwrap_or_default();
+        let kept: BTreeSet<String> = listed
+            .iter()
+            .filter_map(|name| name.as_str())
+            .filter(|name| !rerun.contains(*name))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(kept.len(), stats.reused, "{stats:?} {listed:?}");
+        Self {
+            ran: Some((rerun, kept)),
+        }
+    }
+
+    /// From `codegraph sync`'s phase-timing lines.
+    fn of_phase_lines(stderr: &str) -> Self {
+        let mut ran = false;
+        let mut rerun = BTreeSet::new();
+        let mut kept = BTreeSet::new();
+        for line in stderr.lines() {
+            let mut fields = line.split('\t');
+            if fields.next() != Some("codegraph-phase") || fields.next() != Some("sync") {
+                continue;
+            }
+            let Some(part) = fields
+                .next()
+                .and_then(|phase| phase.strip_prefix("synthesis."))
+            else {
+                continue;
+            };
+            ran = true;
+            if let Some(step) = part.strip_suffix(".reused") {
+                kept.insert(step.to_string());
+            } else if !matches!(part, "read" | "decide" | "merge" | "replace" | "inputs") {
+                rerun.insert(part.to_string());
+            }
+        }
+        Self {
+            ran: ran.then_some((rerun, kept)),
+        }
+    }
+}
+
+/// The CLI driver: `codegraph sync` with its phase-timing lines, and what its
+/// synthesis stage did.
+fn cli_sync(project: &mut Indexed) -> StageRun {
+    let root = project.root().to_path_buf();
+    let output = std::process::Command::new(support::bin())
+        .arg("sync")
+        .arg(&root)
+        .current_dir(&root)
+        .env("CODEGRAPH_NO_DAEMON", "1")
+        .env("CODEGRAPH_NO_WATCH", "1")
+        .env("CODEGRAPH_PHASE_TIMINGS", "1")
+        .output()
+        .unwrap_or_else(|err| panic!("spawn {}: {err}", support::bin().display()));
+    assert!(
+        output.status.success(),
+        "`codegraph sync` exited with {}\n--- stdout\n{}--- stderr\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    project.reload();
+    StageRun::of_phase_lines(&String::from_utf8_lossy(&output.stderr))
+}
+
+/// The case's expectations of the last sync's synthesis stage.
+fn expect_stage(name: &str, driver: &str, case: &Case, stage: &StageRun) {
+    if case.reruns.is_empty() && case.keeps.is_empty() && !case.whole {
+        return;
+    }
+    let Some((rerun, kept)) = &stage.ran else {
+        panic!("[{name}] the {driver} driver's last sync did not run the synthesis stage");
+    };
+    for step in &case.reruns {
+        assert!(
+            rerun.contains(*step),
+            "[{name}] the {driver} driver's last sync kept {step}; ran {rerun:?}, kept {kept:?}"
+        );
+    }
+    for step in &case.keeps {
+        assert!(
+            kept.contains(*step),
+            "[{name}] the {driver} driver's last sync ran {step} again; ran {rerun:?}, kept {kept:?}"
+        );
+    }
+    if case.whole {
+        assert!(
+            kept.is_empty(),
+            "[{name}] the {driver} driver's last sync kept {kept:?}; it must run the stage whole"
+        );
+    }
 }
 
 fn relative_slash(root: &Path, path: &Path) -> String {
@@ -2302,6 +2553,56 @@ matrix! {
     javascript_jsx_tag_forwarding_index_re_points,
     javascript_react_lazy_value_module_gains_its_default,
     javascript_react_lazy_value_tag_after_a_namesake_reference,
+    // W9-00 row 27: the steps a sync keeps.
+    row27_go_method_contains_keeps_its_output,
+    row27_go_implements_keeps_its_output,
+    row27_field_edges_keeps_its_output,
+    row27_closure_coll_edges_keeps_its_output,
+    row27_tier_edges_keeps_its_output,
+    row27_test_request_edges_keeps_its_output,
+    row27_emitter_edges_keeps_its_output,
+    row27_render_edges_keeps_its_output,
+    row27_jsx_edges_keeps_its_output,
+    row27_vue_edges_keeps_its_output,
+    row27_svelte_kit_edges_keeps_its_output,
+    row27_arkui_routes_keeps_its_output,
+    row27_cpp_edges_keeps_its_output,
+    row27_iface_edges_keeps_its_output,
+    row27_kotlin_expect_actual_keeps_its_output,
+    row27_fabric_native_edges_keeps_its_output,
+    row27_expo_x_plat_edges_keeps_its_output,
+    row27_mybatis_edges_keeps_its_output,
+    row27_gin_edges_keeps_its_output,
+    row27_thunk_edges_keeps_its_output,
+    row27_registry_edges_keeps_its_output,
+    row27_rtk_edges_keeps_its_output,
+    row27_pinia_edges_keeps_its_output,
+    row27_vuex_edges_keeps_its_output,
+    row27_celery_edges_keeps_its_output,
+    row27_spring_edges_keeps_its_output,
+    row27_mediatr_edges_keeps_its_output,
+    row27_sidekiq_edges_keeps_its_output,
+    row27_erlang_behaviour_edges_keeps_its_output,
+    row27_c_fn_ptr_edges_keeps_its_output,
+    row27_goframe_edges_keeps_its_output,
+    row27_go_func_field_edges_keeps_its_output,
+    row27_expo_router_return_edges_keeps_its_output,
+    row27_next_link_edges_keeps_its_output,
+    row27_react_router_link_edges_keeps_its_output,
+    row27_angular_template_edges_keeps_its_output,
+    row27_svelte_kit_page_edges_keeps_its_output,
+    row27_nix_option_edges_keeps_its_output,
+    row27_typescript_comment_keeps_the_scans,
+    row27_erlang_comment_keeps_the_behaviour_step,
+    row27_nix_comment_keeps_the_option_step,
+    row27_nix_cascaded_edge_is_written_back,
+    row27_c_include_changes_after_a_tsx_edit,
+    row27_angular_template_changes_after_another_edit,
+    row27_a_new_language_runs_the_stage_whole,
+    row27_a_control_input_runs_the_stage_whole,
+    row27_a_file_starts_to_emit,
+    row27_a_dispatcher_body_changes_its_field,
+    row27_a_framework_change_runs_the_stage_whole,
 }
 
 /// An index built before the module-surface rows existed (W4a-F3) can hold
@@ -2506,7 +2807,7 @@ fn tier_passes_recompute_an_index_of_the_last_synthesis_version() {
         }
         assert_eq!(
             support::project_metadata_with_prefix(&project.db(), "synthesis_version"),
-            [("synthesis_version".to_string(), "23".to_string())],
+            [("synthesis_version".to_string(), "24".to_string())],
             "[{driver}]"
         );
     }
@@ -2562,10 +2863,10 @@ fn tier_edges_converge_beside_an_excluded_import_candidate() {
     ] {
         let final_tree = case.final_tree();
         let mut cli = case.index_before("cli");
-        case.apply(&mut cli);
+        Case::apply(&mut cli, &case.edit);
         cli.sync();
         let mut watch = case.index_before("watch");
-        let changed = case.apply(&mut watch);
+        let changed = Case::apply(&mut watch, &case.edit);
         watcher_sync(&watch, &changed);
         watch.reload();
         let fresh = final_tree

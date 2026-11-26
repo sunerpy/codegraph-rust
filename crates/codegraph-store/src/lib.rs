@@ -17,6 +17,7 @@ pub mod wsl_shared_index;
 
 pub use change_log::{
     ChangeSet, DEFAULT_CHANGE_LOG_CAP, EdgeImage, FileImage, NodeImage, RefImage, RowChanges,
+    SynthesizedEdge,
 };
 pub use connection::{
     ExtractionStampIssue, SchemaVersionReadError, Store, StoreError, StoreStatusOpen,

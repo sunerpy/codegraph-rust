@@ -123,6 +123,63 @@ pub struct SyncOutcome {
     /// reports on the sync without opening the index again (W5-09d). `None`
     /// when the outcome did not come from a sync that read them.
     pub changed_records: Option<Vec<(String, Option<FileRecord>)>>,
+    /// What the synthesis stage did, when this sync ran it: which steps ran
+    /// and how many kept their recorded output (W9-00 row 27).
+    pub synthesis: Option<Box<codegraph_resolve::synthesis::StageStats>>,
+}
+
+/// The largest change log a sync keeps (W9-00 row 27): past it the sync
+/// reruns the synthesis stage whole.
+fn change_log_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = tests::CHANGE_LOG_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    codegraph_store::DEFAULT_CHANGE_LOG_CAP
+}
+
+/// Whether a sync's synthesis stage may keep the steps whose inputs the sync
+/// leaves alone (W9-00 row 27): only when the marker was current when the
+/// sync began, and while the change log records every base row it writes. A
+/// change that reruns the stage whole turns the log off at once.
+struct SynthesisReuse {
+    logging: bool,
+}
+
+impl SynthesisReuse {
+    /// Read the marker and, when it vouches for the stored edges, turn the
+    /// change log on, before the sync's first write.
+    fn begin(store: &Store) -> Result<Self> {
+        let logging = codegraph_resolve::synthesis::marker_is_current(store)?;
+        if logging {
+            store.begin_change_log(change_log_cap())?;
+        }
+        Ok(Self { logging })
+    }
+
+    /// The stage reruns whole: a bootstrap, a control input, the frameworks,
+    /// the Dart manifests or the orphan sweep moved what no row records.
+    fn whole(&mut self, store: &Store) -> Result<()> {
+        self.end(store)
+    }
+
+    /// The base rows the sync moved, the log off: `None` when the stage
+    /// reruns whole, the log overflowed, or it was never on.
+    fn take(&mut self, store: &Store) -> Result<Option<codegraph_store::ChangeSet>> {
+        if !self.logging {
+            return Ok(None);
+        }
+        self.logging = false;
+        Ok(store.take_change_log()?)
+    }
+
+    fn end(&mut self, store: &Store) -> Result<()> {
+        if self.logging {
+            store.end_change_log()?;
+            self.logging = false;
+        }
+        Ok(())
+    }
 }
 
 /// How long each part of one incremental sync took (W9-00a), for
@@ -726,6 +783,13 @@ fn sync_paths_with_store(
     let mut dependent_fallbacks = BTreeSet::new();
     let mut reindexed = HashSet::new();
     let mut changed_names = ChangedNames::default();
+    // Whether the synthesis stage may keep the steps whose inputs this sync
+    // leaves alone (W9-00 row 27): the marker, read before any change
+    // withdraws it as the lanes' markers are, says the stored edges are the
+    // stage's output over the base graph as the sync finds it, and the
+    // change log on this, the one write connection, holds every base row
+    // the sync writes from here on.
+    let mut synthesis_reuse = SynthesisReuse::begin(store)?;
     // An index without the module-surface marker was built before the rows
     // existed, or a sync failed after its first mutation: this sync
     // reconciles every JavaScript-family file, even with nothing changed.
@@ -937,6 +1001,7 @@ fn sync_paths_with_store(
     )?;
     if control.any() {
         changed_names.begin_mutation(store)?;
+        synthesis_reuse.whole(store)?;
     }
     // The pubspec manifests the Dart library model reads (W5-06), compared
     // with their rows once the paths are processed: when they moved, the
@@ -954,6 +1019,7 @@ fn sync_paths_with_store(
         crate::dart_libraries::pubspec_check(store, project_root, dart_manifests_touched)?;
     if pubspecs.moved() {
         changed_names.begin_mutation(store)?;
+        synthesis_reuse.whole(store)?;
     }
     let any_bootstrap = surface_bootstrap
         || cpp_bootstrap
@@ -991,6 +1057,7 @@ fn sync_paths_with_store(
     // (W7-14).
     if any_bootstrap {
         codegraph_resolve::synthesis::withdraw_marker(store)?;
+        synthesis_reuse.whole(store)?;
     }
     // A sync with nothing to do detects no framework: the frameworks read
     // their control files (`package.json`, the Tauri markers), which are the
@@ -1016,6 +1083,7 @@ fn sync_paths_with_store(
     }
     if frameworks_changed {
         changed_names.begin_mutation(store)?;
+        synthesis_reuse.whole(store)?;
         crate::control_inputs::withdraw_frameworks_marker(store)?;
         // Every file is re-extracted and re-resolved: no lane compares.
         changed_names.play.track = false;
@@ -2292,6 +2360,7 @@ fn sync_paths_with_store(
     if store.is_resolution_incomplete()? {
         // The sweep writes base edges: the synthesized ones go stale first.
         codegraph_resolve::synthesis::withdraw_marker(store)?;
+        synthesis_reuse.whole(store)?;
         let stats = sweep_orphaned_refs(project_root, store, &scope.options)?;
         outcome.pending_refs_processed = stats.total;
         outcome.pending_refs_resolved = stats.resolved;
@@ -2321,8 +2390,34 @@ fn sync_paths_with_store(
         if tests::FAIL_BEFORE_SYNTHESIS.with(std::cell::Cell::get) {
             bail!("injected sync failure before synthesis");
         }
-        let (_, stage) =
-            codegraph_resolve::synthesis::run_stage_timed(store, project_root, &scope.options)?;
+        // The steps whose inputs the sync left alone keep their output when
+        // the sync knows every base row it moved; anything else reruns the
+        // stage whole (W9-00 row 27).
+        #[cfg(test)]
+        if let Some((path, text)) =
+            tests::DRIFT_BEFORE_SYNTHESIS.with(|drift| drift.borrow_mut().take())
+        {
+            match text {
+                Some(text) => fs::write(path, text)?,
+                None => fs::remove_file(path)?,
+            }
+        }
+        let reusing = match synthesis_reuse.take(store)? {
+            Some(changes) => codegraph_resolve::synthesis::run_stage_reusing(
+                store,
+                project_root,
+                &scope.options,
+                &changes,
+            )?,
+            None => None,
+        };
+        let (stats, stage) = match reusing {
+            Some(done) => done,
+            None => {
+                codegraph_resolve::synthesis::run_stage_timed(store, project_root, &scope.options)?
+            }
+        };
+        outcome.synthesis = Some(Box::new(stats));
         timings.stage = Some(stage);
         #[cfg(test)]
         if tests::FAIL_BEFORE_SYNTHESIS_MARKER.with(std::cell::Cell::get) {
@@ -2330,6 +2425,7 @@ fn sync_paths_with_store(
         }
         codegraph_resolve::synthesis::write_marker(store)?;
     }
+    synthesis_reuse.end(store)?;
     timings.synthesis += lap.take();
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -4266,6 +4362,16 @@ pub(crate) mod tests {
         /// replaced the edges, before the marker goes back.
         pub(crate) static FAIL_BEFORE_SYNTHESIS_MARKER: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// The change log's cap for the syncs of this thread, in place of
+        /// the default (W9-00 row 27).
+        pub(crate) static CHANGE_LOG_CAP: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+        /// A file the next sync rewrites, or removes when the text is
+        /// `None`, just before its synthesis stage reads, as an editor or a
+        /// checkout racing the sync would (H2).
+        pub(crate) static DRIFT_BEFORE_SYNTHESIS:
+            std::cell::RefCell<Option<(std::path::PathBuf, Option<String>)>> =
+            const { std::cell::RefCell::new(None) };
         /// Fail the next Lua row rebuild once the old rows are purged and
         /// one is written back.
         pub(crate) static FAIL_AFTER_LUA_ROW_PURGE: std::cell::Cell<bool> =
@@ -4511,6 +4617,592 @@ pub(crate) mod tests {
                 .iter()
                 .any(|edge| edge.contains("stale"))
         );
+    }
+
+    // ----- W9-00 row 27: the steps a sync keeps -----------------------------
+
+    const BUS_SAVE: (&str, &str) = (
+        "src/save.ts",
+        "export function save(bus: any) {\n  bus.emit('saved');\n}\n",
+    );
+    const BUS_SAVE_AGAIN: (&str, &str) = (
+        "src/save.ts",
+        "export function save(bus: any) {\n  bus.emit('saved');\n  bus.emit('again');\n}\n",
+    );
+    const BUS_ON: (&str, &str) = (
+        "src/on.ts",
+        "export function onSaved() {\n  return 1;\n}\nexport function wire(bus: any) {\n  bus.on('saved', onSaved);\n}\n",
+    );
+    const OTHER: (&str, &str) = ("src/other.ts", "export const other = 1;\n");
+    const OTHER_EDITED: (&str, &str) = ("src/other.ts", "export const other = 2;\n");
+
+    /// What the last sync's stage did.
+    fn stage_of(outcome: &SyncOutcome) -> codegraph_resolve::synthesis::StageStats {
+        *outcome
+            .synthesis
+            .as_deref()
+            .expect("the sync runs the synthesis stage")
+    }
+
+    fn ran_step(stats: &codegraph_resolve::synthesis::StageStats, step: &str) -> bool {
+        codegraph_resolve::synthesis::step_names()
+            .enumerate()
+            .any(|(at, name)| name == step && stats.rerun & (1 << at) != 0)
+    }
+
+    /// An index of the callback channel and the emitter files, and an
+    /// unrelated file the tests edit.
+    fn reuse_fixture(name: &str) -> (TestDir, PathBuf) {
+        let dir = TestDir::new(name);
+        let db = default_db_path(dir.path()).unwrap();
+        write_files(
+            dir.path(),
+            &[SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER],
+        );
+        sync_changed_paths(
+            dir.path(),
+            &db,
+            [SYNTH_SCENE.0, SYNTH_RENDER.0, BUS_SAVE.0, BUS_ON.0, OTHER.0],
+        )
+        .unwrap();
+        (dir, db)
+    }
+
+    /// An edit no step reads keeps every step's output (W9-00 row 27); the
+    /// edges are a fresh index's.
+    #[test]
+    fn a_sync_keeps_the_steps_its_edit_does_not_reach() {
+        let (dir, db) = reuse_fixture("row27-keep");
+        write_files(dir.path(), &[OTHER_EDITED]);
+        let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        let stats = stage_of(&outcome);
+        assert_eq!(stats.rerun, 0, "{stats:?}");
+        assert!(stats.reused > 0, "{stats:?}");
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "row27-keep-fresh",
+                &[SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER_EDITED]
+            )
+        );
+    }
+
+    /// The whole-project sync's stage timings.
+    fn timed_sync(dir: &Path) -> (SyncOutcome, codegraph_resolve::synthesis::StageTimings) {
+        let (outcome, timings) = sync_project_once_with_progress_timed(dir, |_, _| {}).unwrap();
+        let stage = timings
+            .and_then(|timings| timings.stage)
+            .expect("the sync runs the synthesis stage");
+        (outcome, stage)
+    }
+
+    /// The emitter channel with its handler in a file of its own, which no
+    /// pass's per-file check passes, so an edit there keeps every step.
+    const RESTORE_ON: (&str, &str) = (
+        "src/on.ts",
+        "import { onSaved } from './handler';\nexport function wire(bus: any) {\n  bus.on('saved', onSaved);\n}\n",
+    );
+    const RESTORE_HANDLER: (&str, &str) = (
+        "src/handler.ts",
+        "export function onSaved() {\n  return 1;\n}\n",
+    );
+
+    /// An edit that keeps every step but re-extracts a file the stored edges
+    /// touch (W9-00 row 27): the handler's file, so the emitter edge into it
+    /// goes with the cascade. The sync writes it back from the change log,
+    /// reads no step's output row, and leaves a fresh index's edges.
+    #[test]
+    fn a_sync_that_keeps_every_step_writes_back_the_cascade() {
+        let dir = TestDir::new("row27-restore");
+        let db = default_db_path(dir.path()).unwrap();
+        let files = [BUS_SAVE, RESTORE_ON, RESTORE_HANDLER, OTHER];
+        write_files(dir.path(), &files);
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        assert!(
+            synthesized_edges(&db)
+                .iter()
+                .any(|edge| edge.contains("onSaved")),
+            "{:?}",
+            synthesized_edges(&db)
+        );
+        let handler = format!("{}// note\n", RESTORE_HANDLER.1);
+        write_files(dir.path(), &[(RESTORE_HANDLER.0, handler.as_str())]);
+        let (outcome, stage) = timed_sync(dir.path());
+        let stats = stage_of(&outcome);
+        assert_eq!(stats.rerun, 0, "{stats:?}");
+        assert!(stage.restore.is_some(), "{stage:?}");
+        assert_eq!(stats.removed, 0, "{stats:?}");
+        assert!(stats.inserted > 0, "the cascade dropped an edge: {stats:?}");
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "row27-restore-fresh",
+                &[
+                    BUS_SAVE,
+                    RESTORE_ON,
+                    (RESTORE_HANDLER.0, handler.as_str()),
+                    OTHER
+                ]
+            )
+        );
+    }
+
+    /// The `:edges` row of `step` in `db`'s records.
+    fn edges_row_key(step: &str) -> String {
+        format!(
+            "{}{step}{}",
+            codegraph_resolve::synthesis::PASS_KEY_PREFIX,
+            codegraph_resolve::synthesis::EDGES_KEY_SUFFIX
+        )
+    }
+
+    /// The record rows a fresh index of `files` writes.
+    fn fresh_records(name: &str, files: &[(&str, &str)]) -> Vec<(String, String)> {
+        let dir = TestDir::new(name);
+        write_files(dir.path(), files);
+        let db = default_db_path(dir.path()).unwrap();
+        sync_changed_paths(dir.path(), &db, files.iter().map(|(path, _)| *path)).unwrap();
+        record_rows(&db)
+    }
+
+    /// Plant `row` as `step`'s `:edges` row, its head naming the row's length;
+    /// with `hash` its SHA-256 too, so only the row's text can tell.
+    fn plant_output_row(db: &Path, step: &str, row: &str, hash: bool) {
+        let store = Store::open(db).unwrap();
+        let key = format!("{}{step}", codegraph_resolve::synthesis::PASS_KEY_PREFIX);
+        let mut head: serde_json::Value =
+            serde_json::from_str(&store.get_project_metadata(&key).unwrap().unwrap()).unwrap();
+        head["edgesBytes"] = serde_json::json!(row.len());
+        if hash {
+            head["edgesHash"] = serde_json::json!(codegraph_core::node_id::hash_content(row));
+        }
+        store.set_project_metadata(&key, &head.to_string()).unwrap();
+        store
+            .set_project_metadata(&edges_row_key(step), row)
+            .unwrap();
+    }
+
+    /// An output row that is not the one its head names, though of the
+    /// length named (W9-00 row 27's fix round): the field step's edge turned
+    /// round. A sync that keeps every step reads no output row and keeps the
+    /// step; the sync whose merge reads the row finds its hash is not the
+    /// head's and runs the stage whole, so the turned edge never reaches the
+    /// graph. The edges and the records are then a fresh index's.
+    #[test]
+    fn an_output_row_is_merged_only_when_it_is_the_one_its_head_names() {
+        let (dir, db) = reuse_fixture("row27-mismatch");
+        // Without the change, the emitter edit reruns the emitter step and
+        // merges the field step's kept output.
+        write_files(dir.path(), &[BUS_SAVE_AGAIN]);
+        let stats = stage_of(&sync_changed_paths(dir.path(), &db, [BUS_SAVE_AGAIN.0]).unwrap());
+        assert!(ran_step(&stats, "emitterEdges"), "{stats:?}");
+        assert!(!ran_step(&stats, "fieldEdges"), "{stats:?}");
+        let row = Store::open(&db)
+            .unwrap()
+            .get_project_metadata(&edges_row_key("fieldEdges"))
+            .unwrap()
+            .unwrap();
+        let json = codegraph_resolve::synthesis::decode_output_row(&row).unwrap();
+        let mut edges: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(edges.len(), 1, "{json}");
+        let source = edges[0]["source"].clone();
+        edges[0]["source"] = edges[0]["target"].clone();
+        edges[0]["target"] = source;
+        let turned = codegraph_resolve::synthesis::encode_output_row(
+            &serde_json::to_string(&edges).unwrap(),
+        );
+        assert_ne!(turned, row);
+        plant_output_row(&db, "fieldEdges", &turned, false);
+        write_files(dir.path(), &[OTHER_EDITED]);
+        let (outcome, stage) = timed_sync(dir.path());
+        let stats = stage_of(&outcome);
+        assert_eq!(stats.rerun, 0, "{stats:?}");
+        assert!(stats.reused > 0, "{stats:?}");
+        assert!(stage.restore.is_some(), "{stage:?}");
+        write_files(dir.path(), &[BUS_SAVE]);
+        let outcome = sync_changed_paths(dir.path(), &db, [BUS_SAVE.0]).unwrap();
+        assert_eq!(stage_of(&outcome).reused, 0, "{:?}", outcome.synthesis);
+        let files = [SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER_EDITED];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("row27-mismatch-fresh", &files)
+        );
+        assert_eq!(
+            record_rows(&db),
+            fresh_records("row27-mismatch-records", &files)
+        );
+    }
+
+    /// An output row its head names, length and hash, that does not decode
+    /// (W9-00 row 27's fix round): text that is not base64, base64 of bytes
+    /// that do not inflate (a reserved deflate block type), and a stream that
+    /// inflates to text that is not JSON. The sync whose merge reads it runs
+    /// the stage whole, and the edges and the records are a fresh index's.
+    #[test]
+    fn an_output_row_that_does_not_decode_runs_the_stage_whole() {
+        let cases = [
+            ("not-base64", "not base64!".to_string()),
+            ("not-deflate", "BwAA".to_string()),
+            (
+                "not-json",
+                codegraph_resolve::synthesis::encode_output_row("not json"),
+            ),
+        ];
+        for (label, row) in cases {
+            let (dir, db) = reuse_fixture(&format!("row27-undecodable-{label}"));
+            plant_output_row(&db, "fieldEdges", &row, true);
+            write_files(dir.path(), &[BUS_SAVE_AGAIN]);
+            let outcome = sync_changed_paths(dir.path(), &db, [BUS_SAVE_AGAIN.0]).unwrap();
+            assert_eq!(
+                stage_of(&outcome).reused,
+                0,
+                "{label}: {:?}",
+                outcome.synthesis
+            );
+            let files = [SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE_AGAIN, BUS_ON, OTHER];
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(&format!("row27-undecodable-{label}-fresh"), &files),
+                "{label}"
+            );
+            assert_eq!(
+                record_rows(&db),
+                fresh_records(&format!("row27-undecodable-{label}-records"), &files),
+                "{label}"
+            );
+        }
+    }
+
+    /// A step that runs again with another output rewrites both its rows
+    /// (W9-00 row 27's fix round): the registration moves, the field step
+    /// runs again while the others keep theirs, and its footprint row and
+    /// its `:edges` row are a fresh index's, byte for byte, as are the edges.
+    #[test]
+    fn a_step_that_runs_again_rewrites_both_its_rows() {
+        let (dir, db) = reuse_fixture("row27-rewrite");
+        let before = Store::open(&db)
+            .unwrap()
+            .get_project_metadata(&edges_row_key("fieldEdges"))
+            .unwrap();
+        write_files(dir.path(), &[SYNTH_PAINT]);
+        let stats = stage_of(&sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]).unwrap());
+        assert!(ran_step(&stats, "fieldEdges"), "{stats:?}");
+        assert!(stats.reused > 0, "{stats:?}");
+        let after = Store::open(&db)
+            .unwrap()
+            .get_project_metadata(&edges_row_key("fieldEdges"))
+            .unwrap();
+        assert_ne!(after, before, "the field step's output moved");
+        let files = [SYNTH_SCENE, SYNTH_PAINT, BUS_SAVE, BUS_ON, OTHER];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("row27-rewrite-fresh", &files)
+        );
+        assert_eq!(
+            record_rows(&db),
+            fresh_records("row27-rewrite-records", &files)
+        );
+    }
+
+    /// An `:edges` row deleted by hand (W9-00 row 27's fix round): the next
+    /// sync, though its edit keeps every step and reads no output row, finds
+    /// the row missing and runs the stage whole; the edges and the records
+    /// are then a fresh index's.
+    #[test]
+    fn a_missing_output_row_runs_the_stage_whole() {
+        let (dir, db) = reuse_fixture("row27-missing");
+        Store::open(&db)
+            .unwrap()
+            .delete_project_metadata(&edges_row_key("fieldEdges"))
+            .unwrap();
+        write_files(dir.path(), &[OTHER_EDITED]);
+        let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert_eq!(stage_of(&outcome).reused, 0, "{:?}", outcome.synthesis);
+        let files = [SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER_EDITED];
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges("row27-missing-fresh", &files)
+        );
+        assert_eq!(
+            record_rows(&db),
+            fresh_records("row27-missing-records", &files)
+        );
+    }
+
+    /// Records of another layout or version (W9-00 row 27's fix round) run
+    /// the stage whole and are written again as a fresh index writes them:
+    /// the single-row layout the pre-fixup 27c build left (version 1, the
+    /// output inside the record, no `:edges` row), and heads of this layout
+    /// stamped with 27c's version 1, both under the stage record this build
+    /// wrote, so only the records' layout or version tells them apart. The
+    /// second is what bumping the version answers.
+    #[test]
+    fn records_of_another_layout_or_version_run_the_stage_whole() {
+        for label in ["27c-layout", "27c-version"] {
+            let (dir, db) = reuse_fixture(&format!("row27-layout-{label}"));
+            {
+                let store = Store::open(&db).unwrap();
+                for (key, value) in record_rows(&db) {
+                    let Some(step) =
+                        key.strip_prefix(codegraph_resolve::synthesis::PASS_KEY_PREFIX)
+                    else {
+                        continue;
+                    };
+                    if step.ends_with(codegraph_resolve::synthesis::EDGES_KEY_SUFFIX) {
+                        continue;
+                    }
+                    let mut head: serde_json::Value = serde_json::from_str(&value).unwrap();
+                    head["version"] = serde_json::json!(1);
+                    if label == "27c-layout" {
+                        let fields = head.as_object_mut().unwrap();
+                        fields.remove("edgesBytes");
+                        fields.remove("edgesHash");
+                        fields.insert("edges".to_string(), serde_json::json!([]));
+                        store.delete_project_metadata(&edges_row_key(step)).unwrap();
+                    }
+                    store.set_project_metadata(&key, &head.to_string()).unwrap();
+                }
+            }
+            write_files(dir.path(), &[OTHER_EDITED]);
+            let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+            assert_eq!(
+                stage_of(&outcome).reused,
+                0,
+                "{label}: {:?}",
+                outcome.synthesis
+            );
+            let files = [SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER_EDITED];
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(&format!("row27-layout-{label}-fresh"), &files),
+                "{label}"
+            );
+            assert_eq!(
+                record_rows(&db),
+                fresh_records(&format!("row27-layout-{label}-records"), &files),
+                "{label}"
+            );
+        }
+    }
+
+    /// Each fallback runs the stage whole (W9-00 row 27): the marker away
+    /// when the sync began, the stage record lost, written by another build,
+    /// over other options, a lane bootstrap, the orphan sweep, and a change
+    /// log past its cap. Each leaves a fresh index's edges.
+    #[test]
+    fn each_fallback_runs_the_stage_whole() {
+        type Plant = fn(&Store);
+        let fallbacks: [(&str, Plant); 6] = [
+            ("marker", |store| {
+                store
+                    .delete_project_metadata(codegraph_resolve::synthesis::VERSION_KEY)
+                    .unwrap();
+            }),
+            ("record", |store| {
+                store
+                    .delete_project_metadata(codegraph_resolve::synthesis::STAGE_KEY)
+                    .unwrap();
+            }),
+            ("build", |store| {
+                rewrite_stage_record(store, "build", serde_json::json!("0.0.0+another"));
+            }),
+            ("options", |store| {
+                rewrite_stage_record(store, "options", serde_json::json!("another"));
+            }),
+            ("bootstrap", |store| {
+                store
+                    .delete_project_metadata(codegraph_resolve::module_surface::VERSION_KEY)
+                    .unwrap();
+            }),
+            ("sweep", |store| {
+                store.set_resolution_incomplete().unwrap();
+            }),
+        ];
+        for (label, plant) in fallbacks {
+            let (dir, db) = reuse_fixture(&format!("row27-whole-{label}"));
+            plant(&Store::open(&db).unwrap());
+            write_files(dir.path(), &[OTHER_EDITED]);
+            let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+            assert_eq!(
+                stage_of(&outcome).reused,
+                0,
+                "{label}: {:?}",
+                outcome.synthesis
+            );
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(
+                    &format!("row27-whole-{label}-fresh"),
+                    &[SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER_EDITED]
+                ),
+                "{label}"
+            );
+        }
+        let (dir, db) = reuse_fixture("row27-whole-overflow");
+        write_files(dir.path(), &[OTHER_EDITED]);
+        CHANGE_LOG_CAP.with(|cap| cap.set(Some(1)));
+        let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]);
+        CHANGE_LOG_CAP.with(|cap| cap.set(None));
+        assert_eq!(stage_of(&outcome.unwrap()).reused, 0, "overflow");
+    }
+
+    /// One field of the stored `synthesis_passes` row set to `value`.
+    fn rewrite_stage_record(store: &Store, field: &str, value: serde_json::Value) {
+        let key = codegraph_resolve::synthesis::STAGE_KEY;
+        let mut record: serde_json::Value =
+            serde_json::from_str(&store.get_project_metadata(key).unwrap().unwrap()).unwrap();
+        record[field] = value;
+        store
+            .set_project_metadata(key, &record.to_string())
+            .unwrap();
+    }
+
+    /// A step whose record head no longer reads as this engine's runs the
+    /// stage whole (W9-00 row 27's fix round: a record is never read in
+    /// part); a step whose record says it read what the view cannot see
+    /// into runs again alone.
+    #[test]
+    fn a_step_whose_record_does_not_read_runs_again() {
+        let (dir, db) = reuse_fixture("row27-record");
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(
+                &format!(
+                    "{}emitterEdges",
+                    codegraph_resolve::synthesis::PASS_KEY_PREFIX
+                ),
+                "{\"version\":0}",
+            )
+            .unwrap();
+        write_files(dir.path(), &[OTHER_EDITED]);
+        let stats = stage_of(&sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap());
+        assert_eq!(stats.reused, 0, "{stats:?}");
+        assert!(ran_step(&stats, "emitterEdges"), "{stats:?}");
+        assert!(ran_step(&stats, "fieldEdges"), "{stats:?}");
+        // A record that says its step read what the view cannot see into
+        // (a probe on disk, a listing, a drifted file) is not kept either.
+        {
+            let store = Store::open(&db).unwrap();
+            let key = format!(
+                "{}fieldEdges",
+                codegraph_resolve::synthesis::PASS_KEY_PREFIX
+            );
+            let mut record: serde_json::Value =
+                serde_json::from_str(&store.get_project_metadata(&key).unwrap().unwrap()).unwrap();
+            record["reusable"] = serde_json::json!(false);
+            store
+                .set_project_metadata(&key, &record.to_string())
+                .unwrap();
+        }
+        write_files(dir.path(), &[OTHER]);
+        let stats = stage_of(&sync_changed_paths(dir.path(), &db, [OTHER.0]).unwrap());
+        assert!(ran_step(&stats, "fieldEdges"), "{stats:?}");
+        assert!(!ran_step(&stats, "emitterEdges"), "{stats:?}");
+        write_files(dir.path(), &[OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                "row27-record-fresh",
+                &[SYNTH_SCENE, SYNTH_RENDER, BUS_SAVE, BUS_ON, OTHER_EDITED]
+            )
+        );
+    }
+
+    /// H2: a sync's emitter step reads a file that drifts under it, and the
+    /// file comes back as it was indexed, which no later change log shows.
+    /// The step's record is not reused, so the next sync, which changes an
+    /// unrelated file, runs it again and finds the handler.
+    #[test]
+    fn a_step_that_read_a_drifted_file_runs_again() {
+        for (label, drift) in [("rewritten", Some("// drifted\n")), ("removed", None)] {
+            a_step_that_read_a_drifted_file_runs_again_when(label, drift.map(str::to_string));
+        }
+    }
+
+    fn a_step_that_read_a_drifted_file_runs_again_when(label: &str, drift: Option<String>) {
+        let (dir, db) = reuse_fixture(&format!("row27-drift-{label}"));
+        write_files(dir.path(), &[BUS_SAVE_AGAIN]);
+        DRIFT_BEFORE_SYNTHESIS.with(|hook| {
+            *hook.borrow_mut() = Some((dir.path().join(BUS_ON.0), drift));
+        });
+        let drifted = sync_changed_paths(dir.path(), &db, [BUS_SAVE_AGAIN.0]).unwrap();
+        assert!(ran_step(&stage_of(&drifted), "emitterEdges"));
+        assert!(
+            !synthesized_edges(&db)
+                .iter()
+                .any(|edge| edge.contains("event-emitter")),
+            "the drifted handler is read as absent"
+        );
+        write_files(dir.path(), &[BUS_ON]);
+        write_files(dir.path(), &[OTHER_EDITED]);
+        let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert!(ran_step(&stage_of(&outcome), "emitterEdges"));
+        assert_eq!(
+            edge_projection(&db),
+            fresh_edges(
+                &format!("row27-drift-{label}-fresh"),
+                &[
+                    SYNTH_SCENE,
+                    SYNTH_RENDER,
+                    BUS_SAVE_AGAIN,
+                    BUS_ON,
+                    OTHER_EDITED
+                ]
+            ),
+            "{label}"
+        );
+    }
+
+    /// The `synthesis_pass` rows of `db`.
+    fn record_rows(db: &Path) -> Vec<(String, String)> {
+        Store::open(db)
+            .unwrap()
+            .project_metadata_with_prefix("synthesis_pass")
+            .unwrap()
+    }
+
+    /// H3: a build that knows no step records syncs a change, recomputing
+    /// the stage whole and writing its own marker value, and leaves the
+    /// records of the change before; or a build of other sources wrote the
+    /// records. Either way the next sync runs the stage whole and the edges
+    /// are a fresh index's.
+    #[test]
+    fn records_another_build_left_are_not_trusted() {
+        for label in ["older-build", "other-build"] {
+            let (dir, db) = reuse_fixture(&format!("row27-h3-{label}"));
+            let before = record_rows(&db);
+            write_files(dir.path(), &[SYNTH_PAINT]);
+            sync_changed_paths(dir.path(), &db, [SYNTH_PAINT.0]).unwrap();
+            {
+                let store = Store::open(&db).unwrap();
+                for (key, value) in &before {
+                    store.set_project_metadata(key, value).unwrap();
+                }
+                if label == "older-build" {
+                    store
+                        .set_project_metadata(codegraph_resolve::synthesis::VERSION_KEY, "23")
+                        .unwrap();
+                } else {
+                    rewrite_stage_record(
+                        &store,
+                        "build",
+                        serde_json::json!("0.55.2+0000000000000000"),
+                    );
+                }
+            }
+            write_files(dir.path(), &[OTHER_EDITED]);
+            let outcome = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+            assert_eq!(stage_of(&outcome).reused, 0, "{label}");
+            assert_eq!(
+                edge_projection(&db),
+                fresh_edges(
+                    &format!("row27-h3-{label}-fresh"),
+                    &[SYNTH_SCENE, SYNTH_PAINT, BUS_SAVE, BUS_ON, OTHER_EDITED]
+                ),
+                "{label}"
+            );
+        }
     }
 
     /// The stage follows an edit (W7-14): the registration moves to another
@@ -4795,8 +5487,11 @@ pub(crate) mod tests {
 
     /// A file that changed on disk since it was indexed feeds no pass until
     /// its own sync (W7-14): its old nodes' lines would slice its new text.
-    /// Its lines need not have moved for that: the stage cannot tell, so a
-    /// drift that keeps every line where it was still hides the channel.
+    /// Its lines need not have moved for that: the stage cannot tell. A sync
+    /// of another file keeps the field step whose inputs it left alone
+    /// (W9-00 row 27), so the channel the step found while the scene read as
+    /// indexed stays, beside the scene's indexed nodes, and nothing slices
+    /// the drifted text; a step that runs again reads the scene as absent.
     #[test]
     fn a_drifted_file_feeds_no_synthesis_until_its_sync() {
         const SCENE_DRIFTED: (&str, &str) = (
@@ -4811,10 +5506,38 @@ pub(crate) mod tests {
         sync_changed_paths(dir.path(), &db, [SYNTH_SCENE.0, SYNTH_RENDER.0, OTHER.0]).unwrap();
         assert_eq!(synthesized_edges(&db).len(), 1);
 
-        // The scene drifts; a sync of another file recomputes without it.
+        // The scene drifts; a sync of another file keeps the field step.
         write_files(dir.path(), &[SCENE_DRIFTED, OTHER_EDITED]);
-        sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        let kept = sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
+        assert!(
+            !ran_step(&stage_of(&kept), "fieldEdges"),
+            "{:?}",
+            kept.synthesis
+        );
+        assert_eq!(synthesized_edges(&db).len(), 1);
+
+        // A sync whose field step runs again (its record no longer reads)
+        // reads the drifted scene as absent and hides the channel.
+        Store::open(&db)
+            .unwrap()
+            .set_project_metadata(
+                &format!(
+                    "{}fieldEdges",
+                    codegraph_resolve::synthesis::PASS_KEY_PREFIX
+                ),
+                "{}",
+            )
+            .unwrap();
+        write_files(dir.path(), &[OTHER]);
+        let rerun = sync_changed_paths(dir.path(), &db, [OTHER.0]).unwrap();
+        assert!(
+            ran_step(&stage_of(&rerun), "fieldEdges"),
+            "{:?}",
+            rerun.synthesis
+        );
         assert_eq!(synthesized_edges(&db), Vec::<String>::new());
+        write_files(dir.path(), &[OTHER_EDITED]);
+        sync_changed_paths(dir.path(), &db, [OTHER_EDITED.0]).unwrap();
 
         // Its own sync brings the channel back, as a fresh index has it.
         sync_changed_paths(dir.path(), &db, [SCENE_DRIFTED.0]).unwrap();

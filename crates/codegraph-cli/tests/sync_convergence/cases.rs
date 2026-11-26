@@ -6873,6 +6873,7 @@ pub fn vue_component_template_edit() -> Case {
             "references",
             "component src/components/Badge.vue::Badge",
         )
+        .reruns("vueEdges")
 }
 
 pub fn liquid_snippet_body_edit() -> Case {
@@ -15609,6 +15610,7 @@ pub fn typescript_next_config_appears() -> Case {
             "navigates",
             "route pages/about.tsx::route:/about",
         )
+        .whole_stage()
 }
 
 /// W7-07: one app's manifest comes to declare Next while another app of the
@@ -20520,6 +20522,7 @@ pub fn typescript_synthesis_registration_moves() -> Case {
             "synthesizedBy",
             "callback",
         )
+        .reruns("fieldEdges")
 }
 
 /// W7-14: the file holding a channel's registrar and dispatcher goes, and
@@ -20617,6 +20620,7 @@ pub fn javascript_emitter_handler_gains_a_competitor() -> Case {
             "calls",
             "function handleSave @src/handlers.js",
         )
+        .reruns("emitterEdges")
 }
 
 /// W7-14: the competing definition is renamed, the handler's name means
@@ -20675,6 +20679,7 @@ pub fn swift_closure_collection_keeps_its_field_after_an_edit() -> Case {
             "field",
             "handlers",
         )
+        .reruns("closureCollEdges")
 }
 
 const SYNTH_COUNTER: &str = "export class Counter extends Component {\n  increment() {\n    this.setState({ count: 1 });\n  }\n  render() {\n    return null;\n  }\n}\n";
@@ -20694,6 +20699,7 @@ pub fn typescript_react_state_update_goes() -> Case {
         )
         .edge_before("method Counter::increment", "calls", "method Counter::render")
         .no_edge_after("method Counter::increment", "calls", "method Counter::render")
+        .reruns("renderEdges")
 }
 
 /// W7-14b: one platform's `actual` file goes; the `expect` declaration keeps
@@ -20724,6 +20730,7 @@ pub fn kotlin_actual_file_deleted() -> Case {
             "synthesizedBy",
             "kotlin-expect-actual",
         )
+        .reruns("kotlinExpectActual")
 }
 
 /// W7-14b: a C++ subclass renames its override; the base method no longer
@@ -20744,6 +20751,7 @@ pub fn cpp_override_renamed() -> Case {
         )
         .edge_before("method Iterator::Next", "calls", "method DBIter::Next")
         .no_edge_after("method Iterator::Next", "calls", "method DBIter::Advance")
+        .reruns("cppEdges")
 }
 
 /// W7-14b: a Delphi unit's form appears beside it; the unit references it.
@@ -20788,6 +20796,7 @@ pub fn java_mybatis_mapper_gains_a_namesake() -> Case {
             "calls",
             "method com.example.UserMapper::findById",
         )
+        .reruns("mybatisEdges")
 }
 
 /// W7-14c: a TypeScript class stops implementing an interface; the
@@ -20865,6 +20874,7 @@ pub fn java_interface_file_deleted() -> Case {
             "synthesizedBy",
             "interface-impl",
         )
+        .reruns("ifaceEdges")
 }
 
 const REGISTRY_SAVE: &str = "export function saveDoc(x: string) { return x; }\n";
@@ -20891,6 +20901,7 @@ pub fn typescript_registry_gains_a_handler() -> Case {
             "synthesizedBy",
             "object-registry",
         )
+        .reruns("registryEdges")
 }
 
 /// W7-14d: a registered handler's file is deleted; the dispatch keeps its
@@ -20973,6 +20984,7 @@ pub fn tsx_tag_removed() -> Case {
         )
         .edge_before("function App", "calls", "function Card")
         .no_edge_after("function App", "calls", "function Card")
+        .reruns("jsxEdges")
 }
 
 const GO_SAVER: &str =
@@ -21012,6 +21024,7 @@ pub fn go_interface_method_renamed_off_its_implementer() -> Case {
         )
         .edge_before("struct Store", "implements", "interface Saver")
         .no_edge_after("struct Store", "implements", "interface Saver")
+        .reruns("goMethodContains")
 }
 
 const GO_BASE: &str =
@@ -21050,6 +21063,7 @@ pub fn go_embedded_type_renames_its_method() -> Case {
         )
         .edge_before("struct Wrapper", "implements", "interface NamedCloser")
         .no_edge_after("struct Wrapper", "implements", "interface NamedCloser")
+        .reruns("goImplements")
 }
 
 /// W7-15b (upstream's sync case): the interface embeds another
@@ -21155,6 +21169,7 @@ pub fn go_gin_dispatch_call_removed() -> Case {
         )
         .edge_before("method Context::Next", "calls", "function Logger")
         .no_edge_after("method Context::Next", "calls", "function Logger")
+        .reruns("ginEdges")
 }
 
 /// W7-15d0 (upstream #2682, #693): a member a `var ( … )` group gains is a
@@ -21330,6 +21345,7 @@ pub fn go_func_field_wiring_removed() -> Case {
             "calls",
             "function refreshInstances",
         )
+        .reruns("goFuncFieldEdges")
 }
 
 /// W7-15d: the field stops holding a function, so a call through it is
@@ -21470,6 +21486,7 @@ pub fn ts_thunk_dispatch_target_gains_a_namesake_thunk() -> Case {
             "synthesizedBy",
             "redux-thunk",
         )
+        .reruns("thunkEdges")
 }
 
 /// W7-16a: a Celery task loses its decorator, in its own file; the
@@ -21490,6 +21507,7 @@ pub fn python_celery_task_loses_its_decorator() -> Case {
         )
         .edge_before("function signup", "calls", "function send")
         .no_edge_after("function signup", "calls", "function send")
+        .reruns("celeryEdges")
 }
 
 /// W7-16a: a Spring listener's parameter becomes another event; the
@@ -21511,6 +21529,7 @@ pub fn java_spring_listener_hears_another_event() -> Case {
         )
         .edge_before("method app::Service::ship", "calls", "method app::Listener::on")
         .no_edge_after("method app::Service::ship", "calls", "method app::Listener::on")
+        .reruns("springEdges")
 }
 
 /// W7-16a: a MediatR handler's base list takes another request; the sender
@@ -21539,6 +21558,7 @@ pub fn csharp_mediatr_handler_takes_another_request() -> Case {
             "calls",
             "method Shop::PingHandler::Handle",
         )
+        .reruns("mediatrEdges")
 }
 
 /// W7-16a: a Sidekiq worker drops the mixin, in its own file; the enqueue
@@ -21567,6 +21587,7 @@ pub fn ruby_sidekiq_worker_drops_its_mixin() -> Case {
             "calls",
             "method CleanupWorker::perform",
         )
+        .reruns("sidekiqEdges")
 }
 
 /// W7-16d: another file writes `class Comments::NotifyWorker` with the
@@ -21675,6 +21696,7 @@ pub fn ts_rtk_api_gains_a_hook_binding() -> Case {
         )
         .named_before("function", "useGetPostsQuery")
         .edge_after("function Profile", "calls", "function useGetUserQuery @api.ts")
+        .reruns("rtkEdges")
 }
 
 /// W7-16b: a module's default export gains a second store word, so the file
@@ -21777,6 +21799,7 @@ pub fn ts_pinia_factory_gains_a_namesake_in_another_file() -> Case {
             "synthesizedBy",
             "pinia-store",
         )
+        .reruns("piniaEdges")
 }
 
 /// W7-16b: a Pinia options store gains the action an unchanged consumer
@@ -21851,6 +21874,7 @@ pub fn js_vuex_namespace_gains_a_second_store_file_of_the_action() -> Case {
             "synthesizedBy",
             "vuex-dispatch",
         )
+        .reruns("vuexEdges")
 }
 
 /// W7-16b: a Vuex module gains the mutation its action already commits; the
@@ -21893,6 +21917,7 @@ pub fn c_fnptr_table_gains_an_entry() -> Case {
         .edge_before("function go", "calls", "function one")
         .edge_after("function go", "calls", "function two")
         .edge_metadata_after(("function go", "calls", "function two"), "via", "ops.run")
+        .reruns("cFnPtrEdges")
 }
 
 /// W7-17a: a header's function-pointer typedef becomes a data typedef; the
@@ -22209,6 +22234,7 @@ pub fn typescript_angular_template_file_deleted() -> Case {
         .remove("src/app/x/x.component.html")
         .edge_before("class XComponent", "calls", "method XComponent::one")
         .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .reruns("angularTemplateEdges")
 }
 
 /// W7-18d: the component's `templateUrl` comes to name another template,
@@ -22304,6 +22330,7 @@ pub fn go_goframe_route_path_is_changed() -> Case {
         .named_after("route", "POST /dept/create")
         .edge_before(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
         .edge_after(GOFRAME_ADD_ROUTE, "calls", "method ctl::Add")
+        .reruns("goframeEdges")
 }
 
 /// W7-16c: another controller directory gains a method taking the same
@@ -22387,6 +22414,7 @@ pub fn tsx_next_link_target_page_deleted() -> Case {
             "navigates",
             "route app/[slug]/page.tsx::route:/:slug",
         )
+        .reruns("nextLinkEdges")
 }
 
 const LINKS_REACT_ROUTER_PACKAGE: &str = "{\"name\":\"app\",\"dependencies\":{\"react\":\"18\",\"react-router-dom\":\"6\",\"styled-components\":\"*\"}}\n";
@@ -22505,6 +22533,7 @@ pub fn svelte_sveltekit_page_server_appears() -> Case {
         "synthesizedBy",
         "sveltekit-load",
     )
+    .reruns("svelteKitPageEdges")
 }
 
 /// W7-18b: a page's server loader is deleted and its universal loader
@@ -22535,6 +22564,7 @@ pub fn svelte_sveltekit_page_server_deleted() -> Case {
         "calls",
         "function load",
     )
+        .reruns("svelteKitEdges")
 }
 
 /// W7-18b: a page appears beside a loader no page used: its route calls
@@ -22647,6 +22677,7 @@ pub fn tsx_route_config_get_href_returns_another_path() -> Case {
         .edge_before("function Nav", "navigates", "route src/App.tsx::route:/a")
         .edge_after("function Nav", "navigates", "route src/App.tsx::route:/b")
         .no_edge_after("function Nav", "navigates", "route src/App.tsx::route:/a")
+        .reruns("reactRouterLinkEdges")
 }
 
 /// W7-18a: `tsconfig.json`'s alias comes to point at another directory;
@@ -22762,6 +22793,7 @@ pub fn typescript_expo_helper_returns_another_screen() -> Case {
         "navigates",
         "route src/app/welcome.tsx::route:/welcome",
     )
+    .reruns("expoRouterReturnEdges")
 }
 
 /// W7-18a: another file comes to push the helper's return value: the
@@ -22945,6 +22977,7 @@ pub fn typescript_tier_route_path_changes() -> Case {
             "synthesizedBy",
             "http-client",
         )
+        .reruns("tierEdges")
 }
 
 const TIER_MOUNTED_APP: &str = "import express from 'express'\nconst app = express()\nconst v1 = require('./v1')\napp.use('/api/v1', authenticate, v1)\nexport default app\n";
@@ -23227,6 +23260,7 @@ pub fn php_tier_request_helper_stops_requesting() -> Case {
         )
         .edge_metadata_before(TIER_LOGIN_EDGE, "synthesizedBy", "test-request")
         .no_edge_metadata_after(TIER_LOGIN_EDGE, "synthesizedBy", "test-request")
+        .reruns("testRequestEdges")
 }
 
 /// W7-20: the client moves into a test directory: a test is never a
@@ -24585,6 +24619,7 @@ pub fn expo_module_gains_its_kotlin_implementation() -> Case {
             "synthesizedBy",
             "expo-cross-platform",
         )
+        .reruns("expoXPlatEdges")
 }
 
 /// W7-21: the Kotlin implementation is deleted: the call keeps the Swift
@@ -25185,6 +25220,7 @@ pub fn paper_view_manager_is_deleted() -> Case {
         )
         .edge_throughout("class RNSVGDefs", "extends", PAPER_CLASS)
         .edge_throughout("method RNSVGNode::layout", "calls", PAPER_PROPERTY)
+        .reruns("fabricNativeEdges")
 }
 
 /// A bare TypeScript call the React Native bridge answers by name at 0.6
@@ -27544,6 +27580,7 @@ pub fn arkts_router_page_renamed() -> Case {
         )
         .edge_before("method Home::openDetail", "calls", "struct Detail")
         .no_edge_after("method Home::openDetail", "calls", "struct Detail")
+        .reruns("arkuiRoutes")
 }
 
 /// W7-24b: the importer of a Nix directory whose `default.nix` the case
@@ -27593,6 +27630,7 @@ pub fn nix_option_declared_elsewhere_changes() -> Case {
             "references",
             "variable options.launchd.user.agents",
         )
+        .reruns("nixOptionEdges")
 }
 
 /// W7-24c: a module declared in one file of a directory and used in
@@ -28163,6 +28201,7 @@ pub fn erlang_behaviour_removed() -> Case {
             "calls",
             "function impl::on_event/1",
         )
+        .reruns("erlangBehaviourEdges")
 }
 
 /// W7-24d: the behaviour stops declaring the callback, in another file
@@ -29111,4 +29150,421 @@ pub fn javascript_react_lazy_value_tag_after_a_namesake_reference() -> Case {
         )
         .edge_after("function App", "references", "function DocsPage")
         .no_edge_after("function Preview", "references", "function DocsPage")
+}
+
+// ----- W9-00 row 27: a sync keeps the synthesis steps whose inputs it left alone
+
+// Each step's case keeps its `before` tree and edits only a YAML bystander,
+// which no step scans: the sync runs the stage and the step keeps the output
+// its last run recorded. The step's own case (named in its `reruns`) shows
+// it running again when its inputs change.
+
+/// W9-00 row 27: [`go_interface_method_renamed_off_its_implementer`]'s tree, a bystander edited.
+pub fn row27_go_method_contains_keeps_its_output() -> Case {
+    go_interface_method_renamed_off_its_implementer().bystander_edit("goMethodContains")
+}
+
+/// W9-00 row 27: [`go_embedded_type_renames_its_method`]'s tree, a bystander edited.
+pub fn row27_go_implements_keeps_its_output() -> Case {
+    go_embedded_type_renames_its_method().bystander_edit("goImplements")
+}
+
+/// W9-00 row 27: [`typescript_synthesis_registration_moves`]'s tree, a bystander edited.
+pub fn row27_field_edges_keeps_its_output() -> Case {
+    typescript_synthesis_registration_moves().bystander_edit("fieldEdges")
+}
+
+/// W9-00 row 27: [`swift_closure_collection_keeps_its_field_after_an_edit`]'s tree, a bystander edited.
+pub fn row27_closure_coll_edges_keeps_its_output() -> Case {
+    swift_closure_collection_keeps_its_field_after_an_edit().bystander_edit("closureCollEdges")
+}
+
+/// W9-00 row 27: [`typescript_tier_route_path_changes`]'s tree, a bystander edited.
+pub fn row27_tier_edges_keeps_its_output() -> Case {
+    typescript_tier_route_path_changes().bystander_edit("tierEdges")
+}
+
+/// W9-00 row 27: [`php_tier_request_helper_stops_requesting`]'s tree, a bystander edited.
+pub fn row27_test_request_edges_keeps_its_output() -> Case {
+    php_tier_request_helper_stops_requesting().bystander_edit("testRequestEdges")
+}
+
+/// W9-00 row 27: [`javascript_emitter_handler_gains_a_competitor`]'s tree, a bystander edited.
+pub fn row27_emitter_edges_keeps_its_output() -> Case {
+    javascript_emitter_handler_gains_a_competitor().bystander_edit("emitterEdges")
+}
+
+/// W9-00 row 27: [`typescript_react_state_update_goes`]'s tree, a bystander edited.
+pub fn row27_render_edges_keeps_its_output() -> Case {
+    typescript_react_state_update_goes().bystander_edit("renderEdges")
+}
+
+/// W9-00 row 27: [`tsx_tag_removed`]'s tree, a bystander edited.
+pub fn row27_jsx_edges_keeps_its_output() -> Case {
+    tsx_tag_removed().bystander_edit("jsxEdges")
+}
+
+/// W9-00 row 27: [`vue_component_template_edit`]'s tree, a bystander edited.
+pub fn row27_vue_edges_keeps_its_output() -> Case {
+    vue_component_template_edit().bystander_edit("vueEdges")
+}
+
+/// W9-00 row 27: [`svelte_sveltekit_page_server_deleted`]'s tree, a bystander edited.
+pub fn row27_svelte_kit_edges_keeps_its_output() -> Case {
+    svelte_sveltekit_page_server_deleted().bystander_edit("svelteKitEdges")
+}
+
+/// W9-00 row 27: [`arkts_router_page_renamed`]'s tree, a bystander edited.
+pub fn row27_arkui_routes_keeps_its_output() -> Case {
+    arkts_router_page_renamed().bystander_edit("arkuiRoutes")
+}
+
+/// W9-00 row 27: [`cpp_override_renamed`]'s tree, a bystander edited.
+pub fn row27_cpp_edges_keeps_its_output() -> Case {
+    cpp_override_renamed().bystander_edit("cppEdges")
+}
+
+/// W9-00 row 27: [`java_interface_file_deleted`]'s tree, a bystander edited.
+pub fn row27_iface_edges_keeps_its_output() -> Case {
+    java_interface_file_deleted().bystander_edit("ifaceEdges")
+}
+
+/// W9-00 row 27: [`kotlin_actual_file_deleted`]'s tree, a bystander edited.
+pub fn row27_kotlin_expect_actual_keeps_its_output() -> Case {
+    kotlin_actual_file_deleted().bystander_edit("kotlinExpectActual")
+}
+
+/// W9-00 row 27: [`paper_view_manager_is_deleted`]'s tree, a bystander edited.
+pub fn row27_fabric_native_edges_keeps_its_output() -> Case {
+    paper_view_manager_is_deleted().bystander_edit("fabricNativeEdges")
+}
+
+/// W9-00 row 27: [`expo_module_loses_its_kotlin_implementation`]'s tree, a bystander edited.
+pub fn row27_expo_x_plat_edges_keeps_its_output() -> Case {
+    expo_module_loses_its_kotlin_implementation().bystander_edit("expoXPlatEdges")
+}
+
+/// W9-00 row 27: [`java_mybatis_mapper_gains_a_namesake`]'s tree, a bystander edited.
+pub fn row27_mybatis_edges_keeps_its_output() -> Case {
+    java_mybatis_mapper_gains_a_namesake().bystander_edit("mybatisEdges")
+}
+
+/// W9-00 row 27: [`go_gin_dispatch_call_removed`]'s tree, a bystander edited.
+pub fn row27_gin_edges_keeps_its_output() -> Case {
+    go_gin_dispatch_call_removed().bystander_edit("ginEdges")
+}
+
+/// W9-00 row 27: [`ts_thunk_dispatch_target_gains_a_namesake_thunk`]'s tree, a bystander edited.
+pub fn row27_thunk_edges_keeps_its_output() -> Case {
+    ts_thunk_dispatch_target_gains_a_namesake_thunk().bystander_edit("thunkEdges")
+}
+
+/// W9-00 row 27: [`typescript_registry_gains_a_handler`]'s tree, a bystander edited.
+pub fn row27_registry_edges_keeps_its_output() -> Case {
+    typescript_registry_gains_a_handler().bystander_edit("registryEdges")
+}
+
+/// W9-00 row 27: [`ts_rtk_api_gains_a_hook_binding`]'s tree, a bystander edited.
+pub fn row27_rtk_edges_keeps_its_output() -> Case {
+    ts_rtk_api_gains_a_hook_binding().bystander_edit("rtkEdges")
+}
+
+/// W9-00 row 27: [`ts_pinia_factory_gains_a_namesake_in_another_file`]'s tree, a bystander edited.
+pub fn row27_pinia_edges_keeps_its_output() -> Case {
+    ts_pinia_factory_gains_a_namesake_in_another_file().bystander_edit("piniaEdges")
+}
+
+/// W9-00 row 27: [`js_vuex_namespace_gains_a_second_store_file_of_the_action`]'s tree, a bystander edited.
+pub fn row27_vuex_edges_keeps_its_output() -> Case {
+    js_vuex_namespace_gains_a_second_store_file_of_the_action().bystander_edit("vuexEdges")
+}
+
+/// W9-00 row 27: [`python_celery_task_loses_its_decorator`]'s tree, a bystander edited.
+pub fn row27_celery_edges_keeps_its_output() -> Case {
+    python_celery_task_loses_its_decorator().bystander_edit("celeryEdges")
+}
+
+/// W9-00 row 27: [`java_spring_listener_hears_another_event`]'s tree, a bystander edited.
+pub fn row27_spring_edges_keeps_its_output() -> Case {
+    java_spring_listener_hears_another_event().bystander_edit("springEdges")
+}
+
+/// W9-00 row 27: [`csharp_mediatr_handler_takes_another_request`]'s tree, a bystander edited.
+pub fn row27_mediatr_edges_keeps_its_output() -> Case {
+    csharp_mediatr_handler_takes_another_request().bystander_edit("mediatrEdges")
+}
+
+/// W9-00 row 27: [`ruby_sidekiq_worker_drops_its_mixin`]'s tree, a bystander edited.
+pub fn row27_sidekiq_edges_keeps_its_output() -> Case {
+    ruby_sidekiq_worker_drops_its_mixin().bystander_edit("sidekiqEdges")
+}
+
+/// W9-00 row 27: [`erlang_behaviour_removed`]'s tree, a bystander edited.
+pub fn row27_erlang_behaviour_edges_keeps_its_output() -> Case {
+    erlang_behaviour_removed().bystander_edit("erlangBehaviourEdges")
+}
+
+/// W9-00 row 27: [`c_fnptr_table_gains_an_entry`]'s tree, a bystander edited.
+pub fn row27_c_fn_ptr_edges_keeps_its_output() -> Case {
+    c_fnptr_table_gains_an_entry().bystander_edit("cFnPtrEdges")
+}
+
+/// W9-00 row 27: [`go_goframe_route_path_is_changed`]'s tree, a bystander edited.
+pub fn row27_goframe_edges_keeps_its_output() -> Case {
+    go_goframe_route_path_is_changed().bystander_edit("goframeEdges")
+}
+
+/// W9-00 row 27: [`go_func_field_wiring_removed`]'s tree, a bystander edited.
+pub fn row27_go_func_field_edges_keeps_its_output() -> Case {
+    go_func_field_wiring_removed().bystander_edit("goFuncFieldEdges")
+}
+
+/// W9-00 row 27: [`typescript_expo_helper_returns_another_screen`]'s tree, a bystander edited.
+pub fn row27_expo_router_return_edges_keeps_its_output() -> Case {
+    typescript_expo_helper_returns_another_screen().bystander_edit("expoRouterReturnEdges")
+}
+
+/// W9-00 row 27: [`tsx_next_link_target_page_deleted`]'s tree, a bystander edited.
+pub fn row27_next_link_edges_keeps_its_output() -> Case {
+    tsx_next_link_target_page_deleted().bystander_edit("nextLinkEdges")
+}
+
+/// W9-00 row 27: [`tsx_route_config_get_href_returns_another_path`]'s tree, a bystander edited.
+pub fn row27_react_router_link_edges_keeps_its_output() -> Case {
+    tsx_route_config_get_href_returns_another_path().bystander_edit("reactRouterLinkEdges")
+}
+
+/// W9-00 row 27: [`typescript_angular_template_file_deleted`]'s tree, a bystander edited.
+pub fn row27_angular_template_edges_keeps_its_output() -> Case {
+    typescript_angular_template_file_deleted().bystander_edit("angularTemplateEdges")
+}
+
+/// W9-00 row 27: [`svelte_sveltekit_page_server_appears`]'s tree, a bystander edited.
+pub fn row27_svelte_kit_page_edges_keeps_its_output() -> Case {
+    svelte_sveltekit_page_server_appears().bystander_edit("svelteKitPageEdges")
+}
+
+/// W9-00 row 27: [`nix_option_declared_elsewhere_changes`]'s tree, a bystander edited.
+pub fn row27_nix_option_edges_keeps_its_output() -> Case {
+    nix_option_declared_elsewhere_changes().bystander_edit("nixOptionEdges")
+}
+
+/// W9-00 row 27, the typescript-large edit: a comment appended to a
+/// TypeScript file no scan passes keeps the registry, emitter, tier, field
+/// and JSX steps.
+pub fn row27_typescript_comment_keeps_the_scans() -> Case {
+    typescript_registry_gains_a_handler()
+        .bystander_edit_in(
+            "registryEdges",
+            "src/zz_bystander.ts",
+            "export const zzBystander = 1;\n",
+            "export const zzBystander = 1;\n// \n",
+        )
+        .keeps("emitterEdges")
+        .keeps("tierEdges")
+        .keeps("fieldEdges")
+        .keeps("jsxEdges")
+}
+
+/// W9-00 row 27, the erl-cowboy and erl-rebar3 edit: a comment appended to
+/// an Erlang module that declares no callback and calls through no variable
+/// module keeps the behaviour step.
+pub fn row27_erlang_comment_keeps_the_behaviour_step() -> Case {
+    erlang_behaviour_removed().bystander_edit_in(
+        "erlangBehaviourEdges",
+        "src/zz_bystander.erl",
+        "-module(zz_bystander).\n",
+        "-module(zz_bystander).\n% \n",
+    )
+}
+
+/// W9-00 row 27, the nix-darwin edit: a comment appended to a Nix file keeps
+/// the option step.
+pub fn row27_nix_comment_keeps_the_option_step() -> Case {
+    nix_option_declared_elsewhere_changes().bystander_edit_in(
+        "nixOptionEdges",
+        "modules/zz-bystander.nix",
+        "{ ... }:\n{\n}\n",
+        "{ ... }:\n{\n}\n# \n",
+    )
+}
+
+/// W9-00 row 27: a comment appended to the file whose node the option edge
+/// leaves from re-extracts it, and the cascade drops the edge; the option
+/// step keeps its output, and the replacement writes the edge back.
+pub fn row27_nix_cascaded_edge_is_written_back() -> Case {
+    Case::new(Change::BodyEdit, &[Language::Nix])
+        .file(
+            "modules/launchd.nix",
+            "{ lib, ... }:\n{\n  options.launchd.user.agents = lib.mkOption {\n    default = {};\n  };\n}\n",
+        )
+        .file(
+            "modules/yabai.nix",
+            "{ ... }:\n{\n  launchd.user.agents.yabai = {\n    command = \"yabai\";\n  };\n}\n",
+        )
+        .write(
+            "modules/yabai.nix",
+            "{ ... }:\n{\n  launchd.user.agents.yabai = {\n    command = \"yabai\";\n  };\n}\n# touched\n",
+        )
+        .edge_throughout(
+            "variable launchd.user.agents.yabai",
+            "references",
+            "variable options.launchd.user.agents",
+        )
+        .keeps("nixOptionEdges")
+}
+
+/// W9-00 row 27, H1: a TSX edit reruns the JSX step and keeps the C
+/// function-pointer step, whose `.def` the index does not hold; then only
+/// the `.def` changes. The file stays recorded beside the index through the
+/// first sync, so the second reads it again, reruns the C step and keeps
+/// the JSX one.
+pub fn row27_c_include_changes_after_a_tsx_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::C, Language::Tsx])
+        .file("ops.h", FNPTR_DEF_OPS_H)
+        .file("go.c", FNPTR_DEF_GO_C)
+        .file("tab.def", FNPTR_DEF_TAB)
+        .file("src/app.tsx", JSX_APP)
+        .file("src/card.tsx", JSX_CARD)
+        .write(
+            "src/app.tsx",
+            "import { Card } from './card';\nexport function App() {\n  return <Card />;\n}\n// touched\n",
+        )
+        .then()
+        .write(
+            "tab.def",
+            "static struct ops table[] = { { one }, { two } };\n",
+        )
+        .edge_before("function go", "calls", "function one")
+        .edge_after("function go", "calls", "function two")
+        .edge_throughout("function App", "calls", "function Card")
+        .reruns("cFnPtrEdges")
+        .keeps("jsxEdges")
+}
+
+/// W9-00 row 27, H1: a TSX edit reruns the JSX step and keeps the Angular
+/// template step, which reads TypeScript sources only; then only the
+/// component's template, which the index does not hold, changes, and the
+/// second sync reruns the Angular step and keeps the JSX one.
+pub fn row27_angular_template_changes_after_another_edit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript, Language::Tsx])
+        .file("package.json", ANGULAR_PACKAGE)
+        .file("src/app/x/x.component.ts", ANGULAR_X_COMPONENT)
+        .file("src/app/x/x.component.html", ANGULAR_TEMPLATE_ONE)
+        .file("src/app.tsx", JSX_APP)
+        .file("src/card.tsx", JSX_CARD)
+        .write(
+            "src/app.tsx",
+            "import { Card } from './card';\nexport function App() {\n  return <Card />;\n}\n// touched\n",
+        )
+        .then()
+        .write(
+            "src/app/x/x.component.html",
+            "<button (click)=\"two()\">Two</button>\n",
+        )
+        .edge_before("class XComponent", "calls", "method XComponent::one")
+        .edge_after("class XComponent", "calls", "method XComponent::two")
+        .no_edge_after("class XComponent", "calls", "method XComponent::one")
+        .edge_throughout("function App", "calls", "function Card")
+        .reruns("angularTemplateEdges")
+        .keeps("jsxEdges")
+}
+
+/// W9-00 row 27: a file of a language the index had none of opens other
+/// steps' gates, and the stage runs whole.
+pub fn row27_a_new_language_runs_the_stage_whole() -> Case {
+    Case::new(Change::AddCompetitor, &[Language::Tsx, Language::Python])
+        .file("src/app.tsx", JSX_APP)
+        .file("src/card.tsx", JSX_CARD)
+        .write("tools/zz.py", "def zz():\n    return 1\n")
+        .edge_throughout("function App", "calls", "function Card")
+        .whole_stage()
+}
+
+/// W9-00 row 27: a control input resolution reads moves, and the stage runs
+/// whole.
+pub fn row27_a_control_input_runs_the_stage_whole() -> Case {
+    Case::new(Change::ControlFile, &[Language::Tsx])
+        .file("tsconfig.json", "{}\n")
+        .file("src/app.tsx", JSX_APP)
+        .file("src/card.tsx", JSX_CARD)
+        .write(
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\"}}\n",
+        )
+        .edge_throughout("function App", "calls", "function Card")
+        .whole_stage()
+}
+
+/// W9-00 row 27: a file no emitter scan passed comes to emit an event a
+/// handler listens to; the emitter step asks its check of the changed file
+/// and runs again, though the file was no contributor.
+pub fn row27_a_file_starts_to_emit() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/on.ts",
+            "export function onSaved() {\n  return 1;\n}\nexport function wire(bus: any) {\n  bus.on('saved', onSaved);\n}\n",
+        )
+        .file(
+            "src/save.ts",
+            "export function save(bus: any) {\n  return bus;\n}\n",
+        )
+        .write(
+            "src/save.ts",
+            "export function save(bus: any) {\n  bus.emit('saved');\n}\n",
+        )
+        .edge_after("function save", "calls", "function onSaved")
+        .reruns("emitterEdges")
+}
+
+/// W9-00 row 27: a dispatcher's loop comes to read another field, on a line
+/// past its first; the field step reads the method's lines, and their hash
+/// moves, so it runs again and the channel's edge goes.
+pub fn row27_a_dispatcher_body_changes_its_field() -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file(
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.callbacks) cb();\n  }\n}\n",
+        )
+        .file(
+            "src/app.ts",
+            "import { Scene } from './scene';\nexport class App {\n  scene = new Scene();\n  constructor() {\n    this.scene.onUpdate(this.triggerRender);\n  }\n  triggerRender() {\n    return 1;\n  }\n}\n",
+        )
+        .write(
+            "src/scene.ts",
+            "type Callback = () => void;\nexport class Scene {\n  private callbacks = new Set<Callback>();\n  onUpdate(cb: Callback) {\n    this.callbacks.add(cb);\n  }\n  triggerUpdate() {\n    for (const cb of this.others) cb();\n  }\n}\n",
+        )
+        .edge_before("method Scene::triggerUpdate", "calls", "method App::triggerRender")
+        .no_edge_after("method Scene::triggerUpdate", "calls", "method App::triggerRender")
+        .reruns("fieldEdges")
+}
+
+/// W9-00 row 27: a `next.config.mjs` appears beside the pages of an app that
+/// already holds JavaScript, so the languages stay and only the frameworks
+/// move: Next is detected, and the stage runs whole.
+pub fn row27_a_framework_change_runs_the_stage_whole() -> Case {
+    Case::new(
+        Change::ControlFile,
+        &[Language::TypeScript, Language::Tsx, Language::JavaScript],
+    )
+    .file(
+        "package.json",
+        "{\"name\":\"site\",\"dependencies\":{\"react\":\"19\"}}\n",
+    )
+    .file(
+        "pages/about.tsx",
+        "export default function About() {\n  return null\n}\n",
+    )
+    .file(
+        "lib/nav.ts",
+        "export function go(router: { push(path: string): void }) {\n  router.push('/about')\n}\n",
+    )
+    .file("lib/util.js", "export function util() {\n  return 1\n}\n")
+    .write("next.config.mjs", "export default {}\n")
+    .edge_after(
+        "route pages/about.tsx::route:/about",
+        "calls",
+        "function About",
+    )
+    .whole_stage()
 }

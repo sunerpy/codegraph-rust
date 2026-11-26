@@ -259,10 +259,10 @@ table empty and writes no marker.
 | `file_path` | TEXT primary key | a file that fed a synthesis pass; cascades with `files(path)` |
 
 Migration 9 creates it for upstream's per-file recompute gate. This engine
-recomputes the synthesized edges whenever a sync changes the index, so it never
-writes the table, which stays empty. The files the stage reads that the index
-does not hold are recorded in `project_metadata` instead
-(`synthesis_unindexed_inputs`, below).
+never writes the table, which stays empty: what each synthesis step read,
+the files the index does not hold included, is recorded in `project_metadata`
+instead (`synthesis_pass:{pass}` and `synthesis_unindexed_inputs`, below), and
+a sync decides step by step from those.
 
 ### `project_metadata`
 
@@ -659,14 +659,17 @@ and what a sync re-reads and re-resolves when one moves, is in
 [`architecture.md`](architecture.md#daemon-and-watch-lifecycle). They are not a
 canonical surface.
 
-`synthesis_version` (23) vouches that the synthesized edges are the synthesis
+`synthesis_version` (24) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws
 it before its first change, before a lane bootstrap's first write, before the
 orphan sweep, and when a file `synthesis_unindexed_inputs` records reads
 differently, and, when it changed the index, bootstrapped a lane, swept, or
-found the marker missing or at another version, recomputes the stage and writes
-the marker back as its last write. It is not a canonical surface.
+found the marker missing or at another version, runs the stage and writes the
+marker back as its last write. A build before version 24 recomputed the stage
+whole without touching the step records below, so the value tells a record of
+this engine from edges such a build wrote: the first sync of an index another
+version marked runs the stage whole. It is not a canonical surface.
 
 `synthesis_unindexed_inputs` records the files the stage read beside the index
 (W7-17b): a JSON object, sorted by path, from each project-relative path the
@@ -675,37 +678,57 @@ Angular component's `templateUrl` (W7-18d) led the stage to, to the SHA-256 of t
 no file, a path the scan's ignore rules, `.gitignore` or configuration keep
 out, one through a symbolic link, or a file over `indexing.max_file_size`. A
 path that would leave the project root is never probed nor recorded. Every run
-of the stage rewrites the row, `{}` when it read nothing beside the index. Each
+of the stage writes the row, `{}` when it read nothing beside the index; a sync
+that kept steps writes it only when it changed. Each
 sync that finds the marker current reads every recorded path again the same way
 first, and the watcher hands an event for a recorded path to the next sync. A
 row that does not parse counts as changed; an index without the row has an
 older marker and recomputes anyway. It is not a canonical surface.
 
-`synthesis_passes` and `synthesis_pass:{pass}` record what each run of the
-synthesis stage read and emitted (W9-00 row 27). `synthesis_passes` is a JSON
-object: the record scheme, the engine's `synthesis_version` value, the build
-identity (the package version and a digest of the sources the stage's output
-follows from, taken when the binary is compiled), the schema version, a digest
-of the options the stage reads (`indexing.max_file_size` and the scan scope of
-the files beside the index), the indexed files' languages, and the
-prerequisite steps and passes that ran, in order. Each step that ran has a
-`synthesis_pass:{pass}` row under its upstream name: its raw output (its
-edges in the order it emitted them, before the merge) and its footprint: the
-sorted 64-bit hashes of the keys its reads named (a node by id, a file's
-nodes, a name, a qualified or lower-cased name, a kind in a language, the
-edges of a kind into or out of a node, a site's references, the file list, a
-file's row or text), its pattern lookups (`GLOB` and `LIKE` name patterns, a
-signature or decorator that holds a string), the files each of its per-file
-text checks passed, the lines it read with their hash, the files it read
-beside the index with their hash, and what keeps it from being reused: a
-probe on disk, a directory listing or a table built from the store through
-the stage's resolution context, a file that drifted since it was indexed, or
-a record over 32 MiB, which keeps no output. Every run of the stage (a full
-index, a migration, a sync) writes them with its edges and
-`synthesis_unindexed_inputs` in one transaction, dropping the rows of the
-steps that did not run. Nothing reads them yet. They are not a canonical
-surface; the sync matrix checks that a sync leaves them as a fresh index
-writes them.
+`synthesis_passes`, `synthesis_pass:{pass}` and `synthesis_pass:{pass}:edges`
+record what each run of the synthesis stage read and emitted (W9-00 row 27).
+`synthesis_passes` is a JSON object: the record scheme, the engine's
+`synthesis_version` value, the build identity (the package version and a digest
+of the sources the stage's output follows from, taken when the binary is
+compiled), the schema version, a digest of the options the stage reads
+(`indexing.max_file_size` and the scan scope of the files beside the index), the
+indexed files' languages, and the prerequisite steps and passes that ran, in
+order. Each step that ran has two rows under its upstream name.
+`synthesis_pass:{pass}` is its footprint, a JSON object with its record version:
+the sorted 64-bit hashes of the keys its reads named (a node by id, a file's
+nodes, a name, a qualified or lower-cased name, a kind in a language, the edges
+of a kind into or out of a node, a site's references, the file list, a file's
+row or text), its pattern lookups (`GLOB` and `LIKE` name patterns, a signature
+or decorator that holds a string), the files each of its per-file text checks
+passed, the lines it read with their hash, the files it read beside the index
+with their hash, what keeps it from being reused (a probe on disk, a directory
+listing or a table built from the store through the stage's resolution context,
+a file that drifted since it was indexed, or a footprint and output over 32 MiB
+together, which keep no output), and the byte length and SHA-256 of the stored
+text of the step's `synthesis_pass:{pass}:edges` row. That row is the step's raw
+output: the JSON array of its edges in the order it emitted them, before the
+merge (`[]` for a record that keeps none), as a raw deflate stream (miniz_oxide
+at a fixed level, so equal outputs give equal rows) in standard base64. Every
+run of the stage (a full index, a migration, a sync) writes them with its edges
+and `synthesis_unindexed_inputs` in one transaction, dropping the rows of the
+steps that did not run; a sync that kept steps rewrites only the rows of the
+steps that ran and changed (an output row only when its hash moved), leaves a
+kept step's rows as they are, and writes `synthesis_unindexed_inputs`, when it
+changed, as the union of the kept steps' recorded reads and the others' new
+ones. A sync that found the marker current when it began reads the footprint
+rows (see `architecture.md`, Synthesis) and checks that each output row is there
+with the length its footprint row names, which SQLite reads from the row's
+header without its text; it reads an output row only to merge a kept output or
+to compare a prerequisite step's new output with its last, and uses it only when
+its length and hash are the ones named and it decodes. A footprint row that is
+missing, does not read, or has another version (the earlier single-row layout,
+which kept the output inside the record, among them), or an output row that is
+missing, of another length or, once read, another text, or that does not decode
+(base64, inflate, JSON), runs the stage whole. A step keeps its recorded output
+when its record is reusable and none of the sync's changed rows, changed files
+or files beside the index moves what it read. They are not a canonical surface;
+the sync matrix checks that a sync leaves every one of them, the output rows'
+text included, as a fresh index writes them.
 
 `resolved_refs_version` vouches that every file's rows in `unresolved_refs` and
 `resolved_refs` are what extracting it again gives, with the references of the

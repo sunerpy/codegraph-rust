@@ -911,7 +911,9 @@ regex engine), is not listed.
 - **When a sync recomputes synthesis (W7-14).** A sync recomputes every
   synthesized edge whenever it changes the index, bootstraps a lane or runs
   the orphan sweep, and when the `synthesis_version` marker is missing or at
-  another version.
+  another version. Since W9-00 row 27 it keeps each step whose recorded
+  inputs it left alone and reruns the others, and the edges are a whole
+  run's; that is a mechanism, not a difference in what is synthesized.
   colby decides by what changed (`src/index.ts:985-1082,1378-1409`): a
   changed file that was a synthesis input, held a synthesized edge or
   matches `hasSynthesisPattern`, a new renderable definition, a moved route,

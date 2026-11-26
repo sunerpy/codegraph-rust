@@ -47,6 +47,7 @@ mod links;
 mod nix;
 mod react_native;
 mod registry;
+mod reuse;
 mod stage;
 mod sveltekit;
 mod tier;
@@ -54,10 +55,14 @@ mod vue;
 
 // `path.posix`, for the Laravel resolver's route-file mounts too (W7-19d).
 pub(crate) use c_fnptr::{posix_dirname, posix_normalize};
+/// The text of a step's `:edges` row for an output's JSON, and back (W9-00
+/// row 27): tests read and plant rows with them.
+#[doc(hidden)]
+pub use footprint::{decode_output_row, encode_output_row};
 pub use inputs::{INPUTS_KEY, Inputs, inputs_changed, recorded as recorded_inputs};
 pub use stage::{
-    StageStats, StageTimings, records_alone, run_stage, run_stage_timed, stage_rows, step_names,
-    synthesize,
+    StageStats, StageTimings, records_alone, run_stage, run_stage_reusing, run_stage_timed,
+    stage_rows, step_names, synthesize,
 };
 
 use anyhow::Result;
@@ -71,8 +76,11 @@ use codegraph_store::Store;
 /// next one recomputes.
 pub const VERSION_KEY: &str = "synthesis_version";
 
-/// The marker's value; a change to what the passes produce moves it.
-pub const VERSION: &str = "23";
+/// The marker's value; a change to what the passes produce moves it. "24"
+/// since a sync keeps the steps whose inputs it left alone (W9-00 row 27):
+/// a build before it recomputes the stage whole without touching the step
+/// records, and its marker value tells the records apart from its edges.
+pub const VERSION: &str = "24";
 
 /// `project_metadata` key of what the pass records were written by and for
 /// (W9-00 row 27): the engine's [`VERSION`], the [`BUILD_IDENTITY`], the
@@ -81,8 +89,13 @@ pub const VERSION: &str = "23";
 pub const STAGE_KEY: &str = "synthesis_passes";
 
 /// `project_metadata` key prefix of each step's record, `synthesis_pass:` and
-/// its upstream name: its raw output and what it read.
+/// its upstream name: what it read, and the length and hash of its raw
+/// output's row, the same key with [`EDGES_KEY_SUFFIX`].
 pub const PASS_KEY_PREFIX: &str = "synthesis_pass:";
+
+/// The suffix of a step's raw-output row, `synthesis_pass:{pass}:edges`: its
+/// edges in the order it emitted them, before the merge.
+pub const EDGES_KEY_SUFFIX: &str = ":edges";
 
 /// The build that writes the records: the package version and a digest of
 /// the sources the stage's output follows from, taken when it is compiled
