@@ -20,8 +20,15 @@
   2026-10-22 in
   [`POST_V1_6_2_MAIN_2026-10-22.md`](POST_V1_6_2_MAIN_2026-10-22.md): 225
   commits from the previous boundary, none of them merges and no new upstream
-  tag. Its `DEFER` rows go with the follow-up pull request; its `PORT` and
-  `PARTIAL` rows wait for a later program (OD-A1 in that file).
+  tag. Its `DEFER` rows landed in the follow-up pull request #338 except A 106
+  (#2762, `OWNER-EXCLUDED` with VB.NET) and B 60 and B 98 (#2575, #2785, left
+  for the next round, OD-B55). 180 of its 183 `PORT` and `PARTIAL` rows wait for
+  the next program, which moves the extraction version again (OD-A1 in that
+  file): #338 landed B 17 (#2420, OD-B1) and A 56 and A 57 (OD-B7) whole. B 84
+  is among the 180 with its Go half landed, and so are B 29, B 31 and A 109 with
+  parts landed; that file's "Follow-up pull request status" section says which.
+  The older gaps G19–G25 wait with the rows that need them; G18's Go part
+  landed with #338 (OD-B7).
 - **Previous discovery boundary:** colby `main` at
   `b635dd467f0578926a9c01a37b9d28d2b26689f1` (the 2026-10-10 audit,
   [`V1_6_2_AUDIT_2026-10-10.md`](V1_6_2_AUDIT_2026-10-10.md)).
@@ -32,14 +39,63 @@
   audit's rows under waves W0 to W6 and W10 of its program, with extraction
   version 22. The audit's `LANDED` rows name the commits and #322. See the
   2026-10-22 release and CLOSEOUT entries below.
-- **Planned for the follow-up pull request:** the rows under W7, W8 and W9
-  (the UI family F1–F12 with the synthesis stage and the framework resolvers,
-  VB.NET, `codegraph context`, #1617 and the 26 v1.5.0 performance
-  strategies), by the owner's decision of 2026-10-16. The audit marks them
-  `PLANNED (follow-up PR)`, and a row that landed only partly in `v0.55.0`
-  names both halves. That pull request moves the extraction version from 22 to
-  23, and it also takes the 21 `DEFER` rows of the 2026-10-22 audit. See the
-  2026-10-16 entry below.
+- **Follow-up pull request #338, merged, release pending (2026-11-26):** the
+  rows the owner moved to it on 2026-10-16 (OD-18): W7 (the UI family F1–F12
+  with the synthesis stage and the framework resolvers) and W9
+  (`codegraph context`, #1617 and the 26 v1.5.0 performance strategies),
+  OD-19's refusal of a schema newer than the binary, and 18 of the 2026-10-22
+  audit's 21 `DEFER` rows with their prerequisites (#2420, OD-B1; A 56, A 57 and
+  B 84's Go half, OD-B7). It moves the extraction version from 22 to 23 once,
+  before its first graph change. VB.NET (W8) is `OWNER-EXCLUDED`: the OD-3 trial
+  of `tree-sitter-vb-dotnet =0.1.0` parsed 59.7% of upstream's VB.NET test
+  sources without an error, against a 95% bar. The "Follow-up pull request
+  status" sections of the two dated audits list every row with its commits; see
+  the 2026-11-26 entry below. The release entry follows once the release's
+  downloaded binaries are checked. #338 also closes these caveats of the older
+  syncs below: the per-language framework-resolution bridges of `1.2.0 → 1.4.1`
+  (ArkUI, Nix, Terraform and Erlang; CFML's landed in #322), and the deferred
+  `codegraph context` and #1617 of `1.5.0 → 1.6.0`. The 26 strategies of
+  `1.4.1 → 1.5.0` close with W9-00's dispositions
+  <!-- TODO(main): W9-00 — name the dated dispositions file and row 27's verdict -->.
+  VB.NET, which `1.2.0 → 1.4.1` recorded as having no crate at all, has one
+  now, and it failed that trial.
+- **Left for the next round** (each by the owner decision named, in the plan of
+  the follow-up program):
+  - the 2026-10-22 audit's 180 open `PORT` and `PARTIAL` rows (OD-A1), with
+    G19–G25 (OD-A2) and the other Go rows #2667, #2678 and #2679 (OD-B7);
+  - C following upstream's lone-macro rule, with A 78 (#2709, OD-A3);
+  - `tree-sitter-swift` 0.7.4, its walker changes and #2683 (A 58, OD-B4);
+  - storing each C or C++ file's function-pointer facts so a sync recomputes
+    only the files that changed (OD-B8), and a sync that keeps a routes file's
+    unchanged route nodes, references and edges instead of rewriting them all
+    (W7-19e), both by OD-B89;
+  - three older differences (OD-B15): signatures cut by bytes where upstream
+    counts UTF-16 units, `rust_manifest_inputs` letting a drive-letter path
+    through, and a Python module-level assignment's right-hand call not owned
+    by the name it assigns;
+  - skipping `addons` only in Godot projects (OD-B17);
+  - explore's engine-wide test predicate, #2557 (OD-B23), the dominant file's
+    boost, #2575 and #2785 (OD-B55), and #2655, #2750, #2783 and #2789, which
+    W7-25 names (OD-A1);
+  - the single-candidate shortcut counted before the scope filters (#211), with
+    the Expo exception of `has_bridge_evidence` and the boundary of a partial
+    qualified-name match (OD-B29);
+  - Nix's MCP option-path lookup (OD-B47);
+  - upstream's `shrinkCluster` member rule, CG-27 (OD-B60);
+  - React's Pattern 1 taking a same-directory namesake before the file's own
+    declaration, in `.tsx`, `.jsx` and `.js` alike (OD-B67);
+  - value references in `.jsx` files (`has_value_refs` lacks JSX, OD-B68);
+  - the six whole-table scans each explore runs (OD-B75);
+  - a shorter sync-convergence matrix on Windows CI, such as an in-process CLI
+    driver (OD-B77);
+  - the read-only open's read of the whole main database into memory, untimed
+    in a single-file sync (OD-B91);
+  - a rebuild in place of a sync that would re-extract too many files
+    (OD-B92);
+  - running the synthesis passes in parallel, W9-00's row 9, `DEFER` with its
+    prefilter result (OD-B93);
+  - Django's ORM dispatch (`_iterable_class`), which waits for a sync lane that
+    reads it (KNOWN_DIFFS.md, W7-19b).
 - **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
 - **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
   - #286, which makes a full `sync` keep what `index` keeps;
@@ -88,13 +144,15 @@
   below. The
   graph-semantic families F1–F12 that shipped beside it (framework navigation
   edges and routers, the synthesis layer and its schema, cross-tier channels,
-  server route naming, the explore Flow, the React Native bridge) remain
-  deferred, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
+  server route naming, the explore Flow, the React Native bridge) were deferred
+  then, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
   Steps, then F7–F9 and F12. The 2026-10-10 program planned all of them for
   `v0.55.0`; on 2026-10-16 the owner moved them, with the rest of W7, to the
   follow-up pull request. `v0.55.0` landed from them only `950686de`'s test-file
   classifier and `b1f40c57`'s `e2e/` test path (one predicate with the
-  resolver's), and the route roots its routes list reads.
+  resolver's), and the route roots its routes list reads. The rest landed in
+  #338 (merged, release pending), with the viewer's Steps, Screens and branch
+  conditions.
 
 The Rust product and upstream release versions are independent. This Current
 alignment block is the only place that states release parity; dated log entries
@@ -115,11 +173,14 @@ below remain immutable historical evidence.
 >   namespace scope, and a struct or union defined inside a function body, get
 >   no node.
 > - **Refusing a schema newer than the binary (OD-19) is PLANNED (follow-up
->   PR)**, with the design constraints the audit records.
+>   PR)**, with the design constraints the audit records. It landed in #338
+>   (merged, release pending).
 > - **The rows under W7, W8 and W9 are PLANNED (follow-up PR)** (2026-10-16):
 >   the UI family F1–F12 with the synthesis stage and the framework resolvers,
 >   VB.NET, `codegraph context`, #1617 and the 26 v1.5.0 performance
->   strategies.
+>   strategies. They landed in #338 (merged, release pending), except VB.NET,
+>   `OWNER-EXCLUDED` after its trial; W9-00 decides the 26 strategies
+>   <!-- TODO(main): W9-00 — the dispositions file -->.
 > - **KEEP-RUST divergences** are recorded row by row in the audit. Three of
 >   them add behavior upstream does not have: property type references for
 >   Kotlin and PHP, C# extension methods reached from an outside receiver
@@ -219,6 +280,91 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-11-26 — The follow-up pull request #338 merged, release pending: W7, W9, OD-19 and the `DEFER` rows of `b635dd46..e8ddc4e2`
+
+- **Pull request:** [#338](https://github.com/sunerpy/codegraph-rust/pull/338)
+  (`feat/v0.56-followups` onto `main` at `8c18a34`), squashed into one commit,
+  `feat: framework resolvers, synthesis and codegraph context`. Status: merged,
+  release pending. Release Please releases it as `v0.56.0`; that release's
+  entry records the check of the downloaded binaries, and the two dated audits
+  get their closeout sections then.
+- **Index upgrade:** the extraction version moves once, 22 → 23, in the branch's
+  first commit (`c5514d8`), before any graph change; the schema stays 10. An
+  index `v0.55` built reads as outdated and is rebuilt once by `codegraph sync`,
+  a daemon's catch-up or the first MCP access; `upgrade_from_v055` replays a
+  real `v0.55.2` index through those paths. A binary now refuses an index a
+  newer schema wrote, and leaves its bytes alone (OD-19).
+- **What landed:** framework-edge infrastructure and the resolver's name on its
+  edges; React, NestJS and Nuxt fixes; the explore Flow and its
+  dynamic-dispatch links; the client routers (Next.js, Expo Router, React
+  Router, TanStack Router, Vue Router, Svelte and SvelteKit, Angular); the
+  synthesis stage and its passes (render, override, interface, registry, JSX,
+  Go, the framework dispatch synthesizers, C and C++ function pointers,
+  navigation links, SvelteKit, Vue and Angular templates); the server
+  frameworks and their route naming (Express, Astro, Django, Flask, FastAPI,
+  Spring, Play, Laravel, Drupal, Rails, ASP.NET, Vapor, SwiftUI, UIKit, axum,
+  actix and Cargo workspaces, Go, GoFrame); cross-tier channels and test
+  requests; the React Native, Expo modules, Fabric and Swift–Objective-C
+  bridges; the viewer's Steps, Screens and branch conditions; sync lanes for
+  routes and navigation; the ArkUI, Nix, Terraform and Erlang bridges;
+  explore's relevance ranking and skeletons; `codegraph context`; #1617's Lua
+  module loaders; Rust-side sync and watcher fixes (W7-27, W7-29, W7-31); and a
+  JSX tag in a `.js` file rendering its component (W7-28). The KEEP-RUST
+  divergences each item chose are in [`KNOWN_DIFFS.md`](KNOWN_DIFFS.md).
+  <!-- TODO(main): W9-00 — add the ADOPTED strategies and row 27 if they land -->
+- **The 2026-10-10 audit:** every `PLANNED (follow-up PR)` row landed, except
+  VB.NET and its rows, `OWNER-EXCLUDED`, and the 26 strategies, which W9-00
+  decides <!-- TODO(main): W9-00 — the dispositions -->. Its new "Follow-up
+  pull request status" section lists the commits.
+- **The 2026-10-22 audit:** 18 of the 21 `DEFER` rows landed, with #2420 (B 17)
+  and A 56 and A 57 whole and B 84's Go half; A 106 is `OWNER-EXCLUDED`; B 60
+  and B 98 stay `DEFER` for the next round (OD-B55). Its open question 1, #2683
+  on Windows, waits for the next round (OD-B4); open question 3, the Rust std
+  gate, is `ALREADY-HAVE`, pinned by a probe (W0-05). Its new section lists the
+  commits and the rows with parts landed.
+- **VB.NET `OWNER-EXCLUDED`** (OD-3, pre-authorized 2026-10-10, executed
+  2026-11-26): the trial of `tree-sitter-vb-dotnet =0.1.0` passed the licence,
+  build, ABI, audit and smoke checks, but only 74 of 124 upstream test sources
+  (59.7%) parsed without an error, against a 95% bar. The crate is the only
+  VB.NET grammar on crates.io, and the grammar manifest forbids vendoring one.
+  The 2026-10-10 audit's new section names the rows and the evidence.
+- **Older ledger rows #338 ports** (those entries stay as written):
+  - the 2026-06-24 entry's `DEFER` rows "Framework dispatch synthesizers", all
+    eleven items (GoFrame `g.Meta` (#747) in W7-16c; Laravel events, Sidekiq,
+    MediatR, Spring `publishEvent`, Celery and redux-thunk in W7-16a and
+    W7-16d; Vuex, Pinia and RTK Query in W7-16b; the object-literal registry in
+    W7-14d), and "C/C++ function-pointer dispatch (#932)", in W7-17a and
+    W7-17b;
+  - the two 2026-06-28 entries' `703629e` (C/C++ function-pointer command
+    tables: macro-built, conditional and bare-array tables), in W7-17a. It is
+    #991 (PR #1003); the 2026-07-06 entry's DEFERRED list pairs it with #1043,
+    the templated-base inheritance change it describes;
+  - the 2026-07-14 Metal and CUDA entry's #1172 `cppLocalFnPtrs`, "DEFERRED
+    within G", in W7-17a;
+  - the 2026-07-14 #1212 entry's sub-part 4, the c-fnptr LRU-bounded caches,
+    with #1562 (`81e1f4a9`), recorded "N/A (pass absent)": the pass exists now,
+    and its caches are not ported, since the Rust pass compiles no pattern per
+    name. Table 9.1's rows 15–17 (`d510de4`, `c6850d7`, `69ea438`) measure
+    the pass in W9-00 <!-- TODO(main): W9-00 — rows 15-17's dispositions -->;
+  - the deferred framework bridges of the H1 (ArkTS), H3 (Nix), H4 (Terraform)
+    and H5 (Erlang) entries of 2026-07-15 and 2026-07-16, in W7-24a to
+    W7-24d, with three upstream commits no ledger had recorded: #1174
+    (`f8cdbe3c`, Terraform remote state, provider aliases and `moved`, `import`
+    and `check` blocks) in W7-24c, and #1168 (`a5b8cd8e`, calls in Erlang macro
+    bodies) and #1169 (`a0208fea`, escripts and `.app` and `.app.src` files) in
+    W7-24d;
+  - the 2026-07-10 evaluation's #1180 and the 2026-08-02 audit's #1461,
+    recorded when this port had no Spring config-key or route resolver, in
+    W7-19c's Spring resolver; likewise `V1_6_1_AUDIT_2026-09-30.md`'s #1827
+    (N/A then) in W7-19c and its F9 ASP.NET groups (`bc45e907`) in W7-19f,
+    `V1_6_TRIAGE_2026-08-27.md`'s #1547 (N/A then) in W7-19g's Vapor routes,
+    and #1631's `fileExists` disk half (`POST_V1_6_MAIN_2026-09-15.md`), which
+    W7-17b's reads of non-indexed includes apply.
+- **Left for the next round:** listed in Current alignment above, each with the
+  owner decision that left it.
+- **Not changed:** the tracked release stays `v1.6.2`, and the discovery
+  boundary stays `e8ddc4e2`: this pull request runs no new audit.
 
 ### 2026-10-22 — `b635dd46..e8ddc4e2` AUDITED; its `DEFER` rows join the follow-up pull request
 
