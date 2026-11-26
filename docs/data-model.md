@@ -644,6 +644,21 @@ withdrawn with the others before a sync's first change. A sync that finds it
 missing or at another version rebuilds every row and re-resolves every file
 holding a `module.M:` reference. They are not a canonical surface.
 
+Control-input rows record what resolution reads of the project's control
+files, which are no source files: `control_inputs:<kind>`, one row for each kind
+(`js`, `csharp`, `rust`, `go`, `python`, `jvm`, `php`, `ruby`, `dotnet` and
+`swift`), holds a JSON object from each input's path (project-relative, or the
+absolute path its reader used for one outside the project) to the sha256 of its
+text or of a listed folder's names, `null` for one that is missing.
+`frameworks_detected` holds the detected frameworks, sorted, and, when a
+framework runs only in its own apps, a digest of where it runs. A full index, a
+migration and every sync write the rows, last. `control_inputs_version` (1) is
+withdrawn and restored with the other markers, and `frameworks_version` (1) only
+by a sync that re-extracts for a framework change. Which files each kind reads,
+and what a sync re-reads and re-resolves when one moves, is in
+[`architecture.md`](architecture.md#daemon-and-watch-lifecycle). They are not a
+canonical surface.
+
 `synthesis_version` (23) vouches that the synthesized edges are the synthesis
 stage's output over the current base graph and the files it read beside the
 index. A full index and a migration write it after the stage. A sync withdraws

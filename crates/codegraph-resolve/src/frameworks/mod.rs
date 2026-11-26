@@ -11,9 +11,11 @@
 //! and Nuxt ([`vue`]), NestJS ([`nestjs`]), Godot ([`godot`]), Tauri
 //! ([`tauri`]), Go's server frameworks ([`go`]), GoFrame ([`goframe`]),
 //! Rust's axum and actix routes and Cargo workspace crates ([`rust`],
-//! [`cargo_workspace`]), ASP.NET ([`aspnet`]) and SwiftUI, UIKit and Vapor
-//! ([`swift`]). The other upstream resolvers remain deferred (see
-//! `KNOWN_DIFFS.md`).
+//! [`cargo_workspace`]), ASP.NET ([`aspnet`]), SwiftUI, UIKit and Vapor
+//! ([`swift`]), the React Native bridge ([`react_native`]), Expo modules
+//! ([`expo_modules`]), the Swift–Objective-C bridge ([`swift_objc`]),
+//! Fabric's view components ([`fabric`]) and Terraform ([`terraform`]).
+//! Upstream's CICS resolver stays out with COBOL (see `KNOWN_DIFFS.md`).
 //!
 //! [`detect_frameworks`] ports `frameworks/index.ts:detectFrameworks` restricted
 //! to the ported resolvers; the orchestrator hands the detected list to

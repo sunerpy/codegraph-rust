@@ -87,9 +87,10 @@ colby behaviors are intentionally NOT ported in v1:
   passes, the cross-tier and test-request passes (`tier-synthesizer.ts`), the
   React Native event-channel, Fabric native-view, Expo cross-platform and
   React Native cross-platform passes, the Vue and Angular template passes,
-  the SvelteKit loader and page
-  passes, the Expo Router return pass and the Next.js, React Router, TanStack
-  Router, Vue Router and SvelteKit link passes, and the Go prerequisites
+  the SvelteKit loader and page passes, the ArkUI state, emitter and route
+  passes, the Erlang behaviour pass, the Nix option-path pass, the Expo
+  Router return pass and the Next.js, React Router, TanStack Router, Vue
+  Router and SvelteKit link passes, and the Go prerequisites
   (`go-method-contains`, `go-implements`) are ported
   (`crates/codegraph-resolve/src/synthesis/`); the others draw no edge here
   yet. colby reads no Expo Router `<Link href>`, `<Redirect href>` or
@@ -183,9 +184,11 @@ confined to `codegraph_explore` and `codegraph_status`.
   (kind-weighted scores, the generated, ambient and low-value damping, the
   relative floor, Random-Walk-with-Restart graph relevance, the relevance
   gate, the #1064 buried-type rescue and the comparator with its multi-term
-  corroboration tier). It opens with the same Flow section, weighs the Flow's
-  spine in clusters and windows, and collapses off-spine polymorphic siblings
-  to signatures (`adaptiveExplore`). The `Found` line counts the files whose
+  corroboration tier). It opens with the same Flow section, follows it with
+  the "Dynamic-dispatch links among your symbols" section as `e8ddc4e2`
+  prints it (#2748, #2751), weighs the Flow's spine in clusters and windows,
+  and collapses off-spine polymorphic siblings to signatures
+  (`adaptiveExplore`). The `Found` line counts the files whose
   source the response shows and their listed symbols (#1046), as colby's does.
   - The entry points are the Rust search's eight best matches of colby's
     high-value kinds; colby's multi-channel search in `findRelevantContext`
@@ -203,8 +206,10 @@ confined to `codegraph_explore` and `codegraph_status`.
   - The Flow builder's own dynamic-boundary and polymorphic-dispatch
     announcements are not ported; the port's boundary scan over the explore
     seeds runs instead.
-  - The low-value files are `b635dd46`'s `isLowValue` patterns; colby has since
-    moved explore onto its engine-wide test predicate (#2557).
+  - The low-value files (the hard filter drops them, and a link into one
+    through an end the query did not name goes last) are `b635dd46`'s
+    `isLowValue` patterns; colby has since moved explore onto its engine-wide
+    test predicate (#2557, `PARTIAL` in the 2026-10-22 audit).
   - Left for the next round: #2557, #2655, #2783, #2750 and #2789, and the
     dominant file's directory boost (#2575, #2785). `getTopRouteFile` is N/A:
     nothing in explore reads it.

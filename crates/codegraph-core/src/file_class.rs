@@ -239,8 +239,9 @@ fn contains_path_segment(path: &str, segment: &str) -> bool {
 /// the whole path is equivalent — and case-sensitive, matching upstream's lack
 /// of an `i` flag (`Grpc.cs`, `OuterClass.java`).
 ///
-/// Mockgen's DEFAULT `mock_<src>.go` output is NOT here: upstream anchors it to
-/// the basename (`/^mock_[^/]+\.go$/`), so it needs [`is_mockgen_default_output`].
+/// Mockgen's DEFAULT `mock_<src>.go` output is NOT here: it is a prefix, not a
+/// suffix (upstream's `/^mock_[^/]+\.go$/`, tested against the whole path), so
+/// it needs [`is_mockgen_default_output`].
 const GENERATED_SUFFIXES: &[&str] = &[
     // Go — protobuf / gRPC / pulsar
     ".pb.go",

@@ -13,11 +13,11 @@
 //! React Native bridge, Expo modules (their JavaScript side and their Swift
 //! and Kotlin declarations), Expo Router, Go, GoFrame, Rust (axum, actix and
 //! Cargo workspaces), ASP.NET, SwiftUI, UIKit, Vapor, the Swift↔Objective-C
-//! bridge and Fabric's view components in [`crate::frameworks`], detected
-//! per-project by [`crate::frameworks::detect_frameworks`]. The others
-//! (Terraform's and CICS's) stay deferred (see `KNOWN_DIFFS.md`): they are an
-//! additive heuristic layer on top of the deterministic import + name-matching
-//! core, and porting them is tracked as future work.
+//! bridge, Fabric's view components and Terraform in [`crate::frameworks`],
+//! detected per-project by [`crate::frameworks::detect_frameworks`]. CICS's
+//! stays out with COBOL (see `KNOWN_DIFFS.md`). The resolvers are an
+//! additive heuristic layer on top of the deterministic import +
+//! name-matching core.
 //!
 //! The detected implementations participate in
 //! [`crate::resolver::ReferenceResolver::resolve_one`] exactly where the upstream's
@@ -84,9 +84,7 @@ impl FrameworkExtractionContext {
 /// Ports the upstream `FrameworkResolver` interface (`types.ts:157-197`). Every
 /// method maps 1:1 to an upstream field; `Option`-returning methods model the upstream
 /// `?:` optionals. The implementations live in [`crate::frameworks`]; the
-/// trait remains the seam through which
-/// the remaining upstream resolvers (Java/React-Native/Swift-ObjC/…) can
-/// be added later.
+/// trait remains the seam through which a further resolver is added.
 pub trait FrameworkResolver: Sync {
     /// `FrameworkResolver` name (`name`, `types.ts:159`).
     fn name(&self) -> &str;
