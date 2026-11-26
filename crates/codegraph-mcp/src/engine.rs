@@ -3912,6 +3912,40 @@ impl CodeGraphEngine {
         self.find_relevant_context_with_pins(query, &[], &ExactTargets::default())
     }
 
+    /// Explore's entry-point search: the Rust search's top eight matches of
+    /// upstream's high-value kinds ([`HIGH_VALUE_KINDS`]), with the
+    /// identifier-segment seeds, in rank order and once per id; nothing for a
+    /// blank query. Upstream's multi-channel search is not ported
+    /// (KNOWN_DIFFS).
+    fn explore_seed_search(&self, query: &str) -> anyhow::Result<Vec<Node>> {
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let seed_names = get_segment_matches(&self.store, &extract_segment_search_words(query), 8)
+            .into_iter()
+            .map(|matched| matched.name)
+            .collect();
+        let results = search_nodes(
+            &self.store,
+            query,
+            &SearchOptions {
+                kinds: HIGH_VALUE_KINDS.to_vec(),
+                limit: Some(8),
+                seed_names,
+                deprioritize: Some(Arc::clone(&self.deprioritize)),
+                ..Default::default()
+            },
+            &self.project_name_tokens(),
+        )?;
+        let mut entries: Vec<Node> = Vec::new();
+        for r in results {
+            if !entries.iter().any(|seen| seen.id == r.node.id) {
+                entries.push(r.node);
+            }
+        }
+        Ok(entries)
+    }
+
     fn find_relevant_context_with_pins(
         &self,
         query: &str,
@@ -3920,33 +3954,7 @@ impl CodeGraphEngine {
     ) -> anyhow::Result<ExploreSubgraph> {
         let mut sub = ExploreSubgraph::default();
 
-        let results = if query.trim().is_empty() {
-            Vec::new()
-        } else {
-            let seed_names =
-                get_segment_matches(&self.store, &extract_segment_search_words(query), 8)
-                    .into_iter()
-                    .map(|matched| matched.name)
-                    .collect();
-            search_nodes(
-                &self.store,
-                query,
-                &SearchOptions {
-                    kinds: HIGH_VALUE_KINDS.to_vec(),
-                    limit: Some(8),
-                    seed_names,
-                    deprioritize: Some(Arc::clone(&self.deprioritize)),
-                    ..Default::default()
-                },
-                &self.project_name_tokens(),
-            )?
-        };
-        let mut entries: Vec<Node> = Vec::new();
-        for r in results {
-            if !entries.iter().any(|seen| seen.id == r.node.id) {
-                entries.push(r.node);
-            }
-        }
+        let entries = self.explore_seed_search(query)?;
         // Upstream's walk from the entry points (`findRelevantContext`,
         // `context/index.ts` 1111-1306): hierarchy, breadth-first walk, trims,
         // caps and the edges among what was kept. `isTestQuery` is a plain
@@ -3957,7 +3965,12 @@ impl CodeGraphEngine {
             gathered,
             roots,
             mut reads,
-        } = explore_gather::walk(&self.store, &entries, test_query)?;
+        } = explore_gather::walk(
+            &self.store,
+            &entries,
+            test_query,
+            explore_gather::EXPLORE_WALK,
+        )?;
         for node in gathered.nodes {
             sub.insert(node);
         }
@@ -14697,6 +14710,125 @@ mod tests {
             sub.node(&value.id).is_none(),
             "a property is not walked into the subgraph"
         );
+    }
+
+    // === W9-01a: the walk takes its limits ==================================
+
+    /// Three entry points in rank order, `alphaStep` (`src/alpha.ts`),
+    /// `betaStep` (`src/beta.ts`) and `gammaStep` (`src/gamma.ts`), and the
+    /// chain `alphaStep → alphaHelper → alphaLeaf`.
+    fn w901a_project(engine: &mut CodeGraphEngine) -> (Vec<Node>, Node, Node) {
+        let alpha = w725_fn("alphaStep", "src/alpha.ts", 1);
+        let beta = w725_fn("betaStep", "src/beta.ts", 1);
+        let gamma = w725_fn("gammaStep", "src/gamma.ts", 1);
+        let helper = w725_fn("alphaHelper", "src/alpha_helper.ts", 1);
+        let leaf = w725_fn("alphaLeaf", "src/alpha_leaf.ts", 1);
+        put_nodes(
+            engine,
+            &[
+                alpha.clone(),
+                beta.clone(),
+                gamma.clone(),
+                helper.clone(),
+                leaf.clone(),
+            ],
+        );
+        put_edges(
+            engine,
+            &[
+                w725_edge_at(&alpha, &helper, EdgeKind::Calls, 2),
+                w725_edge_at(&helper, &leaf, EdgeKind::Calls, 2),
+            ],
+        );
+        (vec![alpha, beta, gamma], helper, leaf)
+    }
+
+    fn w901a_ids(nodes: &[Node]) -> Vec<&str> {
+        nodes.iter().map(|node| node.id.as_str()).collect()
+    }
+
+    /// W9-01a: a budget of one node keeps the first entry point alone; the
+    /// others stay entry points the subgraph no longer holds, as upstream's
+    /// trim leaves its `roots`.
+    #[test]
+    fn w901a_walk_at_one_node_keeps_the_first_entry_point() {
+        let mut engine = test_engine();
+        let (entries, _, _) = w901a_project(&mut engine);
+        let walk = explore_gather::walk(
+            &engine.store,
+            &entries,
+            false,
+            explore_gather::WalkLimits {
+                max_nodes: 1,
+                depth: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            w901a_ids(&walk.gathered.nodes),
+            vec![entries[0].id.as_str()]
+        );
+        assert_eq!(
+            walk.roots,
+            entries.iter().map(|n| n.id.clone()).collect::<Vec<_>>()
+        );
+        assert!(walk.gathered.edges.is_empty(), "{:?}", walk.gathered.edges);
+    }
+
+    /// W9-01a: a walk of depth one stops one hop out; explore's three hops
+    /// reach the leaf.
+    #[test]
+    fn w901a_walk_at_depth_one_stops_one_hop_out() {
+        let mut engine = test_engine();
+        let (entries, helper, leaf) = w901a_project(&mut engine);
+        let one_hop = explore_gather::walk(
+            &engine.store,
+            &entries,
+            false,
+            explore_gather::WalkLimits {
+                max_nodes: 20,
+                depth: 1,
+            },
+        )
+        .unwrap();
+        let ids = w901a_ids(&one_hop.gathered.nodes);
+        assert!(ids.contains(&helper.id.as_str()), "{ids:?}");
+        assert!(!ids.contains(&leaf.id.as_str()), "{ids:?}");
+        let explore =
+            explore_gather::walk(&engine.store, &entries, false, explore_gather::EXPLORE_WALK)
+                .unwrap();
+        assert!(
+            w901a_ids(&explore.gathered.nodes).contains(&leaf.id.as_str()),
+            "{:?}",
+            w901a_ids(&explore.gathered.nodes)
+        );
+    }
+
+    /// W9-01a: explore walks at upstream explore's limits (`maxNodes` 200,
+    /// `traversalDepth` 3) from its own search's seeds: its subgraph opens
+    /// with that walk's nodes, in their order, and keeps its entry points.
+    #[test]
+    fn w901a_explore_walks_its_seeds_at_explore_s_limits() {
+        assert_eq!(
+            explore_gather::EXPLORE_WALK,
+            explore_gather::WalkLimits {
+                max_nodes: 200,
+                depth: 3,
+            }
+        );
+        let mut engine = test_engine();
+        let (_, _, leaf) = w901a_project(&mut engine);
+        let query = "alphaStep betaStep gammaStep";
+        let seeds = engine.explore_seed_search(query).unwrap();
+        assert!(seeds.len() >= 3, "{:?}", w901a_ids(&seeds));
+        let walk = explore_gather::walk(&engine.store, &seeds, false, explore_gather::EXPLORE_WALK)
+            .unwrap();
+        let sub = engine.find_relevant_context(query).unwrap();
+        assert_eq!(sub.roots, walk.roots);
+        let walked = w901a_ids(&walk.gathered.nodes);
+        assert_eq!(&w901a_ids(&sub.nodes)[..walked.len()], walked.as_slice());
+        assert!(walked.contains(&leaf.id.as_str()), "{walked:?}");
+        assert!(engine.explore_seed_search("  ").unwrap().is_empty());
     }
 
     /// W7-25a: at most ⌈200 × 0.2⌉ = 40 nodes of one file stay in the

@@ -49,11 +49,21 @@ pub(crate) const HIGH_VALUE_KINDS: [NodeKind; 15] = [
     NodeKind::Namespace,
 ];
 
-/// Explore's `maxNodes` (`tools.ts` b635dd46 4256-4261).
-const MAX_NODES: usize = 200;
+/// The walk's node budget and depth: upstream `findRelevantContext`'s
+/// `maxNodes` and `traversalDepth`, which each caller passes (explore
+/// [`EXPLORE_WALK`], `codegraph context` its own options).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalkLimits {
+    pub(crate) max_nodes: usize,
+    pub(crate) depth: usize,
+}
 
-/// Explore's `traversalDepth`.
-const TRAVERSAL_DEPTH: usize = 3;
+/// Explore's limits: `maxNodes` 200, `traversalDepth` 3 (`tools.ts` b635dd46
+/// 4256-4261).
+pub(crate) const EXPLORE_WALK: WalkLimits = WalkLimits {
+    max_nodes: 200,
+    depth: 3,
+};
 
 /// The kinds whose type hierarchy is expanded before the walk
 /// (`typeHierarchyKinds`, `context/index.ts` 1115).
@@ -267,9 +277,15 @@ impl WalkReads {
 }
 
 /// Upstream's walk from the entry points `roots` (in rank order), the steps
-/// of `context/index.ts` 1111-1306. `test_query` is upstream's `isTestQuery`:
-/// the query mentions `test` or `spec` anywhere (`context/index.ts` 713).
-pub(crate) fn walk(store: &Store, roots: &[Node], test_query: bool) -> anyhow::Result<Walk> {
+/// of `context/index.ts` 1111-1306, within `limits`. `test_query` is
+/// upstream's `isTestQuery`: the query mentions `test` or `spec` anywhere
+/// (`context/index.ts` 713).
+pub(crate) fn walk(
+    store: &Store,
+    roots: &[Node],
+    test_query: bool,
+    limits: WalkLimits,
+) -> anyhow::Result<Walk> {
     let mut gathered = Gathered::default();
     let mut root_ids: Vec<String> = Vec::new();
     for root in roots {
@@ -277,11 +293,11 @@ pub(crate) fn walk(store: &Store, roots: &[Node], test_query: bool) -> anyhow::R
             root_ids.push(root.id.clone());
         }
     }
-    expand_type_hierarchies(store, &mut gathered, &root_ids)?;
-    let per_root = MAX_NODES.div_ceil(root_ids.len().max(1));
+    expand_type_hierarchies(store, &mut gathered, &root_ids, limits.max_nodes)?;
+    let per_root = limits.max_nodes.div_ceil(root_ids.len().max(1));
     let mut reads = WalkReads::default();
     for root in roots {
-        let (nodes, edges) = breadth_first(store, root, TRAVERSAL_DEPTH, per_root, &mut reads)?;
+        let (nodes, edges) = breadth_first(store, root, limits.depth, per_root, &mut reads)?;
         for node in nodes {
             gathered.insert(node);
         }
@@ -289,10 +305,10 @@ pub(crate) fn walk(store: &Store, roots: &[Node], test_query: bool) -> anyhow::R
             gathered.add_edge(edge);
         }
     }
-    trim_to_budget(&mut gathered, &root_ids);
-    cap_per_file(&mut gathered, &root_ids);
+    trim_to_budget(&mut gathered, &root_ids, limits.max_nodes);
+    cap_per_file(&mut gathered, &root_ids, limits.max_nodes);
     if !test_query {
-        cap_non_production(&mut gathered, &mut root_ids);
+        cap_non_production(&mut gathered, &mut root_ids, limits.max_nodes);
     }
     gathered.retain_edges();
     let ids: Vec<String> = gathered.nodes.iter().map(|node| node.id.clone()).collect();
@@ -314,8 +330,9 @@ fn expand_type_hierarchies(
     store: &Store,
     gathered: &mut Gathered,
     root_ids: &[String],
+    max_nodes: usize,
 ) -> anyhow::Result<()> {
-    let budget = MAX_NODES.div_ceil(4);
+    let budget = max_nodes.div_ceil(4);
     let mut added = 0usize;
     for root in root_ids {
         if added >= budget {
@@ -547,8 +564,8 @@ fn other_end<'e>(edge: &'e Edge, from: &str) -> &'e str {
 /// Past `maxNodes`, the entry points and the nodes one edge from the kept
 /// set come first (the set grows while the edges are read once, in order),
 /// then the rest in gather order (`context/index.ts` 1197-1233).
-fn trim_to_budget(gathered: &mut Gathered, root_ids: &[String]) {
-    if gathered.len() <= MAX_NODES {
+fn trim_to_budget(gathered: &mut Gathered, root_ids: &[String], max_nodes: usize) {
+    if gathered.len() <= max_nodes {
         return;
     }
     let mut priority: Vec<String> = Vec::new();
@@ -568,7 +585,7 @@ fn trim_to_budget(gathered: &mut Gathered, root_ids: &[String]) {
     }
     let mut keep: HashSet<String> = HashSet::new();
     for id in &priority {
-        if keep.len() >= MAX_NODES {
+        if keep.len() >= max_nodes {
             break;
         }
         if gathered.contains(id) {
@@ -576,7 +593,7 @@ fn trim_to_budget(gathered: &mut Gathered, root_ids: &[String]) {
         }
     }
     for node in &gathered.nodes {
-        if keep.len() >= MAX_NODES {
+        if keep.len() >= max_nodes {
             break;
         }
         keep.insert(node.id.clone());
@@ -609,8 +626,8 @@ fn trim_to_budget(gathered: &mut Gathered, root_ids: &[String]) {
 /// At most `max(5, ⌈maxNodes × 0.2⌉)` nodes of one file: entry points, then
 /// type declarations, then callables, then the rest, each group in gather
 /// order (`context/index.ts` 1235-1266).
-fn cap_per_file(gathered: &mut Gathered, root_ids: &[String]) {
-    let cap = 5usize.max((MAX_NODES as f64 * 0.2).ceil() as usize);
+fn cap_per_file(gathered: &mut Gathered, root_ids: &[String], max_nodes: usize) {
+    let cap = 5usize.max((max_nodes as f64 * 0.2).ceil() as usize);
     let mut by_file: Vec<(String, Vec<usize>)> = Vec::new();
     let mut file_at: HashMap<String, usize> = HashMap::new();
     for (at, node) in gathered.nodes.iter().enumerate() {
@@ -669,8 +686,8 @@ fn kind_priority(kind: NodeKind) -> u32 {
 /// At most `max(3, ⌈maxNodes × 0.15⌉)` nodes of non-production files (tests,
 /// examples, fixtures: the engine's wide test predicate), in gather order; an
 /// entry point dropped here stops being one (`context/index.ts` 1267-1283).
-fn cap_non_production(gathered: &mut Gathered, root_ids: &mut Vec<String>) {
-    let cap = 3usize.max((MAX_NODES as f64 * 0.15).ceil() as usize);
+fn cap_non_production(gathered: &mut Gathered, root_ids: &mut Vec<String>, max_nodes: usize) {
+    let cap = 3usize.max((max_nodes as f64 * 0.15).ceil() as usize);
     let non_production: Vec<String> = gathered
         .nodes
         .iter()
