@@ -7708,6 +7708,59 @@ pub fn rust_last_source_under_a_nested_manifest_leaves_its_crate_outside() -> Ca
         .no_edge_after("function make", "references", "struct Thing")
 }
 
+/// The manifest beside [`rust_cargo_drive_letter_directory_source_appears`]'s
+/// `.rs` file: it would make `futures` an outside crate, were it read.
+#[cfg(unix)]
+const DRIVE_NAMED_MANIFEST: &str =
+    "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n\n[dependencies]\nfutures = \"0.3\"\n";
+
+/// X08 (OD-B15): the drive-letter analog of
+/// [`rust_first_source_under_a_nested_manifest_makes_its_crate_the_projects`].
+/// On Unix `C:outside` is an ordinary directory name, but a path that starts
+/// with a Windows drive's name is never probed for a `Cargo.toml`, as none is
+/// for a `go.mod`: an intentional over-rejection. The first `.rs` file there
+/// leaves its manifest unread, so the dependency it declares never makes the
+/// imported name an outside item, and each sync, its control-input rows
+/// included, equals a fresh index.
+#[cfg(unix)]
+pub fn rust_cargo_drive_letter_directory_source_appears() -> Case {
+    Case::new(Change::AddImportTarget, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("C:outside/Cargo.toml", DRIVE_NAMED_MANIFEST)
+        .file("src/lib.rs", "mod stream;\nmod source;\n")
+        .file("src/stream.rs", "pub trait Stream {}\n")
+        .file(
+            "src/source.rs",
+            "use futures::Stream;\n\npub fn drain(s: impl Stream) {\n    let _ = s;\n}\n",
+        )
+        .write("C:outside/x.rs", "pub fn outside() {}\n")
+        .edge_throughout("function drain", "references", "trait Stream")
+}
+
+/// X08 (OD-B15): the last `.rs` file under the drive-named directory
+/// leaving, its manifest still unread before and after.
+#[cfg(unix)]
+pub fn rust_cargo_drive_letter_directory_source_leaves() -> Case {
+    Case::new(Change::DeleteImportedModule, &[Language::Rust])
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .file("C:outside/Cargo.toml", DRIVE_NAMED_MANIFEST)
+        .file("C:outside/x.rs", "pub fn outside() {}\n")
+        .file("src/lib.rs", "mod stream;\nmod source;\n")
+        .file("src/stream.rs", "pub trait Stream {}\n")
+        .file(
+            "src/source.rs",
+            "use futures::Stream;\n\npub fn drain(s: impl Stream) {\n    let _ = s;\n}\n",
+        )
+        .remove("C:outside/x.rs")
+        .edge_throughout("function drain", "references", "trait Stream")
+}
+
 pub fn dart_delete_an_imported_library() -> Case {
     Case::new(Change::DeleteImportedModule, &[Language::Dart])
         .file(

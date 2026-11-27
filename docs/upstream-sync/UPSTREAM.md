@@ -72,10 +72,9 @@
     only the files that changed (OD-B8), and a sync that keeps a routes file's
     unchanged route nodes, references and edges instead of rewriting them all
     (W7-19e), both by OD-B89;
-  - three older differences (OD-B15): signatures cut by bytes where upstream
-    counts UTF-16 units, `rust_manifest_inputs` letting a drive-letter path
-    through, and a Python module-level assignment's right-hand call not owned
-    by the name it assigns;
+  - two older differences (OD-B15): signatures cut by bytes where upstream
+    counts UTF-16 units, and a Python module-level assignment's right-hand
+    call not owned by the name it assigns;
   - skipping `addons` only in Godot projects (OD-B17);
   - explore's engine-wide test predicate, #2557 (OD-B23), the dominant file's
     boost, #2575 and #2785 (OD-B55), and #2655, #2750, #2783 and #2789, which

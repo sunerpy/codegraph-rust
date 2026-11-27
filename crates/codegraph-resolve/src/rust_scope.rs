@@ -30,17 +30,20 @@ pub struct RustCrates {
 
 /// The project-relative `Cargo.toml` paths [`load_rust_crates`] reads for
 /// `files`: the root's, and one in every directory at or above an indexed
-/// `.rs` file, a missing one included, sorted (W5-06 compares them).
+/// `.rs` file, a missing one included, sorted (W5-06 compares them). A file
+/// path that could leave the project root lexically (rooted, UNC, a Windows
+/// drive's, or `..` above the root) is skipped, by the rule
+/// `pathutil::lexical_path_within_root` applies, and the others are read
+/// normalized, so no probe leaves the root and the walk up ends.
 pub fn rust_manifest_inputs(files: &[String]) -> Vec<String> {
     let mut dirs: BTreeSet<String> = BTreeSet::from([String::new()]);
     for file in files {
-        let file = file.replace('\\', "/");
-        if !file.ends_with(".rs")
-            || file.starts_with('/')
-            || file.split('/').any(|segment| segment == "..")
-        {
+        if !file.ends_with(".rs") {
             continue;
         }
+        let Some(file) = pathutil::lexical_relative(file) else {
+            continue;
+        };
         let mut dir = pathutil::dirname(&file);
         while !dir.is_empty() {
             dirs.insert(dir.clone());
@@ -67,13 +70,17 @@ pub fn no_rust_crates() -> Arc<RustCrates> {
 /// The crates of every `Cargo.toml` at or above an indexed `.rs` file, the
 /// root's included (upstream `rustProjectCrates` / `rustDependencyCrates`,
 /// which read the root manifest and its workspace members). Only a directory
-/// of a project-relative path is probed, and each manifest is read as a source
-/// file is: a regular file within the size limit, stat first.
+/// of a project-relative path is probed, joined to the root under the rule
+/// [`rust_manifest_inputs`] already applies, and each manifest is read as a
+/// source file is: a regular file within the size limit, stat first.
 pub fn load_rust_crates(project_root: &str, files: &[String]) -> RustCrates {
     let mut crates = RustCrates::default();
     for relative in rust_manifest_inputs(files) {
+        let Some(path) = pathutil::lexical_path_within_root(project_root, &relative) else {
+            continue;
+        };
         let Some(text) = crate::context::read_source_file(
-            &std::path::Path::new(project_root).join(&relative),
+            &path,
             &relative,
             codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
         ) else {
@@ -723,6 +730,98 @@ mod tests {
             ]
         );
         assert_eq!(rust_manifest_inputs(&[]), ["Cargo.toml"]);
+    }
+
+    /// X08 (OD-B15): the inputs `go_module_inputs` is tested with, `.go`
+    /// read as `.rs`. No path that could leave the project is probed: rooted,
+    /// UNC, a Windows drive's, absolute or drive-relative, or `..` above the
+    /// root; the others are probed normalized, so every input is a
+    /// project-relative path `pathutil::lexical_relative` keeps as it is.
+    #[test]
+    fn rust_manifest_inputs_skip_paths_that_could_leave_the_root() {
+        let inputs = rust_manifest_inputs(&[
+            "svc/api/handler.rs".to_string(),
+            "svc\\cli\\main.rs".to_string(),
+            "web/app.ts".to_string(),
+            "a/../b/z.rs".to_string(),
+            "/abs/x.rs".to_string(),
+            "\\rooted\\x.rs".to_string(),
+            "\\\\server\\share\\x.rs".to_string(),
+            "C:\\outside\\x.rs".to_string(),
+            "C:/outside/x.rs".to_string(),
+            "C:outside\\x.rs".to_string(),
+            "./C:/outside/x.rs".to_string(),
+            "a\\..\\C:\\outside\\x.rs".to_string(),
+            "../out/y.rs".to_string(),
+            "a/../../out/y.rs".to_string(),
+        ]);
+        assert_eq!(
+            inputs,
+            [
+                "Cargo.toml",
+                "b/Cargo.toml",
+                "svc/Cargo.toml",
+                "svc/api/Cargo.toml",
+                "svc/cli/Cargo.toml",
+            ]
+        );
+        for input in &inputs {
+            assert_eq!(
+                pathutil::lexical_relative(input).as_deref(),
+                Some(input.as_str()),
+                "{input} is not a normalized project-relative path"
+            );
+        }
+    }
+
+    /// X08 (OD-B15): on Unix `C:outside` is an ordinary directory name, so
+    /// the manifest in it is inside the root. It is not read all the same, as
+    /// `go_module_inputs` reads no `go.mod` there: an intentional
+    /// over-rejection of a path that names a Windows drive, not an escape.
+    /// Windows allows no `:` in a file name, so there no indexed path has
+    /// this shape.
+    #[cfg(unix)]
+    #[test]
+    fn load_rust_crates_over_rejects_a_unix_directory_named_like_a_drive() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cg-rust-crates-drive-name-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("C:outside")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n\n[dependencies]\nanyhow = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("C:outside/Cargo.toml"),
+            "[package]\nname = \"escaped\"\n\n[dependencies]\nfutures = \"0.3\"\n",
+        )
+        .unwrap();
+        let files = ["src/main.rs", "C:outside/x.rs"].map(String::from);
+        let crates = load_rust_crates(root.to_str().unwrap(), &files);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            crates
+                .project
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["app"]
+        );
+        assert_eq!(
+            crates
+                .dependencies
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["anyhow"]
+        );
     }
 
     #[test]
