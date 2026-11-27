@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.56.1](https://github.com/sunerpy/codegraph-rust/compare/v0.56.0...v0.56.1) (2026-11-27)
+
+
+### Bug Fixes
+
+* **daemon:** shut sessions down through live streams and drop the deprecated split halves ([#354](https://github.com/sunerpy/codegraph-rust/issues/354)) ([9ff6295](https://github.com/sunerpy/codegraph-rust/commit/9ff62954749e0a7245307fcac57678d19ebd5e61))
+* **deps:** take rustix 1.1.6 for RUSTSEC-2026-0486 and replace the yanked chacha20 0.10.1 ([#348](https://github.com/sunerpy/codegraph-rust/issues/348)) ([cdcee53](https://github.com/sunerpy/codegraph-rust/commit/cdcee538a6873b7721cf26c7b00109e4f8f1484a))
+* **mcp:** ask the user before initializing a project that has no index ([#351](https://github.com/sunerpy/codegraph-rust/issues/351)) ([47f3e82](https://github.com/sunerpy/codegraph-rust/commit/47f3e8218571fea2835ba0e0068249b4b83ce03c))
+* **resolve:** a paths wildcard whose prefix and suffix overlap an import no longer panics ([#358](https://github.com/sunerpy/codegraph-rust/issues/358)) ([17af313](https://github.com/sunerpy/codegraph-rust/commit/17af313206c572e788fcbbfda5ba3e10035e5d1f))
+* **resolve:** keep the Cargo manifests resolution reads inside the project root ([#349](https://github.com/sunerpy/codegraph-rust/issues/349)) ([1c579c0](https://github.com/sunerpy/codegraph-rust/commit/1c579c00680134e74039d4c4e5e23ecf45d83421))
+
 ## [0.56.0](https://github.com/sunerpy/codegraph-rust/compare/v0.55.2...v0.56.0) (2026-11-26)
 
 
