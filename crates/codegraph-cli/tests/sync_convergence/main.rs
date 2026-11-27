@@ -2605,6 +2605,27 @@ matrix! {
     row27_a_framework_change_runs_the_stage_whole,
 }
 
+// X08 (OD-B15): Unix-only cases outside the matrix, since a directory named
+// `C:outside` exists only there. The `.rs` file under it appearing, then
+// leaving: each sync must equal a fresh index.
+#[cfg(unix)]
+#[test]
+fn rust_cargo_drive_letter_directory_source_appears() {
+    run_case(
+        "rust_cargo_drive_letter_directory_source_appears",
+        &cases::rust_cargo_drive_letter_directory_source_appears(),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_cargo_drive_letter_directory_source_leaves() {
+    run_case(
+        "rust_cargo_drive_letter_directory_source_leaves",
+        &cases::rust_cargo_drive_letter_directory_source_leaves(),
+    );
+}
+
 /// An index built before the module-surface rows existed (W4a-F3) can hold
 /// an edge an older sync left stale: such a sync re-extracted a barrel that
 /// came to forward another module and never refreshed the barrel's importers.

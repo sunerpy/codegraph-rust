@@ -111,13 +111,16 @@ pub fn db_path(root: &Path) -> PathBuf {
 }
 
 /// A fixture path stays inside its project: relative, `/`-separated, with no
-/// empty, `.` or `..` component. Returns it in the platform's own form.
+/// empty, `.` or `..` component, and no `:` except on Unix. On Windows a `:`
+/// names a drive (`C:outside`) or a stream; on Unix it is an ordinary byte of
+/// a name, which a Unix-only case may use (X08). Returns it in the platform's
+/// own form.
 #[track_caller]
 pub fn checked_relative(relative: &str) -> PathBuf {
     let plain = !relative.is_empty()
         && !relative.starts_with('/')
         && !relative.contains('\\')
-        && !relative.contains(':')
+        && (cfg!(unix) || !relative.contains(':'))
         && relative
             .split('/')
             .all(|part| !part.is_empty() && part != "." && part != "..");
