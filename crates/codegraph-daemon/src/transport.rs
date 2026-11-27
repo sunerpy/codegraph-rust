@@ -48,6 +48,13 @@ impl<T> Shared<T> {
     pub(crate) fn new(inner: T) -> Self {
         Self(Arc::new(inner))
     }
+
+    /// A handle that does not keep the stream open: it upgrades only while
+    /// some clone still holds the stream.
+    #[cfg(unix)]
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<T> {
+        Arc::downgrade(&self.0)
+    }
 }
 
 impl<T> Clone for Shared<T> {
@@ -133,6 +140,16 @@ pub(crate) fn shutdown_write(stream: &Stream) -> io::Result<()> {
     // new variant fails to compile here instead of silently skipping the shutdown.
     let Stream::UdSocket(uds) = stream;
     rustix::net::shutdown(uds, rustix::net::Shutdown::Write).map_err(io::Error::from)
+}
+
+/// Shut down both directions of an async local-socket stream, so whoever reads
+/// it, and its peer, see EOF. Unix only. The caller passes a live stream, so the
+/// shutdown reaches that socket and no other.
+#[cfg(unix)]
+pub(crate) fn shutdown_both(stream: &AsyncStream) -> io::Result<()> {
+    // The only variant on unix; see `shutdown_write`.
+    let AsyncStream::UdSocket(uds) = stream;
+    rustix::net::shutdown(uds, rustix::net::Shutdown::Both).map_err(io::Error::from)
 }
 
 /// Resolved rendezvous address for a project daemon. On unix `socket_path` is
