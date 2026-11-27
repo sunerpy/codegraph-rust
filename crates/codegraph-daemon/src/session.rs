@@ -861,6 +861,85 @@ mod tests {
         let mut empty = BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
         assert!(read_first_line_bounded(&mut empty, 64).is_empty());
     }
+
+    /// The state behind the `control_shutdown` BrokenPipe flake: a registered
+    /// session whose socket closed before its guard dropped, and another
+    /// connection that took the descriptor number the registry recorded.
+    #[cfg(unix)]
+    struct ReusedSessionFd {
+        registry: SessionRegistry,
+        guard: SessionGuard,
+        /// The recorded number, which now names `other`'s socket.
+        _number: std::os::fd::OwnedFd,
+        other: std::os::unix::net::UnixStream,
+        other_peer: std::os::unix::net::UnixStream,
+    }
+
+    #[cfg(unix)]
+    impl ReusedSessionFd {
+        fn new() -> Self {
+            use std::os::fd::{AsRawFd, OwnedFd};
+            use std::os::unix::net::UnixStream;
+
+            let registry = SessionRegistry::default();
+            let guard = registry.start_session();
+            let (session_socket, _session_peer) = UnixStream::pair().expect("session socket pair");
+            registry.set_recv_fd(guard.session_id(), session_socket.as_raw_fd());
+            // Close the session's socket and hand its number to another connection
+            // in one step: `dup2` replaces the file the number names atomically, so
+            // no other test thread can take the number in between.
+            let (other, other_peer) = UnixStream::pair().expect("other socket pair");
+            let mut number: OwnedFd = session_socket.into();
+            rustix::io::dup2(&other, &mut number)
+                .expect("point the recorded number at the other socket");
+            Self {
+                registry,
+                guard,
+                _number: number,
+                other,
+                other_peer,
+            }
+        }
+
+        /// The other connection is still open: it can write, and its peer reads
+        /// the byte it wrote.
+        fn assert_other_connection_still_open(&self) {
+            use std::io::{Read, Write};
+
+            (&self.other)
+                .write_all(b"x")
+                .expect("a socket that reused a retired session's fd number must stay open");
+            self.other_peer
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("bound the peer read");
+            let mut byte = [0u8; 1];
+            (&self.other_peer)
+                .read_exact(&mut byte)
+                .expect("the byte written on the other connection arrives");
+            assert_eq!(&byte, b"x");
+        }
+    }
+
+    /// The drain (`close_all_sessions`) must never shut down a socket that took a
+    /// retired session's fd number. On failure the other connection's write fails
+    /// with `BrokenPipe`, the error the flaky control test reported.
+    #[cfg(unix)]
+    #[test]
+    fn close_all_sessions_never_shuts_down_a_socket_that_reused_a_retired_sessions_fd() {
+        let state = ReusedSessionFd::new();
+        state.registry.close_all_sessions();
+        state.assert_other_connection_still_open();
+    }
+
+    /// The dead-client sweep (`shutdown_session`) must never shut down a socket
+    /// that took a retired session's fd number either.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_session_never_shuts_down_a_socket_that_reused_a_retired_sessions_fd() {
+        let state = ReusedSessionFd::new();
+        state.registry.shutdown_session(state.guard.session_id());
+        state.assert_other_connection_still_open();
+    }
 }
 
 #[cfg(all(test, unix))]
