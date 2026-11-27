@@ -205,6 +205,54 @@ fn an_unauthorized_frame_is_refused_without_shutting_the_daemon_down() {
     let _ = std::fs::remove_dir_all(&project);
 }
 
+/// The daemon closes a control connection once it has replied: the client's
+/// next read returns EOF (zero bytes) instead of timing out. This pins the close
+/// after a refused frame, so a dropped writer that no longer half-closes the
+/// socket, or a stray reference that keeps it open, fails here instead of
+/// leaving clients waiting.
+#[test]
+fn a_control_connection_reaches_eof_after_its_reply() {
+    let project = temp_project("eof-after-reply");
+    let paths = paths_of(&project);
+    let handle = start(&project, Duration::from_secs(10));
+    let socket = handle.socket_path().to_path_buf();
+
+    let stream = connect(&socket);
+    stream
+        .set_recv_timeout(Some(WAIT))
+        .expect("bound the control read");
+    stream
+        .set_send_timeout(Some(WAIT))
+        .expect("bound the control write");
+    let mut reader = BufReader::new(&stream);
+    let mut hello = String::new();
+    reader.read_line(&mut hello).expect("read the daemon hello");
+    let refused =
+        ControlFrame::shutdown("0000000000000000000000000000000000000000000000000000000000000000");
+    (&stream)
+        .write_all(format!("{}\n", serde_json::to_string(&refused).expect("frame json")).as_bytes())
+        .expect("send the control frame");
+    let mut ack = String::new();
+    reader.read_line(&mut ack).expect("read the control reply");
+    let ack: ControlAck = serde_json::from_str(ack.trim()).expect("decode the control reply");
+    assert!(!ack.accepted(), "a foreign identity is refused: {ack:?}");
+
+    // A read that times out returns an error here, so this only passes on EOF.
+    let mut rest = Vec::new();
+    reader
+        .read_to_end(&mut rest)
+        .expect("the answered control connection must reach EOF, not time out");
+    assert!(rest.is_empty(), "nothing follows the reply: {rest:?}");
+    drop(reader);
+    drop(stream);
+
+    let ack = send_control_frame(&socket, &ControlFrame::shutdown(paths.project_identity()));
+    assert!(ack.accepted());
+    wait_finished(&handle, "the drained daemon");
+    handle.wait().expect("the accept loop joins cleanly");
+    let _ = std::fs::remove_dir_all(&project);
+}
+
 #[test]
 fn an_exhausted_drain_budget_replies_incomplete_instead_of_success() {
     let project = temp_project("budget-exhausted");

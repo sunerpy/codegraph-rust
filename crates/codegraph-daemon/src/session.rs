@@ -8,13 +8,12 @@ use std::time::Instant;
 use anyhow::Result;
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as _;
-use interprocess::local_socket::traits::tokio::Stream as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use crate::control::{ControlAck, ControlFrame, encode_control_line, parse_control_frame};
-use crate::transport::{AsyncStream, Stream};
+use crate::transport::{AsyncStream, Shared, Stream};
 
 /// Max milliseconds the PROXY waits for the daemon's one-line versioned hello
 /// after connecting, before giving up so the caller falls back to direct
@@ -368,13 +367,13 @@ pub struct DaemonHello<'a> {
 /// parse recorded BEFORE serving, force-close reap via the recorded recv fd
 /// (unix), and no lost/duplicated bytes at the hello seam.
 ///
-/// The recv half is split with interprocess's OWN async split (not
-/// `tokio::io::split`) so its unix `AsFd` raw fd can be recorded for the
-/// pid-sweep force-close; the (hello-consumed) recv remainder is re-chained via
-/// [`tokio::io::AsyncReadExt::chain`] and joined with the send half into one
-/// async transport handed to the standard rmcp serve. On non-unix the recv fd is
-/// not recorded (no `SHUT_RDWR`), so the half-dead-peer force-close reap is
-/// unix-only; ordinary disconnects still reap via async EOF everywhere.
+/// The reader and the writer are two clones of one [`Shared`] stream (the
+/// replacement for interprocess's deprecated split). On unix the socket's raw
+/// fd is recorded for the pid-sweep force-close; the (hello-consumed) reader is
+/// re-chained via [`tokio::io::AsyncReadExt::chain`] and joined with the writer
+/// into one async transport handed to the standard rmcp serve. On non-unix the
+/// fd is not recorded (no `SHUT_RDWR`), so the half-dead-peer force-close reap
+/// is unix-only; ordinary disconnects still reap via async EOF everywhere.
 pub(crate) async fn serve_session_async(
     stream: AsyncStream,
     project_root: PathBuf,
@@ -387,17 +386,16 @@ pub(crate) async fn serve_session_async(
     let guard = registry.start_session();
     let session_id = guard.session_id();
 
-    let (recv, mut send) = stream.split();
-
+    let stream = Shared::new(stream);
     #[cfg(unix)]
     {
-        use interprocess::local_socket::tokio::RecvHalf;
         use std::os::fd::{AsFd, AsRawFd};
-        #[allow(irrefutable_let_patterns)]
-        if let RecvHalf::UdSocket(uds) = &recv {
-            registry.set_recv_fd(session_id, uds.as_fd().as_raw_fd());
-        }
+        // `UdSocket` is the only variant on unix.
+        let AsyncStream::UdSocket(uds) = &*stream;
+        registry.set_recv_fd(session_id, uds.as_fd().as_raw_fd());
     }
+    let mut send = stream.clone();
+    let recv = stream;
 
     let version = hello_version();
     let hello = DaemonHello {
@@ -483,7 +481,7 @@ pub(crate) async fn serve_session_async(
 /// authorized frame hands the request to the accept loop, waits for the loop's
 /// post-drain signal, writes the ACK, and reports completion.
 async fn serve_control_frame(
-    mut send: crate::transport::AsyncSendHalf,
+    mut send: Shared<AsyncStream>,
     frame: &ControlFrame,
     control: Option<&ControlHandle>,
 ) -> Result<()> {
@@ -536,12 +534,12 @@ fn refusal_line(frame: &ControlFrame) -> String {
 
 /// Async analog of [`read_first_line_bounded`]: read from `recv` up to and
 /// including the first `\n`, or `max` bytes, whichever comes first. Returns the
-/// raw bytes read plus the (unconsumed) recv half so the caller can chain the
+/// raw bytes read plus the (unconsumed) reader so the caller can chain the
 /// put-back bytes in front of it. One-byte reads consume EXACTLY the first line.
 async fn read_first_line_bounded_async(
-    mut recv: crate::transport::AsyncRecvHalf,
+    mut recv: Shared<AsyncStream>,
     max: usize,
-) -> (Vec<u8>, crate::transport::AsyncRecvHalf) {
+) -> (Vec<u8>, Shared<AsyncStream>) {
     let mut buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     while buf.len() < max {
