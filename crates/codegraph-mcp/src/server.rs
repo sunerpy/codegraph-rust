@@ -1329,6 +1329,11 @@ mod tests {
             text.contains("No indexed project resolved"),
             "unresolved (raw=None) message, got: {text}"
         );
+        assert!(
+            text.contains("offer to run `codegraph init .`")
+                && text.contains("do not run it without the user's consent"),
+            "the guidance offers init and asks for the user's consent (#269), got: {text}"
+        );
     }
 
     #[test]
@@ -1351,6 +1356,11 @@ mod tests {
         assert!(
             text.contains("No indexed project found for projectPath"),
             "raw-project message, got: {text}"
+        );
+        assert!(
+            text.contains("offer to run `codegraph init .`")
+                && text.contains("do not run it without the user's consent"),
+            "the error offers init and asks for the user's consent (#269), got: {text}"
         );
     }
 

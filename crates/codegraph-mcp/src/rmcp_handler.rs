@@ -1543,6 +1543,11 @@ mod handler_tests {
                 text.contains("No indexed project found for projectPath"),
                 "bad-projectPath message, got: {text}"
             );
+            assert!(
+                text.contains("offer to run `codegraph init .`")
+                    && text.contains("do not run it without the user's consent"),
+                "the error offers init and asks for the user's consent (#269), got: {text}"
+            );
             let _ = client.cancel().await;
             let _ = task.await;
         });

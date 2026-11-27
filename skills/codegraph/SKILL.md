@@ -65,6 +65,11 @@ also escalate through `sync`; do not jump to a forced rebuild merely because the
 CLI version changed. Follow the exact recovery command printed by `status` or the
 failed command.
 
+A project with no CodeGraph index yet is not a recovery case. Creating its index
+is the user's decision: tell the user the project has no index yet, offer to run
+`codegraph init .` in the project directory, and do not run it without the
+user's consent.
+
 Missing index-state slots and an all-`OwnerMismatch` index after a project move
 or copy are supported `init` recovery cases. When `status`, `sync`, or another
 failed command explicitly prints `codegraph init ...`, run that exact command to

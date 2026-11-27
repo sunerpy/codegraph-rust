@@ -242,6 +242,11 @@ fn rmcp_does_not_adopt_unindexed_client_root() {
             text.contains("No indexed project"),
             "unindexed client root must NOT be adopted; expected no-project guidance, got: {text}"
         );
+        assert!(
+            text.contains("offer to run `codegraph init .`")
+                && text.contains("do not run it without the user's consent"),
+            "the guidance offers init and asks for the user's consent (#269), got: {text}"
+        );
 
         let _ = client.cancel().await;
         let _ = server_task.await;
@@ -298,6 +303,11 @@ fn rmcp_http_no_roots_never_adopts() {
         assert!(
             text.contains("No indexed project"),
             "http no_roots mode must NOT adopt the client's indexed root: {text}"
+        );
+        assert!(
+            text.contains("offer to run `codegraph init .`")
+                && text.contains("do not run it without the user's consent"),
+            "the HTTP guidance offers init and asks for the user's consent (#269), got: {text}"
         );
 
         let _ = client.cancel().await;

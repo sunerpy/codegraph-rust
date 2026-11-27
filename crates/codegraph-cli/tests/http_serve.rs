@@ -390,6 +390,11 @@ fn serve_http_global_without_projectpath_returns_actionable_error() {
         resp.contains("No indexed project resolved"),
         "global mode without projectPath must return the actionable resolve error: {resp}"
     );
+    assert!(
+        resp.contains("offer to run `codegraph init .`")
+            && resp.contains("do not run it without the user's consent"),
+        "the error offers init and asks for the user's consent (#269): {resp}"
+    );
 }
 
 /// Spawn `serve --http --path <indexed>` with `CODEGRAPH_DEBUG` set to `debug`
