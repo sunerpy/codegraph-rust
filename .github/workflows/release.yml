@@ -123,7 +123,9 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.build_artifacts == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    # Room for the exact-SHA wait's CI_WAIT_MINUTES of sleeping, its API calls
+    # and the earlier steps; check-ci-gate.sh requires CI_WAIT_MINUTES + 15.
+    timeout-minutes: 110
     permissions:
       actions: read
       contents: read
@@ -234,29 +236,39 @@ jobs:
         if: steps.pr_ci.outputs.accepted != 'true'
         shell: bash
         env:
+          # CI's slowest required chain is Workspace Version (10 minutes), then
+          # Windows Tests (60), then CI Success (5): 75 minutes of job limits,
+          # plus runner queueing. 90 leaves 15 for the queue; check-ci-gate.sh
+          # fails when the chain in ci.yml grows past this budget.
+          CI_WAIT_MINUTES: "90"
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ needs.release-please.outputs.release_sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Finding the push run and waiting for its CI Success share one
+          # budget: each 15-second sleep spends one of CI_WAIT_MINUTES * 4 polls.
+          polls=$((CI_WAIT_MINUTES * 4))
           run_id=""
-          for _ in $(seq 1 120); do
+          while [ "$polls" -gt 0 ]; do
             run_id=$(gh api "repos/${REPO}/actions/runs?head_sha=${HEAD_SHA}&event=push&branch=main&per_page=100" \
               --jq '[.workflow_runs[] | select(.name == "CI")] | sort_by(.created_at) | last | .id // empty')
             [ -z "$run_id" ] || break
+            polls=$((polls - 1))
             sleep 15
           done
           if [ -z "$run_id" ]; then
-            echo "::error title=Release CI::no CI push run found for ${HEAD_SHA}"
+            echo "::error title=Release CI::no CI push run found for ${HEAD_SHA} within ${CI_WAIT_MINUTES} min"
             exit 1
           fi
 
-          for _ in $(seq 1 120); do
+          while [ "$polls" -gt 0 ]; do
             job=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs?per_page=100" \
               --jq '[.jobs[] | select(.name == "CI Success")] | last // {}')
             status=$(jq -r '.status // empty' <<<"$job")
             conclusion=$(jq -r '.conclusion // empty' <<<"$job")
             if [ "$status" != completed ]; then
+              polls=$((polls - 1))
               sleep 15
               continue
             fi
@@ -267,7 +279,7 @@ jobs:
             echo "::error title=Release CI::CI Success concluded ${conclusion:-<missing>} for ${HEAD_SHA}"
             exit 1
           done
-          echo "::error title=Release CI::timed out waiting for CI Success in run ${run_id}"
+          echo "::error title=Release CI::timed out after ${CI_WAIT_MINUTES} min waiting for CI Success in run ${run_id}"
           exit 1
 
   verify:
@@ -275,7 +287,8 @@ jobs:
     needs: [release-please, source-gate]
     if: needs.release-please.outputs.build_artifacts == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The limit of ci.yml's Linux job, which runs the same make check.
+    timeout-minutes: 45
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

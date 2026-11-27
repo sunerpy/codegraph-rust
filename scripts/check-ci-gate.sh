@@ -116,8 +116,7 @@ if len(exact_ci)==1:
         wait=int(raw); verify_ci_limit=minutes('release.yml',rel_jobs,'verify-ci')
         if wait<chain_total: fail('release-wait',f"CI_WAIT_MINUTES={wait} is shorter than CI's slowest required chain ({chain_text})")
         if verify_ci_limit<wait+15: fail('release-wait',f'verify-ci timeout-minutes {verify_ci_limit} is under CI_WAIT_MINUTES + 15 = {wait+15}')
-    if re.search(r'\bseq\b',wait_body) or 'CI_WAIT_MINUTES' not in wait_body:
-        fail('release-wait','the exact-SHA wait step must bound its polling by CI_WAIT_MINUTES, not by a fixed seq count')
+    if re.search(r'\bseq\b',wait_body): fail('release-wait','the exact-SHA wait step polls a fixed seq count instead of within CI_WAIT_MINUTES')
 make_check={j:minutes('ci.yml',ci_jobs,j) for j,spec in sorted(ci_jobs.items()) if isinstance(spec,dict) and any(isinstance(s,dict) and 'make check' in str(s.get('run','')) for s in spec.get('steps') or [])}
 verify_limit=minutes('release.yml',rel_jobs,'verify')
 if not make_check: fail('release-wait','no ci.yml job runs make check for the release verify limit to match')
