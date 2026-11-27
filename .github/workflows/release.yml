@@ -230,6 +230,7 @@ jobs:
           echo "accepted=true" >>"$GITHUB_OUTPUT"
 
       - name: Wait for exact-SHA CI Success
+        id: exact_ci
         if: steps.pr_ci.outputs.accepted != 'true'
         shell: bash
         env:
