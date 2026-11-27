@@ -9,6 +9,9 @@ use std::io;
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 #[cfg(all(test, unix))]
 use interprocess::local_socket::ListenerNonblockingMode;
@@ -20,18 +23,134 @@ use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::{GenericFilePath, ToFsName};
 #[cfg(windows)]
 use interprocess::local_socket::{GenericNamespaced, ToNsName};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(all(test, unix))]
 pub use interprocess::local_socket::Listener;
-pub use interprocess::local_socket::{SendHalf, Stream};
+pub use interprocess::local_socket::Stream;
 
 /// Async (tokio) local-socket types for the daemon accept loop. `AsyncListener`
-/// yields `AsyncStream`s whose split halves are `AsyncRead`/`AsyncWrite`, and on
-/// unix expose `AsFd` for the force-close reap handle.
-pub use interprocess::local_socket::tokio::{
-    Listener as AsyncListener, RecvHalf as AsyncRecvHalf, SendHalf as AsyncSendHalf,
-    Stream as AsyncStream,
-};
+/// yields `AsyncStream`s, which a session reads and writes through [`Shared`].
+pub use interprocess::local_socket::tokio::{Listener as AsyncListener, Stream as AsyncStream};
+
+/// One local-socket stream shared by its reader and its writer.
+///
+/// interprocess 2.4.7 deprecated `split` in favour of this shape: `&Stream`
+/// implements the I/O traits in both directions (`Read`/`Write` for the sync
+/// stream, `AsyncRead`/`AsyncWrite` for the tokio one), so clones of one `Arc`
+/// can read and write at the same time. The socket closes when the last clone
+/// drops, and dropping one clone never half-closes it; a caller that needs a
+/// half-close issues it explicitly through a live clone.
+#[derive(Debug)]
+pub(crate) struct Shared<T>(Arc<T>);
+
+impl<T> Shared<T> {
+    pub(crate) fn new(inner: T) -> Self {
+        Self(Arc::new(inner))
+    }
+
+    /// A handle that does not keep the stream open: it upgrades only while
+    /// some clone still holds the stream.
+    #[cfg(unix)]
+    pub(crate) fn downgrade(&self) -> std::sync::Weak<T> {
+        Arc::downgrade(&self.0)
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> io::Read for Shared<T>
+where
+    for<'a> &'a T: io::Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl<T> io::Write for Shared<T>
+where
+    for<'a> &'a T: io::Write,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+impl<T> AsyncRead for Shared<T>
+where
+    for<'a> &'a T: AsyncRead,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut inner: &T = &self.get_mut().0;
+        Pin::new(&mut inner).poll_read(cx, buf)
+    }
+}
+
+impl<T> AsyncWrite for Shared<T>
+where
+    for<'a> &'a T: AsyncWrite,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut inner: &T = &self.get_mut().0;
+        Pin::new(&mut inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut inner: &T = &self.get_mut().0;
+        Pin::new(&mut inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut inner: &T = &self.get_mut().0;
+        Pin::new(&mut inner).poll_shutdown(cx)
+    }
+}
+
+/// Half-close the write direction of a sync local-socket stream: the peer's
+/// reader sees EOF while this side can still read. Unix only; named pipes have
+/// no half-close.
+#[cfg(unix)]
+pub(crate) fn shutdown_write(stream: &Stream) -> io::Result<()> {
+    // `UdSocket` is the only variant on unix, so this binding is irrefutable; a
+    // new variant fails to compile here instead of silently skipping the shutdown.
+    let Stream::UdSocket(uds) = stream;
+    rustix::net::shutdown(uds, rustix::net::Shutdown::Write).map_err(io::Error::from)
+}
+
+/// Shut down both directions of an async local-socket stream, so whoever reads
+/// it, and its peer, see EOF. Unix only. The caller passes a live stream, so the
+/// shutdown reaches that socket and no other.
+#[cfg(unix)]
+pub(crate) fn shutdown_both(stream: &AsyncStream) -> io::Result<()> {
+    // The only variant on unix; see `shutdown_write`.
+    let AsyncStream::UdSocket(uds) = stream;
+    rustix::net::shutdown(uds, rustix::net::Shutdown::Both).map_err(io::Error::from)
+}
 
 /// Resolved rendezvous address for a project daemon. On unix `socket_path` is
 /// the `.sock` filesystem path; on windows it holds the BARE namespaced name

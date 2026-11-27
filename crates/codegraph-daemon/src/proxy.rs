@@ -37,12 +37,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use interprocess::local_socket::traits::Stream as _;
 use serde_json::{Value, json};
 
 use crate::process::{SupervisionState, current_ppid, is_process_alive, supervision_lost_reason};
 use crate::session::read_daemon_hello;
-use crate::transport::{Rendezvous, connect};
+use crate::transport::{Rendezvous, Shared, Stream, connect};
 
 /// The wire protocol version the daemon advertises in its hello
 /// (`session.rs` `DaemonHello.protocol`). Proxy and daemon must agree.
@@ -172,18 +171,19 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
         return Ok(mismatch);
     }
 
-    // Split into independent recv/send halves. interprocess's split hands BOTH
-    // halves a refcount over the SAME kernel object (an `Arc<RawPipeStream>` on
-    // windows, an `Arc` over one fd on unix), so merely DROPPING the send half
-    // does not signal EOF to the daemon — the object stays open via the recv
-    // half. On unix we therefore capture the WRITE-side fd before moving `send`
-    // into the up pump and, once the host side is done, explicitly half-close it
-    // (shutdown(SHUT_WR)), which makes the daemon's session reader hit EOF,
-    // flush its last reply, and close. Windows named pipes have NO half-close,
-    // so teardown there cannot depend on the daemon closing first; the reply
+    // Share the stream between the two pumps (the replacement for
+    // interprocess's deprecated split): every clone refers to the SAME kernel
+    // object, so merely DROPPING the writer's clone does not signal EOF to the
+    // daemon — the object stays open while any clone lives. This function keeps
+    // its own clone and, once the host side is done, explicitly half-closes the
+    // write direction through it (shutdown(SHUT_WR) on unix), which makes the
+    // daemon's session reader hit EOF, flush its last reply, and close. Holding
+    // that clone also keeps the socket open until the half-close, so it always
+    // reaches this connection. Windows named pipes have NO half-close, so
+    // teardown there cannot depend on the daemon closing first; the reply
     // ledger below is what bounds it on every platform.
-    let (recv, mut send) = stream.split();
-    let write_fd = write_raw_fd(&send);
+    let stream = Shared::new(stream);
+    let mut send = stream.clone();
 
     // Send the OPTIONAL client-hello FIRST (T9), before any JSON-RPC: it
     // announces the host pid this proxy serves so the daemon can reap our
@@ -218,7 +218,7 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
 
     // daemon -> host pump (own thread): forward every daemon line to the host,
     // except the suppressed-initialize reply.
-    let socket_reader = BufReader::new(recv);
+    let socket_reader = BufReader::new(stream.clone());
     let down_suppressed = Arc::clone(&suppressed_id);
     let down_out = Arc::clone(&host_out);
     let down_ledger = Arc::clone(&ledger);
@@ -244,11 +244,11 @@ pub fn run_proxy<R: BufRead, W: Write + Send + 'static>(
     // flushes its final reply, and closes, so the down pump reaches EOF on its
     // own and `down.join()` returns. Windows named pipes have NO half-close
     // (`half_close_write` is a documented no-op there), so the daemon's session
-    // reader NEVER EOFs while our recv half keeps the pipe open — its rmcp serve
+    // reader NEVER EOFs while our reader's clone keeps the pipe open — its rmcp serve
     // loop parks on the next frame, the pipe is never closed, and the down pump
     // therefore never returns. Joining it unconditionally is an UNBOUNDED wait on
     // windows; it is what made this function never return there.
-    half_close_write(write_fd);
+    half_close_write(&stream);
     let settled = ledger.wait_until_settled(REPLY_DRAIN_BUDGET);
     shutdown.store(true, Ordering::SeqCst);
     // Wake the watchdog at once so its join (in drop) returns promptly instead
@@ -359,56 +359,21 @@ impl ReplyLedger {
     }
 }
 
-/// The write-side fd handle carried between `write_raw_fd` and
-/// `half_close_write`. On unix it is the real socket `RawFd`; on non-unix there
-/// is no half-close and the value is always `None`, so a unit placeholder keeps
-/// both cfg variants' signatures structurally identical for the cfg-agnostic
-/// caller. NEVER name `std::os::fd::*` outside the `#[cfg(unix)]` path — that
-/// module does not exist on Windows.
-#[cfg(unix)]
-type WriteFd = std::os::fd::RawFd;
-#[cfg(not(unix))]
-type WriteFd = ();
-
-/// Capture the write-side raw fd from the send half before it is moved into the
-/// up pump. `None` on non-unix (no half-close there).
-#[cfg(unix)]
-fn write_raw_fd(send: &crate::transport::SendHalf) -> Option<WriteFd> {
-    use std::os::fd::{AsFd, AsRawFd};
-    // The enum `SendHalf` does not surface `AsFd`/`AsRawFd`; the concrete
-    // `UdSocket` variant does. Match it to read the raw fd.
-    match send {
-        interprocess::local_socket::SendHalf::UdSocket(uds) => Some(uds.as_fd().as_raw_fd()),
-        #[allow(unreachable_patterns)]
-        _ => None,
-    }
-}
-
-#[cfg(not(unix))]
-fn write_raw_fd(_send: &crate::transport::SendHalf) -> Option<WriteFd> {
-    None
-}
-
 /// Half-close the WRITE direction of the daemon socket (`shutdown(SHUT_WR)`),
 /// leaving the read direction open to drain the daemon's final reply. This is
-/// the EOF signal the daemon's blocking line-reader needs; a plain drop of the
-/// send half is insufficient because interprocess shares one fd across halves.
+/// the EOF signal the daemon's blocking line-reader needs; dropping the writer's
+/// clone is insufficient because the socket stays open while any clone lives.
+/// `stream` is a live clone, so the shutdown cannot reach a closed or reused
+/// descriptor.
 #[cfg(unix)]
-fn half_close_write(write_fd: Option<WriteFd>) {
-    use std::os::fd::BorrowedFd;
-    if let Some(fd) = write_fd {
-        // SAFETY: `fd` is the live socket fd captured at split time; the recv
-        // half still owns the socket, so the fd is valid for this borrow. We
-        // only issue shutdown(SHUT_WR) on it — no ownership is taken.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::Write);
-    }
+fn half_close_write(stream: &Shared<Stream>) {
+    let _ = crate::transport::shutdown_write(stream);
 }
 
 /// Windows named pipes have no half-close; the proxy relies on the full-stream
 /// drop + the daemon's own idle/sweep lifecycle instead.
 #[cfg(not(unix))]
-fn half_close_write(_write_fd: Option<WriteFd>) {}
+fn half_close_write(_stream: &Shared<Stream>) {}
 
 /// host -> daemon: read host_in line-by-line; answer `initialize`, and an
 /// `initialize`-lifecycle `tools/list`, locally, and forward everything else.
@@ -1143,7 +1108,7 @@ mod tests {
 
     /// The teardown wait must be released by the LEDGER, not by the daemon
     /// closing its end: a windows named pipe has no half-close, so the daemon
-    /// never EOFs while the proxy's recv half holds the pipe open. Waiting on the
+    /// never EOFs while the proxy's reader holds the pipe open. Waiting on the
     /// ledger settles on the last reply DELIVERED, which happens on every
     /// platform.
     #[test]

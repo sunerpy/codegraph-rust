@@ -8,13 +8,12 @@ use std::time::Instant;
 use anyhow::Result;
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as _;
-use interprocess::local_socket::traits::tokio::Stream as _;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::debug;
 
 use crate::control::{ControlAck, ControlFrame, encode_control_line, parse_control_frame};
-use crate::transport::{AsyncStream, Stream};
+use crate::transport::{AsyncStream, Shared, Stream};
 
 /// Max milliseconds the PROXY waits for the daemon's one-line versioned hello
 /// after connecting, before giving up so the caller falls back to direct
@@ -57,14 +56,18 @@ pub fn parse_client_hello_line(line: &str) -> Option<u32> {
 }
 
 /// A session's force-close handle. Dropping the [`SessionGuard`] removes the
-/// session from the registry; the sweep additionally calls
-/// [`SessionRegistry::shutdown_session`] to force the session thread (blocked in
-/// the rmcp session serve loop) to EOF by half/full-closing its socket.
+/// session from the registry; the sweep and the drain additionally call
+/// [`SessionRegistry::shutdown_session`] to force the session task (blocked in
+/// the rmcp session serve loop) to EOF by shutting its socket down.
 #[derive(Clone)]
 struct SessionEntry {
     pid: Option<u32>,
+    /// A weak handle to the session's socket, so the entry never keeps it open.
+    /// Once the session drops its stream the handle no longer upgrades, and a
+    /// later shutdown touches nothing, whichever connection now holds the
+    /// socket's old descriptor number.
     #[cfg(unix)]
-    recv_fd: Option<std::os::fd::RawFd>,
+    socket: Option<std::sync::Weak<AsyncStream>>,
 }
 
 /// Tracks live client sessions (each with an OPTIONAL host pid + a shutdown
@@ -125,7 +128,7 @@ impl SessionRegistry {
                 SessionEntry {
                     pid: None,
                     #[cfg(unix)]
-                    recv_fd: None,
+                    socket: None,
                 },
             );
         bump_or_read(&self.last_active, true);
@@ -148,17 +151,17 @@ impl SessionRegistry {
         }
     }
 
-    /// Record a session's recv-side socket fd so the sweep can force EOF by
-    /// shutting it down (unix only).
+    /// Record a weak handle to a session's socket so the sweep and the drain can
+    /// force EOF by shutting it down (unix only).
     #[cfg(unix)]
-    pub(crate) fn set_recv_fd(&self, session_id: u64, fd: std::os::fd::RawFd) {
+    pub(crate) fn record_socket(&self, session_id: u64, socket: &Shared<AsyncStream>) {
         if let Some(entry) = self
             .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_mut(&session_id)
         {
-            entry.recv_fd = Some(fd);
+            entry.socket = Some(socket.downgrade());
         }
     }
 
@@ -201,9 +204,9 @@ impl SessionRegistry {
         self.closing.send_replace(true);
         #[cfg(unix)]
         {
-            // Additionally force EOF on the recorded recv fds: a session blocked in
-            // a read that has not yet reached an await point observes the close
-            // immediately rather than at its next poll.
+            // Additionally shut down every recorded socket that is still open: a
+            // session blocked in a read that has not yet reached an await point
+            // observes the close immediately rather than at its next poll.
             let ids = self
                 .sessions
                 .lock()
@@ -226,28 +229,26 @@ impl SessionRegistry {
         self.closing.subscribe()
     }
 
-    /// Force a dead session's reader to EOF by half-closing the read direction
-    /// of its socket. The session thread, blocked in the rmcp serve loop, then sees
-    /// EOF, returns, and drops its [`SessionGuard`] (which removes the entry +
-    /// bumps last-active). No-op when the fd is unknown or on non-unix.
+    /// Force a session's reader to EOF by shutting down both directions of its
+    /// socket. The session task, blocked in the rmcp serve loop, then sees EOF,
+    /// returns, and drops its [`SessionGuard`] (which removes the entry + bumps
+    /// last-active). No-op when no socket was recorded, when the session has
+    /// already dropped its stream, or on non-unix.
     pub(crate) fn shutdown_session(&self, session_id: u64) {
         #[cfg(unix)]
         {
-            let fd = self
+            let socket = self
                 .sessions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&session_id)
-                .and_then(|entry| entry.recv_fd);
-            if let Some(fd) = fd {
-                use std::os::fd::BorrowedFd;
-                // SAFETY: `fd` is the live recv socket fd recorded by the session
-                // thread, which owns the socket and outlives the sweep call (the
-                // session only drops AFTER its reader EOFs, which this shutdown
-                // triggers). We only issue shutdown(SHUT_RDWR); no ownership is
-                // taken and the fd is not closed here.
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::Both);
+                .and_then(|entry| entry.socket.clone());
+            // A session that dropped its stream no longer upgrades, so nothing is
+            // touched even if its old descriptor number now names another
+            // connection. While `stream` is held the socket cannot close, so the
+            // shutdown reaches only this session's socket.
+            if let Some(stream) = socket.and_then(|weak| weak.upgrade()) {
+                let _ = crate::transport::shutdown_both(&stream);
             }
         }
         #[cfg(not(unix))]
@@ -365,16 +366,17 @@ pub struct DaemonHello<'a> {
 
 /// Serve one async session over the daemon's tokio local-socket `stream`
 /// through the rmcp handler: daemon hello on accept, optional client-hello pid
-/// parse recorded BEFORE serving, force-close reap via the recorded recv fd
-/// (unix), and no lost/duplicated bytes at the hello seam.
+/// parse recorded BEFORE serving, force-close reap via a recorded weak handle to
+/// the socket (unix), and no lost/duplicated bytes at the hello seam.
 ///
-/// The recv half is split with interprocess's OWN async split (not
-/// `tokio::io::split`) so its unix `AsFd` raw fd can be recorded for the
-/// pid-sweep force-close; the (hello-consumed) recv remainder is re-chained via
-/// [`tokio::io::AsyncReadExt::chain`] and joined with the send half into one
-/// async transport handed to the standard rmcp serve. On non-unix the recv fd is
-/// not recorded (no `SHUT_RDWR`), so the half-dead-peer force-close reap is
-/// unix-only; ordinary disconnects still reap via async EOF everywhere.
+/// The reader and the writer are two clones of one [`Shared`] stream (the
+/// replacement for interprocess's deprecated split). On unix the registry keeps
+/// a weak handle to it for the pid-sweep and drain force-close; the
+/// (hello-consumed) reader is re-chained via [`tokio::io::AsyncReadExt::chain`]
+/// and joined with the writer into one async transport handed to the standard
+/// rmcp serve. On non-unix no handle is recorded (no `SHUT_RDWR`), so the
+/// half-dead-peer force-close reap is unix-only; ordinary disconnects still reap
+/// via async EOF everywhere.
 pub(crate) async fn serve_session_async(
     stream: AsyncStream,
     project_root: PathBuf,
@@ -387,17 +389,11 @@ pub(crate) async fn serve_session_async(
     let guard = registry.start_session();
     let session_id = guard.session_id();
 
-    let (recv, mut send) = stream.split();
-
+    let stream = Shared::new(stream);
     #[cfg(unix)]
-    {
-        use interprocess::local_socket::tokio::RecvHalf;
-        use std::os::fd::{AsFd, AsRawFd};
-        #[allow(irrefutable_let_patterns)]
-        if let RecvHalf::UdSocket(uds) = &recv {
-            registry.set_recv_fd(session_id, uds.as_fd().as_raw_fd());
-        }
-    }
+    registry.record_socket(session_id, &stream);
+    let mut send = stream.clone();
+    let recv = stream;
 
     let version = hello_version();
     let hello = DaemonHello {
@@ -483,7 +479,7 @@ pub(crate) async fn serve_session_async(
 /// authorized frame hands the request to the accept loop, waits for the loop's
 /// post-drain signal, writes the ACK, and reports completion.
 async fn serve_control_frame(
-    mut send: crate::transport::AsyncSendHalf,
+    mut send: Shared<AsyncStream>,
     frame: &ControlFrame,
     control: Option<&ControlHandle>,
 ) -> Result<()> {
@@ -536,12 +532,12 @@ fn refusal_line(frame: &ControlFrame) -> String {
 
 /// Async analog of [`read_first_line_bounded`]: read from `recv` up to and
 /// including the first `\n`, or `max` bytes, whichever comes first. Returns the
-/// raw bytes read plus the (unconsumed) recv half so the caller can chain the
+/// raw bytes read plus the (unconsumed) reader so the caller can chain the
 /// put-back bytes in front of it. One-byte reads consume EXACTLY the first line.
 async fn read_first_line_bounded_async(
-    mut recv: crate::transport::AsyncRecvHalf,
+    mut recv: Shared<AsyncStream>,
     max: usize,
-) -> (Vec<u8>, crate::transport::AsyncRecvHalf) {
+) -> (Vec<u8>, Shared<AsyncStream>) {
     let mut buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     while buf.len() < max {
@@ -860,6 +856,168 @@ mod tests {
         assert_eq!(first, b"hello\n");
         let mut empty = BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
         assert!(read_first_line_bounded(&mut empty, 64).is_empty());
+    }
+
+    /// A tokio local-socket stream over one end of a fresh socket pair, and the
+    /// pair's other end. Must run inside a tokio runtime.
+    #[cfg(unix)]
+    fn async_stream_pair() -> (Shared<AsyncStream>, std::os::unix::net::UnixStream) {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (session_end, peer) = UnixStream::pair().expect("session socket pair");
+        session_end
+            .set_nonblocking(true)
+            .expect("tokio needs a nonblocking socket");
+        let stream = interprocess::os::unix::uds_local_socket::tokio::Stream::try_from(
+            OwnedFd::from(session_end),
+        )
+        .expect("register the session socket with tokio");
+        (Shared::new(AsyncStream::from(stream)), peer)
+    }
+
+    #[cfg(unix)]
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// The state behind the `control_shutdown` BrokenPipe flake: a registered
+    /// session whose socket closed before its guard dropped, and another
+    /// connection that took the descriptor number the session's socket had.
+    #[cfg(unix)]
+    struct ReusedSessionFd {
+        registry: SessionRegistry,
+        guard: SessionGuard,
+        /// The session socket's old number, which now names `other`'s socket.
+        _number: std::os::fd::OwnedFd,
+        other: std::os::unix::net::UnixStream,
+        other_peer: std::os::unix::net::UnixStream,
+    }
+
+    #[cfg(unix)]
+    impl ReusedSessionFd {
+        fn new() -> Self {
+            use std::os::fd::{AsFd, AsRawFd};
+            use std::os::unix::net::UnixStream;
+
+            let runtime = test_runtime();
+            // Dropping the session's stream frees its number, and the next
+            // descriptor any thread opens takes it. The other connection exists
+            // before that, so its own sockets cannot take the number; when another
+            // test thread wins it, the scenario is rebuilt, a bounded number of
+            // times.
+            for _ in 0..20 {
+                let registry = SessionRegistry::default();
+                let guard = registry.start_session();
+                let (other, other_peer) = UnixStream::pair().expect("other socket pair");
+                let number = {
+                    let _runtime = runtime.enter();
+                    let (stream, _peer) = async_stream_pair();
+                    registry.record_socket(guard.session_id(), &stream);
+                    let AsyncStream::UdSocket(uds) = &*stream;
+                    uds.as_fd().as_raw_fd()
+                    // `stream` is the session's last clone: it drops here and
+                    // closes the socket while `guard` keeps the registry entry.
+                };
+                // The lowest free number at or above `number`: `number` itself
+                // unless another thread took it in between.
+                let reused = rustix::io::fcntl_dupfd_cloexec(&other, number)
+                    .expect("duplicate the other socket");
+                if reused.as_raw_fd() == number {
+                    return Self {
+                        registry,
+                        guard,
+                        _number: reused,
+                        other,
+                        other_peer,
+                    };
+                }
+            }
+            panic!("in 20 attempts the retired session's fd number never went to the other socket");
+        }
+
+        /// The other connection is still open: it can write, and its peer reads
+        /// the byte it wrote.
+        fn assert_other_connection_still_open(&self) {
+            use std::io::{Read, Write};
+
+            (&self.other)
+                .write_all(b"x")
+                .expect("a socket that reused a retired session's fd number must stay open");
+            self.other_peer
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("bound the peer read");
+            let mut byte = [0u8; 1];
+            (&self.other_peer)
+                .read_exact(&mut byte)
+                .expect("the byte written on the other connection arrives");
+            assert_eq!(&byte, b"x");
+        }
+    }
+
+    /// The drain (`close_all_sessions`) must never shut down a socket that took a
+    /// retired session's fd number. On failure the other connection's write fails
+    /// with `BrokenPipe`, the error the flaky control test reported.
+    #[cfg(unix)]
+    #[test]
+    fn close_all_sessions_never_shuts_down_a_socket_that_reused_a_retired_sessions_fd() {
+        let state = ReusedSessionFd::new();
+        state.registry.close_all_sessions();
+        state.assert_other_connection_still_open();
+    }
+
+    /// The dead-client sweep (`shutdown_session`) must never shut down a socket
+    /// that took a retired session's fd number either.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_session_never_shuts_down_a_socket_that_reused_a_retired_sessions_fd() {
+        let state = ReusedSessionFd::new();
+        state.registry.shutdown_session(state.guard.session_id());
+        state.assert_other_connection_still_open();
+    }
+
+    /// The force-close still works: shutting down a session whose stream is
+    /// alive makes its peer read EOF.
+    #[cfg(unix)]
+    fn assert_a_live_session_shutdown_reaches_its_peer(
+        shut_down: impl FnOnce(&SessionRegistry, u64),
+    ) {
+        use std::io::Read;
+
+        let runtime = test_runtime();
+        let _runtime = runtime.enter();
+        let registry = SessionRegistry::default();
+        let guard = registry.start_session();
+        let (stream, peer) = async_stream_pair();
+        registry.record_socket(guard.session_id(), &stream);
+        shut_down(&registry, guard.session_id());
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("bound the peer read");
+        let mut byte = [0u8; 1];
+        let read = (&peer)
+            .read(&mut byte)
+            .expect("the peer of a shut-down session reads EOF, not a timeout");
+        assert_eq!(read, 0, "the peer of a shut-down session reads EOF");
+        drop((stream, guard));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_session_makes_a_live_sessions_peer_read_eof() {
+        assert_a_live_session_shutdown_reaches_its_peer(|registry, id| {
+            registry.shutdown_session(id);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_all_sessions_makes_a_live_sessions_peer_read_eof() {
+        assert_a_live_session_shutdown_reaches_its_peer(|registry, _| {
+            registry.close_all_sessions();
+        });
     }
 }
 
