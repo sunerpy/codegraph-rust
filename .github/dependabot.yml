@@ -5,10 +5,24 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # tree-sitter-swift and tree-sitter-scala are pinned exactly (`=` in
+    # crates/codegraph-extract/Cargo.toml) and move by hand with the extraction
+    # change they need.
+    ignore:
+      - dependency-name: tree-sitter-swift
+      - dependency-name: tree-sitter-scala
     groups:
+      # Grammar crates change what is extracted, so they need an
+      # extraction-version decision and land on their own, apart from the
+      # other cargo updates. A dependency joins the first group it matches.
+      tree-sitter:
+        patterns:
+          - "tree-sitter*"
       cargo:
         patterns:
           - "*"
+        exclude-patterns:
+          - "tree-sitter*"
 
   - package-ecosystem: github-actions
     directory: /
