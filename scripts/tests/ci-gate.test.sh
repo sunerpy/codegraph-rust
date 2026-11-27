@@ -48,6 +48,11 @@ M=$(fixture M_exact_skipped); mutate "$M/.github/workflows/release.yml" "if: ste
 N=$(fixture N_pr_read); mutate "$N/.github/workflows/release.yml" $'      # commits/<sha>/pulls in the dispatch-only PR-CI step.\n      pull-requests: read\n' ''; run N_pr_read "$N"; expect N_pr_read nonzero 'lacks pull-requests: read'
 O=$(fixture O_no_recheck); mutate "$O/.github/workflows/release.yml" "if: needs.verify-ci.outputs.pr_ci_accepted == 'true'" 'if: false'; run O_no_recheck "$O"; expect O_no_recheck nonzero 'does not re-check exact-SHA CI before publishing'
 P=$(fixture P_publish_needs); mutate "$P/.github/workflows/release.yml" '    needs: [release-please, verify-ci, upload-assets]' '    needs: [release-please, upload-assets]'; run P_publish_needs "$P"; expect P_publish_needs nonzero 'publish-release must need verify-ci'
+Q=$(fixture Q_wait_budget); mutate "$Q/.github/workflows/release.yml" '          CI_WAIT_MINUTES: "90"' '          CI_WAIT_MINUTES: "60"'; run Q_wait_budget "$Q"; expect Q_wait_budget nonzero 'MISMATCH \[release-wait\]: CI_WAIT_MINUTES=60 is shorter than .*windows-test 60 \+ ci-success 5 = 75\)'
+R=$(fixture R_windows_limit); mutate "$R/.github/workflows/ci.yml" '    timeout-minutes: 60' '    timeout-minutes: 100'; run R_windows_limit "$R"; expect R_windows_limit nonzero 'MISMATCH \[release-wait\]: CI_WAIT_MINUTES=90 is shorter than .*windows-test 100 \+ ci-success 5 = 115\)'
+S=$(fixture S_verify_ci_limit); mutate "$S/.github/workflows/release.yml" '    timeout-minutes: 110' '    timeout-minutes: 35'; run S_verify_ci_limit "$S"; expect S_verify_ci_limit nonzero 'MISMATCH \[release-wait\]: verify-ci timeout-minutes 35 is under CI_WAIT_MINUTES \+ 15 = 105'
+T=$(fixture T_verify_limit); mutate "$T/.github/workflows/release.yml" '    timeout-minutes: 45' '    timeout-minutes: 30'; run T_verify_limit "$T"; expect T_verify_limit nonzero 'MISMATCH \[release-wait\]: verify timeout-minutes 30 is shorter than ci.yml gives the same make check \(linux 45\)'
+U=$(fixture U_fixed_polls); mutate "$U/.github/workflows/release.yml" $'          while [ "$polls" -gt 0 ]; do' $'          for _ in $(seq 1 120); do'; run U_fixed_polls "$U"; expect U_fixed_polls nonzero 'MISMATCH \[release-wait\]: the exact-SHA wait step polls a fixed seq count'
 
 echo "ci-gate harness: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

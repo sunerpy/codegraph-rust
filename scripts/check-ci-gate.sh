@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Prove that CI Success is strict and that the same-run release gate is wired.
+# Prove that CI Success is strict, that the same-run release gate is wired, and
+# that the release waits for CI Success at least as long as CI can take.
 set -euo pipefail
 repo_root="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
@@ -85,6 +86,42 @@ if not {'release-please','source-gate','verify-ci','verify','build-binaries'} <=
 if not {'release-please','upload-assets'} <= needset('publish-release'): fail('release-gate','publish-release must need upload-assets')
 if '--verify-only' not in runs('upload-assets') or '--exact' not in runs('upload-assets'): fail('release-gate','upload-assets lacks exact remote verification')
 if '--publish' not in runs('publish-release') or '--exact' not in runs('publish-release'): fail('release-gate','terminal publish lacks exact remote re-verification')
+# Release wait: the exact-SHA wait must cover CI's slowest required chain, the
+# longest needs path of job limits ending at ci-success (an unset limit counts as
+# GitHub's default 360), and each enclosing job limit must cover its own work.
+limits={}
+def minutes(where,jobs,job):
+    if (where,job) not in limits:
+        spec=jobs.get(job); value=spec.get('timeout-minutes',360) if isinstance(spec,dict) else 360
+        ok=not isinstance(value,bool) and re.fullmatch(r'[0-9]+',str(value)) is not None
+        if not ok: fail('release-wait',f'{where} job {job} has timeout-minutes {value!r}, not a whole number')
+        limits[(where,job)]=int(value) if ok else 360
+    return limits[(where,job)]
+chains={}
+def chain(job,path=()):
+    if job in path: die(f'ci.yml needs form a cycle through {job}')
+    if not isinstance(ci_jobs.get(job),dict): die(f'ci.yml needs the undefined job {job}')
+    if job not in chains:
+        deps=ci_jobs[job].get('needs') or []; deps=[deps] if isinstance(deps,str) else deps
+        own=minutes('ci.yml',ci_jobs,job); longest=max((chain(str(d),path+(job,)) for d in deps),default=(0,()))
+        chains[job]=(longest[0]+own,longest[1]+(f'{job} {own}',))
+    return chains[job]
+chain_total,chain_jobs=chain('ci-success'); chain_text=' + '.join(chain_jobs)+f' = {chain_total}'
+wait=verify_ci_limit=None
+if len(exact_ci)==1:
+    raw=(exact_ci[0].get('env') or {}).get('CI_WAIT_MINUTES'); wait_body=str(exact_ci[0].get('run',''))
+    if isinstance(raw,bool) or not re.fullmatch(r'[1-9][0-9]*',str(raw)):
+        fail('release-wait',f"the exact-SHA wait step needs CI_WAIT_MINUTES, whole minutes covering CI's slowest required chain ({chain_text}), got {raw!r}")
+    else:
+        wait=int(raw); verify_ci_limit=minutes('release.yml',rel_jobs,'verify-ci')
+        if wait<chain_total: fail('release-wait',f"CI_WAIT_MINUTES={wait} is shorter than CI's slowest required chain ({chain_text})")
+        if verify_ci_limit<wait+15: fail('release-wait',f'verify-ci timeout-minutes {verify_ci_limit} is under CI_WAIT_MINUTES + 15 = {wait+15}')
+    if re.search(r'\bseq\b',wait_body): fail('release-wait','the exact-SHA wait step polls a fixed seq count instead of within CI_WAIT_MINUTES')
+make_check={j:minutes('ci.yml',ci_jobs,j) for j,spec in sorted(ci_jobs.items()) if isinstance(spec,dict) and any(isinstance(s,dict) and 'make check' in str(s.get('run','')) for s in spec.get('steps') or [])}
+verify_limit=minutes('release.yml',rel_jobs,'verify')
+if not make_check: fail('release-wait','no ci.yml job runs make check for the release verify limit to match')
+elif verify_limit<max(make_check.values()):
+    fail('release-wait',f'verify timeout-minutes {verify_limit} is shorter than ci.yml gives the same make check ('+', '.join(f'{j} {m}' for j,m in make_check.items())+')')
 if failures:
     for area,msg in failures: print(f'check-ci-gate: MISMATCH [{area}]: {msg}',file=sys.stderr)
     print(f'check-ci-gate: FAIL: {len(failures)} problem(s)',file=sys.stderr); raise SystemExit(1)
@@ -92,6 +129,7 @@ print('check-ci-gate: structure OK')
 print('  required jobs      : '+', '.join(actual))
 print('  excluded            : coverage (informational)')
 print('  release topology    : source-gate + exact-SHA CI -> verify/build -> upload -> exact publish')
+print(f'  release wait        : CI_WAIT_MINUTES {wait} >= {chain_text}; verify-ci {verify_ci_limit} >= {wait} + 15; verify {verify_limit} >= make check {max(make_check.values())}')
 PY
 mapfile -t required <"$jobs_out"
 needs_json() {

@@ -106,6 +106,18 @@ all four version surfaces. Maintainers publish only through
 the draft-until-verified workflow after exact-SHA CI, all platform archives,
 checksums, attestations, and archive smoke pass.
 
+The exact-SHA gate waits up to `CI_WAIT_MINUTES`, set in `release.yml`, for the
+release commit's CI push run to pass `CI Success`. `scripts/check-ci-gate.sh`,
+part of `make check`, keeps the release limits in step with `ci.yml`:
+
+- `CI_WAIT_MINUTES` covers CI's slowest required chain, the longest `needs` path
+  of job `timeout-minutes` that ends at `CI Success`;
+- the `Verify CI Passed` job's limit is at least `CI_WAIT_MINUTES` plus 15;
+- the release `verify` job's limit is at least that of the `ci.yml` job that
+  runs the same `make check`.
+
+Raising a CI job's limit can therefore mean raising these release limits too.
+
 GitHub can drop the push event of a release commit. Then no CI push run can
 appear for that commit, and the exact-SHA gate cannot pass. Once the next merge
 to `main` has let Release Please create the draft, dispatch the Release workflow
