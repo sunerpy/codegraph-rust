@@ -450,6 +450,16 @@ pub fn apply_aliases(import_path: &str, aliases: &AliasMap, project_root: &str) 
         }
 
         let captured = if pat.has_wildcard {
+            // The prefix and the suffix may not share characters: `@x/*/index`
+            // starts and ends `@x/index` only by counting its one `/` twice,
+            // which leaves nothing for `*`. tsc's `isPatternMatch` wants the
+            // import at least as long as the two together, so the pattern
+            // does not match and a less specific one may (upstream #2969).
+            // Both are byte-wise prefix and suffix of the import, so byte
+            // lengths decide overlap as tsc's UTF-16 lengths do.
+            if import_path.len() < pat.prefix.len() + pat.suffix.len() {
+                continue;
+            }
             import_path[pat.prefix.len()..import_path.len() - pat.suffix.len()].to_string()
         } else if import_path != pat.prefix {
             // Literal pattern must match exactly.
@@ -1056,6 +1066,108 @@ mod tests {
             apply_aliases("a/Button.vue", &map, "/proj"),
             vec!["comp/Button.vue"]
         );
+    }
+
+    /// A project whose `tsconfig.json` maps `paths` from `./src`, as
+    /// upstream's `path-alias-overlap.test.ts` (77ee3484, #2969) writes it.
+    fn overlap_project(tag: &str, paths: Value) -> (PathBuf, AliasMap) {
+        let root = temp_dir(tag);
+        write_json(
+            root.join("tsconfig.json"),
+            serde_json::json!({ "compilerOptions": { "baseUrl": "./src", "paths": paths } }),
+        );
+        let map = load_project_aliases(root.to_str().unwrap()).expect("aliases");
+        (root, map)
+    }
+
+    /// `@x/*/index` splits into `@x/` and `/index`. `@x/index` starts with
+    /// the one and ends with the other only by counting its one `/` twice,
+    /// which leaves nothing for `*`: the pattern does not match there.
+    #[test]
+    fn apply_aliases_skips_a_wildcard_whose_prefix_and_suffix_overlap() {
+        let (root, map) = overlap_project(
+            "overlap",
+            serde_json::json!({ "@x/*/index": ["widgets/*/index"] }),
+        );
+        let project = root.to_str().unwrap();
+        assert!(apply_aliases("@x/index", &map, project).is_empty());
+        assert_eq!(
+            apply_aliases("@x/button/index", &map, project),
+            vec!["src/widgets/button/index"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Skipping an overlapping pattern does not end the search. Both
+    /// prefixes are `@x/`, so tsc tries the patterns in the order the config
+    /// declares them; this map lists them in that order, the overlapping one
+    /// first.
+    #[test]
+    fn apply_aliases_falls_through_past_an_overlapping_wildcard() {
+        let map = AliasMap {
+            base_url: "/proj/src".to_string(),
+            patterns: vec![
+                AliasPattern {
+                    prefix: "@x/".to_string(),
+                    suffix: "/index".to_string(),
+                    has_wildcard: true,
+                    replacements: vec!["widgets/*/index".to_string()],
+                },
+                AliasPattern {
+                    prefix: "@x/".to_string(),
+                    suffix: String::new(),
+                    has_wildcard: true,
+                    replacements: vec!["lib/*".to_string()],
+                },
+            ],
+        };
+        assert_eq!(
+            apply_aliases("@x/index", &map, "/proj"),
+            vec!["src/lib/index"]
+        );
+        assert_eq!(
+            apply_aliases("@x/button/index", &map, "/proj"),
+            vec!["src/widgets/button/index"]
+        );
+    }
+
+    /// The specificity sort tries the longer prefix `@app/x/` first; where
+    /// it overlaps, the less specific `@app/*` answers.
+    #[test]
+    fn apply_aliases_falls_through_to_a_shorter_prefix_past_an_overlap() {
+        let (root, map) = overlap_project(
+            "overlap-shorter",
+            serde_json::json!({
+                "@app/*": ["lib/*"],
+                "@app/x/*/index": ["widgets/*/index"]
+            }),
+        );
+        let project = root.to_str().unwrap();
+        assert_eq!(map.patterns[0].prefix, "@app/x/");
+        assert_eq!(
+            apply_aliases("@app/x/index", &map, project),
+            vec!["src/lib/x/index"]
+        );
+        assert_eq!(
+            apply_aliases("@app/x/button/index", &map, project),
+            vec!["src/widgets/button/index"]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// tsc's bound is `>=`: at exactly the prefix plus the suffix the two
+    /// meet without sharing a character, and `*` captures the empty string.
+    #[test]
+    fn apply_aliases_accepts_an_empty_capture_at_exactly_prefix_plus_suffix() {
+        let (root, map) = overlap_project(
+            "overlap-exact",
+            serde_json::json!({ "@x/*/index": ["widgets/*/index"] }),
+        );
+        assert_eq!(
+            apply_aliases("@x//index", &map, root.to_str().unwrap()),
+            vec!["src/widgets/index"]
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -1791,6 +1791,8 @@ matrix! {
     typescript_react_dependency_appears_in_package_json,
     javascript_jsconfig_paths_alias_appears,
     typescript_tsconfig_paths_alias_disappears,
+    typescript_tsconfig_overlapping_wildcard_import_appears,
+    typescript_tsconfig_overlapping_wildcard_import_disappears,
     typescript_tsconfig_extends_target_appears,
     typescript_paths_retarget_moves_a_barrel_source,
     typescript_app_tsconfig_paths_appear,
