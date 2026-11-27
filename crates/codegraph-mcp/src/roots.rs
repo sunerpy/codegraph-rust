@@ -483,6 +483,11 @@ pub(crate) fn format_subproject_candidates(base: Option<&Path>, roots: &[PathBuf
     display.join(", ")
 }
 
+/// What a tool response says about a project that may have no index yet:
+/// creating one is the user's decision, so the agent offers `codegraph init .`
+/// and never runs it on its own (sunerpy/codegraph-rust#269).
+const ASK_BEFORE_INIT: &str = "If the project has no CodeGraph index yet, tell the user so, offer to run `codegraph init .` in the project directory, and do not run it without the user's consent.";
+
 pub(crate) fn not_indexed_message(
     raw_project: Option<&str>,
     search_from: Option<&Path>,
@@ -491,11 +496,13 @@ pub(crate) fn not_indexed_message(
 ) -> String {
     if let Some(raw) = raw_project {
         return format!(
-            "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project, or run `codegraph init` there."
+            "No indexed project found for projectPath {raw:?}. Pass an absolute path to an indexed project. {ASK_BEFORE_INIT}"
         );
     }
     let mut message = if candidates.is_empty() {
-        "No indexed project resolved. Pass a `projectPath` argument, run `codegraph init` in the project, or start the server with `--path <project>`.".to_string()
+        format!(
+            "No indexed project resolved. Pass a `projectPath` argument, or start the server with `--path <project>`. {ASK_BEFORE_INIT}"
+        )
     } else {
         let listed = format_subproject_candidates(search_from, candidates);
         format!(
@@ -1643,6 +1650,60 @@ mod tests {
             !not_indexed_message(None, None, &[], false).contains("stopped after"),
             "a complete scan says nothing about stopping"
         );
+    }
+
+    /// sunerpy/codegraph-rust#269: creating an index is the user's decision.
+    /// A message that mentions `codegraph init` only offers it, and tells the
+    /// agent to say the project has no index and to wait for the user's
+    /// consent; the rest of each message stays as it was.
+    #[test]
+    fn not_indexed_messages_offer_init_only_with_the_users_consent() {
+        let explicit = not_indexed_message(Some("/no/such/project"), None, &[], false);
+        let unresolved = not_indexed_message(None, None, &[], false);
+        let truncated = not_indexed_message(None, None, &[], true);
+        for message in [&explicit, &unresolved, &truncated] {
+            assert!(
+                message.contains("has no CodeGraph index yet, tell the user"),
+                "{message}"
+            );
+            assert!(
+                message.contains("offer to run `codegraph init .`"),
+                "{message}"
+            );
+            assert!(
+                message.contains("do not run it without the user's consent"),
+                "{message}"
+            );
+            assert!(
+                !message
+                    .replace("offer to run `codegraph init .`", "")
+                    .contains("codegraph init"),
+                "every mention of `codegraph init` must be an offer: {message}"
+            );
+        }
+        assert!(
+            explicit.starts_with("No indexed project found for projectPath \"/no/such/project\"."),
+            "{explicit}"
+        );
+        assert!(
+            explicit.contains("Pass an absolute path to an indexed project"),
+            "{explicit}"
+        );
+        assert!(
+            unresolved.starts_with("No indexed project resolved."),
+            "{unresolved}"
+        );
+        assert!(
+            unresolved.contains("`projectPath`") && unresolved.contains("`--path <project>`"),
+            "{unresolved}"
+        );
+        assert!(truncated.contains("stopped after"), "{truncated}");
+
+        // With indexed sub-projects to choose from, the message names them and
+        // does not bring up `codegraph init` at all.
+        let base = Path::new("/workspace");
+        let listed = not_indexed_message(None, Some(base), &[base.join("service-a")], false);
+        assert!(!listed.contains("codegraph init"), "{listed}");
     }
 
     #[test]

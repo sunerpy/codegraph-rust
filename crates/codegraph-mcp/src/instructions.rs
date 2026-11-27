@@ -11,6 +11,12 @@
 //! can never drift from what the binary actually parses. Upstream hardcodes a
 //! "30+" prose count; a copied number would silently go stale the next time a
 //! grammar lands.
+//!
+//! The Limitations bullet for a project without an index is this repository's
+//! own wording as well (sunerpy/codegraph-rust#269): the agent tells the user,
+//! offers `codegraph init .`, and runs it only with the user's consent. Upstream
+//! (`461a5d87`) instead tells the agent to stop calling codegraph tools for that
+//! project and never to run `codegraph init` itself.
 
 use codegraph_core::types::Language;
 use std::sync::OnceLock;
@@ -107,7 +113,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 
 ## Limitations
 
-- If a tool reports the project isn't initialized, `.codegraph/` doesn't exist yet — offer to run `codegraph init .` to build the index.
+- If a tool reports the project isn't initialized (no `.codegraph/` directory), tell the user the project has no CodeGraph index yet, offer to run `codegraph init .` to build it, and do not run it without the user's consent.
 - Index lags file writes by ~1 second. A burst of many changes (a branch switch, a mass rename) or a sign that the OS dropped file events makes the watcher re-scan the whole project on its own, and responses can start with "⚠️ CodeGraph auto-sync is RECOVERING" until that catch-up commits. Renames never need a rebuild: `codegraph sync` reconciles the whole project when no watcher is running.
 - Cross-file resolution is best-effort name matching; ambiguous calls may return multiple candidates.
 - Explore matches names and indexed code words lexically, not by meaning; an empty result reports word matches and may suggest indexed candidate names to retry with `codegraph_explore`.
@@ -194,6 +200,36 @@ mod tests {
         assert!(
             text.ends_with('\n') && !text.ends_with("\n\n"),
             "single trailing newline"
+        );
+    }
+
+    /// sunerpy/codegraph-rust#269: when a tool reports a project without an
+    /// index, the agent tells the user and offers `codegraph init .`, and does
+    /// not run it without the user's consent.
+    #[test]
+    fn instructions_offer_init_only_with_the_users_consent() {
+        let text = server_instructions();
+        let bullet = text
+            .lines()
+            .find(|line| line.contains("isn't initialized"))
+            .expect("the Limitations section covers a project without an index");
+        assert!(
+            bullet.contains("tell the user the project has no CodeGraph index yet"),
+            "{bullet}"
+        );
+        assert!(
+            bullet.contains("offer to run `codegraph init .`"),
+            "{bullet}"
+        );
+        assert!(
+            bullet.contains("do not run it without the user's consent"),
+            "{bullet}"
+        );
+        assert!(
+            !text
+                .replace("offer to run `codegraph init .`", "")
+                .contains("codegraph init"),
+            "every mention of `codegraph init` must be an offer"
         );
     }
 }

@@ -744,6 +744,13 @@ probe runs again on relevant requests, while the downward scan is throttled to
 once per five seconds so a project initialized after server startup can be
 adopted without walking the workspace on every call.
 
+The no-default text and the explicit-path error never tell the agent to run
+`codegraph init` on its own. Where one mentions it, it says that if the project
+has no CodeGraph index yet, the agent should tell the user so, offer to run
+`codegraph init .` in the project directory, and not run it without the user's
+consent. The server instructions in the `initialize` response give the same
+rule.
+
 For an explicit path that **does** resolve to an existing index, the first call
 is also the live-service boundary: it waits for catch-up and retains that
 project's shared daemon/watcher as described above. Query routing therefore does
