@@ -245,6 +245,42 @@ These are Tier-2 text-formatting differences (identical input schemas; equal
 output structure), not Tier-3 allowlist rules: they do not change a value the
 oracle compares on the SQLite golden surfaces.
 
+## Nix option paths in symbol lookups (deferred, OD-B47)
+
+colby's `findAllSymbols` (`src/graph/named-symbol-flow.ts` at `e8ddc4e2`, added
+with the Nix support of `7f325134`, #1190) reads a dotted lower-case token such
+as `xdg.configFile` or `launchd.user.agents` (`/^[a-z][\w'-]*(?:\.[\w'-]+)+$/`)
+as a Nix option path first: the declaration `options.<token>`, then the node
+named `<token>`, then at most 12 nodes whose names start with `<token>.`
+(`getNodesByNamePrefix`, an index range scan). It answers with the first ten
+distinct Nix nodes among them, and falls through to its ordinary lookup when
+there is none. colby's callers, callees and impact tools and explore's exact
+targets for a dotted token use it (`tools.ts` at `e8ddc4e2`).
+
+The port reads the convention only for `codegraph_explore`'s named symbols
+(`find_all_symbol_nodes` in `crates/codegraph-graph/src/symbol_lookup.rs`, over
+`Store::nodes_by_name_prefix`). `codegraph_callers`, `codegraph_callees`,
+`codegraph_impact` and explore's exact targets look a token up through the MCP
+engine's `find_all_symbols` (`crates/codegraph-mcp/src/engine.rs`), and the
+CLI's `callers`, `callees` and `impact` commands through `symbol_matches` and
+`exact_or_top_matches` (`crates/codegraph-cli/src/main.rs`). Neither takes
+colby's Nix branch: a write site whose path extends the token (`<token>.<name>`)
+is never among the matches, the matches are not kept to Nix nodes, and the
+`options.<token>` declaration is found only where the qualified-name match
+accepts it (the CLI's `.<token>` suffix match can, the engine's `matches_symbol`
+cannot).
+
+On `7f325134`'s first fixture (`options.launchd.user.agents` declared in
+`modules/launchd.nix`, written as `launchd.user.agents.yabai` in
+`modules/yabai.nix`), the v0.56.0 binary answers MCP `codegraph_callers` and
+`codegraph_impact` for `launchd.user.agents` with "not found"; the CLI's
+`callers` and `impact` find the declaration through the suffix match and list
+the write site only as its caller; `codegraph explore` finds all three symbols.
+
+The mini golden holds no Nix file, so the Task 22 tools stay byte-identical on
+it. OD-B47 leaves the lookup to the next round (`UPSTREAM.md`, "Left for the
+next round").
+
 ## `codegraph context` (Tier-2 content differences)
 
 `codegraph context <task...>` follows colby's `codegraph context`
