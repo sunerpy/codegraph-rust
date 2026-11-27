@@ -57,7 +57,7 @@ tree-sitter = "0.27"
 streaming-iterator = "0.1"
 
 # File watching
-notify = "8"
+notify = "9"
 
 # Cross-platform IPC (daemon local socket / named pipe). The `tokio` feature
 # enables the async local-socket Listener/Stream used by the daemon accept loop.
