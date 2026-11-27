@@ -13,8 +13,9 @@
   excluded by the owner, or moved by the owner to the follow-up pull request,
   as the 2026-10-22 CLOSEOUT entry below lists. The official codegraph-rs
   `v0.55.0` binaries passed the black-box acceptance in the 2026-10-22 release
-  entry. The `main` commits after `b635dd46` are audited but open, as the next
-  bullet says.
+  entry, and the `v0.56.0` binaries in the 2026-11-26 release entry. The
+  `main` commits after `b635dd46` are audited but open, as the next bullet
+  says.
 - **Last discovery audit:** colby `main` at
   `e8ddc4e2be02578d735c350df55f1769b7d6978a` (2026-10-22), audited on
   2026-10-22 in
@@ -39,7 +40,8 @@
   audit's rows under waves W0 to W6 and W10 of its program, with extraction
   version 22. The audit's `LANDED` rows name the commits and #322. See the
   2026-10-22 release and CLOSEOUT entries below.
-- **Follow-up pull request #338, merged, release pending (2026-11-26):** the
+- **Shipped in codegraph-rs `v0.56.0`, 2026-11-26:** #338, the follow-up
+  pull request. It carries the
   rows the owner moved to it on 2026-10-16 (OD-18): W7 (the UI family F1–F12
   with the synthesis stage and the framework resolvers) and W9
   (`codegraph context`, #1617 and the 26 v1.5.0 performance strategies),
@@ -49,9 +51,9 @@
   before its first graph change. VB.NET (W8) is `OWNER-EXCLUDED`: the OD-3 trial
   of `tree-sitter-vb-dotnet =0.1.0` parsed 59.7% of upstream's VB.NET test
   sources without an error, against a 95% bar. The "Follow-up pull request
-  status" sections of the two dated audits list every row with its commits; see
-  the 2026-11-26 entry below. The release entry follows once the release's
-  downloaded binaries are checked. #338 also closes these caveats of the older
+  status" sections of the two dated audits list every row with its commits, and
+  their 2026-11-26 release closeouts mark those rows shipped; see the 2026-11-26
+  release entry below. #338 also closes these caveats of the older
   syncs below: the per-language framework-resolution bridges of `1.2.0 → 1.4.1`
   (ArkUI, Nix, Terraform and Erlang; CFML's landed in #322), and the deferred
   `codegraph context` and #1617 of `1.5.0 → 1.6.0`. The 26 strategies of
@@ -152,7 +154,7 @@
   follow-up pull request. `v0.55.0` landed from them only `950686de`'s test-file
   classifier and `b1f40c57`'s `e2e/` test path (one predicate with the
   resolver's), and the route roots its routes list reads. The rest landed in
-  #338 (merged, release pending), with the viewer's Steps, Screens and branch
+  #338 (shipped in `v0.56.0`), with the viewer's Steps, Screens and branch
   conditions.
 
 The Rust product and upstream release versions are independent. This Current
@@ -175,11 +177,11 @@ below remain immutable historical evidence.
 >   no node.
 > - **Refusing a schema newer than the binary (OD-19) is PLANNED (follow-up
 >   PR)**, with the design constraints the audit records. It landed in #338
->   (merged, release pending).
+>   and shipped in `v0.56.0`.
 > - **The rows under W7, W8 and W9 are PLANNED (follow-up PR)** (2026-10-16):
 >   the UI family F1–F12 with the synthesis stage and the framework resolvers,
 >   VB.NET, `codegraph context`, #1617 and the 26 v1.5.0 performance
->   strategies. They landed in #338 (merged, release pending), except VB.NET,
+>   strategies. They landed in #338 and shipped in `v0.56.0`, except VB.NET,
 >   `OWNER-EXCLUDED` after its trial; W9-00 decides the 26 strategies
 >   in [`V1_5_PERF_DISPOSITIONS_2026-11-26.md`](V1_5_PERF_DISPOSITIONS_2026-11-26.md).
 > - **KEEP-RUST divergences** are recorded row by row in the audit. Three of
@@ -281,6 +283,73 @@ below remain immutable historical evidence.
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-11-26 — `v0.56.0` RELEASED: #338 shipped
+
+Release-please PR [#344](https://github.com/sunerpy/codegraph-rust/pull/344)
+merged as `73c8dd3540bebc55f5d7abed6034152135353f43`, and tag `v0.56.0` was cut
+at that exact commit.
+
+- The merge has the tree of the PR's head `29d140d`, `f28673f…`.
+- The bot's CI run
+  [`45856309945`](https://github.com/sunerpy/codegraph-rust/actions/runs/45856309945)
+  was re-run for the owner; its second attempt lost `macOS Watcher` to GitHub's
+  macOS arm64 runner capacity ("not acquired by Runner of type hosted"), and
+  the re-run of the failed jobs passed (attempt 3, all green). The PR was
+  approved for the code owner and squash-merged at its head.
+- The implementation PR #338 merged as `69afdf5`, with the tree of its
+  reviewed head `a1a3b7e`, `5ed9e65…`. Main CI run
+  [`45856236348`](https://github.com/sunerpy/codegraph-rust/actions/runs/45856236348)
+  passed.
+
+Release workflow run
+[`45864204121`](https://github.com/sunerpy/codegraph-rust/actions/runs/45864204121)
+passed all twelve jobs on its second attempt.
+
+- The push of the release commit triggered it. On the first attempt the six
+  builds and the tag check passed, but `Verify CI Passed` timed out after 30
+  minutes waiting for main CI run
+  [`45864204084`](https://github.com/sunerpy/codegraph-rust/actions/runs/45864204084),
+  whose Windows tests take longer, so the release stayed a draft. When that run
+  passed, `CI Success` included, the failed jobs were re-run; the exact-SHA gate
+  then passed and the assets were attached.
+- The release was published at 2026-11-26T17:46:35Z UTC.
+- The official `codegraph-0.56.0-x86_64-unknown-linux-musl.tar.gz` digest is
+  `d6ae0a65029547a70b9b004474a30d86fae896bb7e4d1c15aebbb1ba5e73a097`.
+
+Black-box acceptance of the downloaded release, one script with 31 checks, all
+passing:
+
+- **Artifacts.** The release is not a draft, and its assets are the six
+  archives and `SHA256SUMS`. `SHA256SUMS` and `gh attestation verify` passed
+  for all six archives; every attestation names run `45864204121` and the tag
+  commit. The binary reports `codegraph 0.56.0`, and its `.comment` section
+  names rustc 1.98.0.
+- **Upgrade.** An index the official `v0.55.2` built reads as outdated, one
+  `sync` makes it current, and the result equals a fresh `init` (schema,
+  extraction stamp and canonical graph). `v0.55.2` refuses a `v0.56.0` index for
+  `search`, `sync` and `init` and writes nothing. A cold daemon-mode MCP session
+  upgrades a `v0.55.2` index through its daemon.
+- **OD-19.** With a schema row 11 added, `status` reports it, and `search`,
+  `context`, `sync`, `init` and an MCP call refuse it, naming both versions,
+  with no byte changed; `uninit --force` discards it and `init` then rebuilds
+  the index.
+- **Features.** Seeds from upstream's tests on the released binary: React
+  Router lazy routes (#2480), Express named handlers (#1957), Go func-field
+  synthesized edges with explore's Flow across one (#2745), jsx-render edges,
+  explore's Flow with its dynamic-dispatch links (#2748), the viewer's
+  `/api/steps` (`v0.55.2` answers 404), `codegraph context` in both formats
+  against the frozen snapshots and its error contract, `[lua]` loader
+  functions, and the Rust std gate's negative case. VB.NET is not checked: it is
+  `OWNER-EXCLUDED` (OD-3).
+- **Contracts.** `search`, `callers`, `callees` and `impact` `--json`, and
+  `export` on two corpora, only add fields relative to `v0.55.2`.
+- **Performance.** The frozen benchmark of the follow-up program (the official
+  `v0.55.2` musl build against the final head's musl build, 24 cells of init at
+  32, 4 and 1 threads on this repository and typescript-large and at 32 and 4
+  threads on nine more corpora) is within budget in every cell: wall ×0.667 to
+  ×0.988, peak RSS ×0.753 to ×1.140. typescript-large's one-file sync is ×1.115
+  against `fec4fbb` on a GitHub runner, under the 1.5 cumulative line.
 
 ### 2026-11-26 — The follow-up pull request #338 merged, release pending: W7, W9, OD-19 and the `DEFER` rows of `b635dd46..e8ddc4e2`
 
