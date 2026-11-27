@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Run the Release workflow's PR-CI fallback against a stub `gh`. The dispatch-only
-# verify-ci step must accept only the release PR's own CI on an identical tree,
-# defer to the exact-SHA gate when a push run exists, and reject everything else;
-# the publish-time re-check must stop publication when a push run that appeared
-# later fails.
+# Run the Release workflow's CI gates against a stub `gh`. The exact-SHA wait
+# must find the release commit's push run and wait for its CI Success within one
+# CI_WAIT_MINUTES budget, four polls a minute, and stop as soon as CI Success
+# fails. The dispatch-only verify-ci step must accept only the release PR's own
+# CI on an identical tree, defer to the exact-SHA gate when a push run exists,
+# and reject everything else; the publish-time re-check must stop publication
+# when a push run that appeared later fails.
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
@@ -12,11 +14,14 @@ import os,sys
 try: import yaml
 except ImportError: print('release-ci-override: ERROR: PyYAML is required',file=sys.stderr); raise SystemExit(2)
 jobs=yaml.safe_load(open(os.environ['CG_WORKFLOW'],encoding='utf-8')).get('jobs') or {}
-for job,step_id,name in (('verify-ci','pr_ci','pr_ci.sh'),('publish-release','exact_ci_recheck','recheck.sh')):
+for job,step_id,name in (('verify-ci','pr_ci','pr_ci.sh'),('verify-ci','exact_ci','exact_ci.sh'),('publish-release','exact_ci_recheck','recheck.sh')):
     steps=[s for s in (jobs.get(job) or {}).get('steps') or [] if isinstance(s,dict) and s.get('id')==step_id]
     if len(steps)!=1: print(f'release-ci-override: ERROR: expected one {job} step with id {step_id}, got {len(steps)}',file=sys.stderr); raise SystemExit(2)
     open(os.path.join(os.environ['CG_OUT'],name),'w',encoding='utf-8').write(steps[0]['run'])
+    # The exact-SHA wait runs with the workflow's own budget unless a case sets one.
+    if step_id=='exact_ci': open(os.path.join(os.environ['CG_OUT'],'exact_ci.wait'),'w',encoding='utf-8').write(str((steps[0].get('env') or {}).get('CI_WAIT_MINUTES','')))
 PY
+ci_wait=$(cat "$work/exact_ci.wait")
 
 # `gh api <path> [--jq <filter>]` answered from $GH_STUB: call n of a path reads
 # <key>.<n>.json when present, else <key>.json; a missing answer is an API failure.
@@ -82,13 +87,13 @@ edit() {
 drop() { rm -f "$work/$1/$(key "$2").json"; }
 
 pass=0; fail=0
-# check <case> pr_ci|recheck accept|defer|reject|pass <log regex> [run id]
+# check <case> pr_ci|exact_ci|recheck accept|defer|reject|pass <log regex> [run id] [CI_WAIT_MINUTES]
 check() {
-  local name=$1 body=$2 want=$3 regex=$4 id=${5:-$run_id} rc ok=1
+  local name=$1 body=$2 want=$3 regex=$4 id=${5:-$run_id} budget=${6:-$ci_wait} rc ok=1
   : >"$work/$name.output"
   set +e
   PATH="$work/bin:$PATH" GH_STUB="$work/$name" GITHUB_OUTPUT="$work/$name.output" \
-    CI_RUN_ID="$id" GH_TOKEN=stub RELEASE_SHA="$release" HEAD_SHA="$release" REPO="$repo" \
+    CI_RUN_ID="$id" CI_WAIT_MINUTES="$budget" GH_TOKEN=stub RELEASE_SHA="$release" HEAD_SHA="$release" REPO="$repo" \
     bash "$work/$body.sh" >"$work/$name.log" 2>&1
   rc=$?
   set -e
@@ -101,6 +106,13 @@ check() {
   grep -Eq -- "$regex" "$work/$name.log" || ok=0
   if [ "$ok" -eq 1 ]; then echo "PASS: $name"; pass=$((pass+1));
   else echo "FAIL: $name (exit $rc)" >&2; cat "$work/$name.log" "$work/$name.output" >&2; fail=$((fail+1)); fi
+}
+# calls <case> <path> <n>: the stub answered <path> exactly <n> times in <case>.
+calls() {
+  local got
+  got=$(cat "$work/$1/$(key "$2").calls" 2>/dev/null || echo 0)
+  if [ "$got" -eq "$3" ]; then echo "PASS: $1 called $2 $3 time(s)"; pass=$((pass+1));
+  else echo "FAIL: $1 called $2 $got time(s), expected $3" >&2; fail=$((fail+1)); fi
 }
 
 # verify-ci: the dispatch-only step that may accept the release PR's CI.
@@ -137,6 +149,14 @@ scenario X5_running_fail; with_push_run X5_running_fail '"status":"completed","c
 scenario X6_never_done; with_push_run X6_never_done '"status":"queued"'; check X6_never_done recheck reject 'has not completed; re-run this job after it finishes'
 scenario X7_list_api; drop X7_list_api "$push_runs"; check X7_list_api recheck reject 'cannot list the push runs'
 scenario X8_jobs_api; with_push_run X8_jobs_api '"status":"completed","conclusion":"success"'; drop X8_jobs_api "$push_jobs_path"; check X8_jobs_api recheck reject "cannot read the jobs of push run $push_run"
+
+# verify-ci: the exact-SHA wait. Finding the push run and waiting for its CI
+# Success spend one budget, and CI_WAIT_MINUTES=1 allows four polls.
+scenario Y1_ci_after_121_polls; with_push_run Y1_ci_after_121_polls '"status":"in_progress"'; answer Y1_ci_after_121_polls "$push_jobs_path" '{"jobs":[{"name":"CI Success","status":"completed","conclusion":"success"}]}' 122; check Y1_ci_after_121_polls exact_ci pass "CI Success passed for exact release SHA $release \\(run $push_run\\)"
+scenario Y2_one_minute_budget; with_push_run Y2_one_minute_budget '"status":"in_progress"'; check Y2_one_minute_budget exact_ci reject "timed out after 1 min waiting for CI Success in run $push_run" '' 1; calls Y2_one_minute_budget "$push_jobs_path" 4
+scenario Y3_no_push_run; check Y3_no_push_run exact_ci reject "no CI push run found for $release within 1 min" '' 1; calls Y3_no_push_run "$push_runs" 4; calls Y3_no_push_run "$push_jobs_path" 0
+scenario Y4_shared_budget; with_push_run Y4_shared_budget '"status":"in_progress"'; answer Y4_shared_budget "$push_runs" '{"workflow_runs":[]}' 1; answer Y4_shared_budget "$push_runs" '{"workflow_runs":[]}' 2; check Y4_shared_budget exact_ci reject "timed out after 1 min waiting for CI Success in run $push_run" '' 1; calls Y4_shared_budget "$push_runs" 3; calls Y4_shared_budget "$push_jobs_path" 2
+scenario Y5_ci_failed; with_push_run Y5_ci_failed '"status":"completed","conclusion":"failure"'; check Y5_ci_failed exact_ci reject "CI Success concluded failure for $release"; calls Y5_ci_failed "$push_jobs_path" 1
 
 echo "release-ci-override harness: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
