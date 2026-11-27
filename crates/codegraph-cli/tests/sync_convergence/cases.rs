@@ -10384,6 +10384,75 @@ pub fn typescript_tsconfig_paths_alias_disappears() -> Case {
         .remove("tsconfig.json")
 }
 
+/// A `tsconfig.json` whose one `paths` key has text on both sides of its `*`
+/// (upstream 77ee3484, #2969), and `src/main.ts` without and with an import
+/// of `@x/index`, which starts with `@x/` and ends with `/index` only by
+/// counting its one `/` twice.
+const OVERLAP_TSCONFIG: &str = "{\"compilerOptions\":{\"baseUrl\":\"./src\",\"paths\":{\"@x/*/index\":[\"widgets/*/index\"]}}}\n";
+const OVERLAP_MAIN: &str = "import { press } from '@x/button/index';\n\nexport function go(): number {\n  return press();\n}\n";
+const OVERLAP_MAIN_IMPORT: &str = "import { trap as caught } from '@x/index';\nimport { press } from '@x/button/index';\n\nexport function go(): number {\n  return caught() + press();\n}\n";
+
+/// The overlap project, its `src/main.ts` written `main`: a `trap` in
+/// `src/widgets/index.ts`, the file the empty capture would name, and a
+/// namesake in `src/index.ts`.
+fn overlapping_wildcard_project(main: &'static str) -> Case {
+    Case::new(Change::BodyEdit, &[Language::TypeScript])
+        .file("tsconfig.json", OVERLAP_TSCONFIG)
+        .file(
+            "src/index.ts",
+            "export function trap(): number {\n  return 1;\n}\n",
+        )
+        .file(
+            "src/widgets/index.ts",
+            "export function trap(): number {\n  return 0;\n}\n",
+        )
+        .file(
+            "src/widgets/button/index.ts",
+            "export function press(): number {\n  return 2;\n}\n",
+        )
+        .file("src/main.ts", main)
+}
+
+/// A10 (upstream 77ee3484, #2969): `src/main.ts` comes to import `@x/index`
+/// under the `paths` key `@x/*/index`, which leaves nothing for its `*` there
+/// and so does not match it, as tsc's `isPatternMatch` rules. The sync no
+/// longer panics, links neither the import nor the call through it to
+/// `src/widgets/index.ts`, and equals a fresh index.
+pub fn typescript_tsconfig_overlapping_wildcard_import_appears() -> Case {
+    overlapping_wildcard_project(OVERLAP_MAIN)
+        .write("src/main.ts", OVERLAP_MAIN_IMPORT)
+        .edge_throughout(
+            "file:src/main.ts",
+            "imports",
+            "file:src/widgets/button/index.ts",
+        )
+        .named_after("import", "@x/index")
+        .no_edge_after("file:src/main.ts", "imports", "file:src/widgets/index.ts")
+        .no_edge_after(
+            "file:src/main.ts",
+            "imports",
+            "function trap @src/widgets/index.ts",
+        )
+        .no_edge_after(
+            "function go",
+            "calls",
+            "function trap @src/widgets/index.ts",
+        )
+}
+
+/// A10: the import of `@x/index` goes again. The index that held it
+/// initializes, and the sync that drops it equals a fresh index.
+pub fn typescript_tsconfig_overlapping_wildcard_import_disappears() -> Case {
+    overlapping_wildcard_project(OVERLAP_MAIN_IMPORT)
+        .write("src/main.ts", OVERLAP_MAIN)
+        .named_before("import", "@x/index")
+        .edge_throughout(
+            "file:src/main.ts",
+            "imports",
+            "file:src/widgets/button/index.ts",
+        )
+}
+
 /// W5-06: the tsconfig `extends` a file that does not exist yet; once it is
 /// created with `paths`, the alias import resolves (the missing target is a
 /// recorded input).
